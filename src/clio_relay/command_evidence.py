@@ -137,7 +137,7 @@ def bounded_error_detail(value: str | None) -> str | None:
 
 
 def _pytest_failed_test_ids(output: str) -> tuple[list[str], bool]:
-    """Return bounded node IDs from the pytest release-gate JSON sentinel."""
+    """Return bounded node IDs from the pytest JSON sentinel."""
     marker_offset = _last_line_marker_offset(output, PYTEST_FAILED_NODE_IDS_MARKER)
     if marker_offset is None:
         return [], False

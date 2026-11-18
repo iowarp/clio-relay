@@ -2,21 +2,17 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from pathlib import Path
 from typing import cast
 
 import pytest
 
-import clio_relay.deployment as deployment
-import clio_relay.doctor as doctor
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.config import RelaySettings
-from clio_relay.deployment import (
+import clio_relay.adapters.worker.deployment as deployment
+from clio_relay.adapters.worker.deployment import (
     install_endpoint_user_service_over_ssh,
     render_endpoint_user_service,
 )
-from clio_relay.doctor import run_cluster_doctor, run_doctor
-from clio_relay.errors import ConfigurationError, RelayError
+from clio_relay.cluster_config import ClusterDefinition
+from clio_relay.errors import RelayError
 from clio_relay.relay_host import (
     FrpcConfig,
     FrpcVisitorConfig,
@@ -129,58 +125,6 @@ def test_render_frpc_config_supports_xtcp_proxy_and_visitor() -> None:
     assert "keepTunnelOpen = true" in visitor
 
 
-def test_live_doctor_requires_frps_address(tmp_path: Path) -> None:
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-
-    with pytest.raises(ConfigurationError, match="CLIO_RELAY_FRPS_ADDR"):
-        run_doctor(settings, live=True)
-
-
-def test_live_doctor_accepts_cluster_frps_address(tmp_path: Path) -> None:
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        frp_token="secret",
-        frpc_bin="python",
-    )
-
-    lines = run_doctor(settings, live=True, frps_addr="frps.example.test")
-
-    assert "frps_addr: frps.example.test" in lines
-    assert "frp_token: configured" in lines
-    assert any(line.startswith("frpc:") for line in lines)
-
-
-def test_live_doctor_reports_missing_frp_token(tmp_path: Path) -> None:
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        frpc_bin="python",
-    )
-
-    lines = run_doctor(settings, live=True, frps_addr="frps.example.test")
-
-    assert "frp_token: missing" in lines
-
-
-def test_live_doctor_does_not_require_cluster_tools_locally(tmp_path: Path) -> None:
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        frps_addr="frps.example.test",
-        frp_token="secret",
-        frpc_bin="python",
-        jarvis_bin="definitely-not-local-jarvis",
-        agent_bin="definitely-not-local-agent",
-    )
-
-    lines = run_doctor(settings, live=True)
-
-    assert "frps_addr: frps.example.test" in lines
-    assert "frp_token: configured" in lines
-    assert any(line.startswith("frpc:") for line in lines)
-
-
 def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     rendered = render_endpoint_user_service(
         cluster="test-cluster",
@@ -194,10 +138,11 @@ def test_endpoint_user_service_is_sudo_less_and_configured() -> None:
     )
 
     assert (
-        "ExecStartPre=%h/.local/bin/clio-relay queue migrate-indexes --all --batch-size 500"
+        "ExecStartPre=%h/.local/bin/clio-relay worker queue migrate-indexes --all --batch-size 500"
     ) in rendered
     assert (
-        "ExecStart=%h/.local/bin/clio-relay endpoint start --role worker --cluster test-cluster"
+        "ExecStart=%h/.local/bin/clio-relay worker endpoint start --role worker "
+        "--cluster test-cluster"
     ) in rendered
     assert (
         'Environment="PATH=%h/.local/share/clio-relay/current/bin:'
@@ -1593,63 +1538,6 @@ printf 'fixture.attempts=%s\n' "$(cat "$test_root/attempts")"
     assert "fixture.attempts=1" in stdout
     assert "active_state=active" in stderr
     assert "job_id=101" in stderr
-
-
-def test_cluster_doctor_rejects_enabled_but_inactive_endpoint_service(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Doctor reports the persistent-worker stall before unrelated tool checks."""
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.fail("bash is required to validate the cluster doctor service check")
-    rendered = doctor._cluster_doctor_script(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        ClusterDefinition(
-            name="test-cluster",
-            ssh_host="test-host",
-            jarvis_bin="jarvis-test",
-            frpc_bin="frpc-test",
-        )
-    )
-    harness = f"""set -u
-systemctl() {{
-  case "${{2:-}}" in
-    is-enabled) echo enabled ;;
-    is-active) echo inactive ;;
-  esac
-}}
-{rendered}
-"""
-    original_run = subprocess.run
-
-    def run(
-        command: list[str],
-        *,
-        input: bytes,
-        capture_output: bool,
-        check: bool,
-    ) -> subprocess.CompletedProcess[bytes]:
-        assert command == ["ssh", "test-host", "bash", "-s"]
-        assert capture_output is True
-        assert check is False
-        return original_run(
-            [bash, "-s"],
-            input=harness.encode("utf-8"),
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-
-    monkeypatch.setattr(doctor.subprocess, "run", run)
-
-    with pytest.raises(RelayError, match="endpoint service is enabled but not active"):
-        run_cluster_doctor(
-            ClusterDefinition(
-                name="test-cluster",
-                ssh_host="test-host",
-                jarvis_bin="jarvis-test",
-                frpc_bin="frpc-test",
-            )
-        )
 
 
 def test_endpoint_user_service_uses_cluster_executable_overrides() -> None:

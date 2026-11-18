@@ -3,7 +3,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond import and
 patch-target updates) alongside their commands' extraction into
-``src/clio_relay/cli_session_owned.py``, per ground rule 3 (§2 of
+``src/clio_relay/adapters/worker/cli_session_owned.py``, per ground rule 3 (§2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through one of the moved commands, or through
 ``_inspect_owned_session_recovery_before_start`` (moved alongside
@@ -32,12 +32,12 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_owned_session_recovery as cli_owned_session_recovery
-import clio_relay.cli_session_owned as cli_session_owned
-from clio_relay.cli import app
-from clio_relay.core_queue import ClioCoreQueue
+import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
+import clio_relay.adapters.worker.cli_session_owned as cli_session_owned
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import OwnedSessionRecoveryStatus
 from clio_relay.models import GatewaySession, JarvisRunSpec, JobKind, RelayJob
-from clio_relay.session_lifecycle import OwnedSessionRecoveryStatus
 from tests.test_cli import (
     _activate_owner_session,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )

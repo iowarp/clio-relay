@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from clio_relay.models import GatewaySession
-from clio_relay.validation_report import redact_sensitive_values
+from clio_relay.redaction import redact_sensitive_values
 
 
 def public_gateway_payload(payload: dict[str, Any]) -> dict[str, Any]:

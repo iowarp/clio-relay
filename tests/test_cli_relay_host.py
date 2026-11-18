@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond import and
 patch-target updates) alongside the ``relay_host_app`` commands' extraction
-into ``src/clio_relay/cli_relay_host.py``, per ground rule 3 (§2 of
+into ``src/clio_relay/adapters/worker/cli_relay_host.py``, per ground rule 3 (§2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises. Tests that
 exercise the ``relay-host`` group as ONE of several parametrized cases
@@ -23,13 +23,13 @@ with session teardown (see ``cli_relay_host.py``'s own docstring for why).
 **F2 subprocess regression guard (iowarp/clio-relay#231 R8(ii) review).**
 ``cli.py`` and ``cli_relay_host.py`` form a real, deliberate import cycle
 (see ``cli_relay_host.py``'s own docstring for the discipline that resolves
-it). Before that fix, importing ``clio_relay.cli_relay_host`` before
-``clio_relay.cli`` in a fresh interpreter raised ``AttributeError:
-partially initialized module 'clio_relay.cli_relay_host' has no attribute
-'relay_host_app'``, and ``python -m clio_relay.cli`` regressed from exit 0
+it). Before that fix, importing ``clio_relay.adapters.worker.cli_relay_host`` before
+``clio_relay.adapters.worker.cli`` in a fresh interpreter raised ``AttributeError:
+partially initialized module 'clio_relay.adapters.worker.cli_relay_host' has no attribute
+'relay_host_app'``, and ``python -m clio_relay.adapters.worker.cli`` regressed from exit 0
 to exit 1 for the same underlying reason (``runpy`` executes ``cli.py`` as
-``__main__``, a distinct module object from ``clio_relay.cli`` in
-``sys.modules``, so ``cli_relay_host.py``'s import of ``clio_relay.cli``
+``__main__``, a distinct module object from ``clio_relay.adapters.worker.cli`` in
+``sys.modules``, so ``cli_relay_host.py``'s import of ``clio_relay.adapters.worker.cli``
 mid-way through ``__main__``'s own load re-enters the same cycle). The
 three subprocess tests at the bottom of this file are the regression guard:
 each spawns a fresh interpreter (in-process re-import cannot reproduce this
@@ -48,17 +48,13 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.transport_probe as transport_probe
-from clio_relay.cli import app
+import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
+import clio_relay.adapters.worker.transport_probe as transport_probe
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.validation_report import (
-    EvidenceReference,
-    LiveValidationReport,
-    ValidationRecorder,
-    ValidationResource,
-)
+from clio_relay.run_report_models import EvidenceReference, LiveValidationReport, ValidationResource
+from clio_relay.run_report_recorder import ValidationRecorder
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 )
@@ -98,7 +94,9 @@ def test_cli_tests_ssh_transport(tmp_path: Path, monkeypatch: MonkeyPatch) -> No
             "transport.cleanup=passed",
         ]
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     report_path = tmp_path / "ssh-transport.json"
 
@@ -176,7 +174,9 @@ def test_cli_ssh_transport_detach_report_models_retention_without_residual(
             "transport.cleanup=detached",
         ]
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_ssh_forward_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_ssh_forward_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_API_TOKEN", "api-token")
     report_path = tmp_path / "ssh-detach.json"
 
@@ -249,7 +249,7 @@ def test_cli_tests_http_transport_and_writes_canonical_report(
             )
         )
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_frp_http_probe", fake_probe)
+    monkeypatch.setattr("clio_relay.adapters.worker.transport_probe.run_frp_http_probe", fake_probe)
     monkeypatch.setattr(
         cli_remote_worker_attach, "_attach_verified_remote_worker", fake_worker_identity
     )
@@ -307,7 +307,9 @@ def test_cli_tests_direct_transport_and_writes_canonical_report(
             "transport.cleanup=passed",
         ]
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_frp_direct_http_probe", fake_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "xtcp-secret")
     report_path = tmp_path / "direct-transport.json"
@@ -350,7 +352,9 @@ def test_cli_transport_failure_writes_partial_canonical_report(
         del kwargs
         raise RelayError("live transport failed")
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_frp_http_probe", failing_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_http_probe", failing_probe
+    )
     monkeypatch.setenv("CLIO_RELAY_FRP_TOKEN", "frp-token")
     monkeypatch.setenv("CLIO_RELAY_STCP_SECRET", "stcp-secret")
     report_path = tmp_path / "failed-transport.json"
@@ -653,7 +657,9 @@ def test_cli_direct_transport_is_strict_xtcp_by_default(
         calls.append(kwargs)
         return ["direct_transport.result=xtcp", "transport.cleanup=passed"]
 
-    monkeypatch.setattr("clio_relay.transport_probe.run_frp_direct_http_probe", fake_direct_probe)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.transport_probe.run_frp_direct_http_probe", fake_direct_probe
+    )
 
     result = CliRunner().invoke(
         app,
@@ -689,7 +695,7 @@ def test_cli_install_proxy_delegates_to_frpc_proxy_bringup(
 
     def fake_install(**kwargs: object) -> object:
         calls.append(kwargs)
-        from clio_relay.frpc_proxy_receipt import FrpcProxyBringupReceipt
+        from clio_relay.adapters.worker.frpc_proxy_receipt import FrpcProxyBringupReceipt
 
         return FrpcProxyBringupReceipt(
             cluster="ares",
@@ -705,7 +711,9 @@ def test_cli_install_proxy_delegates_to_frpc_proxy_bringup(
             installed_at="2026-08-26T00:00:00Z",
         )
 
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install
+    )
 
     result = CliRunner().invoke(
         app,
@@ -730,7 +738,9 @@ def test_cli_install_proxy_respects_an_ssh_host_override(
         calls.append(kwargs)
         raise RelayError("stop before any real dial -- this test only checks argument wiring")
 
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", fake_install
+    )
 
     result = CliRunner().invoke(
         app,
@@ -751,7 +761,7 @@ def test_cli_teardown_proxy_delegates_to_frpc_proxy_bringup(
 
     def fake_teardown(**kwargs: object) -> object:
         calls.append(kwargs)
-        from clio_relay.frpc_proxy_receipt import FrpcProxyTeardownReceipt
+        from clio_relay.adapters.worker.frpc_proxy_receipt import FrpcProxyTeardownReceipt
 
         return FrpcProxyTeardownReceipt(
             cluster="ares",
@@ -762,7 +772,9 @@ def test_cli_teardown_proxy_delegates_to_frpc_proxy_bringup(
             torn_down_at="2026-08-26T00:05:00Z",
         )
 
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", fake_teardown)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", fake_teardown
+    )
 
     result = CliRunner().invoke(
         app,
@@ -784,7 +796,7 @@ def test_cli_proxy_status_delegates_to_frpc_proxy_bringup(
 
     def fake_status(**kwargs: object) -> object:
         calls.append(kwargs)
-        from clio_relay.frpc_proxy_receipt import FrpcProxyStatusDocument
+        from clio_relay.adapters.worker.frpc_proxy_receipt import FrpcProxyStatusDocument
 
         return FrpcProxyStatusDocument(
             cluster="ares",
@@ -801,7 +813,9 @@ def test_cli_proxy_status_delegates_to_frpc_proxy_bringup(
             diagnosis="frpc proxy unit is inactive (state=inactive/dead)",
         )
 
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.frpc_proxy_status_over_ssh", fake_status)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", fake_status
+    )
 
     result = CliRunner().invoke(
         app,
@@ -842,9 +856,15 @@ def test_cli_frpc_proxy_verbs_report_an_unconfigured_cluster_cleanly(
     def poison(**_kwargs: object) -> object:
         raise AssertionError("must fail resolving --cluster before any ssh-executing call")
 
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.install_frpc_proxy_over_ssh", poison)
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", poison)
-    monkeypatch.setattr("clio_relay.frpc_proxy_bringup.frpc_proxy_status_over_ssh", poison)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.install_frpc_proxy_over_ssh", poison
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.teardown_frpc_proxy_over_ssh", poison
+    )
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.frpc_proxy_bringup.frpc_proxy_status_over_ssh", poison
+    )
 
     result = CliRunner().invoke(app, verb_args)
 
@@ -864,16 +884,16 @@ def test_cli_frpc_proxy_verbs_report_an_unconfigured_cluster_cleanly(
 
 
 def test_cli_relay_host_reverse_first_import_succeeds() -> None:
-    """A fresh interpreter importing ``clio_relay.cli_relay_host`` before
-    ``clio_relay.cli`` must succeed. Before the F2 fix this raised
-    ``AttributeError: partially initialized module 'clio_relay.cli_relay_host'
+    """A fresh interpreter importing ``clio_relay.adapters.worker.cli_relay_host`` before
+    ``clio_relay.adapters.worker.cli`` must succeed. Before the F2 fix this raised
+    ``AttributeError: partially initialized module 'clio_relay.adapters.worker.cli_relay_host'
     has no attribute 'relay_host_app'`` -- ``cli_relay_host.py`` read
     ``cli.py`` as a module-level runtime import, and ``cli.py``'s own
     module-level import of ``cli_relay_host`` (to register
     ``relay_host_app``) re-entered a still-loading ``cli.py``.
     """
     result = subprocess.run(
-        [sys.executable, "-c", "import clio_relay.cli_relay_host"],
+        [sys.executable, "-c", "import clio_relay.adapters.worker.cli_relay_host"],
         capture_output=True,
         text=True,
         check=False,
@@ -882,13 +902,13 @@ def test_cli_relay_host_reverse_first_import_succeeds() -> None:
 
 
 def test_cli_first_import_still_succeeds() -> None:
-    """A fresh interpreter importing ``clio_relay.cli`` first must also
+    """A fresh interpreter importing ``clio_relay.adapters.worker.cli`` first must also
     succeed -- the direction that already worked before the F2 fix, guarded
     here so a future change to the cycle can't silently break it while
     fixing (or re-breaking) the reverse direction.
     """
     result = subprocess.run(
-        [sys.executable, "-c", "import clio_relay.cli"],
+        [sys.executable, "-c", "import clio_relay.adapters.worker.cli"],
         capture_output=True,
         text=True,
         check=False,
@@ -897,16 +917,16 @@ def test_cli_first_import_still_succeeds() -> None:
 
 
 def test_cli_module_invocation_exits_zero() -> None:
-    """``python -m clio_relay.cli`` -- the real end-user launch path -- must
+    """``python -m clio_relay.adapters.worker.cli`` -- the real end-user launch path -- must
     exit 0. ``runpy`` executes ``cli.py`` as ``__main__``, a module object
-    distinct from ``clio_relay.cli`` in ``sys.modules``; ``cli_relay_host.py``
-    importing ``clio_relay.cli`` mid-way through ``__main__``'s own load
+    distinct from ``clio_relay.adapters.worker.cli`` in ``sys.modules``; ``cli_relay_host.py``
+    importing ``clio_relay.adapters.worker.cli`` mid-way through ``__main__``'s own load
     then re-enters the same cycle the reverse-first-import test above
     guards, so this regressed the same way: exit 0 -> exit 1 with the same
     ``AttributeError``, before the F2 fix.
     """
     result = subprocess.run(
-        [sys.executable, "-m", "clio_relay.cli"],
+        [sys.executable, "-m", "clio_relay.adapters.worker.cli"],
         capture_output=True,
         text=True,
         check=False,

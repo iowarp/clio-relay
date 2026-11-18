@@ -171,7 +171,7 @@ def _identities() -> Identities:
     paths = _paths()
     return Identities(
         IdentityContext(
-            store=TokenStore(),
+            store=TokenStore(config_dir=paths.config_dir),
             grants=GrantFiles.from_settings({"grant_files": dict(paths.grant_files)}),
         )
     )

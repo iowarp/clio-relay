@@ -11,15 +11,14 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
-from clio_relay import deployment
-from clio_relay.cli import app
+from clio_relay.adapters.worker import deployment
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,
     WorkerCapacityPolicy,
 )
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.deployment import render_endpoint_user_service
 from clio_relay.models import JobKind
 
 
@@ -119,42 +118,6 @@ def test_cluster_add_persists_generic_worker_capacity(
         control_query_concurrency=2,
         kind_concurrency={JobKind.JARVIS: 4},
     )
-
-
-def test_endpoint_cli_passes_reserved_control_capacity_to_worker(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The service-level flag reaches durable endpoint capacity metadata."""
-    core = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "endpoint",
-            "start",
-            "--role",
-            "worker",
-            "--cluster",
-            "alpha",
-            "--scheduler-provider",
-            "external",
-            "--once",
-            "--concurrency",
-            "3",
-            "--control-query-concurrency",
-            "1",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    endpoints = ClioCoreQueue(core).list_endpoints(cluster="alpha")
-    assert len(endpoints) == 1
-    assert endpoints[0].metadata["concurrency"] == 3
-    assert endpoints[0].metadata["workload_concurrency"] == 2
-    assert endpoints[0].metadata["control_query_concurrency"] == 1
 
 
 def test_install_service_persists_explicit_capacity_overrides(

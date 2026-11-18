@@ -15,37 +15,29 @@ from typing import Any, Literal, cast
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.adapters.worker.session_api_readiness as session_api_readiness
+import clio_relay.adapters.worker.session_cleanup_execution as session_cleanup_execution
+import clio_relay.adapters.worker.session_cleanup_targets as session_cleanup_targets
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
+import clio_relay.adapters.worker.session_lifecycle_report as session_lifecycle_report
+import clio_relay.adapters.worker.session_process_scope as session_process_scope
+import clio_relay.adapters.worker.session_recovery_attempt_status as session_recovery_attempt_status
+import clio_relay.adapters.worker.session_remote_command as session_remote_command
+import clio_relay.adapters.worker.session_remote_scripts as session_remote_scripts
+import clio_relay.adapters.worker.session_start_execution as session_start_execution
+import clio_relay.adapters.worker.session_start_query as session_start_query
+import clio_relay.adapters.worker.session_start_wait as session_start_wait
+import clio_relay.adapters.worker.session_startup_receipt as session_startup_receipt
+import clio_relay.adapters.worker.session_transaction as session_transaction
 import clio_relay.installation as installation_module
-import clio_relay.session_api_readiness as session_api_readiness
-import clio_relay.session_cleanup_execution as session_cleanup_execution
-import clio_relay.session_cleanup_targets as session_cleanup_targets
-import clio_relay.session_lifecycle as session_lifecycle
-import clio_relay.session_lifecycle_report as session_lifecycle_report
-import clio_relay.session_process_scope as session_process_scope
-import clio_relay.session_recovery_attempt_status as session_recovery_attempt_status
-import clio_relay.session_recovery_cleaned_receipt as session_recovery_cleaned_receipt
-import clio_relay.session_remote_command as session_remote_command
-import clio_relay.session_remote_scripts as session_remote_scripts
-import clio_relay.session_start_attempt_validation as session_start_attempt_validation
-import clio_relay.session_start_execution as session_start_execution
-import clio_relay.session_start_query as session_start_query
-import clio_relay.session_start_wait as session_start_wait
-import clio_relay.session_startup_receipt as session_startup_receipt
-import clio_relay.session_transaction as session_transaction
 import clio_relay.session_wire_models as session_wire_models
 from clio_relay import __version__
-from clio_relay.cluster_config import (
-    MAX_CLUSTER_REGISTRY_BYTES,
-    ClusterDefinition,
-    ClusterRegistry,
-    RemoteMcpServerConfig,
-    cluster_route_revision,
+from clio_relay.adapters.worker import (
+    session_recovery_cleaned_receipt,
+    session_start_attempt_validation,
 )
-from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.errors import RelayError, RemoteExecutableMissingError
-from clio_relay.installation import InstallReceipt
-from clio_relay.session_lifecycle import (
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,
     OwnedSessionCleanupFinalizeRequest,
     OwnedSessionCleanupReportReadRequest,
@@ -66,13 +58,23 @@ from clio_relay.session_lifecycle import (
     status_remote_session,
     teardown_remote_session,
 )
-from clio_relay.session_lifecycle_report import (
+from clio_relay.adapters.worker.session_lifecycle_report import (
     SESSION_CONNECTORS_CHECK_ID,
     SESSION_GATEWAY_CHECK_ID,
     SESSION_SCHEDULER_CANCELED_CHECK_ID,
     SESSION_WORKER_CHECK_ID,
 )
-from clio_relay.session_start_query import challenge_remote_session_identity
+from clio_relay.adapters.worker.session_start_query import challenge_remote_session_identity
+from clio_relay.cluster_config import (
+    MAX_CLUSTER_REGISTRY_BYTES,
+    ClusterDefinition,
+    ClusterRegistry,
+    RemoteMcpServerConfig,
+    cluster_route_revision,
+)
+from clio_relay.config import ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV
+from clio_relay.errors import RelayError, RemoteExecutableMissingError
+from clio_relay.installation import InstallReceipt
 from clio_relay.session_wire_models import OwnedSessionCleanupTarget, RemoteSessionStateEvidence
 
 
@@ -852,7 +854,7 @@ def test_owned_session_recovery_trusts_snapshot_across_route_revision_algorithm_
 
     monkeypatch.setattr(session_lifecycle, "cluster_route_revision", _skewed_route_revision)
 
-    caplog.set_level("WARNING", logger="clio_relay.session_lifecycle")
+    caplog.set_level("WARNING", logger="clio_relay.adapters.worker.session_lifecycle")
     status = inspect_owned_session_recovery_status(
         cluster="ares",
         session_id="session-1",
@@ -976,7 +978,7 @@ def test_pre_metadata_start_attempt_trusts_snapshot_across_route_revision_algori
     # fallback into the pre-metadata path -- the same direct-call pattern
     # `test_contained_start_crash_is_promoted_only_after_full_identity_recheck`
     # already uses for a sibling private function.
-    caplog.set_level("WARNING", logger="clio_relay.session_recovery_attempt_status")
+    caplog.set_level("WARNING", logger="clio_relay.adapters.worker.session_recovery_attempt_status")
     status = session_recovery_attempt_status._inspect_owned_session_start_attempt_status(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
         cluster=request.cluster,
         session_id=request.session_id,
@@ -4389,7 +4391,7 @@ def test_start_remote_session_writes_owned_pid_and_metadata(monkeypatch: MonkeyP
     assert receipt.outcome == "started"
     script = scripts[0]
     assert "CLIO_RELAY_API_TOKEN='token'" in script
-    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
+    assert '"$HOME/.local/bin/clio-relay" worker session start-owned' in script
     assert "umask 077" in script
     assert '"cluster":"ares"' in script
     assert '"session_id":"session-1"' in script
@@ -4501,8 +4503,8 @@ def test_owned_session_scripts_use_the_route_pinned_relay_executable() -> None:
     )
 
     assert all(pinned in script for script in scripts)
-    assert all("\nclio-relay session" not in script for script in scripts)
-    assert all("| clio-relay session" not in script for script in scripts)
+    assert all("\nclio-relay worker session" not in script for script in scripts)
+    assert all("| clio-relay worker session" not in script for script in scripts)
 
 
 def test_start_remote_session_checks_existing_api_release_before_reuse(
@@ -4539,7 +4541,7 @@ def test_start_remote_session_checks_existing_api_release_before_reuse(
     )
 
     script = scripts[0]
-    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
+    assert '"$HOME/.local/bin/clio-relay" worker session start-owned' in script
     assert '"replace":false' in script
     assert '"expected_api_release_identity"' in script
     assert "exec 9>" not in script
@@ -4590,7 +4592,7 @@ def test_start_remote_session_stages_large_registry_without_python_argv(
     script = scripts[0]
     assert len(script.encode("utf-8")) > 128 * 1024
     assert "printf '%s'" in script
-    assert '"$HOME/.local/bin/clio-relay" session start-owned' in script
+    assert '"$HOME/.local/bin/clio-relay" worker session start-owned' in script
     assert "python3 -" not in script
 
 
@@ -4643,7 +4645,7 @@ def test_status_remote_session_returns_json(monkeypatch: MonkeyPatch) -> None:
 
     assert status == {"session_id": "session-1", "running": True}
     script = scripts[0]
-    command_index = script.index('"$HOME/.local/bin/clio-relay" session recovery-status')
+    command_index = script.index('"$HOME/.local/bin/clio-relay" worker session recovery-status')
     for export in (
         'export PATH="$HOME/.local/bin:$PATH";',
         "export CLIO_RELAY_CLI_MODE=local;",
@@ -4682,7 +4684,7 @@ def test_status_remote_session_marks_pre_start_cleanup_probe_explicitly(
     assert status["cleanup_receipt"] is False
     assert status["recovery_verified"] is False
     assert (
-        '"$HOME/.local/bin/clio-relay" session recovery-status --cluster ares '
+        '"$HOME/.local/bin/clio-relay" worker session recovery-status --cluster ares '
         "--session-id fresh-session --pre-start-cleanup-probe"
     ) in scripts[0]
 
@@ -4713,7 +4715,7 @@ def test_remote_session_start_status_uses_cluster_environment(
 
     assert observed == expected
     script = scripts[0]
-    command_index = script.index('"$HOME/.local/bin/clio-relay" session start-status-owned')
+    command_index = script.index('"$HOME/.local/bin/clio-relay" worker session start-status-owned')
     for export in (
         'export PATH="$HOME/.local/bin:$PATH";',
         "export CLIO_RELAY_CLI_MODE=local;",
@@ -4753,7 +4755,7 @@ def test_remote_session_identity_challenge_binds_process_cluster_and_nonce(
 
     assert observed == expected
     script = scripts[0]
-    assert '"$HOME/.local/bin/clio-relay" session challenge-owned' in script
+    assert '"$HOME/.local/bin/clio-relay" worker session challenge-owned' in script
     assert '"session_generation_id":"generation-1"' in script
     assert f'"nonce":"{nonce}"' in script
     assert "metadata.json" not in script
@@ -5022,7 +5024,7 @@ def test_detach_remote_session_retains_verified_remote_api(monkeypatch: MonkeyPa
         }
 
     monkeypatch.setattr(
-        "clio_relay.session_lifecycle.status_remote_session",
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session",
         fake_status,
     )
 
@@ -5064,7 +5066,9 @@ def test_detach_remote_session_rejects_unverified_remote_api_retention(
             "session_generation_id": "generation-123",
         }
 
-    monkeypatch.setattr("clio_relay.session_lifecycle.status_remote_session", fake_status)
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.session_lifecycle.status_remote_session", fake_status
+    )
 
     report = detach_remote_session(
         definition=ClusterDefinition(name="cluster", ssh_host="cluster"),
@@ -5298,7 +5302,7 @@ def test_teardown_remote_session_kills_owned_pid_and_optional_worker(
     assert report.resources[0].outcome == "stopped"
     assert report.resources[1].resource_id == "clio-relay-worker-ares.service"
     assert report.to_cleanup_evidence(stop_worker=True).stop_worker is True
-    assert '"$HOME/.local/bin/clio-relay" session teardown-owned' in scripts[0]
+    assert '"$HOME/.local/bin/clio-relay" worker session teardown-owned' in scripts[0]
     assert '"expected_cleanup_operation_id":"cleanup-test"' in scripts[0]
     assert '"expected_session_generation_id":"generation-1"' in scripts[0]
     assert '"stop_worker":true' in scripts[0]
@@ -5328,7 +5332,7 @@ def test_owned_teardown_delegates_to_pinned_cluster_local_executor() -> None:
         cluster="ares",
     )
 
-    assert '"$HOME/.local/bin/clio-relay" session teardown-owned' in script
+    assert '"$HOME/.local/bin/clio-relay" worker session teardown-owned' in script
     assert '"expected_session_generation_id":"generation-1"' in script
     assert '"expected_cleanup_operation_id":"cleanup-test"' in script
     assert "os.killpg" not in script

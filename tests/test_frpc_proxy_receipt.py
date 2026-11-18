@@ -12,8 +12,7 @@ import base64
 
 import pytest
 
-from clio_relay.errors import RelayError
-from clio_relay.frpc_proxy_receipt import (
+from clio_relay.adapters.worker.frpc_proxy_receipt import (
     BRINGUP_RECEIPT_SCHEMA,
     TEARDOWN_RECEIPT_SCHEMA,
     build_frpc_proxy_status_document,
@@ -21,6 +20,7 @@ from clio_relay.frpc_proxy_receipt import (
     parse_frpc_proxy_status_properties,
     parse_frpc_proxy_teardown_receipt,
 )
+from clio_relay.errors import RelayError
 
 _BRINGUP_LINES = [
     f"FrpcProxyReceiptSchema={BRINGUP_RECEIPT_SCHEMA}",
@@ -254,7 +254,7 @@ def test_status_document_classifies_a_masked_proxy_distinctly_not_as_not_install
     assert document.installed is False
     assert document.load_state_category == "masked"
     assert "not installed" not in document.diagnosis
-    assert "run `clio-relay relay-host install-proxy`" not in document.diagnosis
+    assert "run `clio-relay worker relay-host install-proxy`" not in document.diagnosis
     assert "unmask" in document.diagnosis
 
 

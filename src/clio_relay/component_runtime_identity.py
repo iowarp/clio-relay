@@ -20,6 +20,7 @@ from typing import cast
 
 from clio_relay.bounded_process import BoundedProcessError, run_bounded_process
 from clio_relay.errors import ConfigurationError
+from clio_relay.file_digest import sha256_file
 from clio_relay.installation_receipt_models import (
     ComponentArtifactIdentity,
     InstallReceipt,
@@ -39,7 +40,6 @@ from clio_relay.python_distribution_probe import (
     _normalized_distribution_name,
     _probe_python_distribution,
 )
-from clio_relay.validation_report import sha256_file
 from clio_relay.wheel_record_closure import _probe_python_distribution_record_closure
 
 
@@ -243,7 +243,6 @@ from importlib.metadata import version
 
 import clio_relay
 import clio_relay.bounded_command.pkg
-import clio_relay.mcp_call.pkg
 import clio_relay.remote_agent.pkg
 import jarvis_cd
 
@@ -254,7 +253,6 @@ print(json.dumps({
     "imports": [
         "clio_relay",
         "clio_relay.bounded_command.pkg",
-        "clio_relay.mcp_call.pkg",
         "clio_relay.remote_agent.pkg",
         "jarvis_cd",
     ],
@@ -284,7 +282,6 @@ print(json.dumps({
     expected_imports = [
         "clio_relay",
         "clio_relay.bounded_command.pkg",
-        "clio_relay.mcp_call.pkg",
         "clio_relay.remote_agent.pkg",
         "jarvis_cd",
     ]

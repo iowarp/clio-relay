@@ -5,9 +5,8 @@ Each test below is written failing-first against
 deliberately-bare re-raise), the #218/#215 regressions re-pointed at the
 frozen ``REASONS`` table instead of their old ad hoc, per-site shapes, an
 adapter-contract proof of the ``launcher_resolution_failed`` shape, a
-sabotage twin proving unclassified exceptions never reach the wire, the
-browser_gateway fourth adapter replacing its bare ``{"error": message}``
-dict, and the opus re-review findings (F1-F16): the MCP-SDK code-band
+sabotage twin proving unclassified exceptions never reach the wire, and
+the opus re-review findings (F1-F16): the MCP-SDK code-band
 collision, silent truncation, the unenforced byte budget, a hostile
 ``__str__``, and the ``payload_too_large``/deviation-ownership gaps.
 """
@@ -15,20 +14,10 @@ collision, silent truncation, the unenforced byte budget, a hostile
 from __future__ import annotations
 
 import ast
-import asyncio
-import hashlib
 import json
 import re
-import socket
-import subprocess
-import sys
-import threading
-from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlencode
 
 import mcp_types
 import mcp_types.jsonrpc
@@ -36,16 +25,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from fastmcp import Client, FastMCP
-from fastmcp.tools import ToolResult
-from fastmcp_tasks.client import call_tool_task  # pyright: ignore[reportUnknownVariableType]
-from fastmcp_tasks.client_models import ClientGetTaskResult, GetTaskRequest, GetTaskRequestParams
 from mcp.shared.exceptions import MCPError
 
-from clio_relay import door_errors
-from clio_relay.browser_gateway import BrowserGatewayConfig, CapabilityProxyServer
+from clio_relay.adapters.worker import door_errors
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.storage_runtime import (
+    StorageAdmissionError,
+    StorageRuntimeViolation,
+)
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import (
     ConfigurationError,
     NotFoundError,
@@ -54,14 +42,9 @@ from clio_relay.errors import (
     QueueConflictError,
     TaskInputParkConflictError,
 )
-from clio_relay.fastmcp_server import RelayMcpRuntime, RelayTasksExtension, RelayTool
-from clio_relay.http_api import create_app
-from clio_relay.jarvis_dispatch_failure import JarvisDispatchRefusal
 from clio_relay.job_identity import OwnerSessionIdentityError
-from clio_relay.mcp_server import mcp_tool_definitions_and_remote_catalog
-from clio_relay.models import JobKind, JobState
+from clio_relay.models import JobKind
 from clio_relay.storage_policy import StorageDecision, StorageReason
-from clio_relay.storage_runtime import StorageAdmissionError, StorageRuntimeViolation
 
 # --------------------------------------------------------------------------- #
 # The frozen REASONS registry
@@ -72,7 +55,6 @@ _EXPECTED_REASONS = frozenset(
         "mcp_task_input_park_conflict",
         "mcp_task_conflict",
         "mcp_task_status_reconciliation_failed",
-        "jarvis_dispatch_refused",
         "not_found",
         "configuration_error",
         "storage_admission_refused",
@@ -103,7 +85,6 @@ _EXPECTED_REASONS = frozenset(
         "task_not_found",
         "gateway_not_found",
         "artifact_not_found",
-        "execution_not_found",
         "session_generation_identity_unavailable",
         "session_intake_closed",
         "session_binding_headers_required",
@@ -111,7 +92,6 @@ _EXPECTED_REASONS = frozenset(
         "unbound_session_api",
         "job_cluster_mismatch",
         "job_submission_conflict",
-        "mcp_submission_conflict",
         "jarvis_runtime_authority_conflict",
         "jarvis_artifact_conflict",
         "input_ingest_conflict",
@@ -121,7 +101,6 @@ _EXPECTED_REASONS = frozenset(
         "queue_operation_conflict",
         "retention_conflict",
         "job_submission_refused",
-        "mcp_admission_refused",
         "input_ingest_refused",
         "job_route_refused",
         "jarvis_submission_refused",
@@ -134,13 +113,6 @@ _EXPECTED_REASONS = frozenset(
         "route_not_found",
         "method_not_allowed",
         "framework_http_error",
-        "browser_gateway_overloaded",
-        "browser_preflight_refused",
-        "browser_attachment_not_found",
-        "browser_origin_refused",
-        "browser_capability_refused",
-        "browser_method_not_allowed",
-        "browser_upstream_unavailable",
         "websocket_authentication_failed",
         "websocket_session_binding_failed",
         "websocket_page_limit_invalid",
@@ -179,7 +151,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
             "task_not_found",
             "gateway_not_found",
             "artifact_not_found",
-            "execution_not_found",
         },
         404,
     ),
@@ -192,7 +163,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
             "unbound_session_api",
             "job_cluster_mismatch",
             "job_submission_conflict",
-            "mcp_submission_conflict",
             "jarvis_runtime_authority_conflict",
             "jarvis_artifact_conflict",
             "input_ingest_conflict",
@@ -207,7 +177,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
     **dict.fromkeys(
         {
             "job_submission_refused",
-            "mcp_admission_refused",
             "input_ingest_refused",
             "job_route_refused",
             "jarvis_submission_refused",
@@ -223,12 +192,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
     "route_not_found": 404,
     "method_not_allowed": 405,
     "framework_http_error": 500,
-    "browser_gateway_overloaded": 503,
-    **dict.fromkeys({"browser_preflight_refused", "browser_origin_refused"}, 403),
-    "browser_attachment_not_found": 404,
-    "browser_capability_refused": 401,
-    "browser_method_not_allowed": 405,
-    "browser_upstream_unavailable": 502,
     "websocket_authentication_failed": 401,
     "websocket_session_binding_failed": 409,
     "websocket_page_limit_invalid": 422,
@@ -241,7 +204,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 79
+    assert len(door_errors.REASONS) == 68
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -250,7 +213,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 64
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 54
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -425,34 +388,6 @@ def test_classify_carries_owner_session_identity_detail_as_extension_data() -> N
     assert str(exc) not in json.dumps(fault.data)
 
 
-def test_classify_jarvis_dispatch_refusal_is_an_object_entry_point() -> None:
-    """JarvisDispatchRefusal is a durable-result dataclass, never raised-and-caught.
-
-    F11: this reason is declared in the frozen table but not yet emitted by
-    any production call site -- no code today constructs a durable
-    ``jarvis_run`` result and hands its refusal to ``classify()``. This test
-    (and the vocabulary itself) is forward-declared contract, not a
-    regression proof of live behavior.
-    """
-    refusal = JarvisDispatchRefusal(
-        code="jarvis_tool_error",
-        message="the pipeline refused to dispatch",
-        pipeline_id="pipeline-1",
-        execution_id="execution-1",
-        payload_schema_version="jarvis.error.v1",
-    )
-    fault = door_errors.classify(refusal)
-    assert fault.reason == "jarvis_dispatch_refused"
-    assert fault.message == "JARVIS dispatch refused."
-    assert refusal.message not in fault.message
-    assert fault.data == {
-        "code": "jarvis_tool_error",
-        "pipeline_id": "pipeline-1",
-        "execution_id": "execution-1",
-    }
-    assert fault.retryable is False
-
-
 def test_classify_reason_override_is_call_path_scoped_not_type_based() -> None:
     """A bare QueueConflictError means mcp_task_conflict only when the call
     site says so -- the same type is raised 651 other times in
@@ -494,7 +429,7 @@ def test_classify_internal_error_fallback_never_leaks_str_exc(
     class _NovelSurpriseError(RuntimeError):
         pass
 
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         try:
             raise _NovelSurpriseError("a distinctly identifiable internal detail 8f2c1a")
         except _NovelSurpriseError as exc:
@@ -510,7 +445,7 @@ def test_classify_internal_error_fallback_never_leaks_str_exc(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -531,7 +466,7 @@ def test_classify_guards_a_hostile_str_and_never_raises(
         def __str__(self) -> str:
             raise RuntimeError("hostile __str__ payload -- must never propagate")
 
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         fault = door_errors.classify(_HostileConfigurationError("irrelevant"))
 
     assert fault.reason == "configuration_error"
@@ -541,7 +476,7 @@ def test_classify_guards_a_hostile_str_and_never_raises(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -608,7 +543,7 @@ def test_message_under_the_t1_budget_has_no_truncation_record() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# as_mcp_error / as_http_problem / as_browser_gateway_error
+# as_mcp_error / as_http_problem
 # --------------------------------------------------------------------------- #
 
 
@@ -744,14 +679,6 @@ def test_as_http_problem_measures_bytes_with_ensure_ascii_false() -> None:
     assert len(honest) <= door_errors.MAX_ENVELOPE_BYTES
 
 
-def test_as_browser_gateway_error_maps_onto_the_two_arg_shape() -> None:
-    fault = door_errors.classify(ConfigurationError("bad body"), reason="configuration_error")
-    status, document = door_errors.as_browser_gateway_error(fault)
-    assert status == fault.http_status == 400
-    assert document == door_errors.as_http_problem(fault)
-    assert "error" not in document  # not the old bare {"error": message} shape
-
-
 @pytest.mark.parametrize(
     "reason",
     [
@@ -774,73 +701,6 @@ def test_websocket_refusal_adapter_preserves_policy_code_and_reason(reason: str)
 # --------------------------------------------------------------------------- #
 # fastmcp_server.py wiring: the live hole + #218/#215 re-pointed + MCPError pass-through
 # --------------------------------------------------------------------------- #
-
-
-def _fastmcp_task_server(
-    settings: RelaySettings,
-    queue: ClioCoreQueue,
-) -> tuple[FastMCP[dict[str, Any]], RelayMcpRuntime, RelayTool]:
-    runtime = RelayMcpRuntime(settings=settings, profile="user", queue=queue)
-    definitions, _catalog = mcp_tool_definitions_and_remote_catalog(
-        profile="user", registry_path=settings.cluster_registry_path
-    )
-    definition = next(item for item in definitions if item["name"] == "relay_submit_agent")
-    tool = RelayTool(definition, runtime=runtime, catalog_revision=None, task_capable=True)
-    server: FastMCP[dict[str, Any]] = FastMCP(
-        "door-errors-fastmcp-test",
-        tools=[tool],
-        lifespan=runtime.lifespan,
-        tasks=False,
-        strict_input_validation=True,
-    )
-    server.add_extension(RelayTasksExtension(runtime))
-    return server, runtime, tool
-
-
-def test_task_input_park_conflict_is_typed_not_bare(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The live hole (doc §6.1, fastmcp_server.py:1106-1115): before R3,
-    ``intercept_tool_call`` left ``TaskInputParkConflictError`` deliberately
-    unwrapped, so it escaped through FastMCP's generic handler as a bare
-    internal error. Patching the runtime's own raise site proves it is now
-    typed via door_errors instead.
-    """
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
-    )
-    queue = ClioCoreQueue(settings.core_dir)
-    server, runtime, _tool = _fastmcp_task_server(settings, queue)
-
-    async def always_park_conflict(*_args: Any, **_kwargs: Any) -> Any:
-        raise TaskInputParkConflictError("forced park conflict for the door_errors live-hole test")
-
-    monkeypatch.setattr(runtime, "_park_agent_input", always_park_conflict)
-
-    async def scenario() -> None:
-        async with Client(server, mode="auto") as client:
-            arguments = {
-                "cluster": "test-cluster",
-                "prompt_path": str(tmp_path / "prompt.md"),
-                "timeout_seconds": 45,
-                "idempotency_key": "door-errors-park-conflict",
-                "request_followup_message": True,
-            }
-            with pytest.raises(MCPError) as failure:
-                await call_tool_task(client, "relay_submit_agent", arguments)
-            spec = door_errors.REASONS["mcp_task_input_park_conflict"]
-            assert failure.value.code == spec.mcp_code
-            assert failure.value.code != mcp_types.INTERNAL_ERROR
-            assert failure.value.code != mcp_types.INVALID_PARAMS
-            assert spec.retryable is True
-            assert failure.value.data == {"reason": "mcp_task_input_park_conflict"}
-            assert failure.value.message == "MCP task input park conflict."
-            assert "forced park conflict" not in failure.value.message
-
-    asyncio.run(scenario())
 
 
 def test_218_regression_mcp_task_conflict_reason_comes_from_the_table() -> None:
@@ -884,71 +744,6 @@ def test_215_regression_reconciliation_failure_never_leaks_str_exc() -> None:
         "reason": "mcp_task_status_reconciliation_failed",
         "task_id": "job-2",
     }
-
-
-def test_mcp_error_pass_through_is_never_reclassified_by_the_owner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Regression pin: ``_handle_get``'s ``except MCPError: raise`` must
-    stay. ``door_errors`` has no dedicated reason for an already-typed
-    ``MCPError`` -- it is not one of the seven typed reasons dispatched by
-    ``isinstance``, so handing one directly to ``classify()`` collapses it
-    into the generic ``internal_error`` bucket, destroying its original
-    code and data. If the pass-through clause were ever removed, an
-    ``MCPError`` raised inside ``task_status`` (e.g. from a nested call)
-    would fall into the broader ``except Exception`` and be silently
-    re-wrapped.
-    """
-    original = MCPError(
-        code=mcp_types.URL_ELICITATION_REQUIRED,
-        message="a nested, already-typed failure",
-        data={"reason": "url_elicitation_required"},
-    )
-
-    # Ground truth: classify() alone would destroy this if ever reached.
-    reclassified = door_errors.classify(original)
-    assert reclassified.reason == "internal_error"
-    assert reclassified.mcp_code != original.code
-
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        cluster_registry_path=tmp_path / "cluster-registry" / "clusters.json",
-    )
-    queue = ClioCoreQueue(settings.core_dir)
-    server, runtime, tool = _fastmcp_task_server(settings, queue)
-
-    async def raise_original(*_args: Any, **_kwargs: Any) -> Any:
-        raise original
-
-    async def scenario() -> None:
-        saved = await runtime.create_task(
-            tool=tool,
-            arguments={"value": "mcp-error-pass-through"},
-            result=ToolResult(
-                content=[mcp_types.TextContent(type="text", text="queued")],
-                structured_content={
-                    "job_id": "job-mcp-error-pass-through",
-                    "state": JobState.QUEUED.value,
-                    "terminal": False,
-                },
-            ),
-        )
-        assert saved is not None
-        monkeypatch.setattr(runtime, "task_status", raise_original)
-
-        async with Client(server, mode="auto") as client:
-            with pytest.raises(MCPError) as failure:
-                await client.session.send_request(
-                    GetTaskRequest(params=GetTaskRequestParams(task_id=saved.task_id)),
-                    ClientGetTaskResult,
-                )
-            assert failure.value.code == original.code
-            assert failure.value.data == original.data
-            assert failure.value.message == original.message
-
-    asyncio.run(scenario())
 
 
 def test_public_error_constructors_never_interpolate_a_caught_exception() -> None:
@@ -1015,12 +810,12 @@ _HTTP_API_SPLIT_MODULES = (
 
 
 def _http_api_split_sources() -> list[tuple[str, str]]:
-    root = Path(__file__).parents[1] / "src" / "clio_relay"
+    root = Path(__file__).parents[1] / "src" / "clio_relay" / "adapters" / "worker"
     return [(name, (root / name).read_text(encoding="utf-8")) for name in _HTTP_API_SPLIT_MODULES]
 
 
-def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reasons() -> None:
-    """The R9 inventory is closed: 123 raises plus 15 middleware refusals.
+def test_http_api_rewrites_exactly_128_deliberate_sites_through_registered_reasons() -> None:
+    """The R9 inventory is closed: 113 raises plus 15 middleware refusals.
 
     The middleware refusal count is sourced from http_api_middleware.py
     alone: InputArtifactBodyLimitMiddleware moved there as one atomic,
@@ -1049,6 +844,11 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
     123 (was 113): clio-relay#179 dial burn-down (review M5): three new
     owned-session-channel route modules add 10 more raise sites -- see
     ``_HTTP_API_SPLIT_MODULES``'s own comment for the per-module breakdown.
+
+    113 (was 123): removing the MCP job routes drops 6 sites in
+    http_api_routes_jobs.py and 3 MCP admission sites in
+    http_api_context.py, and removing the execution-scoped artifact-listing
+    route drops its single ``execution_not_found`` site.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1072,7 +872,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         )
         assert 'json.dumps({"detail"' not in source
 
-    assert len(calls) == 123
+    assert len(calls) == 113
     reasons = {
         call.args[0].value for call in calls if call.args and isinstance(call.args[0], ast.Constant)
     }
@@ -1084,7 +884,12 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
     )
 
     middleware_source = (
-        Path(__file__).parents[1] / "src" / "clio_relay" / "http_api_middleware.py"
+        Path(__file__).parents[1]
+        / "src"
+        / "clio_relay"
+        / "adapters"
+        / "worker"
+        / "http_api_middleware.py"
     ).read_text(encoding="utf-8")
     middleware_tree = ast.parse(middleware_source)
     functions = {
@@ -1112,7 +917,7 @@ def test_http_api_rewrites_exactly_138_deliberate_sites_through_registered_reaso
         for node in ast.walk(functions["_authentication_error"])
     )
     assert middleware_direct + middleware_too_large + middleware_authentication == 15
-    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 138
+    assert len(calls) + middleware_direct + middleware_too_large + middleware_authentication == 128
 
 
 def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -> None:
@@ -1145,11 +950,11 @@ def test_every_registered_reason_is_a_served_error_v1_document(tmp_path: Path) -
         assert len(json.dumps(document, ensure_ascii=False).encode("utf-8")) <= 8 * 1024
 
 
-def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None:
+def test_all_59_exception_backed_http_sites_use_stable_public_messages() -> None:
     """Every migrated ``exc=``-only site rejects raw exception text as wire detail.
 
     clio-relay#242 actionability audit: 2 of the original 58 sites
-    (``mcp_submission_conflict`` on ``submit_mcp_call``,
+    (a since-removed MCP submission conflict site and
     ``job_submission_conflict`` on ``submit_owned``) deliberately opted OUT
     of this closed set -- an agent meeting either refusal needs the raw
     conflict/mismatch detail PLUS an authored what-to-do-next tail (the
@@ -1167,6 +972,10 @@ def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None
     ``http_api_routes_worker_probe.py``, 3 in ``http_api_routes_
     scheduler.py``, each a ``ConfigurationError`` re-raised as
     ``configuration_error``) join the closed set unchanged: 58 -> 63.
+
+    Removing the MCP job routes drops 3 sites and removing the
+    execution-scoped listing route drops its ``execution_not_found`` site:
+    63 -> 59.
     """
     calls: list[ast.Call] = []
     for _name, source in _http_api_split_sources():
@@ -1181,7 +990,7 @@ def test_all_63_exception_backed_http_sites_use_stable_public_messages() -> None
             and len(node.args) == 1
             and not any(keyword.arg == "message" for keyword in node.keywords)
         )
-    assert len(calls) == 63
+    assert len(calls) == 59
 
     for index, call in enumerate(calls):
         reason = ast.literal_eval(call.args[0])
@@ -1295,7 +1104,7 @@ def test_sabotage_twin_novel_exception_via_testclient_returns_typed_internal_err
     # TestClient's default raise_server_exceptions=True would otherwise
     # surface that re-raise as a test failure instead of a response to assert on.
     client = cast(Any, TestClient(app, raise_server_exceptions=False))
-    with caplog.at_level("ERROR", logger="clio_relay.door_errors"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.door_errors"):
         response = client.get("/__sabotage_twin_9f4b1c")
 
     assert response.status_code == 500
@@ -1308,7 +1117,7 @@ def test_sabotage_twin_novel_exception_via_testclient_returns_typed_internal_err
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.door_errors" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.door_errors" and record.exc_info is not None
     ]
     assert len(logged) == 1
     exc_info = logged[0].exc_info
@@ -1327,7 +1136,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     handles), the handler must fall back to the hardcoded internal_error
     document rather than let a second exception replace the first.
     """
-    import clio_relay.http_api as http_api_module
+    import clio_relay.adapters.worker.http_api as http_api_module
 
     settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
     app = create_app(settings)
@@ -1342,7 +1151,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     monkeypatch.setattr(http_api_module.door_errors, "classify", broken_classify)
 
     client = cast(Any, TestClient(app, raise_server_exceptions=False))
-    with caplog.at_level("ERROR", logger="clio_relay.http_api"):
+    with caplog.at_level("ERROR", logger="clio_relay.adapters.worker.http_api"):
         response = client.get("/__handler_guard_probe")
 
     assert response.status_code == 500
@@ -1353,7 +1162,7 @@ def test_handler_survives_even_when_door_errors_itself_fails(
     logged = [
         record
         for record in caplog.records
-        if record.name == "clio_relay.http_api" and record.exc_info is not None
+        if record.name == "clio_relay.adapters.worker.http_api" and record.exc_info is not None
     ]
     assert len(logged) == 1
 
@@ -1373,235 +1182,3 @@ def test_deliberate_route_failure_uses_specific_handler_before_global_fallback(
     assert body["schema_version"] == door_errors.SCHEMA_VERSION
     assert body["reason"] == "job_not_found"
     assert body["status"] == 404
-
-
-# --------------------------------------------------------------------------- #
-# browser_gateway.py wiring: the fourth adapter
-# --------------------------------------------------------------------------- #
-
-
-class _OversizedBodyBackendHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
-        payload = b'{"accepted":true}'
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, format: str, *args: Any) -> None:
-        del format, args
-
-
-@contextmanager
-def _backend_server() -> Any:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _OversizedBodyBackendHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield int(server.server_address[1])
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-def _bind_capability_proxy_server(
-    config: BrowserGatewayConfig,
-    capability: str,
-    *,
-    attempts: int = 5,
-) -> CapabilityProxyServer:
-    """Construct ``CapabilityProxyServer``, retrying on a TOCTOU port race.
-
-    ``BrowserGatewayConfig.bind_port`` requires ``gt=0`` (Pydantic), so the
-    server cannot bind directly to an OS-assigned ephemeral port the way
-    ``ThreadingHTTPServer(("127.0.0.1", 0), ...)`` does elsewhere in this
-    file -- ``_free_port()`` must reserve a number, close it, and hand it
-    back, leaving a real window another process could grab it in between.
-    Retry-on-EADDRINUSE (F13, opus re-review) reduces that window instead of
-    a single unguarded bind.
-    """
-    last_error: OSError | None = None
-    for _ in range(attempts):
-        port = _free_port()
-        try:
-            return CapabilityProxyServer(config.model_copy(update={"bind_port": port}), capability)
-        except OSError as exc:
-            last_error = exc
-            continue
-    assert last_error is not None
-    raise last_error
-
-
-def _raw_http_response(
-    host: str,
-    port: int,
-    request_bytes: bytes,
-    *,
-    timeout: float = 10.0,
-) -> tuple[int, bytes]:
-    """Send a raw HTTP/1.1 request and return (status, body).
-
-    Avoids httpx: a client can't express a deliberately-invalid request
-    (chunked encoding with no chunked body, or a declared-but-unsent
-    oversized Content-Length) through a conformant HTTP client's normal
-    API, and driving the exact bytes over the wire is also immune to the
-    megabytes-in-flight race a genuinely oversized body would add (the
-    server writes its rejection before reading any body at all in both
-    cases this file exercises).
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect((host, port))
-        sock.sendall(request_bytes)
-        buffer = b""
-        while b"\r\n\r\n" not in buffer:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            buffer += chunk
-        header_blob, _, body = buffer.partition(b"\r\n\r\n")
-        lines = header_blob.split(b"\r\n")
-        status = int(lines[0].decode("latin-1").split(" ", 2)[1])
-        headers = {
-            key.decode("latin-1").strip().lower(): value.decode("latin-1").strip()
-            for key, _, value in (line.partition(b":") for line in lines[1:])
-            if key
-        }
-        content_length = int(headers.get("content-length", "0"))
-        while len(body) < content_length:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            body += chunk
-    return status, body
-
-
-@contextmanager
-def _capability_proxy(tmp_path: Path, *, attachment_id: str) -> Any:
-    with _backend_server() as backend_port:
-        capability = "b" * 43
-        config = BrowserGatewayConfig(
-            attachment_id=attachment_id,
-            token_sha256=hashlib.sha256(capability.encode("utf-8")).hexdigest(),
-            bind_port=_free_port(),
-            upstream_protocol="http",
-            upstream_port=backend_port,
-            allowed_paths=["/commands"],
-            command_path="/commands",
-            expires_at=(datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
-            revocation_path=str((tmp_path / "revoked").resolve()),
-        )
-        server = _bind_capability_proxy_server(config, capability)
-        proxy_port = int(server.server_address[1])
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield proxy_port, capability
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=5)
-
-
-def test_browser_gateway_exception_path_returns_7807_document_not_bare_error(
-    tmp_path: Path,
-) -> None:
-    """browser_gateway.py's ``_error`` (doc §6.1's fourth surface, the least
-    existing structure of the four) previously returned a bare
-    ``{"error": message}`` dict with no code/data/reason at all. A real
-    client-triggered ``ValueError`` from ``_request_body`` (chunked request
-    bodies are refused outright) now returns the same RFC 7807 document
-    shape the HTTP surface uses.
-    """
-    with _capability_proxy(tmp_path, attachment_id="door-errors-browser-gateway-test") as (
-        proxy_port,
-        capability,
-    ):
-        path = f"/commands?{urlencode({'capability': capability})}"
-        request_bytes = (
-            f"POST {path} HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:{proxy_port}\r\n"
-            "Origin: null\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("ascii")
-        status, body = _raw_http_response("127.0.0.1", proxy_port, request_bytes)
-
-    assert status == 400
-    document = json.loads(body)
-    assert "error" not in document
-    assert document["reason"] == "configuration_error"
-    assert document["schema_version"] == door_errors.SCHEMA_VERSION
-    assert document["status"] == 400
-    assert document["detail"] == "Configuration error."
-    assert "chunked" not in document["detail"]
-
-
-def test_browser_gateway_oversized_body_gets_its_own_payload_too_large_reason(
-    tmp_path: Path,
-) -> None:
-    """F7+F14: the oversize branch specifically (``_request_body``'s
-    ``length > MAX_REQUEST_BODY_BYTES`` check) is wired to the dedicated
-    ``payload_too_large`` reason (413) -- not lumped into the blanket
-    ``configuration_error`` (400) the other three ``_request_body``
-    failures still use. A declared, never-sent ``Content-Length`` triggers
-    the check before any body bytes are read, so this needs no real
-    megabyte transfer.
-    """
-    from clio_relay.browser_gateway import MAX_REQUEST_BODY_BYTES
-
-    with _capability_proxy(tmp_path, attachment_id="door-errors-oversize-test") as (
-        proxy_port,
-        capability,
-    ):
-        path = f"/commands?{urlencode({'capability': capability})}"
-        request_bytes = (
-            f"POST {path} HTTP/1.1\r\n"
-            f"Host: 127.0.0.1:{proxy_port}\r\n"
-            "Origin: null\r\n"
-            f"Content-Length: {MAX_REQUEST_BODY_BYTES + 1}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("ascii")
-        status, body = _raw_http_response("127.0.0.1", proxy_port, request_bytes)
-
-    assert status == 413
-    document = json.loads(body)
-    assert document["reason"] == "payload_too_large"
-    assert document["status"] == 413
-    assert document["retryable"] is False
-    assert document["schema_version"] == door_errors.SCHEMA_VERSION
-    assert "exceeds the browser gateway limit" in document["detail"]
-
-
-def test_browser_gateway_does_not_create_an_import_cycle_with_door_errors() -> None:
-    """browser_gateway.py must not import door_errors at module scope: doing
-    so creates a real cycle (browser_gateway -> door_errors -> storage_runtime
-    -> core_queue -> browser_gateway, since core_queue already imports
-    ``BrowserAttachmentRecord`` from browser_gateway.py). Run in a fresh
-    subprocess -- this repo's own test session has already imported both
-    modules, so only an isolated interpreter proves the import ORDER is
-    actually safe rather than merely already-cached.
-    """
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import clio_relay.core_queue; import clio_relay.browser_gateway",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr

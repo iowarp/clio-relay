@@ -1,10 +1,10 @@
 """Classify legacy acceptance-line text facts as proof of success (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Live acceptance runs
 still emit a stream of ``key=value`` text facts (the pre-structured-evidence
 format) alongside typed transport-probe evidence.
-:func:`~clio_relay.validation_recorder.ValidationRecorder.observe_line` asks
+:func:`~clio_relay.run_report_recorder.ValidationRecorder.observe_line` asks
 this module whether one such line proves its check passed
 (:func:`line_proves_success`) and which check scope it belongs to
 (:func:`acceptance_scope`). Nothing here reads or writes a report -- it is a

@@ -58,6 +58,7 @@ from clio_relay.models import (
     utc_now,
 )
 from clio_relay.owner_session_admission import desktop_owner_session_admission_id
+from clio_relay.service_runtime_scheduler_names import ALLOCATION_CONNECTOR_RETIRED
 
 _JARVIS_BIND_IDENTITY_SCHEMA = "clio-relay.jarvis-bind-identity.v1"
 _JARVIS_BIND_POLICY_SCHEMA = "clio-relay.jarvis-bind-policy.v1"
@@ -113,6 +114,8 @@ class _ServiceRuntimeJarvisBindMixin:
             )
         if readiness_timeout_seconds <= 0 or poll_seconds <= 0:
             raise ConfigurationError("runtime readiness intervals must be positive")
+        if binding.scheduler_provider is not None or binding.scheduler_native_id is not None:
+            raise ConfigurationError(ALLOCATION_CONNECTOR_RETIRED)
         if binding.scheduler_native_id is not None:
             if binding.scheduler_provider is None:
                 raise ConfigurationError(
@@ -407,6 +410,11 @@ class _ServiceRuntimeJarvisBindMixin:
         spec = self._validate_jarvis_binding_session(session=session, verified=verified)
         if session.state is GatewaySessionState.READY:
             return self._ready_start_result(session)
+        if (
+            verified.binding.scheduler_provider is not None
+            or verified.binding.scheduler_native_id is not None
+        ):
+            raise ConfigurationError(ALLOCATION_CONNECTOR_RETIRED)
         if session.state in {GatewaySessionState.FAILED, GatewaySessionState.CLOSED}:
             raise ConfigurationError(
                 f"gateway session {session_id} cannot resume from {session.state.value}"
@@ -464,8 +472,6 @@ class _ServiceRuntimeJarvisBindMixin:
                     node=runtime.host,
                     proxy_name=proxy_name,
                     ownership_intent=remote_intent,
-                    allocation_provider=verified.binding.scheduler_provider,
-                    allocation_job_id=verified.binding.scheduler_native_id,
                 )
             except _types._AmbiguousRemoteSideEffectError as exc:
                 latest = self.queue.get_gateway_session(session.session_id)

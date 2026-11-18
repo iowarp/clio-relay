@@ -104,8 +104,6 @@ Core setup:
 - `clio-relay cluster endpoint-service-status`
 - `clio-relay doctor`
 - `clio-relay live-test`
-- `clio-relay release validate-local`
-- `clio-relay release gate`
 
 Transport and sessions:
 

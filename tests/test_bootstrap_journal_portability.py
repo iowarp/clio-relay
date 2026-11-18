@@ -20,7 +20,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import clio_relay.bootstrap_journal as journal
+import clio_relay.adapters.worker.bootstrap_journal as journal
 
 # The floor is set by the system interpreters real clusters ship. Ubuntu 22.04
 # -- still the common HPC login-node OS, and what ares runs -- carries 3.10.

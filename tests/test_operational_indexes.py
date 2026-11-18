@@ -14,7 +14,7 @@ from typing import cast
 
 import pytest
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_jobs,
     queue_layout,
     queue_lease_admission,
@@ -22,12 +22,13 @@ from clio_relay import (
     queue_lease_indexes,
     queue_store_read,
 )
-from clio_relay.core_queue import (
+from clio_relay.adapters.worker.core_queue import (
     DEFAULT_CORE_LOCK_TIMEOUT_SECONDS,
     MAX_ACTIVE_JOB_RECORDS,
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )
+from clio_relay.adapters.worker.queue_management import diagnose_job, discover_stale_jobs
 from clio_relay.errors import QueueConflictError
 from clio_relay.filesystem_paths import WINDOWS_EXTENDED_PATH_PREFIX
 from clio_relay.models import (
@@ -43,7 +44,6 @@ from clio_relay.models import (
     RelayTask,
     utc_now,
 )
-from clio_relay.queue_management import diagnose_job, discover_stale_jobs
 
 
 def _job(key: str, *, metadata: dict[str, object] | None = None) -> RelayJob:
@@ -353,7 +353,7 @@ def test_lease_indexes_reject_missing_endpoint_and_consistent_kind_relabel(
     queue.repair_lease_operational_indexes()
     original_kind_ref = queue._lease_cluster_kind_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
     original_expiry_ref = queue._lease_expiry_ref_path(identity)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    relabeled = replace(identity, job_kind=JobKind.MCP_CALL)
+    relabeled = replace(identity, job_kind=JobKind.REMOTE_AGENT)
     original_kind_ref.unlink()
     original_expiry_ref.unlink()
     for path in (

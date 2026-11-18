@@ -149,10 +149,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # takes the local (Windows) frp installer family the same way --
     # `_install_frp_from_release_archive`/`_assert_frp_pair` are
     # string-path monkeypatch targets
-    # (`monkeypatch.setattr("clio_relay.bootstrap.X", ...)`), so their
+    # (`monkeypatch.setattr("clio_relay.adapters.worker.bootstrap.X", ...)`), so their
     # call sites inside `install_local_frp` are qualified too; `platform`
     # and `shutil` stay imported in bootstrap.py itself (unused in its own
-    # body now) purely because tests patch `clio_relay.bootstrap.platform.*`
+    # body now) purely because tests patch `clio_relay.adapters.worker.bootstrap.platform.*`
     # / `bootstrap.shutil.which` by that exact string path, and both are
     # the same singleton module object every importer shares, so the
     # patch is observed regardless of which file's code actually calls it.
@@ -171,7 +171,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # ONE source of truth, instead of the same literal duplicated in two
     # files with no guard against them drifting apart. A justified,
     # reviewed +1 -- the duplicated literal was the worse state -- 925 -> 926.
-    "src/clio_relay/bootstrap.py": 926,
+    "src/clio_relay/adapters/worker/bootstrap.py": 924,
     # clio-relay#265/#183/#248/#162 "honest verdict" slice, adversarial-
     # review fix round (item 2): the first version of this slice added a
     # NEW baseline entry here at 819 for a file that measured 791 with NO
@@ -239,7 +239,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # test_first_install_journal_forbids_clio_relay_imports now pins this
     # constraint in CI so a future split attempt fails fast there instead of
     # only on a live remote cluster.
-    "src/clio_relay/bootstrap_journal.py": 1534,
+    "src/clio_relay/adapters/worker/bootstrap_journal.py": 1534,
     # #158: +6 net lines -- the receipt binds that activation evidence was
     # recorded, rather than equating the activated digest with the packaged
     # source digest, which JARVIS's normalization makes legitimately unequal.
@@ -269,7 +269,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix batch: -32 net lines after moving overload/error rendering
     # into browser_gateway_errors.py; every former ad-hoc gateway response now
     # uses the door owner without recreating the core/gateway import cycle.
-    "src/clio_relay/browser_gateway.py": 853,
+    # browser_gateway.py: deleted with the old surface (W8), entry removed.
     # #231 R7: +12 net lines -- compute_release_acceptance_matrix_sha256 is
     # extracted from validate_release_acceptance_matrix's inline hashlib.sha256
     # call so release_pins.py's bump command can reuse the exact same digest
@@ -372,13 +372,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # runtime it just produced, so an install can no longer leave a dead
     # relay_executable pointer behind. The reconciliation itself and its
     # operator-visible line rendering live in the new owner module
-    # src/clio_relay/bootstrap_pin.py; what remains here is the recorder.check
+    # src/clio_relay/adapters/worker/bootstrap_pin.py; what remains here is the recorder.check
     # block, which must sit inside the command's evidence scope. A justified,
     # minimal ratchet-up.
     # #158 (probe): +14 further lines -- the `cluster probe` command, a
     # read-only recon surface that never dereferences relay_executable, so a
     # deployment whose pin is dead can still be inspected. Its logic lives in
-    # the new owner module src/clio_relay/cluster_probe.py; only the Typer
+    # the new owner module src/clio_relay/adapters/worker/cluster_probe.py; only the Typer
     # command body is here.
     # #158 (review F1): +1 further line -- the runtime-pin check now passes the
     # remote presence observation, so a pin is only rewritten when proven
@@ -471,7 +471,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # body reasons that comment explains -- entered here rather than
     # force-split, per this file's own docstring ("a known-oversized
     # module still awaiting decomposition").
-    "src/clio_relay/cli_owned_report_artifact.py": 878,
+    "src/clio_relay/adapters/worker/cli_owned_report_artifact.py": 876,
     # split/cli-session-teardown-w3: cli_session_teardown.py's own further
     # decomposition (the closure factory the comment above describes) into
     # a 266-line facade -- the Typer signature, preflight, and
@@ -626,7 +626,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # door_errors.py. Both sides are recorded exactly even below the default
     # cap so this decomposition cannot silently re-accrete.
     # Campaign merge: values are the MEASURED merged-tree counts.
-    "src/clio_relay/door_error_adapters.py": 170,
     # door_errors.py: clio-relay#221/#259 (D3/D5) added two typed SSE
     # refusal reasons (744 -> 750) and clio-relay#179 added two owned-
     # session-channel-route reasons with compacted _http_row rows -- still
@@ -831,7 +830,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # self-alias idiom ruff/pyflakes recognizes as an intentional
     # re-export, so F401 never strips it) precisely because
     # `tests/test_jarvis_execution_recovery_guards.py` still does `from
-    # clio_relay.endpoint import (EndpointWorker,
+    # clio_relay.adapters.worker.endpoint import (EndpointWorker,
     # _close_recovery_directory_anchor, ...)` and several other test files
     # read `endpoint_module.<name>` directly (not only via monkeypatch) --
     # the same "forward every existing access, change nothing else"
@@ -934,13 +933,13 @@ RATCHET_BASELINE: dict[str, int] = {
     # http_api_models.py (327, every HTTP request Pydantic model),
     # http_api_error_handlers.py (103, the four global exception handlers --
     # its module logger is deliberately constructed from the hardcoded name
-    # "clio_relay.http_api", not __name__, so
+    # "clio_relay.adapters.worker.http_api", not __name__, so
     # tests/test_door_errors.py's caplog assertions keep observing the
     # identical Logger object regardless of which file calls
     # logger.exception(...)), http_api_auth.py (162, the bearer-token/
     # owner-session-header dependency factories), http_api_streaming.py
     # (112, the SSE/WebSocket payload generators). Every name external code
-    # or tests reached through clio_relay.http_api (create_app, the
+    # or tests reached through clio_relay.adapters.worker.http_api (create_app, the
     # module-level app, InputArtifactBodyLimitMiddleware,
     # JarvisMcpCallSubmitRequest, OWNER_SESSION_ID_HEADER,
     # SESSION_GENERATION_ID_HEADER, the door_errors module reference) stays
@@ -953,7 +952,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # same call sites, different file. Comfortably under DEFAULT_MAX_LINES
     # -- entry removed per this script's own ground rule 5 ("remove the
     # entry once the file is under DEFAULT_MAX_LINES").
-    "src/clio_relay/input_staging.py": 814,
+    # input_staging.py was deleted with the old relay surface (W8); entry removed.
     # installation.py's own ratchet-baseline entry and history comment were
     # removed here (iowarp/clio-relay#231 split/installation): the file is
     # now 409 lines (an assembly/facade over its owner modules --
@@ -963,16 +962,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # component_runtime_identity.py, component_verification_remote.py,
     # worker_runtime_verification.py), comfortably under DEFAULT_MAX_LINES
     # with no baseline entry needed.
-    "src/clio_relay/jarvis_execution.py": 875,
-    # #172 survivors: +9 net lines -- the agent-facing jarvis_run tool
-    # description and render_virtual_jarvis_agent_context both gain the
-    # package-runtime-activation guidance (inspect jarvis_describe's
-    # provider_resolutions, call the Spack locate tool, pass its immutable
-    # load_spec via spack_specs) that a live campaign validated but that
-    # never landed on main when the rest of PR #172 was superseded. No
-    # deletion offsets it -- this is the genuinely missing guidance text
-    # itself, not a fixable regression. A justified, minimal ratchet-up.
-    "src/clio_relay/jarvis_mcp.py": 956,
+    "src/clio_relay/adapters/worker/jarvis_execution.py": 875,
     # jarvis_mcp_validation.py's own ratchet-baseline entry and history
     # comment (most recently: #231 R6-fix review, A6, the `expected_filters`
     # `content_max_bytes` fix) were removed here (split/jarvis-mcp-validation):
@@ -1036,7 +1026,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # `_remote_command_failure` helper, before falling into the generic
     # "remote command failed: <blob>" that discarded the refusal's own
     # typed code/message. A justified, minimal ratchet-up.
-    "src/clio_relay/live_acceptance.py": 868,
+    # live_acceptance.py was deleted with the old relay surface (W8); entry removed.
     # #231 R6: +10 net lines -- _verified_local_mcp_result now checks
     # bounded_payload.is_delivery_refusal on the envelope
     # relay_ops.read_artifact_bytes returns, so a T2 refusal (the durable
@@ -1360,8 +1350,8 @@ RATCHET_BASELINE: dict[str, int] = {
     # cluster bookkeeping (RemoteConnectionRegistry, the retired-connection
     # ledger, the process-wide singleton) move to the new owner module
     # remote_connection_registry.py (181 lines) -- both a MOVE, not a
-    # rewrite, with every existing `from clio_relay.remote_connection import
-    # ...` and `monkeypatch.setattr("clio_relay.remote_connection.<name>",
+    # rewrite, with every existing `from clio_relay.adapters.worker.remote_connection import
+    # ...` and `monkeypatch.setattr("clio_relay.adapters.worker.remote_connection.<name>",
     # ...)` call site (verified by a whole-tree grep before the move) still
     # resolving unchanged: `_is_stale_stream_error`/
     # `_open_identity_bound_stream`/`_request_json_on_stream` are re-exported
@@ -1506,11 +1496,11 @@ RATCHET_BASELINE: dict[str, int] = {
     # #231 R9 fix round 3: +7 lines keep Pydantic receipt validation detail
     # out of the public conflict while logging it once server-side.
     # #231 CQ18: +1 line -- purge_quarantined_tree_batch's real home moved to
-    # queue_gc_storage.py; the combined `from clio_relay.core_queue import
+    # queue_gc_storage.py; the combined `from clio_relay.adapters.worker.core_queue import
     # ClioCoreQueue, purge_quarantined_tree_batch` splits into two single-name
     # import lines (CQ15 §10.7 precedent: retarget a moved-symbol import to
     # its real new owner, never a facade re-export).
-    "src/clio_relay/retention.py": 952,
+    "src/clio_relay/adapters/worker/retention.py": 952,
     # split/runtime-metadata-w2: runtime_metadata.py becomes a 113-line
     # assembly/facade only (re-exports, no logic) after its nine concerns --
     # schema/state vocabulary (runtime_metadata_types.py), the normalized
@@ -1763,7 +1753,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # mechanical extraction). Matches the cli_session_teardown.py /
     # cli_owned_report_artifact.py precedent of a ratcheted, justified
     # new-file cap above the 800-line default.
-    "src/clio_relay/session_start_execution_core.py": 980,
+    "src/clio_relay/adapters/worker/session_start_execution_core.py": 980,
     # split/session-lifecycle slice J (#231): the failed-start teardown path
     # (_execute_owned_failed_start_teardown, 243 lines) plus
     # execute_owned_session_teardown (342 lines) and their three small
@@ -1771,7 +1761,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # execute_owned_session_teardown itself out of its own helper cluster
     # would separate functions that only ever call each other. 22 lines over
     # the 800 default.
-    "src/clio_relay/session_cleanup_execution.py": 822,
+    "src/clio_relay/adapters/worker/session_cleanup_execution.py": 822,
     # split/session-lifecycle slice K (#231): inspect_owned_session_recovery_
     # status is the single dominant read path every recovery/start/teardown
     # decision in the split verifies against -- durable metadata, process
@@ -1781,7 +1771,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # scope for a mechanical extraction slice. Matches the
     # queue_management.py/queue_validation.py precedent of a ratcheted,
     # justified new-file cap above the 800-line default.
-    "src/clio_relay/session_recovery_inspection.py": 838,
+    "src/clio_relay/adapters/worker/session_recovery_inspection.py": 837,
     # session_lifecycle.py itself has no RATCHET_BASELINE entry here: the
     # split above already took it under the 800-line default cap (582 lines).
     # develop (pre-split) still carries its own "session_lifecycle.py": 7840
@@ -1818,7 +1808,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # (mcp_job_lifecycle.py/mcp_remote_transport.py), so both owners share
     # one constant instead of each defining their own. A justified, minimal
     # ratchet-up: 1023 -> 1070.
-    "src/clio_relay/spool.py": 1070,
+    "src/clio_relay/spool.py": 1064,
     # split/storage-policy-w2: storage_policy.py's own ratchet-baseline entry
     # (1826) is removed here. The wire types/limits/error vocabulary moved to
     # storage_policy_types.py (280 lines), the ledger content codec to
@@ -1883,7 +1873,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # run_ssh_forward_http_probe, _run_frp_http_probe_with_proxy_type,
     # _finish_frp_probe_cleanup) stay resident rather than moving with their
     # concern: tests/test_transport_probe.py patches
-    # clio_relay.transport_probe._wait_for_healthz/_cleanup_remote_probe/
+    # clio_relay.adapters.worker.transport_probe._wait_for_healthz/_cleanup_remote_probe/
     # teardown_remote_session/detach_remote_session directly and expects the
     # probe orchestration to see the fake, which only holds while that call
     # site's enclosing def resolves the bare name against this module's own
@@ -2013,7 +2003,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 79.44
+SRC_DISTRIBUTION_BASELINE_PERCENT = 81.80
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -2024,7 +2014,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 79.44
 #: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
 #: and tests/conftest.py, both under 500 lines.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 70.07
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.13
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

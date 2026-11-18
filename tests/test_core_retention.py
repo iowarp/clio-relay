@@ -11,13 +11,13 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
-from clio_relay import (
+from clio_relay.adapters.worker import (
     queue_gc_storage,
     queue_layout,
     queue_owner_session_records,
     queue_store_write,
 )
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import NotFoundError, QueueConflictError
 from clio_relay.models import (
     ArtifactRef,

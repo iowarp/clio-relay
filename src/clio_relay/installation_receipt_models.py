@@ -18,7 +18,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from clio_relay.contract_gate import SurfaceContractDegradation, SurfaceContractStatus
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.run_report_models import SoftwareIdentity
 
 INSTALL_RECEIPT_SCHEMA = "clio-relay.install-receipt.v1"
 NATIVE_JARVIS_CAPABILITY_SCHEMA = "clio-relay.jarvis-native-execution-capability.v1"

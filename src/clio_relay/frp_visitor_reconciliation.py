@@ -5,7 +5,7 @@ frpc visitor (:class:`~clio_relay.frp_link.HeldFrpVisitor`) has no
 self-tearing-down tether the way ``ssh_forward``'s held stdin pipe does
 (``control_channel.py``'s own module docstring) -- nothing closes it when the
 owning CLI process exits. The atexit hook
-(:mod:`clio_relay.remote_connection_registry`) covers the ordinary-exit case;
+(:mod:`clio_relay.adapters.worker.remote_connection_registry`) covers the ordinary-exit case;
 this module covers what an atexit hook structurally cannot -- a ``kill -9``'d
 or crashed CLI leaves its visitor process (and its rendered-config temp dir,
 secret included) with no owner, and no atexit hook ever runs for a process

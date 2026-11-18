@@ -1,6 +1,6 @@
 """Wire models for owned remote relay session lifecycle operations.
 
-Extracted from :mod:`clio_relay.session_lifecycle` (iowarp/clio-relay#231,
+Extracted from :mod:`clio_relay.adapters.worker.session_lifecycle` (iowarp/clio-relay#231,
 R8(iii); see ``docs/design/relay-architecture-2026-08.md`` §4.4). This module
 owns the wire-contract cluster: one frozen dataclass (:class:`RemoteSession`)
 plus sixteen ``pydantic.BaseModel`` types that define the exact stdin/stdout
@@ -8,7 +8,7 @@ contracts, selectors, and status/result documents the owned-session state
 machine passes across process and API boundaries.
 
 The state-machine logic that constructs and interprets these types stays in
-:mod:`clio_relay.session_lifecycle`, which re-exports every name here under
+:mod:`clio_relay.adapters.worker.session_lifecycle`, which re-exports every name here under
 its original binding so existing callers, tests, and monkeypatch seams that
 reference ``session_lifecycle.<Symbol>`` keep resolving unchanged (a pure
 move, not a behavior change).
@@ -32,10 +32,10 @@ from clio_relay.config import (
     MAX_INPUT_TOTAL_MAX_BYTES,
 )
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.validation_report import SoftwareIdentity
+from clio_relay.run_report_models import SoftwareIdentity
 
 if TYPE_CHECKING:
-    from clio_relay.validation_report import ValidationResource
+    from clio_relay.run_report_models import ValidationResource
 
 # Bound the two Field() constraints below. Both are wire-contract constants
 # (a max_length/le on a model field), not general session_lifecycle.py
@@ -267,7 +267,7 @@ class CleanupResource(BaseModel):
 
     def to_validation_resource(self, *, cluster: str | None) -> ValidationResource:
         """Convert this cleanup result to canonical live-validation resource evidence."""
-        from clio_relay.validation_report import ValidationResource
+        from clio_relay.run_report_models import ValidationResource
 
         validation_kind = {
             "remote_relay_api": "relay_session",

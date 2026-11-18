@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay import safe_archive
-from clio_relay.safe_archive import (
+from clio_relay.adapters.worker import safe_archive
+from clio_relay.adapters.worker.safe_archive import (
     TarExtractionLimits,
     UnsafeArchiveError,
     safe_extract_tar,

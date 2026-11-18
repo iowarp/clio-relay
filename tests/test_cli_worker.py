@@ -2,7 +2,7 @@
 
 This moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``worker_app`` command's extraction into
-``src/clio_relay/cli_worker.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_worker.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 
@@ -26,8 +26,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-from clio_relay.cli import app
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.models import EndpointRegistration, EndpointRole
 
 

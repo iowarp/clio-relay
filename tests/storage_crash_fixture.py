@@ -8,10 +8,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-from clio_relay import queue_jobs, queue_order_index
+from clio_relay.adapters.worker import queue_jobs, queue_order_index
+from clio_relay.adapters.worker.storage_runtime import storage_managed_queue
 from clio_relay.config import RelaySettings
 from clio_relay.models import JarvisRunSpec, JobKind, RelayJob
-from clio_relay.storage_runtime import storage_managed_queue
 
 
 def _settings(root: Path) -> RelaySettings:

@@ -10,10 +10,16 @@ from typing import cast
 import pytest
 from typer.testing import CliRunner
 
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.deployment import render_endpoint_user_service
+from clio_relay.adapters.worker.queue_management import worker_status
+from clio_relay.adapters.worker.worker_concurrency import (
+    kind_concurrency_metadata,
+    normalize_kind_concurrency,
+    parse_kind_concurrency_options,
+)
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.deployment import render_endpoint_user_service
 from clio_relay.errors import ConfigurationError
 from clio_relay.models import (
     EndpointRegistration,
@@ -24,27 +30,21 @@ from clio_relay.models import (
     RelayJob,
     RemoteAgentTaskSpec,
 )
-from clio_relay.queue_management import worker_status
-from clio_relay.worker_concurrency import (
-    kind_concurrency_metadata,
-    normalize_kind_concurrency,
-    parse_kind_concurrency_options,
-)
 
 
 def test_kind_concurrency_options_are_validated_and_stable() -> None:
     """Operator values must produce a deterministic typed policy."""
-    parsed = parse_kind_concurrency_options(["remote_agent=2", "mcp_call=1", "jarvis=3"])
+    parsed = parse_kind_concurrency_options(["remote_agent=2", "input_ingest=1", "jarvis=3"])
 
     assert parsed == {
         JobKind.REMOTE_AGENT: 2,
-        JobKind.MCP_CALL: 1,
+        JobKind.INPUT_INGEST: 1,
         JobKind.JARVIS: 3,
     }
     assert kind_concurrency_metadata(parsed) == {
         "jarvis": 3,
         "remote_agent": 2,
-        "mcp_call": 1,
+        "input_ingest": 1,
     }
 
 
@@ -143,7 +143,7 @@ def test_worker_status_reports_policy_usage_and_conflicts(tmp_path: Path) -> Non
             pid=101,
             metadata={
                 "concurrency": 4,
-                "kind_concurrency": {"remote_agent": 2, "mcp_call": 1},
+                "kind_concurrency": {"remote_agent": 2, "input_ingest": 1},
             },
         )
     )
@@ -159,15 +159,14 @@ def test_worker_status_reports_policy_usage_and_conflicts(tmp_path: Path) -> Non
     assert lease is not None and lease.job_id == remote.job_id
     assert status["configured_kind_concurrency"] == {
         "remote_agent": 2,
-        "mcp_call": 1,
+        "input_ingest": 1,
     }
     assert status["kind_concurrency_consistent"] is True
-    assert status["active_leases_by_kind"] == {
-        "jarvis": 0,
-        "remote_agent": 1,
-        "mcp_call": 0,
-        "input_ingest": 0,
-    }
+    active_leases_by_kind = cast(dict[str, int], status["active_leases_by_kind"])
+    assert active_leases_by_kind["jarvis"] == 0
+    assert active_leases_by_kind["remote_agent"] == 1
+    assert active_leases_by_kind["input_ingest"] == 0
+    assert sum(active_leases_by_kind.values()) == 1
 
     queue.register_endpoint(
         EndpointRegistration(
@@ -187,7 +186,7 @@ def test_worker_status_reports_policy_usage_and_conflicts(tmp_path: Path) -> Non
     assert conflicting["kind_concurrency_consistent"] is False
     configurations = cast(list[dict[str, int]], conflicting["kind_concurrency_configurations"])
     assert {tuple(item.items()) for item in configurations} == {
-        (("remote_agent", 2), ("mcp_call", 1)),
+        (("remote_agent", 2), ("input_ingest", 1)),
         (("remote_agent", 1),),
     }
 
@@ -218,7 +217,7 @@ def test_endpoint_cli_persists_repeatable_kind_limits(
             "--kind-concurrency",
             "remote_agent=2",
             "--kind-concurrency",
-            "mcp_call=1",
+            "input_ingest=1",
         ],
     )
 
@@ -228,7 +227,7 @@ def test_endpoint_cli_persists_repeatable_kind_limits(
     assert endpoints[0].metadata["concurrency"] == 4
     assert endpoints[0].metadata["kind_concurrency"] == {
         "remote_agent": 2,
-        "mcp_call": 1,
+        "input_ingest": 1,
     }
 
 
@@ -280,7 +279,7 @@ def test_user_service_renders_deterministic_kind_limits() -> None:
         ),
         concurrency=4,
         kind_concurrency={
-            JobKind.MCP_CALL: 1,
+            JobKind.INPUT_INGEST: 1,
             JobKind.REMOTE_AGENT: 2,
         },
     )
@@ -288,7 +287,7 @@ def test_user_service_renders_deterministic_kind_limits() -> None:
     assert (
         "--concurrency 4 --control-query-concurrency 1 "
         "--kind-concurrency remote_agent=2 "
-        "--kind-concurrency mcp_call=1 --scheduler-provider slurm"
+        "--kind-concurrency input_ingest=1 --scheduler-provider slurm"
     ) in rendered
 
     with pytest.raises(ConfigurationError):

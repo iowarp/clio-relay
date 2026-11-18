@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``scheduler_app`` commands' extraction into
-``src/clio_relay/cli_scheduler.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_scheduler.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 ``test_scheduler_phase_batch_uses_one_remote_command`` stays in
@@ -10,7 +10,7 @@ through this command group moves with the logic it exercises.
 directly, a separate cli.py-local helper used by session teardown, not one
 of this group's eleven commands.
 
-``monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", ...)``
+``monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", ...)``
 already patched the real owner module directly (the R8(i) idiom, unaffected
 by which file calls it), so no patch-target re-pointing was needed here.
 
@@ -33,9 +33,8 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-import clio_relay.scheduler_providers as scheduler_providers
-from clio_relay.cli import app
-from clio_relay.cluster_config import ClusterRegistry
+import clio_relay.adapters.worker.scheduler as worker_scheduler
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
@@ -52,32 +51,6 @@ def _default_cli_mode(  # pyright: ignore[reportUnusedFunction]
         "CLIO_RELAY_INSTALL_RECEIPT",
         str(tmp_path / "relay-state" / "install-receipt.json"),
     )
-
-
-def test_cli_scheduler_preflight_failure_writes_canonical_report(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry.default().save(tmp_path / ".clio-relay" / "clusters.json")
-    report_path = tmp_path / "scheduler-preflight-failed.json"
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "validate-lifecycle",
-            "--cluster",
-            "missing",
-            "--report",
-            str(report_path),
-        ],
-    )
-
-    assert result.exit_code != 0
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "failed"
-    assert report["checks"][-1]["check_id"] == "scheduler.preflight"
 
 
 def test_scheduler_status_batch_command_returns_each_exact_identity(
@@ -103,7 +76,7 @@ def test_scheduler_status_batch_command_returns_each_exact_identity(
     def resolve_provider(_provider: str) -> Any:
         return scheduler
 
-    monkeypatch.setattr(scheduler_providers, "provider_for_scheduler", resolve_provider)
+    monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", resolve_provider)
 
     result = CliRunner().invoke(
         app,

@@ -10,8 +10,8 @@ from typing import Any, cast
 
 import pytest
 
-from clio_relay import queue_layout
-from clio_relay.core_queue import (
+from clio_relay.adapters.worker import queue_layout
+from clio_relay.adapters.worker.core_queue import (
     MAX_LIVE_LEASE_RECORDS,
     ClioCoreQueue,
 )

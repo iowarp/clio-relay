@@ -1,4 +1,4 @@
-"""Failing-first tests for clio_relay.bootstrap_jarvis_staging (clio-relay#254).
+"""Failing-first tests for clio_relay.adapters.worker.bootstrap_jarvis_staging (clio-relay#254).
 
 The live defect: a full-mode `cluster bootstrap` reconcile over an
 already-bootstrapped host (`~/.local/share/clio-relay/jarvis-venv` exists,
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.bootstrap_jarvis_staging import (
+from clio_relay.adapters.worker.bootstrap_jarvis_staging import (
     jarvis_venv_staging_plan,
     promote_staged_jarvis_venv,
     retired_jarvis_venv_path,

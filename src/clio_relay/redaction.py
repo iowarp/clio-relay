@@ -1,6 +1,6 @@
 """Redact credentials and secrets from validation evidence (#231).
 
-Extracted from :mod:`clio_relay.validation_report`
+Extracted from the former ``validation_report`` module
 (``docs/design/relay-architecture-2026-08.md``, #231). Runtime ownership
 tokens are intentionally durable -- cleanup must be able to authenticate a
 process after the originating CLI exits -- but they are capabilities and
@@ -13,7 +13,7 @@ named it -- the same value can leak back out through free-form evidence
 text), :func:`redacted_invocation` scrubs a CLI argv echo, and
 :func:`redact_url` strips userinfo/query/fragment from a URL before it is
 recorded as evidence. :func:`redact_sensitive_values` is the whole-document
-entry point :func:`~clio_relay.validation_report.write_validation_report`
+entry point :func:`~clio_relay.run_report.write_validation_report`
 and the GACT/HTTP surfaces call before a report or response ever leaves the
 process.
 """

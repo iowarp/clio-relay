@@ -25,6 +25,8 @@ import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
+from clio_relay.adapters.ssh import store
+
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
     ("slurm", "sbatch"),
     ("pbs", "qsub"),
@@ -219,54 +221,6 @@ fi
     )
 
 
-_FORWARD_SIGNALS = """# Some Slurm sites signal only this shell on a cancel and kill the rest after
-# KillWait. Run the launch in its own process group, pass signals on to it and wait.
-# Where the scheduler signals every process itself, the launch has already ended,
-# so the signal is not sent twice.
-_relay_job=
-_relay_held=
-_relay_live() {{
-  command -v ps >/dev/null 2>&1 || return 0
-  case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
-}}
-_relay_pass() {{
-  case $1 in TERM|INT) echo "$1" > {marker};; esac
-  if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
-  sleep 1
-  _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null
-}}
-trap '_relay_pass TERM' TERM
-trap '_relay_pass INT' INT
-trap '_relay_pass USR1' USR1
-trap '_relay_pass USR2' USR2
-set -m
-{launch} &
-_relay_job=$!
-[ -n "$_relay_held" ] && _relay_pass "$_relay_held"
-while :; do wait "$_relay_job"; _relay_rc=$?; kill -0 "$_relay_job" 2>/dev/null || break; done
-set +m
-_relay_return() {{ return "$1"; }}
-_relay_return "$_relay_rc"
-"""
-
-
-def forward_signals(script: str, launcher: str, job_dir: str) -> str:
-    """Wrap the launch line of a rendered batch script so a cancel reaches the command.
-
-    A TERM or INT is also recorded in the job's ``signalled`` file. The command's
-    exit code then says only that it was stopped, not whether by a cancel, the
-    time limit or preemption.
-    """
-    marker = q(f"{job_dir.rstrip('/')}/signalled")
-    lines = script.split("\n")
-    for index, line in enumerate(lines):
-        if launcher in line and not line.lstrip().startswith("#"):
-            wrapped = _FORWARD_SIGNALS.format(launch=line.rstrip(), marker=marker)
-            lines[index] = wrapped.rstrip("\n")
-            return "\n".join(lines)
-    raise ValueError("the rendered script has no launch line")
-
-
 DETACHED_SUBMIT = (
     "if command -v setsid >/dev/null 2>&1; then "
     '(setsid sh "$J/supervise.sh" </dev/null >"$J/supervisor.log" 2>&1 &); '
@@ -346,6 +300,7 @@ def status_script(
     body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
     body += 'echo "@@last"; tail -n 1 states 2>/dev/null\n'
+    body += 'echo "@@inputs"; cat inputs.json 2>/dev/null; echo\n'
     if mode == "scheduler" and status_command is not None and native_id is not None:
         ec = q(native_id + ".ec")
         body += (
@@ -373,12 +328,25 @@ def status_script(
     return body
 
 
-def record_script(job_dir: str, line: str, *, final: bool) -> str:
-    """Append a state change. With ``final``, standard input becomes the ``final`` file."""
+def record_script(
+    job_dir: str,
+    line: str,
+    *,
+    final: bool,
+    root: str | None = None,
+    inputs: Sequence[store.StagedInput] = (),
+) -> str:
+    """Append a state change. With ``final``, standard input becomes the ``final`` file.
+
+    A final record also drops spent and transient inputs from the content store
+    (see :mod:`clio_relay.adapters.ssh.store`).
+    """
     body = f"J={q(job_dir)}\n" + 'cd "$J" || exit 3\n'
     if final:
         body += "cat > final.tmp && mv -f final.tmp final\n"
     body += f"printf '%s %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" {q(line)} >> states\n"
+    if final and root is not None and inputs:
+        body += FRESH + store.drop_script(root, inputs)
     if final:
         body += _LISTING
     return body

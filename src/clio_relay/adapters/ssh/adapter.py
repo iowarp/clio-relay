@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import pricing, scripts
+from clio_relay.adapters.ssh import pricing, scripts, signals, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -243,7 +243,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         rendered = await asyncio.to_thread(self._render, spec, scheduler, root, job_dir, name)
         rendered.files["spec.json"] = spec.model_dump_json(indent=2)
         rendered.files["inputs.json"] = json.dumps(
-            [{"name": item.name, "sha256": item.sha256} for item in spec.inputs], indent=2
+            [store.entry(item) for item in spec.inputs], indent=2
         )
         rendered.files["scheduler"] = (scheduler or "none") + "\n"
 
@@ -390,7 +390,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
             script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
         elif scheduler == "slurm":
-            script = scripts.forward_signals(script, command[1], str(job_dir))
+            script = signals.forward_signals(script, command[1], str(job_dir))
         rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))
@@ -456,7 +456,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
             result = await self.transport.ssh(
-                scripts.record_script(job_dir, line, final=True),
+                scripts.record_script(
+                    job_dir,
+                    line,
+                    final=True,
+                    root=str(handle.data["root"]),
+                    inputs=store.input_entries(sections.get("inputs", [])),
+                ),
                 data=payload,
                 timeout_s=self.config.command_timeout_s,
                 what="recording the job's end",

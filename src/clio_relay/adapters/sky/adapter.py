@@ -259,22 +259,30 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
 
         stdout_task = asyncio.create_task(process.stdout.read())
         stderr_task = asyncio.create_task(follow(process.stderr))
-        while True:
-            done, _ = await asyncio.wait({stdout_task}, timeout=5)
-            if done:
-                break
-            if time.monotonic() - last > self.config.stall_s:
+        try:
+            while True:
+                done, _ = await asyncio.wait({stdout_task}, timeout=5)
+                if done:
+                    break
+                if time.monotonic() - last > self.config.stall_s:
+                    raise Refusal(
+                        RefusalReason.UNREACHABLE,
+                        f"SkyPilot printed nothing for {self.config.stall_s:.0f}s during {op}",
+                        tail="\n".join(tail[-10:]),
+                    )
+            await process.wait()
+            await stderr_task
+        except BaseException:
+            # Kill the bridge and close its pipes on this loop, also when cancelled.
+            if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-                await process.wait()
-                stderr_task.cancel()
-                raise Refusal(
-                    RefusalReason.UNREACHABLE,
-                    f"SkyPilot printed nothing for {self.config.stall_s:.0f}s during {op}",
-                    tail="\n".join(tail[-10:]),
-                )
-        await process.wait()
-        await stderr_task
+            rest = [asyncio.ensure_future(process.wait()), stdout_task, stderr_task]
+            await asyncio.wait(rest, timeout=5)
+            for step in rest:
+                step.cancel()
+            await asyncio.wait(rest)
+            raise
         answer: dict[str, Any] | None = None
         for line in stdout_task.result().decode("utf-8", "replace").splitlines():
             if line.startswith(MARKER):

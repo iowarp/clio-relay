@@ -32,13 +32,11 @@ from clio_relay.jarvis_service_runtime_models import (
 from clio_relay.models import (
     REGISTERED_JARVIS_USER_CONTRACT,
     ArtifactRef,
-    JobKind,
     JobState,
     McpCallSpec,
     McpOperation,
     RelayJob,
 )
-from clio_relay.remote_mcp import remote_mcp_server_artifact_binding_verified
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments, native_execution_documents
 
 
@@ -53,7 +51,7 @@ def _validate_source_job(job: RelayJob, *, cluster: str) -> McpCallSpec:
         raise ValueError("JARVIS service source job belongs to a different cluster")
     if job.state is not JobState.SUCCEEDED:
         raise ValueError("JARVIS service source job must have completed successfully")
-    if job.kind is not JobKind.MCP_CALL or not isinstance(job.spec, McpCallSpec):
+    if not isinstance(job.spec, McpCallSpec):
         raise ValueError("JARVIS service source job is not an MCP call")
     if job.spec.operation is not McpOperation.TOOLS_CALL or job.spec.tool != "jarvis_get_execution":
         raise ValueError("JARVIS service source must be jarvis_get_execution")
@@ -111,12 +109,11 @@ def _validate_mcp_result(
     ):
         raise ValueError("JARVIS MCP result server artifact binding did not match")
     if spec.expected_registered_contract is not None:
-        artifact_verified = remote_mcp_server_artifact_binding_verified(
-            document.get("server_artifact"),
-            expected_digest=spec.expected_server_artifact_digest,
-        )
+        # Registered remote MCP routes came from the retired remote_mcp registry.
+        artifact_verified = False
         artifact_failure = (
-            "JARVIS MCP result server artifact identity is not the immutable registered route"
+            "JARVIS MCP result came through a registered remote MCP route, "
+            "which relay no longer supports"
         )
     else:
         artifact_verified = jarvis_mcp_server_artifact_binding_verified(

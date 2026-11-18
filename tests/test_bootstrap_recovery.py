@@ -1,4 +1,4 @@
-"""Failing-first tests for clio_relay.bootstrap_recovery (clio-relay#247).
+"""Failing-first tests for clio_relay.adapters.worker.bootstrap_recovery (clio-relay#247).
 
 The exact live defect: a `full`-mode bootstrap transaction journal at
 `service_verified` (active generation healthy, commit record never written)
@@ -18,13 +18,13 @@ from typing import Any
 
 import pytest
 
-import clio_relay.bootstrap_recovery as bootstrap_recovery
-from clio_relay.bootstrap_reconcile import (
+import clio_relay.adapters.worker.bootstrap_recovery as bootstrap_recovery
+from clio_relay.adapters.worker.bootstrap_reconcile import (
     BootstrapDesiredState,
     BootstrapTransactionJournal,
     BootstrapTransactionState,
 )
-from clio_relay.bootstrap_recovery import (
+from clio_relay.adapters.worker.bootstrap_recovery import (
     complete_active_generation_recovery,
     recovery_needs_staged_identity,
     require_phase_identity,
