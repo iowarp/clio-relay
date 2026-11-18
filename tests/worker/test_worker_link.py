@@ -6,9 +6,11 @@ The live conformance module covers the same paths against a placed worker.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -131,6 +133,65 @@ def test_site_status_reports_the_placed_session_and_its_protocol(tmp_path: Path)
     assert status["session_generation_id"] == "generation_1"
     assert status["remote_api_port"] == 8765
     assert status["running"] is True
+
+
+def _files(client: TestClient, op: str, **body: object) -> dict[str, Any]:
+    response = client.post(
+        f"/adapter/files/{op}", headers=_headers(), json={"namespace": "ab" * 8, **body}
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def test_site_writes_a_file_in_chunks_and_refuses_a_chunk_out_of_place(tmp_path: Path) -> None:
+    client = TestClient(site_app(_settings(tmp_path)))
+
+    first = _files(client, "write-chunk", path="d/f.bin", data=_b64(b"abc"), offset=0, final=False)
+    assert "ok" in first
+    gap = _files(client, "write-chunk", path="d/f.bin", data=_b64(b"x"), offset=5, final=False)
+    assert gap["refusal"]["reason"] == RefusalReason.INVALID_ARGUMENTS.value
+    last = _files(client, "write-chunk", path="d/f.bin", data=_b64(b"def"), offset=3, final=True)
+    assert last["ok"]["size"] == 6
+    read = _files(client, "read", path="d/f.bin")
+    assert base64.b64decode(read["ok"]) == b"abcdef"
+
+
+@pytest.mark.parametrize("offset", [True, "3", 1.5])
+def test_site_refuses_a_chunk_offset_that_is_not_an_integer(tmp_path: Path, offset: object) -> None:
+    client = TestClient(site_app(_settings(tmp_path)))
+
+    answer = _files(client, "write-chunk", path="f", data=_b64(b"x"), offset=offset, final=True)
+
+    assert answer["refusal"]["reason"] == RefusalReason.INVALID_ARGUMENTS.value
+    assert not (tmp_path / "adapter" / ("ab" * 8) / "f").exists()
+
+
+def test_site_deletes_a_file_and_a_directory_only_when_recursive(tmp_path: Path) -> None:
+    client = TestClient(site_app(_settings(tmp_path)))
+    _files(client, "write", path="d/inner/f", data=_b64(b"x"))
+    _files(client, "write", path="g", data=_b64(b"y"))
+
+    assert _files(client, "delete", path="g") == {"ok": None}
+    assert "refusal" in _files(client, "delete", path="d")
+    assert _files(client, "delete", path="d", recursive=True) == {"ok": None}
+    root = tmp_path / "adapter" / ("ab" * 8)
+    assert not (root / "g").exists()
+    assert not (root / "d").exists()
+
+
+def test_site_refuses_a_file_operation_it_does_not_know(tmp_path: Path) -> None:
+    # An older site answers write-chunk and delete this way, so the client never
+    # mistakes one chunk for a whole file.
+    client = TestClient(site_app(_settings(tmp_path)))
+
+    answer = _files(client, "truncate", path="f")
+
+    assert answer["refusal"]["reason"] == RefusalReason.INVALID_ARGUMENTS.value
+    assert "unknown file operation" in answer["refusal"]["message"]
 
 
 def _adapter(tmp_path: Path) -> WorkerAdapter:

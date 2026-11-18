@@ -116,6 +116,11 @@ async def _answer(action: Callable[[], Awaitable[Any]]) -> dict[str, Any]:
         return {"refusal": refusal.to_dict()}
 
 
+def _is_int(value: object) -> bool:
+    # JSON true and false arrive as bool, which is an int subclass.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 async def _file_op(adapter: LocalAdapter, op: str, body: dict[str, Any]) -> Any:
     files: FileAccess = await adapter.files()
     if op == "list":
@@ -125,7 +130,7 @@ async def _file_op(adapter: LocalAdapter, op: str, body: dict[str, Any]) -> Any:
     if op == "read":
         offset = body.get("offset", 0)
         limit = body.get("limit")
-        if not isinstance(offset, int) or (limit is not None and not isinstance(limit, int)):
+        if not _is_int(offset) or (limit is not None and not _is_int(limit)):
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "offset and limit must be integers")
         data = await files.read(_text(body, "path"), offset=offset, limit=limit)
         return base64.b64encode(data).decode("ascii")
@@ -136,7 +141,7 @@ async def _file_op(adapter: LocalAdapter, op: str, body: dict[str, Any]) -> Any:
         return written.model_dump(mode="json")
     if op == "write-chunk":
         offset = body.get("offset", 0)
-        if not isinstance(offset, int):
+        if not _is_int(offset):
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "offset must be an integer")
         written = await files.write(
             _text(body, "path"),
