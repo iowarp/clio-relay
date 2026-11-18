@@ -253,9 +253,8 @@ def field_components(
 ) -> list[str]:
     """Add one form field, its help and its error, and return their ids.
 
-    A TextField or CheckBox shows its own error, through a check bound to
-    ``check_path`` that the form's data sets false. A ChoicePicker shows no check
-    message in every renderer, so its error stays a caption.
+    Each field shows its own error, through a check bound to ``check_path``
+    that the form's data sets false. Without a ``check_path`` the error is a caption.
     """
     label = f"{item.label} (required)" if item.required else item.label
     value = bound(path)
@@ -263,7 +262,6 @@ def field_components(
     if item.kind == "bool":
         ids = [tree.add(base, "CheckBox", label=label, value=value, **checks)]
     elif item.kind == "choice":
-        checks = {}
         ids = [
             tree.add(
                 base,
@@ -273,6 +271,7 @@ def field_components(
                 value=value,
                 variant="mutuallyExclusive",
                 displayStyle="chips",
+                **checks,
             )
         ]
     else:
@@ -621,11 +620,11 @@ def add_surface(
                 value=bound("/catalog/id"),
                 variant="mutuallyExclusive",
                 displayStyle="chips",
+                **_checks(
+                    errors.get(CATALOG_SITE_ERROR), valid_path(CATALOG_PATH, CATALOG_SITE_ERROR)
+                ),
             )
         )
-        message = errors.get(CATALOG_SITE_ERROR)
-        if message:
-            children.append(tree.text("add-catalog-site-error", message, "caption"))
         children.append(
             tree.add(
                 "add-catalog-id",
@@ -687,7 +686,7 @@ def add_surface(
         "catalog": {
             "id": [catalog[0].id] if catalog else [],
             "site_id": "",
-            "valid": valid_map(errors, (CATALOG_ID_ERROR,)),
+            "valid": valid_map(errors, (CATALOG_ID_ERROR, CATALOG_SITE_ERROR)),
         },
         "drafts": {"add": {**add_draft(forms), "valid": valid_map(errors, ADD_ERROR_PREFIXES)}},
     }

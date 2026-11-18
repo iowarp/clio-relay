@@ -22,7 +22,7 @@ from clio_relay.surface.a2ui import (
     TAB_URI,
 )
 from clio_relay.surface.a2ui.components import COMPONENTS, Tree
-from clio_relay.surface.a2ui.forms import Field, form
+from clio_relay.surface.a2ui.forms import Field, Kind, form
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
 from clio_relay.surface.a2ui.surfaces import field_components
 from clio_relay.surface.a2ui.tab import _sentence  # pyright: ignore[reportPrivateUsage]
@@ -235,22 +235,25 @@ def test_notices_keep_the_case_of_names() -> None:
     assert _sentence("") == ""
 
 
-def test_a_choice_keeps_its_error_as_a_caption() -> None:
-    """A Basic ChoicePicker draws no check message, so its error stays visible as text."""
-    item = Field("policy", "Policy", "choice", options=("guarded",))
+def test_every_field_carries_its_own_error_as_a_check() -> None:
+    """A ChoicePicker, a CheckBox and a TextField each fail a check bound to the form's data."""
+    kinds: tuple[tuple[Kind, tuple[str, ...]], ...] = (
+        ("choice", ("guarded",)),
+        ("bool", ()),
+        ("text", ()),
+    )
+    for kind, options in kinds:
+        item = Field("x", "X", kind, options=options)
+        tree = Tree()
+        ids = field_components(tree, "f", item, "/d/x", "Wrong", "/d/valid/x")
+        assert ids == ["f"]
+        assert tree.components[0]["checks"] == [
+            {"condition": {"path": "/d/valid/x"}, "message": "Wrong"}
+        ]
     tree = Tree()
-    ids = field_components(tree, "f", item, "/d/policy", "Pick one", "/d/valid/policy")
-    by_id = {component["id"]: component for component in tree.components}
-    assert "checks" not in by_id["f"]
-    assert by_id["f-error"]["text"] == "Pick one"
-    assert ids == ["f", "f-error"]
-    text = Field("name", "Name", "text")
-    tree = Tree()
-    ids = field_components(tree, "t", text, "/d/name", "Too long", "/d/valid/name")
-    assert ids == ["t"]
-    assert tree.components[0]["checks"] == [
-        {"condition": {"path": "/d/valid/name"}, "message": "Too long"}
-    ]
+    ids = field_components(tree, "c", Field("x", "X", "choice", options=("a",)), "/d/x", "Wrong")
+    assert ids == ["c", "c-error"]
+    assert "checks" not in tree.components[0]
 
 
 def test_a_reread_with_nothing_changed_is_identical(relay_paths: RelayPaths) -> None:
@@ -540,8 +543,11 @@ def test_add_from_catalog(relay_paths: RelayPaths) -> None:
             assert host.get("relay-add", "/catalog/valid/catalog.site_id") is False
             host.set("relay-add", "/catalog/id", [])
             await host.press("relay-add", "add-catalog")
-            assert host.failing("relay-add") == {}
-            assert "Choose a site from the catalog" in host.text("relay-add")
+            assert host.failing("relay-add") == {
+                "add-catalog-site": "Choose a site from the catalog"
+            }
+            assert host.get("relay-add", "/catalog/valid/catalog.id") is False
+            assert "Choose a site from the catalog" not in host.text("relay-add")
             host.set("relay-add", "/catalog/id", [first])
             host.set("relay-add", "/catalog/site_id", "mine")
             result = await host.press("relay-add", "add-catalog")
