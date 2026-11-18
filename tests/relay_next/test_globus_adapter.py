@@ -8,6 +8,7 @@ runs. These are mock results, never live passes.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -19,8 +20,7 @@ import pytest
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
-from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig
-from clio_relay.adapters.globus import tokens
+from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig, tokens
 from clio_relay.adapters.globus.compute import ComputeService, function_digest
 from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
 from clio_relay.adapters.globus.task import relay_task
@@ -162,9 +162,15 @@ def test_user_config_keys_follow_the_site(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_job_reaches_the_endpoint_with_its_user_config(tmp_path: Path) -> None:
     adapter = _build(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    launcher = bin_dir / "mpiexec"
+    launcher.write_text('#!/bin/sh\nshift 2\nexec "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
     spec = JobSpec(
         executable="echo",
         arguments=["hello"],
+        environment={"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"},
         resources=JobResources(node_count=1, process_count=4),
         launcher="mpiexec",
         attributes=JobAttributes(queue_name="debug", account="myproject"),
@@ -261,7 +267,9 @@ async def test_grant_file_provider_reads_tokens(tmp_path: Path) -> None:
 
 
 def test_grant_file_provider_reports_expired(tmp_path: Path) -> None:
-    path = _grant(tmp_path / "grant.json", [{"resource_server": "x", "access_token": "a", "expires_at": 5}])
+    path = _grant(
+        tmp_path / "grant.json", [{"resource_server": "x", "access_token": "a", "expires_at": 5}]
+    )
     assert tokens.GrantFileProvider("globus", path).status() == "expired"
     assert tokens.GrantFileProvider("globus", tmp_path / "none.json").status() == "signed_out"
 

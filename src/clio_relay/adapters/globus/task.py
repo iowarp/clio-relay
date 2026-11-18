@@ -19,6 +19,7 @@ from typing import Any
 def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PLR0915
     """Run, cancel or report one relay job on the endpoint."""
     import base64
+    import contextlib
     import hashlib
     import json
     import os
@@ -32,8 +33,12 @@ def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PL
     os.makedirs(job_dir, exist_ok=True)
     state_path = os.path.join(job_dir, "relay-state.json")
     cancel_path = os.path.join(job_dir, "relay-cancel")
-    stdout_path = os.path.join(job_dir, os.path.expanduser(str(payload.get("stdout_path") or "stdout")))
-    stderr_path = os.path.join(job_dir, os.path.expanduser(str(payload.get("stderr_path") or "stderr")))
+    stdout_path = os.path.join(
+        job_dir, os.path.expanduser(str(payload.get("stdout_path") or "stdout"))
+    )
+    stderr_path = os.path.join(
+        job_dir, os.path.expanduser(str(payload.get("stderr_path") or "stderr"))
+    )
     final_states = ("completed", "failed", "cancelled")
 
     def read_state() -> "dict[str, Any]":
@@ -91,10 +96,8 @@ def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PL
         }
 
     def signal_group(pid: int, signum: int) -> None:
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signum)
-        except (ProcessLookupError, PermissionError):
-            pass
 
     mode = payload.get("mode", "run")
     if mode == "status":
@@ -141,7 +144,9 @@ def relay_task(payload: "dict[str, Any]") -> "dict[str, Any]":  # noqa: C901, PL
         open(stdout_path, "ab") as stdout,
         open(stderr_path, "ab") as stderr,
         open(
-            os.path.join(job_dir, os.path.expanduser(str(stdin_path))) if stdin_path else os.devnull,
+            os.path.join(job_dir, os.path.expanduser(str(stdin_path)))
+            if stdin_path
+            else os.devnull,
             "rb",
         ) as stdin,
     ):

@@ -32,7 +32,11 @@ from clio_relay.adapters.globus.compute import (
     SdkComputeService,
     TaskInfo,
 )
-from clio_relay.adapters.globus.transfer import GlobusFileAccess, SdkTransferService, TransferService
+from clio_relay.adapters.globus.transfer import (
+    GlobusFileAccess,
+    SdkTransferService,
+    TransferService,
+)
 from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -68,7 +72,9 @@ class StartConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     adapter: str = Field(description="Adapter that runs the command on a login node: worker or ssh")
-    config: dict[str, Any] = Field(default_factory=dict[str, Any], description="That adapter's settings")
+    config: dict[str, Any] = Field(
+        default_factory=dict[str, Any], description="That adapter's settings"
+    )
     command: list[str] = Field(
         default_factory=lambda: ["globus-compute-endpoint", "start", "clio-relay"],
         min_length=1,
@@ -225,7 +231,9 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
         if keys.queue and attributes.queue_name:
             values[keys.queue] = attributes.queue_name
         if keys.walltime:
-            values[keys.walltime] = format_walltime(attributes.duration, self.config.walltime_format)
+            values[keys.walltime] = format_walltime(
+                attributes.duration, self.config.walltime_format
+            )
         if keys.nodes:
             values[keys.nodes] = spec.resources.nodes()
         if keys.reservation and attributes.reservation_id:

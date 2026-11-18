@@ -194,7 +194,9 @@ class SdkComputeService:
                 meta_dict = cast(dict[str, Any], meta)
                 schema: Any = meta_dict.get("user_config_schema") or {}
                 properties: Any = (
-                    cast(dict[str, Any], schema).get("properties") if isinstance(schema, dict) else None
+                    cast(dict[str, Any], schema).get("properties")
+                    if isinstance(schema, dict)
+                    else None
                 )
                 if isinstance(properties, dict):
                     facts["user_config_keys"] = sorted(cast(dict[str, Any], properties))
