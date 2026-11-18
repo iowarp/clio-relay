@@ -59,7 +59,7 @@ def test_the_job_records_its_own_id_after_the_directives() -> None:
     script = "#!/bin/bash\n#SBATCH --nodes=1\n\n#SBATCH -p x\nexec work\n"
     marked = mark_script(script, "slurm", Path("/jobs/op 1")).split("\n")
     assert marked[:4] == ["#!/bin/bash", "#SBATCH --nodes=1", "", "#SBATCH -p x"]
-    assert marked[4] == "printf \"%s\\n\" \"${SLURM_JOB_ID:-}\" > '/jobs/op 1/scheduler_id'"
+    assert marked[4] == 'printf "%s\\n" "${SLURM_JOB_ID:-}" > \'/jobs/op 1/scheduler_id\''
     assert marked[5] == "exec work"
 
 

@@ -12,7 +12,7 @@ import json
 import re
 from datetime import timedelta
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -90,15 +90,17 @@ class JobAttributes(_Spec):
         from psij import JobAttributes as PsijJobAttributes
 
         custom: dict[str, object] | None = dict(self.custom_attributes) or None
-        # psij defaults to 10 minutes; an explicit None sends no walltime at all.
-        return PsijJobAttributes(
-            duration=cast(timedelta, self.duration),
+        attributes = PsijJobAttributes(
             queue_name=self.queue_name,
             account=self.account,
             reservation_id=self.reservation_id,
             project_name=self.project_name,
             custom_attributes=custom,
         )
+        # psij's constructor defaults to 10 minutes and refuses None; the setter takes
+        # None, which sends no walltime at all.
+        attributes.duration = self.duration
+        return attributes
 
 
 class InputRef(_Spec):

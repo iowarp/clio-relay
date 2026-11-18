@@ -104,6 +104,7 @@ def mark_script(script: str, scheduler: SchedulerName, job_dir: Path) -> str:
         at += 1
     return "\n".join([*lines[:at], line, *lines[at:]])
 
+
 _executors: dict[tuple[str, str], BatchSchedulerExecutor] = {}
 _executors_lock = threading.Lock()
 

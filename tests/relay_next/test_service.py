@@ -39,8 +39,8 @@ async def test_open_site_runs_without_asking(relay_paths: RelayPaths) -> None:
 
 
 async def test_guarded_site_refuses_without_a_guard(relay_paths: RelayPaths) -> None:
-    hooks_see = getattr(RelayService(relay_paths).guard, "context").settings
-    assert hooks_see["config_dir"] == str(relay_paths.config_dir)
+    guard: Any = RelayService(relay_paths).guard
+    assert guard.context.settings["config_dir"] == str(relay_paths.config_dir)
     add_site(relay_paths, policy="guarded")
     service = RelayService(relay_paths)
     with pytest.raises(Refusal) as refused:
@@ -266,6 +266,7 @@ async def test_exec_and_describe(relay_paths: RelayPaths) -> None:
     result = await service.exec("fx", ["echo", "hi"], timeout_s=5, max_output_bytes=100)
     assert result["exit_code"] == 0
     assert "hi" in result["stdout"]
+
 
 async def test_adapters_set_up_a_saved_site(
     relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
