@@ -427,7 +427,7 @@ Files: `src/clio_relay/adapters/tapis/` (adapter, client, files, launcher, mappi
 
 ### Evidence
 
-All on Ares, in `~/clio-relay-rework/clio-relay-w10` with its own venv (`uv sync --extra tapis`, plus `keyrings.alt`), against the stub in `tests/fixtures/tapis_stub` and W2's `fx-ssh` and `fx-slurm`. Ruff, format and pyright are clean on the W10 paths. Branch at 5adb058 (integration 14e8edd merged) plus the conformance and LQ40 test changes in the next commit.
+All on Ares, in `~/clio-relay-rework/clio-relay-w10` with its own venv (`uv sync --extra tapis`, plus `keyrings.alt`), against the stub in `tests/fixtures/tapis_stub` and W2's `fx-ssh` and `fx-slurm`. Ruff, format and pyright are clean on the W10 paths. Tests ran at c7cdaf3 (integration 14e8edd merged): conformance 11, identity 9, register 3 and service 4 of 5, the fifth being LQ37, which needs W7. In a scratch worktree with W7 (b44a2a8) merged in, all 28 pass.
 
 | Row | State | Command | What was read |
 | --- | --- | --- | --- |
