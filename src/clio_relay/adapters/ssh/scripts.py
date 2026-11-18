@@ -382,11 +382,11 @@ def record_script(
     *,
     final: bool,
     root: str | None = None,
-    inputs: Sequence[tuple[str, str]] = (),
+    inputs: Sequence[store.StagedInput] = (),
 ) -> str:
     """Append a state change. With ``final``, standard input becomes the ``final`` file.
 
-    A final record also drops the inputs the job deleted from the content store
+    A final record also drops spent and transient inputs from the content store
     (see :mod:`clio_relay.adapters.ssh.store`).
     """
     body = f"J={q(job_dir)}\n" + 'cd "$J" || exit 3\n'
