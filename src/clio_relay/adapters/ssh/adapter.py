@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import pricing, scripts, store
+from clio_relay.adapters.ssh import pricing, scripts, signals, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -390,7 +390,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
             script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
         elif scheduler == "slurm":
-            script = scripts.forward_signals(script, command[1], str(job_dir))
+            script = signals.forward_signals(script, command[1], str(job_dir))
         rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))

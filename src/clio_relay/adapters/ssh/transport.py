@@ -4,7 +4,8 @@ Relay embeds no SSH library. Each call is its own process with the person's
 profile, so their agent, keys, jump hosts and ``~/.ssh/config`` apply, and
 nothing is held open between calls. A site that asks for a code on every
 connection is the one exception: with ``interactive_sign_in`` the person signs
-in once through an ask, and later calls reuse that connection's master.
+in once through an ask, and later calls reuse that connection's master. The
+master ends with the relay process that started it.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import shlex
 import signal
 import tempfile
@@ -50,6 +52,13 @@ _NETWORK_MARKERS = (
     "lost connection",
     "control socket connect",
     "mux_client",
+)
+
+# ``ssh -N -f`` leaves the master in its own session, so it would outlive relay.
+# This watcher, detached too, stops it once the relay process that started it ends.
+_WATCH_MASTER = (
+    'while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 5; done; '
+    'kill "$2" 2>/dev/null'
 )
 
 
@@ -263,6 +272,7 @@ class SshTransport:
         self.state_dir = state_dir
         key = hashlib.sha256(f"{config.ssh_profile}|{state_dir}".encode()).hexdigest()[:16]
         self.control_path = _short_dir(state_dir / "cm") / f"{key}.sock"
+        self._starting = asyncio.Lock()
 
     # argv
 
@@ -457,8 +467,12 @@ class SshTransport:
 
     async def master_up(self) -> bool:
         """Return whether a signed-in master connection is running."""
+        return await self.master_pid() is not None
+
+    async def master_pid(self) -> int | None:
+        """Return the running master's pid (0 if ssh does not say), or ``None``."""
         if not self.config.interactive_sign_in or not self.control_path.exists():
-            return False
+            return None
         argv = [
             self.config.ssh_command,
             *self._common_options(batch=True),
@@ -467,46 +481,80 @@ class SshTransport:
             self.config.ssh_profile,
         ]
         result = await run_process(argv, timeout_s=30, max_output_bytes=4096)
-        return result.exit_code == 0
+        if result.exit_code != 0:
+            return None
+        found = re.search(rb"pid=(\d+)", result.stderr + result.stdout)
+        return int(found.group(1)) if found else 0
 
     def starter(self) -> Callable[[dict[str, str]], Awaitable[None]]:
         """Return the coroutine the sign-in page runs to bring the master up."""
 
         async def _start(env: dict[str, str]) -> None:
-            self.control_path.parent.mkdir(parents=True, exist_ok=True)
-            with contextlib.suppress(OSError):
-                self.control_path.parent.chmod(0o700)
-            argv = [
-                self.config.ssh_command,
-                *self._common_options(batch=False, master=True),
-                "-o",
-                "ControlPersist=no",
-                # ControlMaster=yes makes this the master; adding -M would turn it into "ask".
-                "-N",
-                "-f",
-                self.config.ssh_profile,
-            ]
-            merged = dict(os.environ)
-            merged.update(env)
-            if self.config.askpass:
-                merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
-            # The backgrounded master keeps its stderr, so a pipe would never close.
-            with tempfile.TemporaryFile() as log:
-                process = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=log,
-                    env=merged,
-                    start_new_session=POSIX,
-                )
-                code = await process.wait()
-                log.seek(0)
-                detail = log.read(65536).decode("utf-8", errors="replace").strip()
-            if code != 0:
-                raise RuntimeError(f"ssh sign-in to {self.config.ssh_profile} failed: {detail}")
+            async with self._starting:
+                # A second master would find the socket taken and stay up as a
+                # plain connection that nothing ever closes.
+                if await self.master_up():
+                    return
+                # A master that was killed can leave its socket behind.
+                with contextlib.suppress(OSError):
+                    self.control_path.unlink()
+                await self._start_master(env)
+                await self._watch_master()
 
         return _start
+
+    async def _start_master(self, env: dict[str, str]) -> None:
+        self.control_path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self.control_path.parent.chmod(0o700)
+        argv = [
+            self.config.ssh_command,
+            *self._common_options(batch=False, master=True),
+            "-o",
+            "ControlPersist=no",
+            # ControlMaster=yes makes this the master; adding -M would turn it into "ask".
+            "-N",
+            "-f",
+            self.config.ssh_profile,
+        ]
+        merged = dict(os.environ)
+        merged.update(env)
+        if self.config.askpass:
+            merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
+        # The backgrounded master keeps its stderr, so a pipe would never close.
+        with tempfile.TemporaryFile() as log:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=log,
+                env=merged,
+                start_new_session=POSIX,
+            )
+            code = await process.wait()
+            log.seek(0)
+            detail = log.read(65536).decode("utf-8", errors="replace").strip()
+        if code != 0:
+            raise RuntimeError(f"ssh sign-in to {self.config.ssh_profile} failed: {detail}")
+
+    async def _watch_master(self) -> None:
+        """Stop the master when this relay process ends, however it ends."""
+        pid = await self.master_pid()
+        if not POSIX or not pid:
+            return
+        watcher = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            f"({_WATCH_MASTER}) &",
+            "sh",
+            str(os.getpid()),
+            str(pid),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        await watcher.wait()
 
     def register_sign_in(self) -> None:
         """Offer the starter to relay's sign-in page."""
