@@ -12,10 +12,10 @@ from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from clio_relay.jobs.handles import OutputRef, utc_now
+from clio_relay.jobs.handles import PROVENANCE_METADATA, OutputRef, utc_now
 from clio_relay.jobs.records import OperationRecord
 
-PROVENANCE_KEY = "provenance"
+PROVENANCE_KEY = PROVENANCE_METADATA
 SCHEMA = "relay.provenance.v1"
 
 
@@ -74,3 +74,19 @@ def for_output(record: OperationRecord, output: OutputRef) -> Provenance:
         uri=output.path,
         size_bytes=output.size,
     )
+
+
+def with_provenance(record: OperationRecord, outputs: list[OutputRef]) -> list[OutputRef]:
+    """Return the outputs with relay's block under ``metadata["provenance"]``.
+
+    An output that already carries a provenance block, such as a package's own,
+    keeps it, and every other metadata key passes through unchanged.
+    """
+    marked: list[OutputRef] = []
+    for output in outputs:
+        if PROVENANCE_KEY in output.metadata:
+            marked.append(output)
+            continue
+        metadata = {**output.metadata, PROVENANCE_KEY: for_output(record, output).block()}
+        marked.append(output.model_copy(update={"metadata": metadata}))
+    return marked

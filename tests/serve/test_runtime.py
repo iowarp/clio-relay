@@ -10,7 +10,7 @@ from typing import Any, cast
 import pytest
 
 from clio_relay.jobs.handles import JobState, JobStatus, OutputRef
-from clio_relay.jobs.records import OperationRecord
+from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve.desktop import decode, settings, visitor_plan
@@ -130,6 +130,45 @@ def test_artifacts_drop_the_wrapper_files_but_keep_its_logs(name: str, kept: boo
 
 def test_tool_prefix() -> None:
     assert tool_prefix("ares", "counter") == "ares_counter_"
+
+
+def test_a_stops_outputs_carry_provenance(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path).model_copy(update={"job_dir": "/scratch/jobs/op_test"})
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    runtime.plans[plan.operation_id] = plan
+    record = OperationRecord(
+        operation_id=plan.operation_id,
+        kind="serve",
+        site="fx",
+        adapter="fixture",
+        spec={},
+        spec_digest="c" * 64,
+        state=OperationState.RUNNING,
+    )
+    runtime.records.put(plan.operation_id, record)
+    files = {
+        "stopped.json": b'{"reason": "stopped", "exit_code": 0}',
+        "artifacts.txt": b"12\tstate.pvsm\n",
+    }
+
+    async def read(_plan: ServePlan, _adapter: Any, name: str, *, tail: int = 0) -> bytes | None:
+        del tail
+        return files.get(name)
+
+    runtime._read = read  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    own = {"provenance": {"schema": "a package's own"}, "view": {"path": "/x"}}
+    log = OutputRef(name="serve/launch.log", path="/scratch/jobs/op_test/serve/launch.log")
+    status = JobStatus(state=JobState.COMPLETED, outputs=[log.model_copy(update={"metadata": own})])
+    final = asyncio.run(runtime._finish(plan, None, status))  # pyright: ignore[reportPrivateUsage]
+    found = {item.name: item.metadata for item in final.outputs}
+    assert found["serve/launch.log"] == own
+    block = found["state.pvsm"]["provenance"]
+    assert (block["schema"], block["operation_id"], block["site"]) == (
+        "relay.provenance.v1",
+        "op_test",
+        "fx",
+    )
+    assert (block["uri"], block["size_bytes"]) == ("/scratch/jobs/op_test/state.pvsm", 12)
 
 
 def test_settings_cli_sets_shows_and_clears(tmp_path: Path) -> None:

@@ -50,6 +50,7 @@ from clio_relay.serve.plan import (
     site_files,
     wrapped_job,
 )
+from clio_relay.serve.provenance import with_provenance
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)
@@ -627,6 +628,9 @@ class ServeRuntime:
                 seen.add(path)
                 size = int(size_text) if size_text.strip().isdigit() else None
                 outputs.append(OutputRef(name=name, path=path, size=size))
+        record = self.records.get(plan.operation_id)
+        if record is not None:
+            outputs = with_provenance(record, outputs)
         await self._stop_hop(adapter, plan)
         message = self._final_message(plan, status, stopped)
         final = status.model_copy(update={"outputs": outputs, "message": message})

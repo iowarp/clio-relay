@@ -7,7 +7,7 @@ import hashlib
 from clio_relay.jobs.handles import JobHandle, OutputRef
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.serve import descriptor
-from clio_relay.serve.provenance import PROVENANCE_KEY, SCHEMA, for_output
+from clio_relay.serve.provenance import PROVENANCE_KEY, SCHEMA, for_output, with_provenance
 
 DIGEST = "b" * 64
 
@@ -54,3 +54,22 @@ def test_provenance_block_is_neutral() -> None:
     assert block["package"] == {"name": "gray_scott", "version": "0.1.0", "sha256": DIGEST}
     assert (block["uri"], block["size_bytes"]) == ("/run/gs.bp", 10)
     assert "clio" not in str(block).lower()
+
+
+def test_with_provenance_keeps_a_packages_own_block() -> None:
+    record = OperationRecord(
+        operation_id="op_2",
+        kind="serve",
+        site="ares",
+        adapter="ssh",
+        spec={},
+        spec_digest="c" * 64,
+        state=OperationState.COMPLETED,
+    )
+    own = OutputRef(name="a", path="/a", metadata={PROVENANCE_KEY: {"x": 1}, "view": {"y": 2}})
+    plain = OutputRef(name="b", path="/b", metadata={"view": {"z": 3}})
+    kept, marked = with_provenance(record, [own, plain])
+    assert kept.metadata == own.metadata
+    assert marked.metadata["view"] == {"z": 3}
+    assert marked.metadata[PROVENANCE_KEY]["operation_id"] == "op_2"
+    assert plain.metadata == {"view": {"z": 3}}
