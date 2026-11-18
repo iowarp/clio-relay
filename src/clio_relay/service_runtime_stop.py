@@ -142,7 +142,7 @@ class _ServiceRuntimeStopMixin:
         )
         if allocation_scoped:
             try:
-                remote_resource = self._stop_allocation_connector(
+                remote_resource: CleanupResource = self._stop_allocation_connector(
                     session_id=session.session_id,
                     connector=remote_connector,
                 )

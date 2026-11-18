@@ -16,6 +16,8 @@ This is a mixin: it depends on ``self.queue`` and ``self.settings`` from
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from clio_relay import service_runtime_connector_identity as _connector_identity
 from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_readiness as _readiness
@@ -25,9 +27,24 @@ from clio_relay.errors import BrowserAttachmentIdentityConflictError, Configurat
 from clio_relay.models import GatewaySession, utc_now
 from clio_relay.session_wire_models import CleanupResource
 
+if TYPE_CHECKING:
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+
 
 class _ServiceRuntimeBrowserMixin:
     """Revoke a browser attachment left by an older relay."""
+
+    if TYPE_CHECKING:
+        queue: ClioCoreQueue
+
+        def _stop_local_connector(
+            self,
+            *,
+            session_id: str,
+            connector: dict[str, object],
+            require_record: bool = False,
+            absence_verified: bool = False,
+        ) -> tuple[int | None, CleanupResource]: ...
 
     def _revoke_browser_attachment(
         self,
