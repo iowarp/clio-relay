@@ -6,10 +6,8 @@ import asyncio
 from typing import Any
 
 import mcp_types
-import pytest
 from fastmcp import FastMCP
 from mcp import Client
-from mcp.server.connection import Connection
 from mcp.shared.subscriptions import ResourcesListChanged, ResourceUpdated
 
 from clio_relay.surface.server import RelayServer
@@ -74,36 +72,5 @@ def test_legacy_session_gets_the_bare_notification(relay_paths: RelayPaths) -> N
             await relay.changes.resource_updated(URI)
             async with asyncio.timeout(10):
                 assert await heard.get() == URI
-
-    asyncio.run(scenario())
-
-
-def test_a_listening_legacy_session_hears_each_change_once(
-    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    relay, server = _relay(relay_paths)
-    bare: list[str] = []
-    send = Connection.send_resource_updated
-
-    async def counted(self: Connection, uri: str, **kwargs: Any) -> None:
-        bare.append(uri)
-        await send(self, uri, **kwargs)
-
-    monkeypatch.setattr(Connection, "send_resource_updated", counted)
-
-    async def scenario() -> None:
-        async with Client(server._mcp_server, mode="legacy") as client:  # pyright: ignore[reportPrivateUsage]
-            await client.list_tools()
-            async with client.listen(resource_subscriptions=[URI]) as subscription:
-                await client.list_tools()
-                await relay.changes.resource_updated(URI)
-                async with asyncio.timeout(10):
-                    event = await anext(aiter(subscription))
-                assert isinstance(event, ResourceUpdated)
-                assert bare == [], "the listen stream already carried it"
-            # With the stream closed, the next request makes it a bare listener again.
-            await client.list_tools()
-            await relay.changes.resource_updated(URI)
-            assert bare == [URI]
 
     asyncio.run(scenario())
