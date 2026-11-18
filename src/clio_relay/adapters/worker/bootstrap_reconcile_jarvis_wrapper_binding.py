@@ -63,7 +63,17 @@ def _verify_active_generation_jarvis_wrapper(
         "install_receipt",
         "install_receipt_sha256",
     }
-    if set(manifest) != expected_manifest_keys:
+    # Full-mode generations also record the activation paths they promote
+    # (bootstrap_script_commit, read by bootstrap_full_activation_staging).
+    optional_manifest_keys = {"full_activation_paths"}
+    manifest_keys = set(manifest)
+    if not expected_manifest_keys <= manifest_keys or (
+        manifest_keys - expected_manifest_keys - optional_manifest_keys
+    ):
+        raise ConfigurationError("active generation manifest has an unknown shape")
+    if "full_activation_paths" in manifest and not isinstance(
+        manifest["full_activation_paths"], dict
+    ):
         raise ConfigurationError("active generation manifest has an unknown shape")
     expected_receipt_path = generation / "install-receipt.json"
     manifest_receipt_value = manifest.get("install_receipt")

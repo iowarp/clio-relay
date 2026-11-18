@@ -2619,6 +2619,25 @@ def test_active_generation_rejects_coordinated_manifest_and_wrapper_tamper(
         installation=installation,
     )
 
+    # A full-mode generation also records its activation paths; that key is allowed
+    # as an object, and any other extra key or shape is still refused.
+    manifest["full_activation_paths"] = {}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        generation,
+        desired=desired,
+        installation=installation,
+    )
+    for extra in ({"full_activation_paths": "not-an-object"}, {"unexpected": {}}):
+        manifest_path.write_text(json.dumps({**manifest, **extra}), encoding="utf-8")
+        with pytest.raises(ConfigurationError, match="manifest has an unknown shape"):
+            bootstrap_reconcile_module._verify_active_generation_jarvis_wrapper(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+                generation,
+                desired=desired,
+                installation=installation,
+            )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
     _replacement_root, replacement_python, _replacement_jarvis, replacement_identity = (
         make_execution_root("replacement")
     )
