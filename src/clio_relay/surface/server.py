@@ -53,7 +53,7 @@ from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
-from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
+from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_call
 from clio_relay.surface.progress import progress_message
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -582,32 +582,10 @@ class RelayServer:
             is_error=result["exit_code"] != 0,
         )
 
-    async def files(
-        self,
-        site: str,
-        op: str,
-        path: str | None,
-        content: str | None,
-        content_base64: str | None,
-        offset: int,
-        limit: int | None,
-        overwrite: bool,
-        digest: str | None,
-    ) -> ToolResult:
+    async def files(self, site: str, args: FilesArgs) -> ToolResult:
         """The ``files`` verb."""
         try:
-            structured, text = await files_call(
-                self.service,
-                site,
-                op,
-                path,
-                content,
-                content_base64,
-                offset,
-                limit,
-                overwrite,
-                digest,
-            )
+            structured, text = await files_call(self.service, site, args)
         except Refusal as refusal:
             return refusal_result(refusal)
         return ToolResult(
@@ -691,26 +669,52 @@ class RelayServer:
 
         @server.tool(
             name="files",
-            title="List, read, write and stage files on a site",
+            title="List, read, write, delete and stage files on a site",
             annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
         )
         async def files(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
-            op: Literal["list", "stat", "read", "write", "stage", "has"],
-            path: str | None = None,
+            op: Literal["list", "stat", "read", "write", "delete", "stage", "has"],
+            path: Annotated[
+                str | None,
+                Field(description="Absolute, ~/ for home, or relative to relay's work directory"),
+            ] = None,
             content: Annotated[str | None, Field(description="Text to write or stage")] = None,
             content_base64: Annotated[
                 str | None, Field(description="Bytes to write or stage, base64")
             ] = None,
-            offset: Annotated[int, Field(ge=0)] = 0,
+            offset: Annotated[
+                int, Field(ge=0, description="Where a read starts, or where a write chunk goes")
+            ] = 0,
             limit: Annotated[int | None, Field(ge=1)] = None,
             overwrite: bool = False,
+            final: Annotated[
+                bool, Field(description="False while more write chunks follow")
+            ] = True,
+            recursive: Annotated[
+                bool, Field(description="Delete a directory that is not empty")
+            ] = False,
             digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
         ) -> ToolResult:
-            """Small files inline. stage puts bytes in the site's content store and
-            returns the SHA-256 a JobSpec input names."""
+            """Files up to 4 MiB move inline. A larger upload is chunks of up to 4 MiB:
+            write each at its offset with final=false and the last with final=true; after
+            a dropped link, stat "<path>.relay-part" gives the offset to resume at. A
+            larger download is reads at increasing offsets. stage puts bytes in the
+            site's content store and returns the SHA-256 a JobSpec input names."""
             return await relay.files(
-                site, op, path, content, content_base64, offset, limit, overwrite, digest
+                site,
+                FilesArgs(
+                    op=op,
+                    path=path,
+                    content=content,
+                    content_base64=content_base64,
+                    offset=offset,
+                    limit=limit,
+                    overwrite=overwrite,
+                    final=final,
+                    recursive=recursive,
+                    digest=digest,
+                ),
             )
 
         async def serve(

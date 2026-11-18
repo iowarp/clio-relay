@@ -30,7 +30,8 @@ import pytest
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS, AdapterContext, BaseAdapter
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
+from clio_relay.jobs.file_rules import PART_SUFFIX, part_path
+from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobSpec
@@ -145,6 +146,16 @@ async def _refuses(target: ConformanceTarget, verb: str) -> bool:
     return True
 
 
+async def _deletes(files: FileAccess, path: str) -> bool:
+    """Delete ``path``; False if the site cannot delete yet."""
+    try:
+        await files.delete(path)
+    except Refusal as refusal:
+        assert refusal.reason == RefusalReason.VERB_NOT_IMPLEMENTED, refusal
+        return False
+    return True
+
+
 class AdapterConformance:
     """The suite. Subclasses provide the ``target`` fixture."""
 
@@ -227,6 +238,86 @@ class AdapterConformance:
         assert digest == hashlib.sha256(payload).hexdigest()
         assert await files.has(digest)
         assert await files.stage(payload) == digest
+
+    @pytest.mark.asyncio
+    async def test_files_delete(self, target: ConformanceTarget) -> None:
+        """docs/files.md: delete refuses a missing path, needs recursive for a
+        directory that is not empty, and never removes relay's work directory."""
+        if await _refuses(target, "files"):
+            return
+        files = await target.build().files()
+        folder = f"{target.files_dir}/{new_id('d')}"
+        await files.write(f"{folder}/inner/a.txt", b"a")
+        if not await _deletes(files, f"{folder}/inner/a.txt"):
+            return
+        with pytest.raises(Refusal) as gone:
+            await files.stat(f"{folder}/inner/a.txt")
+        assert gone.value.reason == RefusalReason.PATH_NOT_FOUND
+        with pytest.raises(Refusal) as missing:
+            await files.delete(f"{folder}/inner/a.txt")
+        assert missing.value.reason == RefusalReason.PATH_NOT_FOUND
+        await files.delete(f"{folder}/inner")
+        await files.write(f"{folder}/b.txt", b"b")
+        with pytest.raises(Refusal) as full:
+            await files.delete(folder)
+        assert full.value.reason == RefusalReason.INVALID_ARGUMENTS
+        await files.delete(folder, recursive=True)
+        with pytest.raises(Refusal) as removed:
+            await files.stat(folder)
+        assert removed.value.reason == RefusalReason.PATH_NOT_FOUND
+        for root in (".", "/"):
+            with pytest.raises(Refusal) as kept:
+                await files.delete(root, recursive=True)
+            assert kept.value.reason == RefusalReason.INVALID_ARGUMENTS, root
+
+    @pytest.mark.asyncio
+    async def test_files_chunked_write(self, target: ConformanceTarget) -> None:
+        """docs/files.md: chunks collect in <path>.relay-part, a wrong offset says
+        where to resume, and the final chunk moves the file into place."""
+        if await _refuses(target, "files"):
+            return
+        files = await target.build().files()
+        path = f"{target.files_dir}/{new_id('c')}.bin"
+        first, second, third = b"a" * 1000, b"b" * 700, b"c" * 300
+        try:
+            part = await files.write(path, first, final=False)
+        except Refusal as refusal:
+            assert refusal.reason == RefusalReason.VERB_NOT_IMPLEMENTED, refusal
+            return
+        assert part.path.endswith(PART_SUFFIX)
+        assert part.size == len(first)
+        with pytest.raises(Refusal) as not_yet:
+            await files.stat(path)
+        assert not_yet.value.reason == RefusalReason.PATH_NOT_FOUND
+        # The link drops and the client resumes from the part's size.
+        assert (await files.stat(part_path(path))).size == len(first)
+        with pytest.raises(Refusal) as wrong:
+            await files.write(path, second, offset=len(first) + 5, final=False)
+        assert wrong.value.reason == RefusalReason.INVALID_ARGUMENTS
+        assert wrong.value.data.get("resume_at") == len(first)
+        await files.write(path, second, offset=len(first), final=False)
+        done = await files.write(path, third, offset=len(first) + len(second))
+        assert done.size == len(first) + len(second) + len(third)
+        assert await files.read(path) == first + second + third
+        with pytest.raises(Refusal) as part_gone:
+            await files.stat(part_path(path))
+        assert part_gone.value.reason == RefusalReason.PATH_NOT_FOUND
+        with pytest.raises(Refusal) as exists:
+            await files.write(path, first, final=False)
+        assert exists.value.reason == RefusalReason.PATH_EXISTS
+        await files.write(path, b"new ", overwrite=True, final=False)
+        await files.write(path, b"bytes", overwrite=True, offset=4)
+        assert await files.read(path) == b"new bytes"
+
+    @pytest.mark.asyncio
+    async def test_files_relative_paths_stay_inside(self, target: ConformanceTarget) -> None:
+        """docs/files.md: a relative path may not leave relay's work directory."""
+        if await _refuses(target, "files"):
+            return
+        files = await target.build().files()
+        with pytest.raises(Refusal) as escaped:
+            await files.write("../relay-escape.txt", b"x")
+        assert escaped.value.reason == RefusalReason.INVALID_ARGUMENTS
 
     @pytest.mark.asyncio
     async def test_job_lifecycle(self, target: ConformanceTarget) -> None:
