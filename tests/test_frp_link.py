@@ -522,48 +522,6 @@ def test_close_reports_residual_config_file_when_cleanup_fails(monkeypatch: Monk
     assert visitor.config_path == config_path
 
 
-@pytest.mark.skipif(
-    os.name != "nt",
-    reason="reproduces the review's exact Windows open-file-handle scenario",
-)
-def test_close_reports_residual_config_file_when_windows_holds_it_open() -> None:
-    """The same F3 fix, reproduced without a monkeypatch: an actual open file
-    handle on Windows makes ``shutil.rmtree`` (inside ``TemporaryDirectory.
-    cleanup``) fail with a real ``OSError``, exactly as the review reproduced
-    it (secret readable on disk, ledger said residual=False, pre-fix).
-    """
-
-    def factory(command: list[str], **_kwargs: Any) -> FakeFrpProcess:
-        return FakeFrpProcess(command)
-
-    visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
-        config=_link_config(),
-        local_bind_port=19884,
-        process_factory=factory,
-    )
-    visitor.establish()
-    config_path = visitor.config_path
-    assert config_path is not None
-
-    handle = open(config_path, "rb")  # noqa: SIM115 -- deliberately held open across close()
-    try:
-        visitor.close()
-    finally:
-        handle.close()
-
-    try:
-        assert visitor.config_cleanup_error is not None
-        assert config_path.exists()
-    finally:
-        # Manual cleanup: close() left it behind on purpose (F3); do not
-        # leak a real temp directory on the test host.
-        with suppress(OSError):
-            config_path.unlink()
-        with suppress(OSError):
-            config_path.parent.rmdir()
-
-
 # --------------------------------------------------------------------------
 # wait_for_channel_health / wait_healthy: parameterized subject (F4)
 # --------------------------------------------------------------------------

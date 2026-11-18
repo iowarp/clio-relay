@@ -959,6 +959,102 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 
 ## W9. serve
 
+Branch `jaimecernuda-relay-rework-w9`; the commit sent to W1 is named in the report to the coordinator. Rows: RL19 to RL23, LQ12 to LQ15, the service half of LQ-L1, and LQ-L11. It feeds RL43 and RL45. Host page: [docs/rendezvous-host.md](../rendezvous-host.md).
+
+Files: `src/clio_relay/serve/` (config, plan, frp, forward, desktop, mount, runtime, store, descriptor, provenance, the vendored `schemas/view-descriptor.v1.json`, and `_site/launch.sh` and `_site/hop_proxy.py`, which run on the site), and `tests/serve/`. The old runtime files (`service_runtime*`, `jarvis_service_runtime*`, `models_gateway.py`, `frp_*`) and their tests stay W9's until the old surface goes.
+
+### Published interfaces
+
+- `clio_relay.serve.start_for(adapter, spec: ServiceSpec, *, operation_id) -> Endpoint`. An adapter that declares `serve` returns this from its `serve()` and never reaches into `serve/`. The runtime submits the wrapped job through `adapter.run` and reads it through `adapter.status`. It also uses three optional adapter methods:
+  - `ssh_argv()` and `transport.environment()` (W7) for the `ssh -L` path;
+  - `hop_exec(site, argv)` (W8), or `exec` where there is no `hop_exec`, to start the login hop.
+- The `ServeHook` comes from the `serve` entry point in `clio_relay.hooks` (`clio_relay.serve:factory`):
+  - `start`, `status` and `stop`;
+  - `attach(server, changes)` mounts served MCP servers and announces them with `changes.tools_list_changed()`;
+  - `ui_data(record)` gives `{"ports": {<name>: {"address", "url"?, "secret"?, "secret_env"?}}}`. W1 puts it in the serve result's `_meta["ai.iowarp.relay/service"]`. It is the only place a URL or a secret appears (RL22).
+- The CLI functions: `connect(handle, *, paths)` and `settings(paths, changes)`, behind `clio-relay connect` and `clio-relay rendezvous set|show`.
+- Settings. The file is `rendezvous.json`, found in this order: the `rendezvous_file` hook setting, then `CLIO_RELAY_RENDEZVOUS_FILE`, then `<state>/serve/rendezvous.json`.
+  - `rendezvous`: `address`, `port`, `protocol` (tcp, kcp, quic, websocket, wss), `token_file` or `token_env`, `ca_file`, `server_name`, `frpc`, and `direct` (XTCP first, STCP as the fallback).
+  - Per site, a `serve:` block in the site entry, or the file's `sites`:
+    - `path`: auto, frp or ssh;
+    - `address` and `port`: the rendezvous as the site sees it;
+    - `hop`: none, login or http_proxy, with `proxy_url`, `hop_bind` and `hop_advertise`;
+    - `frpc` or `frpc_binary`, and `python`;
+    - `stop_grace_s`, default 30.
+- In the job, `${CLIO_RELAY_PORT_<NAME>}` in args and env becomes the service's port on the node.
+- Mounted tools are named `<site>_<name>_<tool>`. Their MCP Apps metadata (`_meta.ui`) passes through unchanged.
+- `serve.descriptor`: the view descriptor schema, vendored byte for byte from clio-jarvis a6aba08 (identical at v0.1.0, 2d12dbb), sha256 `8773b9ed…1b076`, with `problems(descriptor)`.
+- `serve.provenance`: the neutral block `relay.provenance.v1` under an artifact's `metadata["provenance"]`, and `for_output(record, output)`. It names nothing CLIO-specific. `models_gateway.ArtifactRef` reads it first and the legacy `clio.provenance.v1` second.
+
+### Decisions
+
+- A service is never exposed publicly. Its frpc runs beside it inside the job and registers an STCP proxy (XTCP too when `direct` is set) with a per-service secret key. The desktop runs the visitor on a loopback port. With no rendezvous host and an adapter that gives `ssh_argv()`, relay forwards with `ssh -N -L` instead, adding `-J` when the job is on a compute node.
+- wss always verifies the certificate: frpc gets `trustedCaFile` (when `ca_file` is set) and `serverName` explicitly. This closes the open item on frpc not verifying the frps certificate.
+- Port protection (RL22): an `http` port must say how it is protected, or validation refuses it. If the port is already in use on the node, launch.sh refuses with exit 98 and names the port. The service that holds it is left alone.
+- Stop (RL23): relay writes a stop file, and launch.sh sends TERM to the service's process group. After `stop_grace_s` it sends KILL. Then it writes `final-artifact.json` and the artifacts list. The outputs are the service's own files plus `serve/{frpc,launch,service}.log`, stdout and stderr. The wrapper's own files, `.relay-package` and the package runner's JARVIS tree are left out, except `.relay-jarvis/shared/`.
+- Durable rebinding (LQ13): frpc logs in again on its own. The visitor rebinds the same local port. The plan, including the secret, is kept in `<state>/serve/plans/`, so a new relay rebinds the same port at startup (from the mount provider's lifespan). The ports of a service whose job has ended close when that operation is next observed.
+- One session (LQ14): the mount holds one client connection to one server instance for the life of the service, checked with W2's `server_instance`.
+- No time limits. Relay sets no duration on a service. The `ssh -L` forward is retried with visible restart lines, and readiness has no deadline.
+- Placement is the caller's choice. The headline driver puts pvserver on the run's node with the custom attribute `slurm.nodelist` and binds it with `lifetime.bound_to`. serve does not choose nodes.
+- Three cuts in the old runtime, approved by the coordinator. The new server has no compatibility path, and 1.6.8 stays on PyPI for the old surface.
+  - The allocation-scoped connector is retired. Starting one refuses and points to serve. Stopping or detaching an old session that has one reports a residual naming the Slurm job and step to `scancel`. The remote `connector-step-*` commands and every caller of them are gone.
+  - Browser attach is gone. Revoke on teardown stays for records an older relay left, through `adapters.worker.browser_attachment_record`.
+  - JARVIS MCP results that came through a registered `remote_mcp` route are refused, because that route came only from the deleted registry.
+- The old runtime no longer imports `browser_gateway`, `scheduler_providers`, `remote_mcp` or the old `cli`. `core_queue` comes from `clio_relay.adapters.worker.core_queue`. Tests of the retired connector, browser attach and the deleted gateway CLI commands were removed, and the rest were migrated.
+
+### Facts
+
+- At protocol 2026-07-28, `notifications/tools/list_changed` reaches a client only on a `subscriptions/listen` stream with `tools_list_changed: true`. A client that never opens one does not see mounts.
+- Ares `/mnt/common` is NFSv3 with a 120 s attribute cache. A file written on one node can stay invisible to `[ -f ]` on another node for up to two minutes; a readdir forces it. launch.sh checks the stop file with `ls`. Reading a growing output from another node can lag, so pvserver goes on the run's node.
+- On Ares, a compute node's sshd sometimes accepts the key and then closes every session ("Connection closed by UNKNOWN port 65535"), even for a plain `ssh ares-comp-03` from the login node. It happened while other short jobs started and ended on the same node under the shared account. The `ssh -L` forward recovered by retrying.
+- `jarvis ppl run` is `start()` then `stop()`, so a package runner that ends in `ppl run` stops a service as soon as it is ready.
+- An Ares venv must be synced again (`uv sync --all-extras`) when the entry points in `pyproject.toml` change. Otherwise a hook falls back to its stub with no message.
+- Strict pyright fails across the whole repository at every point. The count fell from 1940 errors at M1 (719104c) to 1729 on this branch, and no new error is in W9's files.
+
+### Evidence
+
+All runs on Ares from `~/clio-relay-rework/clio-relay-w9` with its own venv. Each is a plain MCP client over stdio to `clio-relay-next serve` at 2026-07-28 on the tasks path, unless marked otherwise. The fixture runs use site fx-slurm (W7's ssh adapter) and W2's frps at 47104. The site and the rendezvous were set with the CLI (`site add`, `rendezvous set`).
+
+- LQ12, `op_7aab27479b5e65d1952ed548`: the serve task reached `working` with "the service is running: web 127.0.0.1:25687". `serve(service=)` returned an endpoint with no URL. The secret and URL were only in `_meta["ai.iowarp.relay/service"]`, and describe carried no secret. `/health` gave 200, `/` without the secret gave 401 and with it 200 (hostname fx-slurm), and a WebSocket echo worked.
+- LQ13, through the surface, `op_cecb10b501c9c394694eb4db`: a scratch frps inside fx-slurm went down for 60 s and came back. The task stayed `working`, and `/health` came back on the same port 127.0.0.1:57819 about 20 s later. The echo worked before and after. An earlier hook-direct run, `op_4563a495…`, gave the same result.
+- LQ14, `op_3b4d3ed48567ff3ed011fbcd`: W2's counter MCP was mounted as `fx-slurm_counter_{count_slowly,increment,read,reset}`. The client heard `tools/list_changed` on its listen stream at mount and again at unmount. Three increments gave 1, 2 and 3, and read gave 3. `server_instance` stayed `34954cbd950d47b28d592c9f5c12cea1` (pid 42974) throughout, while `session_id` changed on every request. After stop, no tools were left under the prefix.
+- LQ15, `op_7aab27479b5e65d1952ed548`: `serve(stop=)` completed with "stopped". The task result listed `final-artifact.json`, `serve/{frpc,launch,service}.log`, stdout and stderr, and the desktop port closed. Whether CLIO shows these as artifacts is the client half.
+- Refusals: an unprotected http port is refused at validation ("port 'web' is http: say how it is protected (RL22)"). `op_e0642d468a4e401aa3d5edd3` failed with exit 98 and "refused: port 33867 (web) was already in use on fx-slurm", and the service holding the port kept running.
+- wss with the fixture CA (`FX_WSS_CA_FILE`, serverName fx-frps), `op_205e6c36b36e94547e5285be`: health 200 and echo. With a wrong CA, `op_c510b58cf681ce1b9ecf5044`: frpc refused ("x509: certificate signed by unknown authority"), the service never reported ready, and the status message named frpc's warning.
+- The login hop through relay's CONNECT proxy, `op_c5aacee8c9db63ba48fd3808`: health and echo worked, and the proxy closed afterwards.
+- `ssh -L` with no rendezvous, `op_8222d02b39b5abe644f900b4`: health and echo worked, and the forward closed afterwards.
+- `clio-relay connect <handle>` against a relay over HTTP printed "web: http://127.0.0.1:64319". The handle's port was already held by relay on the same machine, so connect picked a free one. Health, the secret and the echo passed, and connect's frpc exited on SIGTERM.
+- Relay restart, `op_37114594d3e2ddeb52e47464`: a new relay rebound the same port and secret at startup. `/health` gave 200 before any call, then the echo worked and stop completed.
+- No duration, `op_f03945ba4f85360941a309b9`, Slurm job 27750 on ares-comp-03 (site `ares`, pvserver): relay sent `{"queue_name": "debug"}` and nothing else, so squeue showed the partition's limit, 4-00:00:00. The service read `running` from 2.4 to 12.8 minutes. At 12.8 minutes pvpython rendered through the desktop port (screenshot read: "after 13 min: rendered on ares-comp-03"). Stop gave "completed, stopped", and the port closed afterwards.
+- LQ-L11 and the service half of LQ-L1, on site `ares` over `ssh -L` (Ares has no rendezvous host):
+  - pvserver alone, `op_9c61aa86f5da1a5712ec8801`: clio-jarvis's supervisor ran 2 ranks in persist mode on ares-comp-03 and was ready in about 7 s. Two separate pvpython clients rendered through the loopback port; both screenshots, read, show the wavelet contour captioned "rendered on ares-comp-03". Stop took about 12 s ("stopping: stopped", exit 0). The artifacts included `pv/pvserver-stop.json`, and the port closed afterwards.
+  - The headline chain, run `op_9c7046029b42d2e46b3f0fc8` and serve `op_5cd896ca3eb45c9ca0b74768`: Gray-Scott ran with 4 ranks, L128 and 15000 steps, writing BP5 on ares-comp-03. pvserver was served bound to the run and placed on its node. pvpython followed the growing output with ADIOS2VTXReader reloads at 8, 23, 39 and 54 steps; the screenshots, read, show 4 spots at step 8 and a full pattern at step 54. When the run completed, the bound service ended on its own ("completed, stopped") and the port closed. The agent then listed and read the run directory with `files`.
+- RL45, pvserver as a clio-jarvis package (`clio_jarvis.pvserver` v0.1.0, archive sha256 `43d9c882…f20419`), lowered by W13's `guard.prepare` (w13 6f6ad40 merged into a throwaway tree) on the ssh adapter. serve needed no change.
+  - Slurm 27780: clio-jarvis's contract refused `max_lifetime=0`.
+  - Slurm 27782, with `max_lifetime` 172800: pvserver became ready, then the runner's `jarvis ppl run` stopped it.
+  - The next runs used a runner tail of `jarvis ppl start`, then a wait, with `jarvis ppl stop` on TERM:
+    - Slurm 27783 held about 11 minutes. `serve(stop=)` sent TERM, `ppl stop` ran and pvserver exited 0.
+    - Slurm 27787: two pvpython clients rendered through 127.0.0.1:46691 on ares-comp-03, and the port was closed after stop.
+    - Slurm 27791: the same run, with clean outputs.
+  - The headline chain as a package: run `op_2a7c5f13547423ea0abafd29` (Slurm 27792, ares-comp-03) and serve `op_40c9386b921a742d4823146e` (Slurm 27793), bound to it. The view followed 4 rounds, from step 21 (t 3150) to step 67 (t 10050). The screenshots `follow-op_40c9386b…-1` and `-4`, read, show the pattern evolving. The bound service ended "completed, stopped", and the port was closed after.
+- Regression tests on Ares are in the gate report: `tests/serve`, `tests/relay_next`, `tests/test_service_runtime.py`, `tests/test_jarvis_service_runtime.py` and the `tests/test_frp*` modules, in a venv with all extras.
+
+### Requests to other owners
+
+- **W13:** the package runner must be service-aware. A service package needs `ppl start`, a wait, then `ppl stop` on TERM; an application package keeps `ppl run`. The tail above is proven. It needs a service flag from `_start_service` through `guard.prepare` (W1's interface) or `package_job(service=True)` (W13's file).
+- **W5:** the pvserver contract caps `max_lifetime` and `walltime` at 60 to 172800 s, and `max_lifetime` is required (default 14400). That conflicts with "no hard time limits".
+- **W1:** `OutputRef` has no metadata, so nothing can carry the provenance block yet, and no task progress carries a view descriptor (RL43). `serve.provenance.for_output` and `serve.descriptor.problems` are ready for whoever adds both.
+- **The owners of five non-W9 tests:** `remote_mcp*` is imported only by `test_ci_clio_kit_wheel`, `test_clio_kit_mcp_contracts`, `test_cluster_config`, `test_contract_gate` and `test_validation_report`. Deleting it belongs with them.
+- `scheduler_providers` stays, because W8's `adapters/worker/http_api_routes_scheduler.py` uses it.
+
+### Open
+
+- XTCP direct (`direct: true`) and the `http_proxy` hop are built and unit-tested but not proven live.
+- The service secrets and the frp token reach the job as the input `serve/secrets.env`. launch.sh deletes the job's copy once read, but the staged blob stays in the site's content store (`<remote_dir>/content/cas`), readable by the site account. Removing the blob after the job starts, or staging secrets outside the store, needs the adapter's staging (W7).
+- The `connect` handle carries no frps token. `connect` reads it from the person's own rendezvous setting.
+- W7's cancel did not let launch.sh run its trap. W7 fixed this in 337ca66, which is not yet in integration; it closes when merged. Relay's own stop never depended on it, because it writes the stop file first.
+- `plans/remote-visualization-scope.md` was not available. Its seven questions are answered by RL19 to RL23.
+
 ## W10. Tapis
 
 Branch `jaimecernuda-relay-rework-w10`; the commit sent to W1 is named in the report to the coordinator. Rows: RL46 to RL49 (RL50's plugin row is W14's), LQ35 to LQ40, and the live rows LQ-L14, LQ-L15 and LQ-L17. Page: [docs/adapters/tapis.md](../adapters/tapis.md).

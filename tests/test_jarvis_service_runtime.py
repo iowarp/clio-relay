@@ -7,15 +7,13 @@ import socket
 import subprocess
 import sys
 import threading
-import urllib.parse
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.http_api_routes_session as http_api_routes_session_module
 import clio_relay.jarvis_service_runtime as runtime_binding
@@ -24,13 +22,10 @@ import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
 import clio_relay.service_runtime_core as service_runtime_core_module
 import clio_relay.service_runtime_observation as service_runtime_observation_module
-import clio_relay.service_runtime_types as service_runtime_types_module
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.adapters.worker.remote_connection import validate_channel_request
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource
-from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserDetachmentResult
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -40,7 +35,7 @@ from clio_relay.cluster_config import (
 )
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation
+from clio_relay.jarvis_mcp import jarvis_cd_lock_binding_expectation, server_artifact_digest
 from clio_relay.jarvis_service_runtime import (
     RELAY_JARVIS_RUNTIME_BINDING_SCHEMA,
     JarvisDatasetDescriptor,
@@ -57,12 +52,8 @@ from clio_relay.models import (
     JobState,
     McpCallSpec,
     RelayJob,
-    SchedulerConnectorStepIdentity,
-    SchedulerPhase,
-    SchedulerStatus,
     ServiceRuntimeSpec,
 )
-from clio_relay.remote_mcp import remote_mcp_server_artifact_digest
 from clio_relay.service_runtime import (
     ServiceRuntimePendingResult,
     ServiceRuntimeStopResult,
@@ -1272,11 +1263,11 @@ def test_service_runtime_source_rejects_generic_unmarked_jarvis_call(
         )
 
 
-def test_registered_service_runtime_source_binds_exact_durable_result(
+def test_registered_service_runtime_source_is_refused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An operator-registered JARVIS route uses its contract and artifact proof."""
+    """Relay no longer binds a result that came through a registered remote MCP route."""
     queue, definition, job, artifact, envelope = _source_result(
         tmp_path,
         server="/opt/operator/bin/registered-jarvis-mcp",
@@ -1284,19 +1275,15 @@ def test_registered_service_runtime_source_binds_exact_durable_result(
     )
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
 
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-
-    assert verified.binding.source_relay_job_id == job.job_id
-    assert verified.binding.source_relay_artifact_id == artifact.artifact_id
-    assert verified.binding.jarvis_execution_id == "execution-1"
-    assert verified.runtime.service_instance_id == "paraview-live-1"
+    with pytest.raises(ValueError, match="registered remote MCP route"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
 
 
 def test_registered_service_runtime_source_rejects_wrong_contract(
@@ -1353,54 +1340,6 @@ def test_registered_service_runtime_source_rejects_result_contract_mismatch(
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
 
     with pytest.raises(ValueError, match="result registered contract"):
-        resolve_jarvis_service_runtime(
-            queue=queue,
-            definition=definition,
-            source_job_id=job.job_id,
-            source_artifact_id=artifact.artifact_id,
-            package_id="paraview-1",
-            package_name="builtin.paraview",
-        )
-
-
-def test_registered_service_runtime_source_rejects_mismatched_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    queue, definition, job, artifact, envelope = _source_result(
-        tmp_path,
-        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
-    )
-    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
-    document["server_artifact"]["install_artifact_sha256"] = "c" * 64
-    _replace_envelope_document(envelope, document)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-
-    with pytest.raises(ValueError, match="not the immutable registered route"):
-        resolve_jarvis_service_runtime(
-            queue=queue,
-            definition=definition,
-            source_job_id=job.job_id,
-            source_artifact_id=artifact.artifact_id,
-            package_id="paraview-1",
-            package_name="builtin.paraview",
-        )
-
-
-def test_registered_service_runtime_source_rejects_unverified_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    server_artifact = _registered_jarvis_server_artifact()
-    server_artifact["verified"] = False
-    queue, definition, job, artifact, envelope = _source_result(
-        tmp_path,
-        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
-        server_artifact=server_artifact,
-    )
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-
-    with pytest.raises(ValueError, match="not the immutable registered route"):
         resolve_jarvis_service_runtime(
             queue=queue,
             definition=definition,
@@ -1510,7 +1449,7 @@ def test_internal_bind_override_rejects_occupied_loopback_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An internal/operator override must fail before creating connector state on collision."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     verified = resolve_jarvis_service_runtime(
         queue=queue,
@@ -1636,7 +1575,7 @@ def test_jarvis_bind_serializes_connector_creation_against_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bound-runtime stop cannot close before its connector producer publishes."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -1737,11 +1676,11 @@ def test_jarvis_bind_serializes_connector_creation_against_stop(
     assert stopped.canceled_scheduler_job is None
 
 
-def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
+def test_retired_allocation_connector_cleanup_reports_the_step_to_cancel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -1867,70 +1806,31 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
         "remote_connector": allocation_connector,
     }
     queue.update_gateway_session(started.session.session_id, gateway=gateway)
-    step_statuses = iter(["active", "active", "absent"])
     allocation_commands: list[str] = []
 
     def allocation_ssh(script: str) -> str:
         allocation_commands.append(script)
-        if "connector-step-status" in script:
-            state = next(step_statuses)
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-step-status.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "placement_host": "compute-07",
-                    "record_found": state == "active",
-                    "state": state,
-                    "observed_host": "compute-07" if state == "active" else None,
-                    "source": "slurm-squeue-steps",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:02Z",
-                }
-            )
-        if "connector-step-cancel" in script:
-            return json.dumps(
-                {
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "cancel_requested": True,
-                    "accepted": True,
-                    "returncode": 0,
-                    "stdout": "",
-                    "stderr": "",
-                }
-            )
         raise AssertionError(f"unexpected allocation connector script: {script}")
 
     monkeypatch.setattr(supervisor, "_ssh", allocation_ssh)
 
     detached = supervisor.detach(session_id=started.session.session_id)
-    assert detached.stopped_local_pid == 555
-    assert detached.stopped_remote_pid is None
-    assert detached.canceled_scheduler_job is None
-    assert next(item for item in detached.resources if item.kind == "scheduler_job").action == (
-        "retain"
-    )
     detached_remote = next(item for item in detached.resources if item.kind == "remote_connector")
     assert detached_remote.resource_id == "12345.7"
-    assert detached_remote.location == "compute-07"
-    assert detached_remote.outcome == "retained"
+    assert detached_remote.outcome == "refused"
+    assert detached_remote.residual is True
+    assert "scancel 12345.7" in str(detached_remote.detail)
+    assert any("scancel 12345.7" in error for error in detached.errors)
 
     stopped = supervisor.stop(session_id=started.session.session_id)
     assert stopped.canceled_scheduler_job is None
-    scheduler = next(item for item in stopped.resources if item.kind == "scheduler_job")
-    assert scheduler.action == "retain"
-    assert scheduler.outcome == "retained"
     stopped_remote = next(item for item in stopped.resources if item.kind == "remote_connector")
     assert stopped_remote.resource_id == "12345.7"
-    assert stopped_remote.outcome == "stopped"
-    assert stopped_remote.metadata["parent_scheduler_job_retained"] is True
-    assert sum("connector-step-status" in command for command in allocation_commands) == 3
-    assert sum("connector-step-cancel" in command for command in allocation_commands) == 1
-    assert reverified == ["paraview-live-1", "paraview-live-1"]
-    assert reverified_settings == [supervisor.settings, supervisor.settings]
+    assert stopped_remote.outcome == "refused"
+    assert stopped_remote.residual is True
+    assert "scancel 12345.7" in str(stopped_remote.detail)
+    assert any("scancel 12345.7" in error for error in stopped.errors)
+    assert allocation_commands == []
 
 
 def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
@@ -2049,13 +1949,13 @@ def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
     assert observed_settings == [settings]
 
 
-def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
+def test_jarvis_bind_refuses_a_scheduler_backed_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Slurm-backed JARVIS service is served with serve, not an allocation connector."""
     queue, definition, job, artifact, envelope = _source_result(tmp_path)
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
@@ -2064,203 +1964,7 @@ def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
         package_id="paraview-1",
         package_name="builtin.paraview",
     )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(
-            core_dir=tmp_path / "core",
-            spool_dir=tmp_path / "spool",
-            frpc_bin="frpc-test",
-        ),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-    monkeypatch.setattr(supervisor, "_stop_local_connector", _fake_local_connector_stop)
-    monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
-    canceled: list[str] = []
-
-    def request_cancel(*, provider: str, scheduler_job_id: str) -> None:
-        canceled.append(f"{provider}:{scheduler_job_id}")
-
-    def scheduler_terminal(**_kwargs: object) -> str:
-        return "canceled"
-
-    monkeypatch.setattr(supervisor, "_request_scheduler_provider_cancel", request_cancel)
-    monkeypatch.setattr(
-        supervisor,
-        "_wait_for_scheduler_terminal",
-        scheduler_terminal,
-    )
-    started = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-live",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-    binding = dict(started.session.gateway["jarvis_runtime_binding"])
-    binding["service_revision"] = 4
-    queue.update_gateway_session(
-        started.session.session_id,
-        gateway={**started.session.gateway, "jarvis_runtime_binding": binding},
-    )
-
-    stopped = supervisor.stop(
-        session_id=started.session.session_id,
-        cancel_scheduler_job=True,
-    )
-
-    assert canceled == []
-    scheduler = next(item for item in stopped.resources if item.kind == "scheduler_job")
-    assert scheduler.action == "cancel"
-    assert scheduler.outcome == "refused"
-    assert scheduler.residual is True
-    assert "re-verification failed" in str(scheduler.detail)
-
-
-def test_browser_attachment_is_one_time_safe_and_idempotently_revoked(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    _patch_connector_start(monkeypatch)
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    supervisor = ServiceRuntimeSupervisor(
-        settings=settings,
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-    started = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-live",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-
-    def start_browser_proxy(
-        *,
-        session: GatewaySession,
-        config: Any,
-        capability: str,
-        upstream_authorization: str | None,
-        ownership_intent: dict[str, object],
-    ) -> dict[str, object]:
-        assert len(capability) >= 43
-        assert upstream_authorization == f"Bearer {'a' * 64}"
-        return {
-            "owner": "clio-relay",
-            "session_id": session.session_id,
-            "attachment_id": config.attachment_id,
-            "pid": 777,
-            "process_group_id": 777,
-            "process_start_marker": "start-777",
-            "owner_token": ownership_intent["owner_token"],
-            "connector_generation_id": ownership_intent["connector_generation_id"],
-            "config_path": ownership_intent["config_path"],
-            "stdout_path": ownership_intent["stdout_path"],
-            "stderr_path": ownership_intent["stderr_path"],
-            "metadata_path": ownership_intent["metadata_path"],
-        }
-
-    monkeypatch.setattr(supervisor, "_start_browser_proxy", start_browser_proxy)
-
-    def browser_health(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(supervisor, "_wait_for_browser_health", browser_health)
-    marker_seen: list[Path] = []
-
-    def stop_browser_proxy(
-        *,
-        session_id: str,
-        connector: dict[str, object],
-        require_record: bool = False,
-        absence_verified: bool = False,
-    ) -> tuple[int | None, CleanupResource]:
-        del require_record, absence_verified
-        record = queue.get_gateway_session(session_id).gateway["browser_attachment"]
-        marker = Path(str(cast(dict[str, object], record)["revocation_path"]))
-        assert marker.exists()
-        marker_seen.append(marker)
-        return 777, CleanupResource(
-            kind="desktop_connector",
-            resource_id="777",
-            location="desktop",
-            action="stop",
-            ownership_verified=True,
-            outcome="stopped",
-            verified_after_operation=True,
-        )
-
-    monkeypatch.setattr(supervisor, "_stop_local_connector", stop_browser_proxy)
-
-    grant = supervisor.browser_attach(
-        session_id=started.session.session_id,
-        ttl_seconds=300,
-    )
-    query = urllib.parse.parse_qs(urllib.parse.urlsplit(grant.state_url).query)
-    capability = query["capability"][0]
-    persisted = queue.get_gateway_session(started.session.session_id)
-    serialized_gateway = json.dumps(persisted.gateway, sort_keys=True)
-    assert capability not in serialized_gateway
-    assert persisted.gateway["browser_attachment"]["state"] == "active"
-    assert (
-        persisted.gateway["browser_attachment"]["token_sha256"]
-        == hashlib.sha256(capability.encode("utf-8")).hexdigest()
-    )
-
-    with pytest.raises(ConfigurationError, match="does not match"):
-        supervisor.browser_detach(
-            session_id=started.session.session_id,
-            attachment_id="browser-wrong",
-        )
-    first = supervisor.browser_detach(
-        session_id=started.session.session_id,
-        attachment_id=grant.attachment_id,
-    )
-    repeated = supervisor.browser_detach(
-        session_id=started.session.session_id,
-        attachment_id=grant.attachment_id,
-    )
-
-    assert first.state == "revoked"
-    assert first.already_revoked is False
-    assert first.proxy_stopped is True
-    assert first.capability_revoked is True
-    assert repeated.revoked_at == first.revoked_at
-    assert repeated.already_revoked is True
-    assert repeated.proxy_stopped is False
-    assert marker_seen
-
-
-def test_browser_attach_serializes_its_launch_against_runtime_stop(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Stop cannot commit absence while a browser proxy launch is in flight."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    _patch_connector_start(monkeypatch)
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
+    assert verified.binding.scheduler_native_id == "12345"
     supervisor = ServiceRuntimeSupervisor(
         settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
         queue=queue,
@@ -2270,519 +1974,20 @@ def test_browser_attach_serializes_its_launch_against_runtime_stop(
         secret_key="secret",
         sleep=lambda _seconds: None,
     )
-    started = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-live",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-    launch_entered = threading.Event()
-    allow_launch_return = threading.Event()
-    stop_entered = threading.Event()
 
-    def start_browser_proxy(
-        *,
-        session: GatewaySession,
-        config: Any,
-        capability: str,
-        upstream_authorization: str | None,
-        ownership_intent: dict[str, object],
-    ) -> dict[str, object]:
-        del capability, upstream_authorization
-        launch_entered.set()
-        assert allow_launch_return.wait(timeout=5)
-        return {
-            "owner": "clio-relay",
-            "session_id": session.session_id,
-            "attachment_id": config.attachment_id,
-            "pid": 777,
-            "process_group_id": 777,
-            "process_start_marker": "start-777",
-            "owner_token": ownership_intent["owner_token"],
-            "connector_generation_id": ownership_intent["connector_generation_id"],
-            "config_path": ownership_intent["config_path"],
-            "stdout_path": ownership_intent["stdout_path"],
-            "stderr_path": ownership_intent["stderr_path"],
-            "metadata_path": ownership_intent["metadata_path"],
-        }
+    def no_ssh(script: str) -> str:
+        raise AssertionError(f"a refused bind ran a remote command: {script}")
 
-    def stop_serialized(**_kwargs: object) -> ServiceRuntimeStopResult:
-        stop_entered.set()
-        raise RuntimeError("stop entered after browser launch transition")
+    monkeypatch.setattr(supervisor, "_ssh", no_ssh)
 
-    def browser_health_ready(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(supervisor, "_start_browser_proxy", start_browser_proxy)
-    monkeypatch.setattr(supervisor, "_wait_for_browser_health", browser_health_ready)
-    monkeypatch.setattr(supervisor, "_stop_serialized", stop_serialized)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        attach_future = executor.submit(
-            supervisor.browser_attach,
-            session_id=started.session.session_id,
-            ttl_seconds=300,
-        )
-        assert launch_entered.wait(timeout=5)
-        stop_future = executor.submit(
-            supervisor.stop,
-            session_id=started.session.session_id,
-        )
-        assert not stop_entered.wait(timeout=0.2)
-        allow_launch_return.set()
-        grant = attach_future.result(timeout=5)
-        with pytest.raises(RuntimeError, match="stop entered after browser launch transition"):
-            stop_future.result(timeout=5)
-
-    assert grant.attachment_id.startswith("browser-")
-    assert stop_entered.is_set()
-
-
-def test_bound_remote_connector_persists_verified_slurm_placement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = ClusterDefinition(
-        name="test-cluster",
-        ssh_host="localhost",
-        scheduler_provider="slurm",
-        frp_transport=FrpTransportConfig(
-            protocol="wss",
-            server_addr="frps.example.org",
-            server_port=443,
-        ),
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=ClioCoreQueue(tmp_path / "core"),
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-    )
-    commands: list[str] = []
-    session = GatewaySession(cluster=definition.name, name="paraview")
-    step_marker = (
-        "clio-relay-connector-"
-        + hashlib.sha256(f"{session.session_id}\x00generation-1".encode()).hexdigest()[:32]
-    )
-
-    def keep_intent(
-        current: GatewaySession,
-        _role: str,
-        _intent: dict[str, object],
-    ) -> GatewaySession:
-        return current
-
-    monkeypatch.setattr(
-        supervisor,
-        "_set_ownership_intent",
-        keep_intent,
-    )
-
-    def ssh(script: str) -> str:
-        commands.append(script)
-        if "clio-relay scheduler connector-placement" in script:
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-placement.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "placement_host": "compute-07",
-                    "allocation_node_count": 1,
-                    "source": "slurm-scontrol-batch-host",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:00Z",
-                }
-            )
-        assert "connector-step-start" in script
-        assert "connector-step-reconcile" in script
-        assert "nohup setsid" not in script
-        return json.dumps(
-            {
-                "schema_version": "clio-relay.allocation-connector-start.v1",
-                "session_id": session.session_id,
-                "connector_generation_id": "generation-1",
-                "config_path": "/runtime/remote.toml",
-                "log_path": "/runtime/remote.log",
-                "step_identity": {
-                    "schema_version": "clio-relay.scheduler-connector-step.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "step_marker": step_marker,
-                    "placement_host": "compute-07",
-                    "source": "slurm-srun-detached-marker",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:01Z",
-                },
-            }
-        )
-
-    monkeypatch.setattr(supervisor, "_ssh", ssh)
-    connector = supervisor._start_remote_connector(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        session=session,
-        spec=ServiceRuntimeSpec(
-            kind="jarvis-service-runtime",
-            submit_command=None,
-            deployment_driver="jarvis-bound",
-            service_port=18777,
+    with pytest.raises(ConfigurationError, match="serve the service with the serve tool"):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-live",
+            verified=verified,
             desktop_bind_port=28777,
-            scheduler="slurm",
-        ),
-        node="127.0.0.1",
-        proxy_name="paraview-proxy",
-        ownership_intent={
-            "owner_token": "owner-token",
-            "connector_generation_id": "generation-1",
-        },
-        allocation_provider="slurm",
-        allocation_job_id="12345",
-    )
-
-    assert len(commands) == 2
-    assert connector["execution_scope"] == "scheduler_allocation"
-    assert connector["scheduler_step_id"] == "12345.7"
-    assert "pid" not in connector
-    placement = cast(dict[str, object], connector["placement"])
-    assert placement["placement_host"] == "compute-07"
-    start_script = commands[1]
-    assert start_script.index("clio-relay.allocation-connector-sidecar.v1") < (
-        start_script.index("connector-step-reconcile")
-    )
-    assert start_script.index("connector-step-reconcile") < start_script.index(
-        "connector-step-start"
-    )
-    assert "scheduler-connector-step.pending.json" in start_script
-    assert "remote_frpc_pid" not in start_script
-
-
-def test_public_jarvis_bind_uses_the_durable_allocation_connector_revision(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A real allocation-scoped bind must not publish through a stale queue revision."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-
-    def ssh(script: str) -> str:
-        if "clio-relay scheduler connector-placement" in script:
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-placement.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "placement_host": "compute-07",
-                    "allocation_node_count": 1,
-                    "source": "slurm-scontrol-batch-host",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:00Z",
-                }
-            )
-        assert "connector-step-start" in script
-        session = queue.list_gateway_sessions(cluster=definition.name)[0]
-        remote_intent = cast(
-            dict[str, object],
-            cast(dict[str, object], session.gateway["ownership_intents"])["remote_connector"],
-        )
-        generation = str(remote_intent["connector_generation_id"])
-        step_marker = (
-            "clio-relay-connector-"
-            + hashlib.sha256(f"{session.session_id}\x00{generation}".encode()).hexdigest()[:32]
-        )
-        return json.dumps(
-            {
-                "schema_version": "clio-relay.allocation-connector-start.v1",
-                "session_id": session.session_id,
-                "connector_generation_id": generation,
-                "config_path": "/runtime/remote.toml",
-                "log_path": "/runtime/remote.log",
-                "step_identity": {
-                    "schema_version": "clio-relay.scheduler-connector-step.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "step_marker": step_marker,
-                    "placement_host": "compute-07",
-                    "source": "slurm-srun-detached-marker",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:01Z",
-                },
-            }
         )
 
-    def start_local(
-        *,
-        session: GatewaySession,
-        spec: ServiceRuntimeSpec,
-        proxy_name: str,
-        ownership_intent: dict[str, object],
-    ) -> dict[str, object]:
-        del spec, proxy_name
-        return {
-            "owner": "clio-relay",
-            "session_id": session.session_id,
-            "pid": 555,
-            "process_group_id": 555,
-            "process_start_marker": "start-555",
-            "connector_generation_id": ownership_intent["connector_generation_id"],
-            "owner_token": ownership_intent["owner_token"],
-            "config_path": "/runtime/desktop-frpc.toml",
-            "stdout_path": "/runtime/desktop-frpc.out",
-            "stderr_path": "/runtime/desktop-frpc.err",
-        }
-
-    def jarvis_health_ready(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(supervisor, "_ssh", ssh)
-    monkeypatch.setattr(supervisor, "_start_local_visitor", start_local)
-    monkeypatch.setattr(supervisor, "_wait_for_jarvis_health", jarvis_health_ready)
-
-    started = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-live",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-
-    assert started.session.state is GatewaySessionState.READY
-    remote = cast(
-        dict[str, object],
-        cast(dict[str, object], started.session.gateway["transport"])["remote_connector"],
-    )
-    assert remote["execution_scope"] == "scheduler_allocation"
-    assert remote["scheduler_step_id"] == "12345.7"
-    intents = cast(dict[str, object], started.session.gateway["ownership_intents"])
-    remote_intent = cast(dict[str, object], intents["remote_connector"])
-    assert remote_intent["state"] == "recorded"
-
-
-def test_jarvis_bind_preserves_and_resumes_allocation_connector_after_lost_start_response(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A lost SSH response stays pending and adopts the exact scheduler step on replay."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-    events: list[str] = []
-
-    def allocation_context() -> tuple[
-        GatewaySession,
-        dict[str, object],
-        dict[str, object],
-        dict[str, object],
-    ]:
-        session = queue.list_gateway_sessions(cluster=definition.name)[0]
-        intent = cast(
-            dict[str, object],
-            cast(dict[str, object], session.gateway["ownership_intents"])["remote_connector"],
-        )
-        placement = cast(dict[str, object], intent["placement"])
-        connector = {
-            "owner": "clio-relay",
-            "session_id": session.session_id,
-            "execution_scope": "scheduler_allocation",
-            "scheduler_provider": "slurm",
-            "scheduler_native_id": "12345",
-            "scheduler_step_marker": intent["scheduler_step_marker"],
-            "connector_generation_id": intent["connector_generation_id"],
-            "owner_token": intent["owner_token"],
-            "config_path": "/runtime/remote.toml",
-            "log_path": "/runtime/remote.log",
-            "placement": placement,
-        }
-        step = {
-            "schema_version": "clio-relay.scheduler-connector-step.v1",
-            "scheduler": "slurm",
-            "scheduler_job_id": "12345",
-            "scheduler_step_id": "12345.7",
-            "step_marker": intent["scheduler_step_marker"],
-            "placement_host": "compute-07",
-            "source": "slurm-squeue-step-marker",
-            "verified": True,
-            "observed_at": "2026-07-15T02:00:01Z",
-        }
-        return session, intent, connector, step
-
-    def ssh(script: str) -> str:
-        if "clio-relay scheduler connector-placement" in script:
-            events.append("placement")
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-placement.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "placement_host": "compute-07",
-                    "allocation_node_count": 1,
-                    "source": "slurm-scontrol-batch-host",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:00Z",
-                }
-            )
-        if "__CLIO_WRITE_ALLOCATION_FRPC__" in script:
-            events.append("start-side-effect")
-            raise service_runtime_types_module._AmbiguousRemoteSideEffectError(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-                "lost allocation connector start response"
-            )
-        _session, intent, connector, step = allocation_context()
-        if "__CLIO_DISCOVER_CONNECTOR__" in script:
-            events.append("discover")
-            return json.dumps(
-                {
-                    "present": True,
-                    "ownership_verified": True,
-                    "connector": connector,
-                }
-            )
-        if "connector-step-reconcile" in script:
-            events.append("reconcile-step")
-            return json.dumps(
-                {
-                    "schema_version": ("clio-relay.scheduler-connector-step-reconciliation.v1"),
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "step_marker": intent["scheduler_step_marker"],
-                    "placement_host": "compute-07",
-                    "found": True,
-                    "step": step,
-                }
-            )
-        if "connector-step-cancel" in script:
-            events.append("cancel-step")
-            return json.dumps(
-                {
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "cancel_requested": True,
-                    "accepted": True,
-                    "returncode": 0,
-                }
-            )
-        if "connector-step-status" in script:
-            status_count = sum(event.startswith("status-") for event in events)
-            state = "active" if status_count < 2 else "absent"
-            events.append(f"status-{state}")
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-step-status.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "placement_host": "compute-07",
-                    "record_found": state != "absent",
-                    "state": state,
-                    "observed_host": "compute-07" if state != "absent" else None,
-                    "source": "slurm-squeue-steps",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:02Z",
-                }
-            )
-        raise AssertionError("unexpected remote connector script")
-
-    monkeypatch.setattr(supervisor, "_ssh", ssh)
-    first = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-lost-allocation-response",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-
-    assert isinstance(first, ServiceRuntimePendingResult)
-    assert first.session.state is GatewaySessionState.STARTING
-    assert first.scheduler_action == "none"
-    assert first.relay_action == "none"
-    assert events == ["placement", "start-side-effect"]
-    assert "cancel-step" not in events
-    remote_intent = cast(
-        dict[str, object],
-        cast(dict[str, object], first.session.gateway["ownership_intents"])["remote_connector"],
-    )
-    assert remote_intent["state"] == "starting"
-    assert remote_intent["scheduler_native_id"] == "12345"
-
-    def start_local(
-        *,
-        session: GatewaySession,
-        spec: ServiceRuntimeSpec,
-        proxy_name: str,
-        ownership_intent: dict[str, object],
-    ) -> dict[str, object]:
-        del spec, proxy_name
-        return {
-            "owner": "clio-relay",
-            "session_id": session.session_id,
-            "pid": 555,
-            "process_group_id": 555,
-            "process_start_marker": "start-555",
-            "connector_generation_id": ownership_intent["connector_generation_id"],
-            "owner_token": ownership_intent["owner_token"],
-            "config_path": ownership_intent["config_path"],
-            "stdout_path": ownership_intent["stdout_path"],
-            "stderr_path": ownership_intent["stderr_path"],
-            "metadata_path": ownership_intent["metadata_path"],
-        }
-
-    monkeypatch.setattr(supervisor, "_start_local_visitor", start_local)
-
-    def health_ready(*_args: object, **_kwargs: object) -> None:
-        return None
-
-    monkeypatch.setattr(
-        supervisor,
-        "_wait_for_jarvis_health",
-        health_ready,
-    )
-    resumed = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-lost-allocation-response",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-
-    assert not isinstance(resumed, ServiceRuntimePendingResult)
-    assert resumed.session.session_id == first.session.session_id
-    assert resumed.session.state is GatewaySessionState.READY
-    assert len(queue.list_gateway_sessions(cluster=definition.name)) == 1
-    assert events == [
-        "placement",
-        "start-side-effect",
-        "discover",
-        "reconcile-step",
-        "status-active",
-    ]
-    assert "cancel-step" not in events
+    assert queue.list_gateway_sessions(cluster=definition.name) == []
 
 
 def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
@@ -2790,7 +1995,7 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A local sidecar and intent survive ambiguity without cleanup or replacement."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -2899,7 +2104,7 @@ def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A retry may change observation bounds, but not connector side-effect policy."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -2950,74 +2155,14 @@ def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
     assert sessions[0].state is GatewaySessionState.STARTING
 
 
-def test_jarvis_bind_fails_closed_on_definitive_scheduler_terminal_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A proven terminal allocation is failure evidence, not a pending observation."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-
-    def fail_connector(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise RelayError("scheduler connector placement is unavailable")
-
-    def completed_status(**_kwargs: object) -> SchedulerStatus:
-        return SchedulerStatus(
-            scheduler="slurm",
-            scheduler_job_id="12345",
-            phase=SchedulerPhase.COMPLETED,
-            record_found=True,
-            active_record_found=False,
-        )
-
-    def no_connectors(session: GatewaySession) -> GatewaySession:
-        return session
-
-    monkeypatch.setattr(supervisor, "_start_remote_connector", fail_connector)
-    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", completed_status)
-    monkeypatch.setattr(supervisor, "_reconcile_ownership_intents", no_connectors)
-
-    with pytest.raises(
-        RelayError,
-        match="scheduler job reached a terminal state before its verified JARVIS service",
-    ):
-        supervisor.bind_verified_jarvis_runtime(
-            name="paraview-terminal",
-            verified=verified,
-            desktop_bind_port=28777,
-        )
-
-    persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
-    assert persisted.state is GatewaySessionState.FAILED
-    assert persisted.scheduler_job_id == "12345"
-    assert "terminal state" in str(persisted.metadata["last_error"])
-
-
 @pytest.mark.parametrize("operation", ["stop", "detach"])
-def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_binding(
+def test_cleanup_refuses_a_scheduler_identity_left_only_in_the_jarvis_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
-    """Cleanup cannot close or detach without an exact scheduler disposition."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    """Cleanup refuses an old binding whose scheduler identity the session no longer has."""
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -3042,9 +2187,15 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
         verified=verified,
         desktop_bind_port=28777,
     )
+    binding = {
+        **cast(dict[str, object], started.session.gateway["jarvis_runtime_binding"]),
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "12345",
+    }
     queue.update_gateway_session(
         started.session.session_id,
         scheduler_job_id=None,
+        gateway={**started.session.gateway, "jarvis_runtime_binding": binding},
     )
     local_cleanup_calls: list[str] = []
     ssh_calls: list[str] = []
@@ -3061,341 +2212,13 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
     monkeypatch.setattr(supervisor, "_ssh", ssh)
     cleanup = supervisor.stop if operation == "stop" else supervisor.detach
 
-    with pytest.raises(RelayError, match="scheduler job identity disagrees"):
+    with pytest.raises(RelayError, match="scheduler provider disagrees"):
         cleanup(session_id=started.session.session_id)
 
     persisted = queue.get_gateway_session(started.session.session_id)
     assert persisted.state is GatewaySessionState.READY
     assert local_cleanup_calls == []
     assert ssh_calls == []
-
-
-def test_allocation_connector_reconciliation_recovers_crash_interrupted_step(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = ClusterDefinition(
-        name="test-cluster",
-        ssh_host="localhost",
-        scheduler_provider="slurm",
-        frp_transport=FrpTransportConfig(
-            protocol="wss",
-            server_addr="frps.example.org",
-            server_port=443,
-        ),
-    )
-    queue = ClioCoreQueue(tmp_path / "core")
-    queue.initialize()
-    session = GatewaySession(
-        cluster=definition.name,
-        name="crash-recovery",
-        scheduler="slurm",
-        scheduler_job_id="12345",
-        metadata={"owner": "clio-relay"},
-    )
-    generation_id = "generation-1"
-    step_marker = (
-        "clio-relay-connector-"
-        + hashlib.sha256(f"{session.session_id}\x00{generation_id}".encode()).hexdigest()[:32]
-    )
-    placement: dict[str, object] = {
-        "schema_version": "clio-relay.scheduler-connector-placement.v1",
-        "scheduler": "slurm",
-        "scheduler_job_id": "12345",
-        "placement_host": "compute-07",
-        "allocation_node_count": 1,
-        "source": "slurm-scontrol-batch-host",
-        "verified": True,
-        "observed_at": "2026-07-15T02:00:00Z",
-    }
-    intent: dict[str, object] = {
-        "schema_version": "clio-relay.gateway-ownership-intent.v1",
-        "state": "starting",
-        "updated_at": "2026-07-15T02:00:00Z",
-        "owner_token": "owner-token",
-        "connector_generation_id": generation_id,
-        "execution_scope": "scheduler_allocation",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "scheduler_step_marker": step_marker,
-        "placement": placement,
-    }
-    session = queue.create_gateway_session(
-        session.model_copy(
-            update={
-                "gateway": {
-                    "transport": {},
-                    "ownership_intents": {"remote_connector": intent},
-                }
-            }
-        )
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-    )
-    connector_base: dict[str, object] = {
-        "owner": "clio-relay",
-        "session_id": session.session_id,
-        "execution_scope": "scheduler_allocation",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "scheduler_step_marker": step_marker,
-        "connector_generation_id": generation_id,
-        "owner_token": "owner-token",
-        "config_path": "/runtime/remote-frpc.toml",
-        "log_path": "/runtime/remote-frpc.log",
-        "placement": placement,
-    }
-    step: dict[str, object] = {
-        "schema_version": "clio-relay.scheduler-connector-step.v1",
-        "scheduler": "slurm",
-        "scheduler_job_id": "12345",
-        "scheduler_step_id": "12345.7",
-        "step_marker": step_marker,
-        "placement_host": "compute-07",
-        "source": "slurm-squeue-step-marker",
-        "verified": True,
-        "observed_at": "2026-07-15T02:00:01Z",
-    }
-
-    def ssh(script: str) -> str:
-        if "__CLIO_DISCOVER_CONNECTOR__" in script:
-            return json.dumps(
-                {
-                    "present": False,
-                    "ownership_verified": True,
-                    "reconciliation_required": True,
-                    "connector": connector_base,
-                }
-            )
-        if "connector-step-reconcile" in script:
-            return json.dumps(
-                {
-                    "schema_version": ("clio-relay.scheduler-connector-step-reconciliation.v1"),
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "step_marker": step_marker,
-                    "placement_host": "compute-07",
-                    "found": True,
-                    "step": step,
-                }
-            )
-        if "connector-step-status" in script:
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-step-status.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "placement_host": "compute-07",
-                    "record_found": True,
-                    "state": "active",
-                    "observed_host": "compute-07",
-                    "source": "slurm-squeue-steps",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:02Z",
-                }
-            )
-        raise AssertionError(script)
-
-    monkeypatch.setattr(supervisor, "_ssh", ssh)
-
-    recovered = supervisor._reconcile_ownership_intents(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        session
-    )
-
-    connector = cast(
-        dict[str, object],
-        cast(dict[str, object], recovered.gateway["transport"])["remote_connector"],
-    )
-    assert connector["scheduler_step_id"] == "12345.7"
-    assert "pid" not in connector
-    recovered_intent = cast(
-        dict[str, object],
-        cast(dict[str, object], recovered.gateway["ownership_intents"])["remote_connector"],
-    )
-    assert recovered_intent["state"] == "recorded"
-
-
-def test_internal_scheduler_step_start_cli_preserves_connector_argv(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = ClusterDefinition(
-        name="test-cluster",
-        ssh_host="localhost",
-        scheduler_provider="slurm",
-    )
-    registry_path = tmp_path / "clusters.json"
-    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
-    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
-    marker = "clio-relay-connector-0123456789abcdef0123456789abcdef"
-    observed_command: list[str] = []
-
-    class Provider:
-        def launch_connector_step(
-            self,
-            scheduler_job_id: str,
-            *,
-            placement_host: str,
-            step_marker: str,
-            command: list[str],
-            output_path: str,
-        ) -> SchedulerConnectorStepIdentity:
-            assert scheduler_job_id == "12345"
-            assert placement_host == "compute-07"
-            assert step_marker == marker
-            assert output_path == "/runtime/remote-frpc.log"
-            observed_command.extend(command)
-            return SchedulerConnectorStepIdentity(
-                scheduler="slurm",
-                scheduler_job_id="12345",
-                scheduler_step_id="12345.7",
-                step_marker=marker,
-                placement_host="compute-07",
-                source="slurm-srun-detached-marker",
-                verified=True,
-            )
-
-    provider = Provider()
-
-    def allocation_provider(_name: str) -> Provider:
-        return provider
-
-    monkeypatch.setattr(
-        "clio_relay.scheduler_providers.allocation_connector_provider_for_scheduler",
-        allocation_provider,
-    )
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "scheduler",
-            "connector-step-start",
-            "12345",
-            "--cluster",
-            "test-cluster",
-            "--provider",
-            "slurm",
-            "--placement-host",
-            "compute-07",
-            "--step-marker",
-            marker,
-            "--output-path",
-            "/runtime/remote-frpc.log",
-            "--",
-            "/opt/frpc",
-            "-c",
-            "/runtime/remote-frpc.toml",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output)["scheduler_step_id"] == "12345.7"
-    assert observed_command == [
-        "/opt/frpc",
-        "-c",
-        "/runtime/remote-frpc.toml",
-    ]
-
-
-def test_internal_browser_cli_emits_pinned_one_time_and_detach_schemas(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    definition = ClusterDefinition(name="test-cluster", ssh_host="localhost")
-    registry_path = tmp_path / "clusters.json"
-    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
-    monkeypatch.setenv("CLIO_RELAY_CLUSTER_REGISTRY", str(registry_path))
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(tmp_path / "core"))
-    monkeypatch.setenv("CLIO_RELAY_SPOOL_DIR", str(tmp_path / "spool"))
-
-    def attach(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-        ttl_seconds: int,
-        bind_port: int | None,
-    ) -> BrowserAttachmentGrant:
-        assert session_id == "gateway-test"
-        assert ttl_seconds == 600
-        assert bind_port == 28788
-        return BrowserAttachmentGrant(
-            attachment_id="browser-test",
-            expires_at="2026-07-15T20:00:00Z",
-            connect_url="http://127.0.0.1:28788/?capability=secret",
-            health_url="http://127.0.0.1:28788/healthz?capability=secret",
-            stream_url="http://127.0.0.1:28788/live-data?capability=secret",
-            events_url="http://127.0.0.1:28788/events?capability=secret",
-            state_url="http://127.0.0.1:28788/state?capability=secret",
-            command_url="http://127.0.0.1:28788/commands?capability=secret",
-        )
-
-    def detach(
-        _self: ServiceRuntimeSupervisor,
-        *,
-        session_id: str,
-        attachment_id: str,
-    ) -> BrowserDetachmentResult:
-        assert session_id == "gateway-test"
-        assert attachment_id == "browser-test"
-        return BrowserDetachmentResult(
-            attachment_id=attachment_id,
-            revoked_at="2026-07-15T19:45:00Z",
-            already_revoked=False,
-            proxy_process_id=777,
-            proxy_stopped=True,
-        )
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "browser_attach", attach)
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "browser_detach", detach)
-    runner = CliRunner()
-    attached = runner.invoke(
-        app,
-        [
-            "gateway",
-            "browser-attach",
-            "gateway-test",
-            "--cluster",
-            definition.name,
-            "--ttl-seconds",
-            "600",
-            "--bind-port",
-            "28788",
-        ],
-    )
-    detached = runner.invoke(
-        app,
-        [
-            "gateway",
-            "browser-detach",
-            "gateway-test",
-            "--cluster",
-            definition.name,
-            "--attachment-id",
-            "browser-test",
-        ],
-    )
-
-    assert attached.exit_code == 0, attached.output
-    assert json.loads(attached.output)["schema_version"] == "clio-relay.browser-attachment.v1"
-    assert "capability=secret" in json.loads(attached.output)["events_url"]
-    assert detached.exit_code == 0, detached.output
-    assert json.loads(detached.output) == {
-        "schema_version": "clio-relay.browser-detachment.v1",
-        "attachment_id": "browser-test",
-        "state": "revoked",
-        "revoked_at": "2026-07-15T19:45:00Z",
-        "already_revoked": False,
-        "proxy_process_id": 777,
-        "proxy_stopped": True,
-        "capability_revoked": True,
-    }
 
 
 def _source_result(
@@ -3407,6 +2230,7 @@ def _source_result(
     bind_relay_jarvis: bool = True,
     expected_registered_contract: str | None = None,
     server_artifact: dict[str, Any] | None = None,
+    execution_mode: Literal["direct", "scheduler"] = "scheduler",
 ) -> tuple[ClioCoreQueue, ClusterDefinition, RelayJob, ArtifactRef, dict[str, Any]]:
     queue = ClioCoreQueue(tmp_path / "core")
     resolved_server_artifact = (
@@ -3418,7 +2242,7 @@ def _source_result(
         if server_artifact is None
         else server_artifact
     )
-    digest = remote_mcp_server_artifact_digest(resolved_server_artifact)
+    digest = server_artifact_digest(resolved_server_artifact)
     job = queue.submit_job(
         RelayJob(
             cluster="test-cluster",
@@ -3452,6 +2276,7 @@ def _source_result(
         digest=digest,
         spec=cast(McpCallSpec, job.spec),
         server_artifact=resolved_server_artifact,
+        execution_mode=execution_mode,
     )
     payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     artifact = ArtifactRef(
@@ -3485,7 +2310,9 @@ def _mcp_result_document(
     digest: str,
     spec: McpCallSpec,
     server_artifact: dict[str, Any],
+    execution_mode: Literal["direct", "scheduler"] = "scheduler",
 ) -> dict[str, Any]:
+    scheduled = execution_mode == "scheduler"
     submission = {
         "schema_version": "jarvis.scheduler.submission.v1",
         "execution_id": "execution-1",
@@ -3495,32 +2322,32 @@ def _mcp_result_document(
         "submitted": True,
         "identity_source": "scheduler_submit_api",
     }
+    ownership: dict[str, Any] = {
+        "mode": execution_mode,
+        "scheduler_provider": "slurm" if scheduled else None,
+        "scheduler_native_id": "12345" if scheduled else None,
+        "cluster": "test-cluster" if scheduled else None,
+    }
     handle = {
         "schema_version": "jarvis.execution.handle.v1",
         "execution_id": "execution-1",
         "pipeline_id": "pipeline-1",
-        "mode": "scheduler",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "cluster": "test-cluster",
+        **ownership,
     }
     record = {
         "schema_version": "jarvis.execution.record.v1",
         "execution_id": "execution-1",
         "pipeline_id": "pipeline-1",
         "pipeline_name": "pipeline-1",
-        "mode": "scheduler",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "cluster": "test-cluster",
+        **ownership,
         "state": "running",
-        "submitted": True,
+        "submitted": scheduled,
         "terminal": False,
         "created_at": "2026-07-15T02:00:00Z",
         "updated_at": "2026-07-15T02:01:00Z",
         "return_code": None,
         "error": None,
-        "metadata": {"submission": submission},
+        "metadata": {"submission": submission} if scheduled else {},
     }
     progress = {
         "schema_version": "jarvis.execution.progress.v1",
@@ -3679,10 +2506,8 @@ def _patch_connector_start(monkeypatch: pytest.MonkeyPatch) -> None:
         node: str,
         proxy_name: str,
         ownership_intent: dict[str, object],
-        allocation_provider: str | None = None,
-        allocation_job_id: str | None = None,
     ) -> dict[str, object]:
-        del spec, node, proxy_name, allocation_provider, allocation_job_id
+        del spec, node, proxy_name
         return {
             "owner": "clio-relay",
             "session_id": session.session_id,

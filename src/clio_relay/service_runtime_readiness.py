@@ -6,9 +6,9 @@ browser health endpoints without an ambient-proxy-discovering client
 (``_read_bounded_http_response``, ``_new_readiness_http_client``,
 ``_sleep_before_deadline``), loopback-port selection/validation for desktop
 binds (``_available_loopback_port``, ``_validated_available_loopback_port``),
-and the browser-attachment capability-URL/revocation-marker helpers
-(``_browser_attachment_grant``, ``_utc_timestamp``,
-``_owned_browser_runtime_path``, ``_write_browser_revocation_marker``).
+and the browser-attachment revocation helpers used when cleaning up a record
+an older relay left (``_owned_browser_runtime_path``,
+``_write_browser_revocation_marker``).
 
 Depends on ``service_runtime_types`` (``_BoundedHttpResponse``,
 ``_BoundedHttpReadState``) -- never on the supervisor class, which imports
@@ -23,20 +23,17 @@ import secrets
 import socket
 import threading
 import time
-import urllib.parse
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import httpx
 
 from clio_relay import service_runtime_types as _types
-from clio_relay.browser_gateway import BrowserAttachmentGrant, BrowserAttachmentRecord
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.models import ServiceRuntimeSpec, utc_now
+from clio_relay.models import utc_now
 
 # #231 service-runtime split, slice 11: shared by the start/jarvis-bind/browser
 # mixins' local-health waits -- moved here (rather than duplicated three times)
@@ -167,46 +164,6 @@ def _validated_available_loopback_port(port: object) -> int:
     except OSError as exc:
         raise ConfigurationError(f"desktop bind port is already occupied: {port}") from exc
     return port
-
-
-def _browser_attachment_grant(
-    *,
-    record: BrowserAttachmentRecord,
-    capability: str,
-    spec: ServiceRuntimeSpec,
-) -> BrowserAttachmentGrant:
-    """Build the one-time capability URLs without copying them into gateway state."""
-    if spec.command_path is None or spec.stream_path is None or spec.event_stream_path is None:
-        raise ConfigurationError("browser attachment requires stream, events, and command paths")
-    if spec.state_path is None:
-        raise ConfigurationError("browser attachment requires a state path")
-    base = f"http://{record.bind_addr}:{record.bind_port}"
-
-    def capability_url(path: str) -> str:
-        encoded = urllib.parse.urlencode({"capability": capability})
-        return f"{base}{path}?{encoded}"
-
-    return BrowserAttachmentGrant(
-        attachment_id=record.attachment_id,
-        expires_at=record.expires_at,
-        connect_url=capability_url("/"),
-        health_url=capability_url(spec.health_path),
-        stream_url=capability_url(spec.stream_path),
-        events_url=capability_url(spec.event_stream_path),
-        state_url=capability_url(spec.state_path),
-        command_url=capability_url(spec.command_path),
-    )
-
-
-def _utc_timestamp(value: str) -> datetime:
-    """Parse one explicitly UTC persisted timestamp."""
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise RelayError("browser attachment timestamp is invalid") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
-        raise RelayError("browser attachment timestamp is not UTC")
-    return parsed
 
 
 def _owned_browser_runtime_path(
