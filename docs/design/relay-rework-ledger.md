@@ -119,6 +119,14 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - W8 at ac9b06d (merge 343ef76): `JobKind.MCP_CALL` and the helpers only it used are gone (`McpCallSpec` stays for W9), an unread state-map fixture and an old release note are deleted, and the owner-session lease test uses its own `jarvis_bin`. The pyright ratchet fell to 4925, and the ratchet scripts no longer carry history notes that name deleted modules (LQ32). Then at 0ca5436 (merge 2345b81): `docs/operations.md` is rewritten for `clio-relay worker` and `docs/connect-desktop-homelab-cluster.md` is deleted. `docs/ai/interface-context.md` is rewritten as a map of the new surface, and the reading order in `docs/ai/README.md` no longer names deleted pages.
   - The cutover, the jarvis-cd group and the two merges above, gated together at 6285a7d on Ares: core 469, asks 79, guard 86, relay_tapis 50 and relay_ssh 108 passed, 0 skipped; the worker kit 11 of 11; pyright 4925; the installed-wheel checks in the cutover decision above.
   - Fixes at merge: `conftest.answer_page(..., auth=)`, and `test_transports` passes the operator token to the ask page over HTTP.
+  - W9 at c4e94d4 (merge 32f565e): `McpCallSpec` and the dead JARVIS bind chain are gone. A stored `jarvis_runtime_binding` session refuses with a plain message, and stop or detach report a residual. `service_runtime.py` left the size ratchet's per-file list, and the ratchet comments that named deleted modules went (ee5b0d7). Then at f4e855d (merge e99d25e): `frp_transport.py` cites the architecture doc's §8.4 to §8.6 instead of the deleted `connection-model.md`. My own citations of that page moved too: `session_api.py` states the rule it cited, the architecture doc's §8 says where the page's contract lives now, and §11 links `docs/adapters/worker.md`.
+  - W14 at 875ce7f (merge 8feb336), then at 4eca67d (merge faf48e6): relay's CLIO plugin and the Compute tab (RL31 to RL33), then field errors as A2UI checks on their field and the plugin title "Relay". W14's findings:
+    - Test-only adapters showed in the add form's adapter switch. `AdapterBase.listed` (default `True`) now says whether an adapter is offered there; `FixtureAdapter` sets `False`, and the forms, surfaces and tab offer only listed adapters.
+    - Two `mcp_resource_updated` per change. Within one relay process there is one: `test_compute_tab_changes.py` checks that a change from the command line notifies once and the host's reread is not a second change, and that an out-of-date button refreshes the tab once (the refusal path now records what it wrote, so the watcher does not announce it again). The mcp 2.3 client refuses `subscriptions/listen` at 2025-11-25, so the second one comes from outside one process (two relay processes or connections, or the host). W14 is asked for its host trace.
+    - Whole-repo pyright near 7.5k against the 4925 baseline. The ratchet counts with every extra installed (`uv sync --all-extras`); see the measurement below.
+    - Size: `surfaces.py` (676 lines) put the src floor under 82.10, so the add-site surface moved to `adding.py`, the field components and their checks to `forms.py` and the message builders to `protocol.py`. The tab's change tests moved to `test_compute_tab_changes.py`, and its catalog and caption tests to `test_compute_tab_forms.py`. `tab.py` stays at 764, under the 800 cap for a new file.
+  - Cutover breaks the uv-pin tests caught. Develop's uv-pin tests in `test_run_report.py` need uv 0.11.28, so the gate puts that uv first on PATH for them; at 0.13.9 they error before running. With it they showed that `installation-info` is now `clio-relay worker installation-info`, and the two uvx receipt tests now drive `clio-relay worker cluster bootstrap` (`live-test` is deleted). They also found a real bug: `uv_tool_receipt` bound the launcher by `from == clio-relay` alone, and the wheel's second script `clio-relay-askpass` made that ambiguous. It now also requires `name == "clio-relay"`.
+  - Ratchets: pyright 4558 (from 4925), size floors src 82.18 and tests 77.53.
 - **Relay never imposes a walltime or a duration (coordinator decision, the person's rule).** `JobAttributes.duration` is `timedelta | None` with no default, for run and serve specs alike. When it is unset, the site's `defaults.duration` applies if the site sets one. Otherwise no walltime is sent, and the scheduler's own default applies. `to_psij` passes `duration=None` explicitly, because psij's own default is 10 minutes. `JobSpec.node_hours()` returns `None` when the duration is unknown, and `Charge.walltime_s` and `Charge.node_hours` may be `None`, meaning unknown. The globus, iri, tapis and sky adapters send no walltime when the spec has none. These are compat edits in W10's and W11's files, for their owners to review. Sky prices such a job with no amount.
 - **An unknown cost always asks (coordinator decision).** `SpendPolicy.needs_approval(None)` is true unless the site's `ask` is `never`. The approval message says plainly: "sets no walltime, so its duration and cost are unknown: the scheduler's default limit applies".
 - **No new job state for a job the scheduler forgot (coordinator decision).** A job the scheduler no longer lists, with no exit record of its own, stays open as running with `native_state: "unknown"` and a message that says cancel ends it. It is never recorded as failed. W7's ssh adapter and relay's `local` adapter both follow this.
@@ -1182,6 +1190,7 @@ Files: `src/clio_relay/serve/` (config, plan, frp, forward, desktop, mount, runt
   - The allocation-scoped connector is retired. Starting one refuses and points to serve. Stopping or detaching an old session that has one reports a residual naming the Slurm job and step to `scancel`. The remote `connector-step-*` commands and every caller of them are gone.
   - Browser attach is gone. Revoke on teardown stays for records an older relay left, through `adapters.worker.browser_attachment_record`.
   - JARVIS MCP results that came through a registered `remote_mcp` route are refused, because that route came only from the deleted registry.
+- The JARVIS runtime binding is retired with the `mcp_call` job kind (W8 ac9b06d), because a binding was verified from an `mcp_call` result and no job can carry one now. Deleted: `McpCallSpec`, `jarvis_service_runtime_validation.py`, `service_runtime_jarvis_bind.py`, `resolve_jarvis_service_runtime`, the handoff derivation, the bind-time authority lookup, the JARVIS health wait, the quiesced-owner source recovery and `docs/ai/jarvis-service-runtime-binding-validation-2026-07-15.md`. A session that still holds a `jarvis_runtime_binding` is refused on start, attach and resume, with a message naming the JARVIS execution and, when it has one, the scheduler job to cancel. Stop and detach report that job as a residual and never cancel it. `reverify_jarvis_service_runtime` always refuses, so W8's owned-session authority route answers 409. The local authority functions stay because W8's files import them.
 - The old runtime no longer imports `browser_gateway`, `scheduler_providers`, `remote_mcp` or the old `cli`. `core_queue` comes from `clio_relay.adapters.worker.core_queue`. Tests of the retired connector, browser attach and the deleted gateway CLI commands were removed, and the rest were migrated.
 
 ### Facts
@@ -1690,6 +1699,152 @@ Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (cli
 - The full suite on Ares hung at exit in pytest's temp cleanup after writing its report (job 27790).
 
 ## W14. Relay's CLIO plugin and the Compute tab
+
+Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (7d38476 pins relay f31b292).
+
+### Decisions
+
+- **Action tools (coordinator decision B, LQ1 as amended in 956f7e8).**
+  - The tab's actions are real tools marked `_meta.ui.visibility: ["app"]`.
+  - Relay lists them only when that `tools/list` request's `_meta` declares `org.a2ui/a2ui`. A client without A2UI sees exactly the five verbs.
+  - Every call needs the single-use action token from the surface relay rendered. A missing, unknown, spent or wrong-action token is refused.
+  - Reason: this is the standard MCP Apps pattern, and it needs no host change.
+- **Tokens.**
+  - Tokens are minted per rendered surface and kept in relay's state dir, so a re-read after a restart still has working buttons.
+  - A token presented to the wrong action is spent and refused, rather than kept. A token can't be probed for the actions it allows.
+- **One store.** Every action calls W1's `sites/store.py` and the `SiteAdded.on_site_added` hook, as the CLI's `site add`, `edit` and `switch` do. The tab does nothing the command line can't.
+- **Relay's dirs come from the plugin.**
+  - `plugin/mcp.json` sets `CLIO_RELAY_CONFIG_DIR=${PLUGIN_DATA}/config` and `CLIO_RELAY_STATE_DIR=${PLUGIN_DATA}/state`, so a CLIO install keeps its sites in its own plugin data dir.
+  - A terminal that should share the tab's sites sets the same two variables.
+  - `CLIO_RELAY_GRANT_FILE_GLOBUS=${CLIO_ACCOUNT_GLOBUS_FILE}` is HS4a's mapping. Relay's code reads no CLIO name.
+- **Per-site degrade.** A site whose adapter or identity can't be read becomes one "Unavailable" row with Edit and Remove. The rest of the tab still renders.
+- **Server command (O9).** The server command lives in `plugin/mcp.json` beside `plugin.json`. clio-agent has no connector entry for relay.
+- **Skills (RL34).** `plugin/skills/use-relay/SKILL.md` points at `relay://skills/{name}` and `relay://sites/{site}/skill` and copies no skill text.
+- **The plugin's title.** `ai.iowarp.clio.title` is "Relay". CLIO sends it as `plugin_title` (clio-agent ebe5573), and the breadcrumb shows it. Agent Plugins 1.0.0 has no top-level title.
+- **Field errors are checks on the field.**
+  - An error that names a field puts `checks: [{condition: {path: <form>/valid/<key>}, message}]` on that TextField or CheckBox, and the form's `valid/<key>` is `false`. A literal `condition: false` reads as valid in web_core.
+  - The forms are `/drafts/add`, `/drafts/{site}` and `/catalog`. A catalog error names `catalog.site_id` (the Site ID field) or `catalog.id` (the picker).
+  - An error that names no field stays a caption. So does an error on a ChoicePicker, because the Basic ChoicePicker draws no check message.
+- **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
+
+### Facts
+
+- The manifest (`plugin/plugin.json`, version 1.6.8):
+  - `ai.iowarp.clio.tabs`: tab `compute`, resource `a2ui://clio-relay/compute`.
+  - `accounts`: Globus, with the transfer and GCS scopes.
+  - `elicitation`: loopback plus `https://tacc.tapis.io`.
+- The catalog is `plugin/ai.iowarp.clio/a2ui/clio-relay-compute/`. The tab uses only components CLIO already renders.
+- Surfaces (`src/clio_relay/surface/a2ui/`):
+  - Each site's card shows its status, identity, Probe, Connect, adapter switch, Edit and Remove.
+  - The add-site form is built from each adapter's `Config` JSON schema.
+  - Remove asks for confirmation.
+- The tab watches the site store every 2 s (`tab.WATCH_INTERVAL_S`) and sends `notifications/resources/updated`, so a CLI change reaches an open tab.
+- A2UI goes out only when the request carries `org.a2ui/a2ui`, and always alongside the full text result.
+
+### Evidence
+
+All live on Ares, on my own stack:
+- clio-agent at 489c557, with gact-tui `bcdecb4` from iowarp/gact-tui#1320.
+- Agent on :18914, UI on :15914, `CLIO_AGENT_HOME=~/clio-relay-rework/w14-live/agent-home`.
+- Plugin installed from the marketplace clone.
+
+- **Option B gate.**
+  - Over stdio, a plain `mcp` client sees 5 tools.
+  - A client whose `tools/list` `_meta` declares `org.a2ui/a2ui` sees 15: the 5 verbs plus 10 app-only action tools.
+  - An action call with no token is refused, and so is one with a made-up token.
+- **LQ27 (local flow), passed live in the browser.**
+  - Covered: open the Compute tab, add a local site from the form, Probe, Edit and save, Remove and confirm.
+  - Add Stampede3 from the catalog, switch its adapter, remove it.
+  - Screenshots `lq27-00` to `lq27-12` (`.png`) are in the session artifacts.
+- **LQ28 (visual QA).** Screenshots at 390×844 in en, 1440×900 in el and 390×844 in el.
+- **Keyring.** Stampede3 first degraded to "Unavailable (NoKeyringError)" on Ares, which has no keyring backend. W6 fixed this at 723c9a2: a 0600 file fallback, and `describe` shows `facts.credentials.stored_in`.
+- **CLI change with the tab open (part of LQ27), passed live** on clio-agent cfd4747 (W3's fix for both host bugs).
+  - A CLI `site add` showed in the open tab and a `site remove` disappeared from it, before and after a PATCH remove/add remount. Screenshots `lq27-13` and `lq27-14`.
+  - Revisions: a CLI add moves only `relay-sites`, which rises by one per change. Re-reads with no change keep every revision.
+  - W3 also noticed that `relay-add` took fresh action tokens on every read and re-rendered, which could wipe a half-filled form. Fixed at 1f26714: an unspent token for the same action and subject is reused while more than half its lifetime is left. A new relay process re-mints once.
+- **Connect on Stampede3, live** at a0e2802 and again at ea56fc6, with W6's fix.
+  - The card reads TACC, Signed out, Unavailable, "Relay registers one after you sign in", with Connect. Pressing Connect raises the host permission card "Sign in to a site". After Allow once, relay answers that it has no OAuth client for the TACC tenant, on the card and as the tab notice. Screenshots `lq27-15` to `lq27-17`.
+  - A real TACC sign-in needs `CLIO_RELAY_TACC_CLIENT_ID`, which this stack doesn't have. That is the W10 owner blocker, not a tab gap.
+  - Found and fixed on the way: notices passed refusal text through `str.capitalize`, which lowercased TACC and the env names (a0e2802).
+- **Tests.** On Ares at 1f26714, `tests/relay_next tests/asks` gave 326 passed, 0 skipped. At a0e2802, `test_compute_tab.py` gave 12 passed, 0 skipped, with ruff and pyright clean on `surface/a2ui`.
+- **After the cutover (integration c214d4f, merged at 66ffa34).** The plugin runs `clio-relay serve`, pinned at ea56fc6 (309df86), and the marketplace is at 89c56a1.
+  - `tests/relay_next tests/asks` gave 328 passed, 0 skipped.
+  - The option-B gate passed against `clio-relay serve` over stdio, in both auto and legacy modes. A plain client sees 5 tools. An A2UI client sees 15, and the 10 app-only tools equal `ACTIONS`. A call without a token is refused, and so is one with a made-up token.
+  - On the live agent, after a plugin update and a remount, relay runs `@ea56fc6… clio-relay serve`, and Connect on Stampede3 gives the same result as above.
+- **Field checks and the title (f31b292, 242044c), live** on clio-agent ebe5573 with gact-tui da11008 (iowarp/gact-tui#1320), plugin from marketplace 7d38476.
+  - Add site with an empty Site ID: "Enter a site ID" appears once, beneath the field, in the destructive colour at 14px, and the field's border turns red. No caption and no separator.
+  - Passed at 1440×900 and 390×844, in en and el. A valid add then clears the check.
+  - The breadcrumb reads "Relay", from `plugin_title`.
+  - Screenshots `lq28-{1440,390}-{en,el}-05-field-check.png` and `lq28-1440-en-b-06-check-cleared.png`.
+  - On Ares, `tests/relay_next tests/asks` gave 329 passed, 0 skipped at f31b292, with ruff and pyright clean. `test_plugin.py` and `test_compute_tab.py` gave 17 passed, 0 skipped at 242044c.
+
+### Open items
+
+- **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
+- **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
+- **ChoicePicker errors are captions.** The Basic ChoicePicker, which CLIO uses for 8 options or fewer, draws no `validationErrors`. A check on a picker would show nothing, so relay keeps those errors as captions. This is for W12.
+- **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit, with `clio-relay serve` since the cutover. Repin to the integration commit after W1 merges.
+
+### Run sheets for the person rows
+
+Each sheet lists what the person needs, the steps, and what to record. Results go in W16's summary.
+
+**LQ-L7. The Windows fence (LQ5, LQ10, LQ12 and LQ29 from Windows).**
+
+Needs:
+- A Windows laptop with CLIO Desktop built from the integration branches, with the clio-relay plugin installed from the marketplace and turned on for an agent.
+- The W2 fixtures, from `scripts/ares/fixtures.sh up` on Ares. From Windows, reach each fixture through an SSH tunnel to Ares or an `ssh_config` `ProxyJump ares` entry. The ports are fx-ssh 47100, fx-slurm 47101, fx-otp 47103, fx-frps 47104 and 47105.
+- A `~/.ssh/config` on Windows with the hosts `fx-slurm` and `fx-otp`, reached through Ares.
+
+Steps:
+1. In the Compute tab, add `fx-slurm` as an `ssh` site with `ssh_profile` set to `fx-slurm` and the scheduler set to `slurm`. Probe it. Record the card's status.
+2. **LQ5.**
+   - Ask the agent to `run` `sleep 5400; hostname` (90 minutes) on `fx-slurm`, and note the handle.
+   - Close CLIO, then close the lid for an hour.
+   - Open it, open CLIO, and ask for the handle's status.
+   - It must complete from the site's job record.
+   - While the lid was closed and between polls, `Get-Process ssh -ErrorAction SilentlyContinue` must show no SSH process.
+3. **LQ10.**
+   - Add `fx-otp` as a `worker` site (rendezvous at fx-frps) and press Connect.
+   - Exactly one question arrives, with a loopback address. Type the code on that page.
+   - The worker must dial the rendezvous.
+   - Afterwards no SSH process remains (`Get-Process ssh`).
+   - The code must not appear in the transcript.
+4. **LQ12.**
+   - Ask the agent to `serve` `clio-fixture-secret-service` on `fx-slurm`.
+   - The task reaches `working` with an endpoint.
+   - `Invoke-WebRequest` to the loopback port with the secret answers. Without it, the request is refused.
+5. **LQ29.**
+   - In CLIO's fenced shell, run `ssh fx-slurm hostname`.
+   - It must succeed, and the session's events must show a `net.egress` event naming the host and port 22.
+6. In `describe` for an SSH site and the Stampede3 site, read `facts.credentials.stored_in` ("keyring" with Windows Credential Manager).
+
+Record for each row:
+- Pass or fail, with the handle, the times, the `Get-Process ssh` output and screenshots of the tab and the transcript.
+- Any Windows path or quoting problem in the fence (ssh `known_hosts`, control sockets, the ProxyCommand shim).
+
+**LQ-L18. A third-party agent host.**
+
+Needs:
+- Claude Code or the Copilot CLI, at a recorded version.
+- `uv` on PATH.
+- An Ares account the person can `ssh ares` to.
+
+Steps:
+1. Add relay with the host's documented command, using the integration commit `<sha>`:
+   - Claude Code: `claude mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay serve`.
+   - Copilot CLI: `copilot mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay serve`.
+2. In a terminal, run `uvx --from "clio-relay @ git+…@<sha>" clio-relay site add-from-catalog ares`, then `site show ares`. Before step 4, `ssh ares hostname` must work without a prompt.
+3. Start the host and list its tools. It must show exactly the five relay verbs and no action tools, because it doesn't declare A2UI.
+4. Ask: "submit hostname to Ares and tell me the node".
+
+Record:
+- The host and its version.
+- The tool list.
+- The handle.
+- The node name, checked against `sacct` on Ares.
+- The full transcript.
+- Every question the host showed.
 
 ## W15. ParaView follows a growing source (RL44, LQ-L12)
 

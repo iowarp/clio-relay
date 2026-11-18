@@ -5,10 +5,9 @@ split): the public ``attach`` entry point and its transition-lock-serialized
 ``_attach_serialized`` implementation. Attach either defers entirely to the
 start-cluster resume path (a still-pending or pre-ready submission resumes
 in place rather than treating this as a reattach), or recreates only the
-desktop connector against an already-live remote connector/JARVIS binding,
-waiting for the appropriate health check (local health for a submitted
-runtime, JARVIS health with its authorization header for a bound one)
-before publishing readiness.
+desktop connector against an already-live remote connector, waiting for
+local health before publishing readiness. A session that still holds a
+JARVIS runtime binding is refused (``retired_jarvis_binding_message``).
 
 This is a mixin, not a standalone class: it depends on attributes set by
 ``_ServiceRuntimeCoreMixin.__init__`` (``self.queue``, ``self.settings``,
@@ -19,8 +18,7 @@ the detach mixin's resumability predicates and completed-detach consumption
 ``self._consume_completed_detach_for_attach``), the start mixin's resume
 path and connector predicates (``self._resume_start_locked``,
 ``self._connector_reuse_is_verified``, ``self._connector_launch_is_authorized``,
-``self._connector_recovery_pending``), the jarvis-bind mixin's rollback
-(``self._rollback_jarvis_binding``), reconciliation
+``self._connector_recovery_pending``), reconciliation
 (``self._reconcile_ownership_intents``), and connector lifecycle
 (``self._local_connector_intent``, ``self._start_local_visitor``,
 ``self._stop_local_connector``, ``self._remove_unpublished_local_connector_files``).
@@ -36,12 +34,8 @@ from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_readiness as _readiness
 from clio_relay import service_runtime_results as _results
 from clio_relay import service_runtime_scheduler_contracts as _scheduler_contracts
-from clio_relay import service_runtime_types as _types
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.jarvis_service_runtime import (
-    VerifiedJarvisServiceRuntime,
-    reverify_jarvis_service_runtime,
-)
+from clio_relay.jarvis_service_runtime import retired_jarvis_binding_message
 from clio_relay.models import GatewaySessionState, ServiceRuntimeSpec, utc_now
 
 
@@ -87,36 +81,9 @@ class _ServiceRuntimeAttachMixin:
             session = self._consume_completed_detach_for_attach(session)
         session = self._reconcile_ownership_intents(session)
         spec = ServiceRuntimeSpec.model_validate(session.gateway["runtime_spec"])
-        verified_runtime: VerifiedJarvisServiceRuntime | None = None
-        service_authorization: str | None = None
         binding_document = session.gateway.get("jarvis_runtime_binding")
         if binding_document is not None:
-            try:
-                verified_runtime = reverify_jarvis_service_runtime(
-                    queue=self.queue,
-                    definition=self.definition,
-                    settings=self.settings,
-                    binding_document=binding_document,
-                )
-            except ValueError as exc:
-                raise RelayError(
-                    f"JARVIS service runtime binding re-verification failed: {exc}"
-                ) from exc
-            runtime = verified_runtime.runtime
-            if runtime.lifecycle != "ready":
-                raise ConfigurationError("detached JARVIS service runtime is no longer ready")
-            if (
-                spec.deployment_driver != "jarvis-bound"
-                or runtime.port != spec.service_port
-                or runtime.protocol != spec.protocol
-                or runtime.health_path != spec.health_path
-                or runtime.live_data_path != spec.stream_path
-                or runtime.events_path != spec.event_stream_path
-                or runtime.state_path != spec.state_path
-                or runtime.command_path != spec.command_path
-            ):
-                raise RelayError("detached JARVIS runtime endpoints changed before reattachment")
-            service_authorization = self._jarvis_runtime_authorization(verified_runtime)
+            raise RelayError(retired_jarvis_binding_message(binding_document))
         transport = _primitives._object(session.gateway.get("transport", {}))
         remote_connector = _primitives._object(transport.get("remote_connector", {}))
         if not remote_connector or not self._connector_reuse_is_verified(
@@ -195,32 +162,16 @@ class _ServiceRuntimeAttachMixin:
                 f"{spec.desktop_bind_port}{spec.health_path}"
             )
             try:
-                if verified_runtime is None:
-                    self._wait_for_local_health(
-                        health_url,
-                        min(
-                            spec.readiness_timeout_seconds,
-                            _readiness._RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS,
-                        ),
-                        spec.poll_seconds,
-                        expected_body=spec.health_expected_body,
-                        max_attempts=1,
-                    )
-                else:
-                    self._wait_for_jarvis_health(
-                        health_url,
-                        timeout_seconds=min(
-                            spec.readiness_timeout_seconds,
-                            _readiness._RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS,
-                        ),
-                        poll_seconds=spec.poll_seconds,
-                        runtime_schema_version=verified_runtime.runtime.schema_version,
-                        authorization=service_authorization,
-                        max_attempts=1,
-                    )
-            except _types._DefinitiveRuntimeObservationError as exc:
-                self._rollback_jarvis_binding(session_id=session_id, error=exc)
-                raise
+                self._wait_for_local_health(
+                    health_url,
+                    min(
+                        spec.readiness_timeout_seconds,
+                        _readiness._RUNTIME_HEALTH_OBSERVATION_TIMEOUT_SECONDS,
+                    ),
+                    spec.poll_seconds,
+                    expected_body=spec.health_expected_body,
+                    max_attempts=1,
+                )
             except RelayError as exc:
                 pending = self._record_runtime_observation_pending(
                     session,

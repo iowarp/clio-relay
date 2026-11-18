@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from clio_relay import service_runtime_primitives as _primitives
 from clio_relay import service_runtime_scheduler_contracts as _scheduler_contracts
 from clio_relay.errors import RelayError
+from clio_relay.jarvis_service_runtime import retired_jarvis_binding_message
 from clio_relay.models import GatewaySession, GatewaySessionState, utc_now
 from clio_relay.public_records import public_gateway_payload
 from clio_relay.session_wire_models import CleanupResource
@@ -178,32 +179,9 @@ class ServiceRuntimePendingResult:
             "scheduler_provider": self.session.scheduler,
             "scheduler_job_id": scheduler_job_id,
         }
-        binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
-        if binding:
-            required = {
-                "source_relay_job_id",
-                "source_relay_artifact_id",
-                "package_id",
-                "package_name",
-                "service_instance_id",
-            }
-            if not required.issubset(binding):
-                raise RelayError("pending JARVIS runtime omitted its durable binding identity")
-            selector.update(
-                {
-                    "resume_tool": "relay_bind_jarvis_runtime",
-                    "binding": {
-                        "cluster": self.session.cluster,
-                        "source_job_id": binding["source_relay_job_id"],
-                        "source_artifact_id": binding["source_relay_artifact_id"],
-                        "package_id": binding["package_id"],
-                        "package_name": binding["package_name"],
-                        "service_instance_id": binding["service_instance_id"],
-                    },
-                    "name": self.session.name,
-                }
-            )
-            return selector
+        binding = self.session.gateway.get("jarvis_runtime_binding")
+        if binding is not None:
+            raise RelayError(retired_jarvis_binding_message(binding))
         if scheduler_job_id is not None:
             return selector
         intents = _primitives._object(self.session.gateway.get("ownership_intents", {}))
@@ -252,16 +230,11 @@ class ServiceRuntimePendingResult:
         observed_at = utc_now()
         selector = self.retry_selector()
         scheduler_job_id = self.session.scheduler_job_id
-        jarvis_binding = _primitives._object(self.session.gateway.get("jarvis_runtime_binding", {}))
-        unresolved_submission = scheduler_job_id is None and not jarvis_binding
+        unresolved_submission = scheduler_job_id is None
         summary = (
             "exact scheduler submission intent is durable; submission outcome is unresolved"
             if unresolved_submission
-            else (
-                "verified JARVIS runtime binding is durable and its local gateway is not ready yet"
-                if jarvis_binding
-                else "scheduler-backed gateway is durably submitted and not ready yet"
-            )
+            else "scheduler-backed gateway is durably submitted and not ready yet"
         )
         report.checks.append(
             ValidationCheck(
@@ -292,70 +265,36 @@ class ServiceRuntimePendingResult:
                 metadata={"retry_selector": selector},
             )
         )
-        if jarvis_binding:
-            report.resources.append(
-                ValidationResource(
-                    kind="jarvis_service_runtime",
-                    resource_id=cast(str, jarvis_binding["service_instance_id"]),
-                    cluster=self.session.cluster,
-                    provider=self.session.scheduler,
-                    state=self.session.queue_state,
-                    metadata={
+        report.resources.append(
+            ValidationResource(
+                kind=("scheduler_job" if not unresolved_submission else "scheduler_submission"),
+                resource_id=(scheduler_job_id or cast(str, selector["submission_id"])),
+                cluster=self.session.cluster,
+                provider=self.session.scheduler,
+                state=(
+                    self.session.queue_state if not unresolved_submission else "intent_recorded"
+                ),
+                metadata=(
+                    {
                         "gateway_session_id": self.session.session_id,
-                        "jarvis_execution_id": jarvis_binding.get("jarvis_execution_id"),
+                        "retained": True,
                         "scheduler_job_id": scheduler_job_id,
                         "cancel_requested": False,
                         "resubmit_requested": False,
-                    },
-                )
+                    }
+                    if not unresolved_submission
+                    else {
+                        "gateway_session_id": self.session.session_id,
+                        "scheduler_job_id": None,
+                        "submission_id": selector["submission_id"],
+                        "submission_marker": selector["submission_marker"],
+                        "submission_outcome": "unresolved",
+                        "cancel_requested": False,
+                        "resubmit_requested": False,
+                    }
+                ),
             )
-            if scheduler_job_id is not None:
-                report.resources.append(
-                    ValidationResource(
-                        kind="scheduler_job",
-                        resource_id=scheduler_job_id,
-                        cluster=self.session.cluster,
-                        provider=self.session.scheduler,
-                        state=self.session.queue_state,
-                        metadata={
-                            "gateway_session_id": self.session.session_id,
-                            "retained": True,
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        },
-                    )
-                )
-        else:
-            report.resources.append(
-                ValidationResource(
-                    kind=("scheduler_job" if not unresolved_submission else "scheduler_submission"),
-                    resource_id=(scheduler_job_id or cast(str, selector["submission_id"])),
-                    cluster=self.session.cluster,
-                    provider=self.session.scheduler,
-                    state=(
-                        self.session.queue_state if not unresolved_submission else "intent_recorded"
-                    ),
-                    metadata=(
-                        {
-                            "gateway_session_id": self.session.session_id,
-                            "retained": True,
-                            "scheduler_job_id": scheduler_job_id,
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        }
-                        if not unresolved_submission
-                        else {
-                            "gateway_session_id": self.session.session_id,
-                            "scheduler_job_id": None,
-                            "submission_id": selector["submission_id"],
-                            "submission_marker": selector["submission_marker"],
-                            "submission_outcome": "unresolved",
-                            "cancel_requested": False,
-                            "resubmit_requested": False,
-                        }
-                    ),
-                )
-            )
+        )
         report.completed_at = observed_at
         report.status = ValidationStatus.PENDING
         report.error = None

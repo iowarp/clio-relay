@@ -169,6 +169,8 @@ class BaseAdapter[ConfigT: BaseModel]:
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe"})
     # True when the site runs a reviewed package from the package store, not the agent's command.
     runs_packages: ClassVar[bool] = False
+    # False for test-only adapters: the Compute tab does not offer them for a new site.
+    listed: ClassVar[bool] = True
 
     def __init__(self, config: ConfigT, context: AdapterContext) -> None:
         self.config = config

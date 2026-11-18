@@ -50,6 +50,7 @@ from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
@@ -738,6 +739,7 @@ class RelayServer:
         server.add_provider(self.skills)
         self.changes.install(server)
         self.service.serve_hook.attach(server, self.changes)
+        install_compute_tab(server, self.service, self.changes)
         return server
 
     @asynccontextmanager

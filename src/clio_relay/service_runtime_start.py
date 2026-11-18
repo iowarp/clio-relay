@@ -14,8 +14,8 @@ failure-path cleanup.
 This is a mixin, not a standalone class: it depends on attributes set by
 ``_ServiceRuntimeCoreMixin.__init__`` (``self.queue``, ``self.settings``,
 ``self.definition``, ``self.cluster``) and calls back into methods owned by
-sibling mixins through ``self`` -- most notably the JARVIS-bind resume path
-(``self._validate_jarvis_binding_session``, ``self._resume_jarvis_binding_locked``),
+sibling mixins through ``self`` -- the stored-JARVIS-binding refusal
+(``retired_jarvis_binding_message``),
 the detach/resume-readiness predicates
 (``self._detached_pending_submission_can_resume``, ``self._completed_detach_result``,
 ``self._consume_completed_detach_for_attach``), reconciliation
@@ -44,7 +44,7 @@ from clio_relay import service_runtime_submission_scripts as _submission_scripts
 from clio_relay import service_runtime_types as _types
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_remote_scripts import remote_stop_script as _remote_stop_script
-from clio_relay.jarvis_service_runtime import reverify_jarvis_service_runtime
+from clio_relay.jarvis_service_runtime import retired_jarvis_binding_message
 from clio_relay.models import GatewaySession, GatewaySessionState, ServiceRuntimeSpec, utc_now
 from clio_relay.service_runtime_scheduler_names import canonical_scheduler
 
@@ -63,7 +63,7 @@ class _ServiceRuntimeStartMixin:
     ) -> _results.ServiceRuntimeStartResult | _results.ServiceRuntimePendingResult:
         """Start a scheduler-backed remote service and bind it to a desktop port."""
         if spec.deployment_driver == "jarvis-bound":
-            raise ConfigurationError("jarvis-bound runtimes must use bind_verified_jarvis_runtime")
+            raise ConfigurationError("relay no longer binds jarvis-bound runtimes")
         if spec.submit_command is None:
             raise ConfigurationError("submitted runtimes require a submit command")
         submit_command = spec.submit_command
@@ -225,35 +225,7 @@ class _ServiceRuntimeStartMixin:
         self._validate_gateway_transition_session(session)
         binding_document = session.gateway.get("jarvis_runtime_binding")
         if binding_document is not None:
-            try:
-                verified_runtime = reverify_jarvis_service_runtime(
-                    queue=self.queue,
-                    definition=self.definition,
-                    settings=self.settings,
-                    binding_document=binding_document,
-                )
-            except ValueError as exc:
-                raise RelayError(
-                    f"JARVIS service runtime binding re-verification failed: {exc}"
-                ) from exc
-            spec = self._validate_jarvis_binding_session(
-                session=session,
-                verified=verified_runtime,
-            )
-            if session.gateway.get("teardown_intent") is not None:
-                raise ConfigurationError(
-                    f"gateway session {session_id} is committed to teardown and cannot resume"
-                )
-            if session.state is GatewaySessionState.READY:
-                return self._ready_start_result(session)
-            authorization = self._jarvis_runtime_authorization(verified_runtime)
-            return self._resume_jarvis_binding_locked(
-                session_id=session_id,
-                verified=verified_runtime,
-                authorization=authorization,
-                readiness_timeout_seconds=spec.readiness_timeout_seconds,
-                poll_seconds=spec.poll_seconds,
-            )
+            raise RelayError(retired_jarvis_binding_message(binding_document))
         if session.state is GatewaySessionState.READY:
             return self._ready_start_result(session)
         if session.gateway.get("teardown_intent") is not None:

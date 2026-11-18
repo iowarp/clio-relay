@@ -1318,6 +1318,11 @@ acceptance fixture's `2.6.6` was correct all along, by design.
 
 ## 8. Transports (#188) in the owner-module architecture
 
+`docs/connection-model.md`, which this section cites by line, was deleted in
+the 2026-11 relay rework. Its transport and reconnect contract now lives in
+this section (§8.4's dial-count table, §8.6's open items) and in
+[the worker adapter page](../adapters/worker.md).
+
 ### 8.1 The seam that exists
 
 `src/clio_relay/control_channel.py` (676 lines post-R4, down from 750 —
@@ -2122,5 +2127,5 @@ uv run --no-sync pyright
 ## Related pages
 
 - [architecture](../architecture.md) — roles, durable records, execution boundary.
-- [connection-model](../connection-model.md) — the normative transport/reconnect/staging contract this document's §8 extends into an owner-module map.
+- [worker adapter](../adapters/worker.md): how the worker's one link is set up and kept, which replaced the deleted connection-model page that this document's §8 extends.
 - [one-link control plane](../one-link-control-plane.md) — the implemented `ssh_forward` transport this document's §8 generalizes to modes (a)/(b).
