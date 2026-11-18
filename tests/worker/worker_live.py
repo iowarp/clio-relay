@@ -93,7 +93,7 @@ async def sign_in_page(url: str) -> dict[str, Any]:
     while True:
         polls += 1
         shown = page(url)
-        if "Signed in" in shown["text"] or re.search(r"fail|declin|did not", shown["text"], re.I):
+        if "Waiting for the site" not in shown["text"]:
             out["page"] = shown["text"][-600:]
             break
         await asyncio.sleep(2)
@@ -165,7 +165,7 @@ async def files_round_trip(client: Client, site: str, tag: str) -> dict[str, Any
     )
     read = brief(await tool(client, "files", {"site": site, "op": "read", "path": path}))
     out["read"] = read
-    out["read_matches"] = text in json.dumps(read)
+    out["read_matches"] = read.get("text") == text
     out["stat"] = brief(await tool(client, "files", {"site": site, "op": "stat", "path": path}))
     out["list"] = brief(
         await tool(client, "files", {"site": site, "op": "list", "path": "w8-proof"})
