@@ -64,11 +64,11 @@ def add_surface(
                 value=bound("/catalog/id"),
                 variant="mutuallyExclusive",
                 displayStyle="chips",
+                **error_checks(
+                    errors.get(CATALOG_SITE_ERROR), valid_path(CATALOG_PATH, CATALOG_SITE_ERROR)
+                ),
             )
         )
-        message = errors.get(CATALOG_SITE_ERROR)
-        if message:
-            children.append(tree.text("add-catalog-site-error", message, "caption"))
         children.append(
             tree.add(
                 "add-catalog-id",
@@ -134,7 +134,7 @@ def add_surface(
         "catalog": {
             "id": [catalog[0].id] if catalog else [],
             "site_id": "",
-            "valid": valid_map(errors, (CATALOG_ID_ERROR,)),
+            "valid": valid_map(errors, (CATALOG_ID_ERROR, CATALOG_SITE_ERROR)),
         },
         "drafts": {"add": {**add_draft(forms), "valid": valid_map(errors, ADD_ERROR_PREFIXES)}},
     }

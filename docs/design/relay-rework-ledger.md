@@ -1720,7 +1720,7 @@ Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (cli
 
 ## W14. Relay's CLIO plugin and the Compute tab
 
-Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (7d38476 pins relay f31b292).
+Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (pins the W14 head with the picker checks; see "The pin").
 
 ### Decisions
 
@@ -1742,9 +1742,10 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
 - **Skills (RL34).** `plugin/skills/use-relay/SKILL.md` points at `relay://skills/{name}` and `relay://sites/{site}/skill` and copies no skill text.
 - **The plugin's title.** `ai.iowarp.clio.title` is "Relay". CLIO sends it as `plugin_title` (clio-agent ebe5573), and the breadcrumb shows it. Agent Plugins 1.0.0 has no top-level title.
 - **Field errors are checks on the field.**
-  - An error that names a field puts `checks: [{condition: {path: <form>/valid/<key>}, message}]` on that TextField or CheckBox, and the form's `valid/<key>` is `false`. A literal `condition: false` reads as valid in web_core.
+  - An error that names a field puts `checks: [{condition: {path: <form>/valid/<key>}, message}]` on that TextField, CheckBox or ChoicePicker, and the form's `valid/<key>` is `false`. A literal `condition: false` reads as valid in web_core.
   - The forms are `/drafts/add`, `/drafts/{site}` and `/catalog`. A catalog error names `catalog.site_id` (the Site ID field) or `catalog.id` (the picker).
-  - An error that names no field stays a caption. So does an error on a ChoicePicker, because the Basic ChoicePicker draws no check message.
+  - An error that names no field stays a caption.
+  - Pickers carry checks since W12's #1320 779fbc0e0, which draws a ChoicePicker's failed checks. Spend is a TextField, so it already had one.
 - **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
 
 ### Facts
@@ -1797,13 +1798,22 @@ All live on Ares, on my own stack:
   - The breadcrumb reads "Relay", from `plugin_title`.
   - Screenshots `lq28-{1440,390}-{en,el}-05-field-check.png` and `lq28-1440-en-b-06-check-cleared.png`.
   - On Ares, `tests/relay_next tests/asks` gave 329 passed, 0 skipped at f31b292, with ruff and pyright clean. `test_plugin.py` and `test_compute_tab.py` gave 17 passed, 0 skipped at 242044c.
+- **Picker checks (47b9f04, ported into the split forms at b7b502d), live** on clio-agent ebe5573 with gact-tui 779fbc0 (iowarp/gact-tui#1320), plugin from marketplace f71904b.
+  - Add from the catalog with no site picked: "Choose a site from the catalog" appears beneath the chips in the destructive colour, and the chips take a red border. No caption.
+  - Add site with a policy outside the options: pydantic's "Input should be 'open' or 'guarded'" appears beneath the Policy picker, with a red border.
+  - A valid catalog add then clears every check.
+  - Chips can't be deselected by a click, so the driver forced the empty pick and the bad policy by rewriting the action body in the browser.
+  - Passed at 1440×900 and 390×844, in en and el. Screenshots `lq28-{1440,390}-{en,el}-07-catalog-pick-check.png`, `lq28-{1440,390}-{en,el}-08-policy-check.png` and `lq28-1440-el-09-checks-cleared.png`.
+  - On Ares at b7b502d (integration 2db7d8d merged), `tests/relay_next tests/asks` gave 330 passed, 0 skipped. Ruff, the size ratchet and pyright are clean, and the pyright ratchet is at its 4558 baseline.
+  - Re-checked live on the pin c1cca62 (marketplace d07aa21) at 1440×900 in el. The catalog check, the policy check and the clear all pass. Screenshots `lq28-1440-el-c2-0{7,8,9}-*.png`. Since W1 hid the fixture adapter, the add form opens on globus, whose required Endpoint fails its own check first, so the policy run picks the local adapter.
+  - After a refused add, the re-rendered form shows its first adapter tab again. An error on a field of another adapter's tab would then be out of sight. The selection lives in the renderer, not in the surface's data, so this is for W12 and W3.
 
 ### Open items
 
 - **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
 - **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
-- **ChoicePicker errors are captions.** The Basic ChoicePicker, which CLIO uses for 8 options or fewer, draws no `validationErrors`. A check on a picker would show nothing, so relay keeps those errors as captions. This is for W12.
-- **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit, with `clio-relay serve` since the cutover. Repin to the integration commit after W1 merges.
+- **The pin.** `plugin/mcp.json` and the marketplace pin the W14 commit that carries this ledger entry, with `clio-relay serve`. Integration 2db7d8d lacks the picker checks, so the pin trails W14 until W1 merges it. Repin to the integration commit after that merge.
+- **Two `mcp_resource_updated` per tab action.** On the live stack, each tab action POST is followed by two adjacent `mcp_resource_updated namespace=relay uri=a2ui://clio-relay/compute` lines in the agent log, even for an action that only sets an error. Only one relay process is up. W1's tests show one notification per change inside relay, so the second is probably counted on the host side. This is for W3.
 
 ### Run sheets for the person rows
 

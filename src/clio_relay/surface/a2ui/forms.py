@@ -268,9 +268,8 @@ def field_components(
 ) -> list[str]:
     """Add one form field, its help and its error, and return their ids.
 
-    A TextField or CheckBox shows its own error, through a check bound to
-    ``check_path`` that the form's data sets false. A ChoicePicker shows no check
-    message in every renderer, so its error stays a caption.
+    Each field shows its own error, through a check bound to ``check_path``
+    that the form's data sets false. Without a ``check_path`` the error is a caption.
     """
     label = f"{item.label} (required)" if item.required else item.label
     value = bound(path)
@@ -278,7 +277,6 @@ def field_components(
     if item.kind == "bool":
         ids = [tree.add(base, "CheckBox", label=label, value=value, **checks)]
     elif item.kind == "choice":
-        checks = {}
         ids = [
             tree.add(
                 base,
@@ -288,6 +286,7 @@ def field_components(
                 value=value,
                 variant="mutuallyExclusive",
                 displayStyle="chips",
+                **checks,
             )
         ]
     else:
