@@ -869,7 +869,14 @@ The routes that only the old tools used go with them. These are gateway sessions
 
 LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `scheduler_providers`. Today they appear in about 112 files outside the deletion list, mostly tests and the `mcp_call` job kind in the endpoint, queue and models. W8 removes them all from `src`, `tests`, `jarvis-packages`, `scripts`, `.github` and the user docs. The design docs under `docs/design/` and the dated validation notes under `docs/ai/` keep the names, because they record the history. Assumption: LQ32 reads the shipped tree and the user docs, not the design record.
 
-Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` are held, not deleted, because W9's runtime still imports them (see the requests below). W8's own code no longer imports them. LQ32 passes once W9 drops those imports and deletes the held modules.
+Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` were held, because W9's runtime still imported them. W9 dropped those imports at 5a01766. W8 merged W9's branch at that commit (91bcc3c), so the deletion could go ahead, and deleted the three groups with their tests (ba5ad4b). Nothing in `src`, `tests`, `jarvis-packages` or `scripts` imports them now. The worker's scheduler module is imported as `worker_scheduler`.
+
+Still to clear for LQ32, in a follow-up on this branch:
+- the `browser_gateway_overloaded` code and its adapter in `door_errors`;
+- the `mcp_call` job kind (`models_enums`, `models_job_specs`, and W9's `jarvis_service_runtime_validation`);
+- the `virtual_*_mcp_call` release-gate roles;
+- comments in W1's scripts;
+- the user docs (`architecture`, `mcp-tasks`, `operations`, `release-acceptance-1.0`). README is W1's.
 
 ### clio-schemas
 
@@ -939,7 +946,17 @@ Fixes and edits beyond the mechanical move, in commit order:
   - `test_core_queue_split_architecture` accepts `clio_relay.adapters.worker` as an owner package. `queue_validation` leaves its non-owner lists. The `queue_startup` import budget goes from 550 to 552, for the two import lines the move wraps.
   - `test_door_errors` expects 61 HTTP statuses, not 64. `jarvis_dispatch_refused`, `execution_not_found`, `mcp_submission_conflict` and `mcp_admission_refused` went with their routes.
   - `test_bootstrap` disables commit signing for its scratch commits (46751cd). Ares sets `commit.gpgsign=true`, and gpg fails in Slurm.
-- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` entry. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: see the gate.
+- **The bootstrap build-info line.** The payload template wrapped the `BOOTSTRAP_CANDIDATE_PROVIDER_BUILD_INFO` assignment across a swallowed line break, so bash ran the path as a command. Found by a live bootstrap on fx-slurm. It is assigned through `BOOTSTRAP_CANDIDATE_WORKER` now, with a regression test that every shell variable is assigned on its own line (dd1352c).
+- **The route-revision warning** in `cli_cluster` told the person to refresh remote MCP, which is gone. It is removed with its 3 tests (dd1352c, af85a62).
+- **The held modules.** `remote_mcp*`, `scheduler_providers/` and `browser_gateway*` are deleted after merging W9 at 5a01766 (91bcc3c, ba5ad4b). Test edits:
+  - `test_scheduler_status`: 26 old provider, connector and registry tests deleted; the selection and JARVIS isolation checks run against `adapters.worker.scheduler`.
+  - `test_door_errors`: the 3 browser gateway tests deleted.
+  - `test_validation_report`: the 3 remote MCP tests deleted.
+  - `test_ci_clio_kit_wheel`: the certification pin test deleted.
+  - `test_clio_kit_mcp_contracts`: 4 contract tests deleted; the 3 install receipt tests stay.
+  - `test_contract_gate`: imports `adapters.worker.clio_kit_constants`.
+  - `test_cluster_config`: the two cache-path tests check only the registry path now.
+- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` and `browser_gateway.py` entries. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: the baseline goes 7498 to 5583 (89fd6c8), then to 5076.
 - **W9's tests (import-only edits, and prunes that let them collect).** `test_service_runtime`, `test_jarvis_service_runtime` and `test_frp_transport_dials` import the moved modules from `adapters.worker`. 15 tests in `test_jarvis_service_runtime` are deleted, with the helper `_owner_token_values`. The first drove `cli_jarvis_mcp` and the rest drove `mcp_server`:
     - `test_hidden_relay_authority_command_emits_one_private_json_document`
     - `test_model_facing_mcp_projection_redacts_runtime_bearer_token`
@@ -957,6 +974,18 @@ Fixes and edits beyond the mechanical move, in commit order:
     - `test_agent_bind_pending_replays_same_gateway_and_connector_intents`
     - `test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission`
 
+### Gate evidence
+
+On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) was clean and touched no worker file.
+
+- **LQ4 (`worker`).** The conformance kit in `tests/worker` passed 11 of 11 with no skips. It ran on the login node against fx-slurm over a tcp rendezvous, with a fresh remote directory and the wheel built at that commit (sha256 `b81d0726206f…`). The kit includes the new exec-without-limit test and the `verb_not_implemented` checks.
+- **LQ10 and LQ11.** Passed on fx-otp through W6's askpass interface: the sign-in ran as asks, and the link came up with no terminal (`op_6774ddf180e7bcf14383b593`).
+- **Bootstrap.** A live `clio-relay worker cluster bootstrap` on fx-slurm gets past the overlay. It then fails exactly as base ee1a845 does: `systemctl: command not found`, and then "bootstrap existing executable digest changed" for `~/.local/bin/uv`. Another workstream put uv 0.13.9 there, and the bootstrap pins 0.11.28 and refuses to adopt it. No fixture has a systemd user manager, so a full bootstrap cannot finish on one. What this proves is that the moved bootstrap behaves like base.
+- **The process-containment modules** (the six that need a user manager) passed 170 of 170 on the login node at af85a62.
+- **Targeted modules** (17 files: the edited tests plus the cli, scheduler, http api, service runtime and patch-seam modules) ran in Slurm (job 27799). 13 tests failed, all of them in develop's 142, so none are new: 12 in the two scheduler-cancel files ("relay-managed JARVIS installation receipt does not match this worker"), and `test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks`, which fails because the compute node has no user manager.
+- **pyright.** 5076 errors, under the 5583 baseline, measured with `uv run` at 8b34a44. The baseline is lowered to match. Run without the venv active, the count is 8987, because imports do not resolve then. That is a measuring mistake, not a regression.
+- **The full suite** runs once in Slurm at the request commit. Its result and the develop failures it retires go here when it ends.
+
 ### Workflows
 
 There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `live-validation-attest`, `main-provenance`, `release-gate`, `release`, `released-validation-attest` and `stage-candidate`. `ci` is rewritten to run `uv run ruff check`, `uv run ruff format --check`, `uv run pyright` and `uv run pytest` on the new tree. `release` is reduced to building and publishing the wheel. The other six only served the old release gate, which reads the deleted `release_*`, `live_validation*` and `promotion_record` modules, so they are deleted. Neither workflow is enabled or waited on.
@@ -964,10 +993,9 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 ### Requests to other owners
 
 - **W9.**
-  - The held modules `browser_gateway`, `scheduler_providers` and `remote_mcp*` stay only because W9's runtime imports them: `service_runtime_browser`, `service_runtime_local_start` and `service_runtime_readiness` (`browser_gateway`), `service_runtime_observation`, `service_runtime_remote_connector` and `service_runtime_start` (`scheduler_providers`), and `jarvis_service_runtime_validation` (`remote_mcp`). W9 drops those imports and then deletes the held modules, which finishes LQ32. The tests that only test the held modules go with them: `test_scheduler_status.py` (the provider and connector-step parts), `test_clio_kit_mcp_contracts.py`, `test_contract_gate.py`, and the `remote_mcp` parts of `test_cluster_config.py`, `test_validation_report.py` and `test_door_errors.py`.
-  - `BrowserAttachmentRecord` has two definitions: `browser_gateway` and `adapters/worker/browser_attachment_record.py`. The queue uses the worker one, which W9 keeps for revoke-on-teardown. W9's `service_runtime_readiness` and `service_runtime_browser` still use the `browser_gateway` one.
-  - The allocation connector is retired (W9's decision). The worker has no `connector-step-*` commands. `frp_remote_scripts.py:156,197` still calls `clio-relay scheduler connector-step-reconcile` and `connector-step-start`, and `service_runtime_connector_step_scripts.py` builds `connector-step-status`, `-cancel` and `-reconcile`. Nothing outside W9's files and the held `scheduler_providers` calls them.
+  - Done: W9 dropped its imports of the held modules (5a01766), and W8 deleted them (ba5ad4b). `BrowserAttachmentRecord` now has one definition, `adapters/worker/browser_attachment_record.py`, and nothing calls the `connector-step-*` commands. W8's branch contains W9 at 5a01766, so merging W8 brings it in.
   - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
+  - `jarvis_service_runtime_validation.py:55` uses the `mcp_call` job kind. LQ32 needs it gone; W8 removes the kind once W9 drops that use.
   - Test failures in W9's files on this branch, none of them rerun:
     - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
     - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list.
