@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import platform
@@ -29,6 +30,7 @@ from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
 from clio_relay.jobs.handles import (
+    Endpoint,
     ExecResult,
     FileAccess,
     JobHandle,
@@ -37,7 +39,7 @@ from clio_relay.jobs.handles import (
     OutputRef,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec
+from clio_relay.jobs.spec import JobSpec, ServiceSpec
 
 if TYPE_CHECKING:
     from psij.executors.batch.batch_scheduler_executor import BatchSchedulerExecutor
@@ -122,7 +124,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     name: ClassVar[str] = "local"
     Config: ClassVar[type[BaseModel]] = LocalConfig
-    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
+    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
 
     def __init__(self, config: LocalConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
@@ -506,3 +508,17 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def files(self) -> FileAccess:
         await asyncio.to_thread(self.work_dir.mkdir, parents=True, exist_ok=True)
         return LocalFileAccess(self.work_dir, self.context.content)
+
+    async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
+        try:
+            runtime: Any = importlib.import_module("clio_relay.serve")
+        except ModuleNotFoundError as exc:
+            if exc.name not in ("clio_relay.serve", "clio_relay"):
+                raise
+            raise Refusal(
+                RefusalReason.VERB_NOT_IMPLEMENTED,
+                "serve needs the service runtime, and it is not installed",
+                verb="serve",
+            ) from exc
+        endpoint: Endpoint = await runtime.start_for(self, spec, operation_id=operation_id)
+        return endpoint
