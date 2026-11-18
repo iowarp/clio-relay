@@ -54,6 +54,10 @@ Relay asks the scheduler for no walltime of its own. A job's walltime is its
 neither, the batch script has no time line, and the scheduler's default for
 the partition or queue applies.
 
+The spend gate's charge is in node-hours: nodes times walltime. A job with no
+walltime has an unknown cost, so its charge has no amount and no node-hours,
+and the gate asks for it unless the site's `spend.ask` is `never`.
+
 ## How a job runs
 
 1. Relay renders the batch script on your machine with
@@ -70,6 +74,17 @@ the partition or queue applies.
 Relay keeps no connection open between calls, so it can restart at any time.
 After a restart, `find` reads the job's directory and returns the same job, so
 a retried `run` never submits a second copy.
+
+`cancel` uses the scheduler's own command (`scancel`, `qdel`). Your command
+gets `SIGTERM` first, so a `trap` in it can clean up, and is killed only after
+the scheduler's grace period (Slurm's `KillWait`, PBS's `kill_delay`). Some
+Slurm sites signal only the batch shell; relay's Slurm script passes the
+signal on to your command, so it behaves the same on every site.
+
+On a shared filesystem such as NFS, a file written on one node can stay
+invisible on another for a minute or two. Relay lists a directory before it
+checks a file in it, which makes the filesystem look again, so job records,
+exit codes and outputs show up as soon as they are written.
 
 Schedulers forget finished jobs; Slurm drops them from `squeue` after
 `MinJobAge`, often five minutes. When the scheduler no longer lists a job,
@@ -102,7 +117,8 @@ never types into ssh itself.
   asks you to sign in again.
 
 `askpass` replaces the program that shows the prompts, for example with a
-program of your own that reads codes from a token.
+program of your own that reads codes from a token. With such a program, relay
+signs in by itself and only asks you if the program fails.
 
 ## Serving a port
 

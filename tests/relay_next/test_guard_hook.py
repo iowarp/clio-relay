@@ -42,15 +42,20 @@ class ReviewingGuard(DefaultGuard):
 
     def __init__(self, context: HookContext) -> None:
         super().__init__(context)
-        self.prepared: list[tuple[str, JobSpec, str]] = []
+        self.prepared: list[tuple[str, JobSpec, str, bool]] = []
 
     async def check_run(self, site: SiteEntry, spec: JobSpec) -> GuardDecision:
         return GuardDecision(allowed=True, data={"asks": [REVIEW]})
 
     async def prepare(
-        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+        self,
+        site: SiteEntry,
+        spec: JobSpec,
+        *,
+        adapter: BaseAdapter[Any],
+        service: bool = False,
     ) -> JobSpec:
-        self.prepared.append((site.id, spec, adapter.name))
+        self.prepared.append((site.id, spec, adapter.name, service))
         if self.refuse_prepare:
             raise Refusal(RefusalReason.POLICY_REFUSED, "the package store is unreachable")
         return spec.model_copy(update={"arguments": ["from-the-package"]})
@@ -131,8 +136,7 @@ async def test_a_package_review_is_an_approval_bound_to_the_spec(
     assert "from-the-package" in service.view(done)["result"]["stdout_tail"]
     assert done.spec == ECHO.model_dump(mode="json")
     assert done.spec_digest == record.spec_digest
-    ((site_id, prepared_from, adapter_name),) = guards[-1].prepared
-    assert (site_id, prepared_from, adapter_name) == ("fx", ECHO, record.adapter)
+    assert guards[-1].prepared == [("fx", ECHO, record.adapter, False)]
     await service.close()
 
 
@@ -190,6 +194,8 @@ async def test_a_service_starts_the_prepared_job(
         (service_spec,) = started[-1].started
         assert service_spec.job.arguments == ["from-the-package"]
         assert service_spec.ports == spec.ports
+        ((_, _, _, as_service),) = guards[-1].prepared
+        assert as_service is True
         assert service.operation(record.operation_id).spec == spec.model_dump(mode="json")
         await service.close()
     finally:
