@@ -165,7 +165,9 @@ async def test_lq7_a_rerun_stages_nothing(fx: dict[str, str], tmp_path: Path) ->
     adapter.transport.upload = recording  # pyright: ignore[reportAttributeAccessIssue]
     blob = adapter.context.content.path_for(digest)
     spec = JobSpec(
-        executable="sha256sum", arguments=["big.bin"], inputs=[InputRef(name="big.bin", sha256=digest)]
+        executable="sha256sum",
+        arguments=["big.bin"],
+        inputs=[InputRef(name="big.bin", sha256=digest)],
     )
     first_sizes = 0
     for attempt in range(2):
@@ -187,7 +189,9 @@ async def test_lq8_a_detached_job_is_read_by_a_later_poll(
 ) -> None:
     operation_id = new_id("op")
     first = build(fx, tmp_path / "before", "fx-ssh")
-    spec = JobSpec(executable="sh", arguments=["-c", "sleep 8; echo lq8-out; echo lq8-err >&2; exit 7"])
+    spec = JobSpec(
+        executable="sh", arguments=["-c", "sleep 8; echo lq8-out; echo lq8-err >&2; exit 7"]
+    )
     handle = await first.run(spec, operation_id=operation_id)
     assert handle.data["mode"] == "detached"
     assert handle.native_id is not None and handle.native_id.startswith("pid:")
@@ -219,7 +223,10 @@ async def test_lq9_a_code_site_refuses_and_names_worker(
     if interactive and transport._askpass_module() is not None:  # pyright: ignore[reportPrivateUsage]
         pytest.skip("W6's askpass is installed, so this site can ask; see the sign-in test")
     assert await adapter.sign_in_needed() is None
-    for call in (adapter.describe(), adapter.run(JobSpec(executable="true"), operation_id=new_id("op"))):
+    for call in (
+        adapter.describe(),
+        adapter.run(JobSpec(executable="true"), operation_id=new_id("op")),
+    ):
         with pytest.raises(Refusal) as refused:
             await call
         assert refused.value.reason == RefusalReason.INTERACTIVE_AUTH_REQUIRED
@@ -277,8 +284,17 @@ async def test_lq9_the_code_site_gets_in_once_askpass_answers(
         assert len(prompts) == 1, prompts  # one sign-in served every call
     finally:
         subprocess.run(
-            ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", "-o",
-             f"ControlPath={adapter.transport.control_path}", "fx-otp", f"rm -rf {RUN_DIR}"],
+            [
+                "ssh",
+                "-F",
+                fx["FX_SSH_CONFIG"],
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ControlPath={adapter.transport.control_path}",
+                "fx-otp",
+                f"rm -rf {RUN_DIR}",
+            ],
             check=False,
             capture_output=True,
             timeout=60,
