@@ -8,7 +8,7 @@ verification, and a staging cleanup -- plus a further, entirely separate
 ssh dial elsewhere (``cli_remote_worker_probe._remote_target_identity``) to
 observe the cluster's physical target identity. On a 2FA-gated cluster every
 dial is a fresh authentication a human must approve, so a routine cold
-install grew to roughly eight sessions (docs/connection-model.md:141-157
+install grew to roughly eight sessions (docs/one-link-control-plane.md
 caps the whole bootstrap SETUP phase at one).
 
 This module renders that entire six-step sequence -- and the physical

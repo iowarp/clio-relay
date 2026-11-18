@@ -715,7 +715,7 @@ def test_cold_bootstrap_costs_exactly_two_ssh_dials(
     Enumerated: (1) the preflight discovery pass (unavoidable -- it is what
     tells warm from cold) and (2) the ONE combined install pass this slice
     introduces. That is the total authenticated ssh session count for a cold
-    bootstrap, <= the 2-dial budget docs/connection-model.md:141-157 sets
+    bootstrap, <= the 2-dial budget docs/one-link-control-plane.md sets
     (the held link is a later, separate phase and is not one of these two).
     This test must fail the moment any code path adds a third dial back.
     """

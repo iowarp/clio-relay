@@ -23,7 +23,7 @@ render, and the actual remote install used to cost SIX further separate ssh/
 scp dials (mkdir staging, two scp uploads, the remote script invocation, a
 receipt-``cat`` verification, and a cleanup ``rm -rf``); on a 2FA-gated
 cluster that is six more authentications for what the ssh-budget doctrine
-(docs/connection-model.md:141-157) caps at one combined setup pass. Those six
+(docs/one-link-control-plane.md) caps at one combined setup pass. Those six
 steps are now composed as ONE ``bash -s`` stdin script by
 ``bootstrap_one_pass_script.render_one_pass_cold_bootstrap_script`` (payloads
 travel inline as base64 blocks, never a second dial) and issued as a single

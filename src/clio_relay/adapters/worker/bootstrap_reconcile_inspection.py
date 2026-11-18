@@ -92,8 +92,6 @@ def inspect_exact_bootstrap_noop(
         reasons.append("JARVIS is not initialized")
     if not jarvis_state.managed_repo_registered:
         reasons.append("the exact relay-managed JARVIS repository is not registered")
-    if not jarvis_state.managed_builtin_repo_registered:
-        reasons.append("the exact JARVIS-managed builtin repository slot is not registered")
 
     queue_ready = _queue_readiness_verified(queue_evidence)
     if not queue_ready:

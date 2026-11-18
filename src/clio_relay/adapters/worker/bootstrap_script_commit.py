@@ -59,21 +59,13 @@ def script_commit(
     transaction dispatch, and the final receipt/version echo.
     """
     return f"""from clio_relay.adapters.worker.bootstrap_reconcile import (
-    _relay_owned_jarvis_builtin_repositories,
     reconcile_managed_jarvis_repository,
 )
-
-relay_owned_builtin_repos = _relay_owned_jarvis_builtin_repositories(home=Path.home())
 
 evidence = reconcile_managed_jarvis_repository(
     Path(os.environ["JARVIS_REPOS_FILE"]),
     Path(os.environ["MANAGED_JARVIS_REPO"]),
-    managed_builtin_repo=Path(os.environ["JARVIS_REPOS_FILE"]).parent / "builtin",
-    previous_managed_repos=(
-        Path(sys.argv[1]),
-        Path(sys.argv[2]),
-        *relay_owned_builtin_repos,
-    ),
+    previous_managed_repos=(Path(sys.argv[1]), Path(sys.argv[2])),
 )
 print(f"jarvis_managed_repo={{evidence['action']}}")
 __CLIO_RELAY_JARVIS_REPO_RECONCILE__

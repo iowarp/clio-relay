@@ -253,7 +253,7 @@ class RemoteConnection:
         connection still remembers holding a (now-dead) transport, so only an
         explicit, user-authorized :meth:`reconnect` -- never a background
         retry -- may replace it (the 2FA doctrine,
-        docs/connection-model.md:141-157). ``"not_established"`` means no
+        docs/one-link-control-plane.md). ``"not_established"`` means no
         channel has ever been held on this connection object. ``session_attach.
         attach_owned_session`` branches on this exact literal to decide
         between resuming a live channel in place and performing the one

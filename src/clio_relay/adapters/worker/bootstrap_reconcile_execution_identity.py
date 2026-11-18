@@ -250,11 +250,8 @@ def inspect_jarvis_state(
         raise ConfigurationError(
             "relay-managed JARVIS repository is registered through multiple path aliases"
         )
+    # Evidence only: relay neither registers nor requires the builtin slot (RL39).
     managed_builtin_matches = [value for value in repo_values if value in managed_builtin_aliases]
-    if len(managed_builtin_matches) > 1:
-        raise ConfigurationError(
-            "JARVIS-managed builtin repository is registered through multiple path aliases"
-        )
     return JarvisStateEvidence(
         initialized=True,
         root=str(jarvis_root),

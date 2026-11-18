@@ -7,8 +7,9 @@ never move a run input out of band. Copying scientific inputs to the cluster
 before a run masks the staging seam and makes the results describe the harness
 rather than relay; that bypass has already invalidated a benchmark campaign and
 is tracked as [#177](https://github.com/iowarp/clio-relay/issues/177). Every
-harness that submits work asserts the invariants in `docs/connection-model.md`,
-not the ones its own scaffolding happens to satisfy.
+harness that submits work asserts the one-link invariants in
+`docs/one-link-control-plane.md`, not the ones its own scaffolding happens to
+satisfy.
 
 ## local gates
 
@@ -87,36 +88,13 @@ live-validation claim.
 
 ## recent live evidence
 
-Historical release-candidate evidence is retained in
-`release-validation-0.9.17.md`. Use that file only as the authoritative record
-for the 0.9.17 candidate; it is not evidence for the current 1.0 gate.
-
-The 0.9.17 validation includes:
-
-- wheel-backed packaged bootstrap from a temporary directory with no `.git`.
-- Ares worker restart with `clio_relay.__version__ == 0.9.17`.
-- Homelab WSS/STCP, XTCP, and SSH-forward transport checks, followed by clean
-  probe-process and metadata cleanup scans.
-- Ares application-package acceptance with WSS relay, XTCP direct transport,
-  stdout, stderr, artifacts, provenance, and package-owned progress.
-- Ares remote-agent MCP child application submission.
-- forced SLURM pending state and relay cancel propagation.
-- ParaView-style gateway create, update, get, and close record lifecycle.
-- task timeline CLI record/read and HTTP, SSE, and WebSocket replay over an
-  owned SSH-forwarded Ares API session.
-
-Historical validation files remain useful for debugging regressions, but they
-are not current proof for a release candidate.
+Live evidence for the rework is recorded per workstream in
+`docs/design/relay-rework-ledger.md`, against the LQ and RL rows of
+`docs/design/relay-rework-plan.md`.
 
 Refresh this evidence when changing the relevant code. Do not present old live evidence as current proof after transport, lifecycle, worker, or acceptance code changes.
 
 ## machine-readable evidence
-
-`clio-relay live-test` writes a versioned JSON report by default under
-`.clio-relay/validation-reports`. The report is canonical; an optional Markdown
-file is only a view. Reports contain package/build/install identity, checks,
-relay and scheduler jobs, sessions/connectors, artifact and log references,
-cleanup policy, residual resources, and partial failure evidence.
 
 The report-producing acceptance commands sit under `clio-relay worker`:
 `relay-host test-frpc-connection`, `test-http-transport`, `test-direct-transport`, and

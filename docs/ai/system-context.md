@@ -8,8 +8,9 @@
 - The file-backed queue in this repository is a development backend for the same record contract.
 - frp and SSH forwarding are byte transports only. A connection has exactly one
   such link, established at bring-up and held; every control-plane and
-  data-plane operation rides it. See `docs/connection-model.md`, which is
-  normative for transport, ssh budget, reconnect, and input staging.
+  data-plane operation rides it. See `docs/one-link-control-plane.md` for
+  transport, the ssh budget and reconnect, and `docs/adapters/worker.md` for the
+  worker's link.
 - JARVIS-CD owns cluster execution, scheduler integration, package behavior, output collection, and provenance.
 - Application-specific behavior belongs in JARVIS packages or package-aware adapters, not in generic relay core code.
 
@@ -169,14 +170,8 @@ concurrently, behind one stable client-facing MCP endpoint.
 
 Transport failure must not corrupt queue state. Direct transport and NAT punching are optimizations, not reliability requirements.
 
-`docs/connection-model.md` is normative for this section. The owned-session
-control plane (#179) and the built-in JARVIS door's input staging (#176) meet it
-as of this release; `docs/one-link-control-plane.md` describes the implemented
-transport. The deviations that remain — per-operation ssh in
-`owner_session_admission.py` and the `jarvis_service_runtime` bridge, cluster-
-targeted CLI dispatch, the missing reconnect surface, the two unbuilt transport
-modes, compute-node-side live-stream `frpc`, and the outstanding #177 staging
-proof — are listed on that page and tracked on #182.
+`docs/one-link-control-plane.md` describes the implemented transport and lists
+the paths that still dial ssh per operation; they are tracked on #182.
 
 ## Sessions
 
@@ -217,62 +212,8 @@ as a crash. The status probe is read-only and reports ready, recovering,
 intentional-stop, failed, inactive-unexpected, not-installed, or degraded
 evidence.
 
-A JARVIS-owned live service uses a connector-only gateway. The user MCP operation
-`relay_bind_jarvis_runtime` resolves one ready authenticated
-`jarvis.service-runtime.v2` solely
-from an authenticated completed relay-routed MCP result and persists
-`gateway.jarvis_runtime_binding`. That record binds the source relay job and
-artifact SHA-256 to the JARVIS execution, optional scheduler provider/native id,
-package/service revision, and exact dataset descriptor. Caller-provided runtime
-metadata and lifecycle commands are rejected. A waited execution query emits a
-compact selector-only `service_runtime_bindings` handoff which is copied unchanged
-into the bind call; the source artifact is still re-read and fully verified.
-Binding starts no application or
-scheduler work; it starts only the relay connectors. The binding and owner identity
-derive one deterministic gateway ID. Connector or health ambiguity remains a
-durable pending observation and identical bind calls reconcile that exact intent;
-they never replace it merely because a client observation expired. Any later explicit scheduler
-cancellation re-verifies the immutable source before invoking the provider.
-The public v2 report carries only the execution-owned capability's scheme and
-SHA-256; the raw bearer remains in JARVIS's owner-private sidecar. After re-reading
-the durable MCP artifact, relay calls JARVIS's non-MCP private resolver with the
-exact execution, pipeline, package, service-instance, revision, and digest identities.
-The resolved capability exists only in process memory for readiness/reconnect probes
-and reaches the private browser proxy in one bounded JSON document over an anonymous
-inherited stdin pipe that is immediately closed. It never appears in process
-environment, MCP output, public gateway records, browser URLs, relay connector
-configuration, command arguments, relay-owned or public sidecars, or logs. Legacy v1
-runtime records remain parseable and re-verifiable for existing bindings, but cannot
-create new handoffs or bindings.
-
-Scheduler-owned loopback services require allocation-scoped connector placement.
-The SLURM provider proves one exact `BatchHost`, requires a single-node allocation
-and exact one-host `NodeList` expansion, then launches frpc through a detached
-`srun --jobid ... --overlap --exact` pinned to that host. The provider boundedly
-resolves the actual `job.step` by its unique marker and host and terminates the
-launcher if registration cannot be proven. Relay never treats the login-node `srun`
-launcher PID as frpc. Detach proves the exact step remains active with
-`squeue --steps`, while stop uses `scancel job.step` and confirms step absence.
-The parent job remains retained unless scheduler-job cancellation is separately
-and explicitly requested. Placement or step observation ambiguity stays pending
-without a replacement side effect; identity/integrity mismatch or provider-proven
-terminal state fails closed.
-Readiness is provenance-bearing and application-neutral: relay re-verifies the
-exact JARVIS execution, package, service, endpoint, dataset-descriptor, revision,
-and authorization identities, then proves authenticated v2 health is both protected
-(no bearer returns 401) and live (the resolved bearer returns 2xx). JARVIS packages
-own application-specific readiness before reporting `READY`; VIGIL validates the
-ParaView health, state, dataset, and scene contract after browser attachment.
-
-The browser security boundary is a separate desktop-local capability proxy. Normal
-bind/get records contain neither the raw browser token nor the JARVIS service
-bearer. Explicit internal browser attach
-returns one short-lived capability URL set; every request and preflight requires
-that unexpired/unrevoked capability plus exact sandbox `Origin: null`. The proxy
-allows no wildcard CORS, strips the browser capability upstream, forwards only
-exact advertised paths and narrow methods/headers, and injects the independently
-verified JARVIS bearer only on the private upstream hop. Explicit browser detach, runtime
-detach, and teardown write the revocation marker before stopping the owned proxy.
+Live services go through the `serve` verb. The old JARVIS runtime binding, the
+allocation-scoped connector and the browser gateway are retired.
 
 ## Scheduler provider boundary
 
@@ -281,10 +222,7 @@ default for package-owned or nonscheduler runtimes; a SLURM site selects `slurm`
 in its cluster definition. Missing provider metadata must never silently become
 SLURM. Structured JARVIS runtime metadata is preferred for provider and job ids,
 and must agree with the worker's configured provider before polling or canceling.
-For authenticated `jarvis.service-runtime.v2` bindings, provider/native identity,
-authorization digest, and the complete binding are re-verified from the original
-durable MCP artifact before any explicit
-scheduler cancellation. Default detach and stop paths retain scheduler work.
+Default detach and stop paths retain scheduler work.
 
 ## Configurability
 

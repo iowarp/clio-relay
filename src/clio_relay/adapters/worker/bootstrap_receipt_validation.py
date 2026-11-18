@@ -302,7 +302,6 @@ def validate_bootstrap_receipt(
         repository_update.get("before_sha256") != before_state.get("repos_sha256")
         or repository_update.get("after_sha256") != after_state.get("repos_sha256")
         or after_state.get("managed_repo_registered") is not True
-        or after_state.get("managed_builtin_repo_registered") is not True
         or not isinstance(repository_update.get("added_managed_repos"), list)
         or not isinstance(repository_update.get("removed_previous_managed_repos"), list)
     ):
@@ -577,7 +576,11 @@ def _jarvis_repository_removals_are_proven(
     remote_home: str,
     exact_paths: set[str],
 ) -> bool:
-    """Accept only exact historical relay repository paths in bootstrap evidence."""
+    """Accept only exact historical relay repository paths in bootstrap evidence.
+
+    Current bootstraps never remove a builtin entry (RL39); relay venv builtin
+    paths stay accepted for receipts written by older bootstraps.
+    """
     if not all(isinstance(value, str) for value in values):
         return False
     repositories = cast(list[str], values)
@@ -597,7 +600,11 @@ def _jarvis_repository_additions_are_proven(
     managed_repo: str,
     managed_builtin_repo: str,
 ) -> bool:
-    """Accept only the ordered relay and JARVIS stable repository bindings."""
+    """Accept only the ordered relay and JARVIS stable repository bindings.
+
+    Current bootstraps add only the relay repository (RL39). The builtin slot
+    stays accepted so receipts written by older bootstraps still validate.
+    """
     allowed = [managed_repo, managed_builtin_repo]
     if not all(isinstance(value, str) for value in values):
         return False

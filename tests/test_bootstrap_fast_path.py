@@ -1202,11 +1202,9 @@ with tempfile.TemporaryDirectory() as value:
         "storage:\n  nvme:\n    capacity: 100\n", encoding="utf-8"
     )
     managed_repo = home / ".local/share/clio-relay/clio_relay"
-    managed_builtin_repo = jarvis_root / "builtin"
     first_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
-        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1275,7 +1273,6 @@ with tempfile.TemporaryDirectory() as value:
     second_repository = reconcile_managed_jarvis_repository(
         repos_file,
         managed_repo,
-        managed_builtin_repo=managed_builtin_repo,
         previous_managed_repos=(previous_repo,),
         exchange_identity=desired.fingerprint,
     )
@@ -1297,11 +1294,9 @@ with tempfile.TemporaryDirectory() as value:
     if first_repository["action"] != "updated" or second_repository["action"] != "reused":
         raise SystemExit("repository alias did not converge exactly once")
     lexical_managed = str(home / ".local/share/clio-relay/clio_relay")
-    lexical_builtin = str(home / ".ppi-jarvis/builtin")
     if yaml.safe_load(repos_file.read_text(encoding="utf-8"))["repos"] != [
         lexical_managed,
         "/operator/clio_relay",
-        lexical_builtin,
     ]:
         raise SystemExit(
             "repository registration did not retain stable lexical managed paths"
@@ -2693,6 +2688,27 @@ def test_component_upgrade_receipt_accepts_only_bound_managed_repo_registration(
 
     bootstrap_receipt_validation.validate_bootstrap_receipt(
         receipt,
+        bootstrap_profile="linux-user",
+        relay_install_spec=desired.relay_install_spec,
+        desired_fingerprint=desired.fingerprint,
+        expected_jarvis_resource_graph_profile="ares",
+        expected_allow_jarvis_resource_graph_build=False,
+        expected_worker_service=desired.worker_service,
+    )
+
+    # RL39: current bootstraps add only relay's repository and no longer
+    # require the builtin slot; its registration is evidence only.
+    without_builtin = copy.deepcopy(receipt)
+    without_builtin_preservation = cast(dict[str, object], without_builtin["jarvis_preservation"])
+    cast(dict[str, object], without_builtin_preservation["after"])[
+        "managed_builtin_repo_registered"
+    ] = False
+    without_builtin_binding = cast(dict[str, object], without_builtin_preservation["repositories"])
+    cast(dict[str, object], without_builtin_binding["repositories"])["added_managed_repos"] = [
+        managed_repo
+    ]
+    bootstrap_receipt_validation.validate_bootstrap_receipt(
+        without_builtin,
         bootstrap_profile="linux-user",
         relay_install_spec=desired.relay_install_spec,
         desired_fingerprint=desired.fingerprint,

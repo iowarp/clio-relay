@@ -57,7 +57,6 @@ _BOOTSTRAP_CANDIDATE_SOURCE_NAMES = (
     # Both owner-module families must travel with the candidate so the
     # facade's own directory is always the one that wins import resolution.
     "adapters/worker/bootstrap_reconcile_activation_paths.py",
-    "adapters/worker/bootstrap_reconcile_builtin_repos.py",
     "adapters/worker/bootstrap_reconcile_constants.py",
     "adapters/worker/bootstrap_reconcile_execution_identity.py",
     "adapters/worker/bootstrap_reconcile_generation_staging.py",
