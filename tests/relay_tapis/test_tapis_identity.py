@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import mcp_types
 import pytest
@@ -75,7 +75,7 @@ def _secrets(stub: TapisStub, store: MemoryStore) -> set[str]:
         found.update(
             str(record[key]) for key in ("access_token", "refresh_token") if record.get(key)
         )
-        pending = record.get("pending") or {}
+        pending = cast(dict[str, Any], record.get("pending") or {})
         if pending.get("device_code"):
             found.add(str(pending["device_code"]))
     return {item for item in found if item}
@@ -120,7 +120,7 @@ def test_sign_in_is_one_url_elicitation_and_no_secret_leaks(
         async with Client(
             create_server(relay_paths), mode="legacy", elicitation_handler=person
         ) as client:
-            result = await client.call_tool("run", {"site": SITE, "spec": ECHO, "wait_s": 600})
+            result = await client.call_tool("run", {"site": SITE, "spec": ECHO, "wait_s": 300})
             transcript.append(json.dumps(result.structured_content, default=str))
             transcript.extend(str(item) for item in result.content)
             view = _structured(result)
@@ -139,9 +139,10 @@ def test_sign_in_is_one_url_elicitation_and_no_secret_leaks(
     transcript.extend(json.dumps(item) for item in elicited)
     secrets = _secrets(stub, store)
     assert len(secrets) >= 4, "the device code, both tokens and the client key"
+    asks = RelayService(relay_paths).asks.all()
     places = {
         "transcript": "\n".join(transcript),
-        "asks": json.dumps([ask.model_dump(mode="json") for ask in RelayService(relay_paths).asks.all()]),
+        "asks": json.dumps([ask.model_dump(mode="json") for ask in asks]),
         "relay files": _relay_files(relay_paths),
         "log": caplog.text,
     }
@@ -174,8 +175,10 @@ def test_client_without_elicitation_gets_needs_sign_in_with_the_address(
             code = CODE.search(ask["message"])
             assert code is not None
             assert stub.state.approve(code.group(1), USERNAME)
+            # The refusal's own route: the person signs in at TACC, then answers the ask.
+            RelayService(relay_paths).answer(ask["ask_id"], "accept", by="person")
             resumed = await client.call_tool(
-                "run", {"resume": refusal["data"]["operation_id"], "wait_s": 600}
+                "run", {"resume": refusal["data"]["operation_id"], "wait_s": 300}
             )
             assert _structured(resumed)["state"] == "completed"
 

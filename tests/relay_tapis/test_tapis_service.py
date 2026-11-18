@@ -214,7 +214,11 @@ async def test_a_tacc_host_gets_a_tms_credential_and_no_key(
     )
     adapter = TapisAdapter(config, context)
     made: list[str] = []
-    monkeypatch.setattr(register, "make_key_pair", lambda comment: made.append(comment))
+
+    def no_key(comment: str) -> None:
+        made.append(comment)
+
+    monkeypatch.setattr(register, "make_key_pair", no_key)
     registered = await register.register_host(adapter, None)
     print(f"tms registration {registered}")
     assert not registered.created_system and not registered.key_installed

@@ -22,9 +22,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 class TapisFiles:
     """``FileAccess`` over one Tapis system."""
 
-    def __init__(
-        self, client: Callable[[], Awaitable[Any]], system_id: str, work_dir: str
-    ) -> None:
+    def __init__(self, client: Callable[[], Awaitable[Any]], system_id: str, work_dir: str) -> None:
         self._client = client
         self.system_id = system_id
         self.work_dir = work_dir.rstrip("/") or "/"
@@ -46,7 +44,7 @@ class TapisFiles:
     def content_path(self, digest: str) -> str:
         return f"{self.work_dir}/content/{digest}"
 
-    async def _call(self, operation: str, **kwargs: Any) -> Any:
+    async def _call(self, operation: str, /, **kwargs: Any) -> Any:
         client = await self._client()
         return await acall(client, "files", operation, systemId=self.system_id, **kwargs)
 
@@ -118,9 +116,7 @@ class TapisFiles:
                 return b""
             headers["range"] = f"{offset},{size}"
         try:
-            data = await self._call(
-                "getContents", path=target.lstrip("/"), _tapis_headers=headers
-            )
+            data = await self._call("getContents", path=target.lstrip("/"), _tapis_headers=headers)
         except TapisCallError as exc:
             raise self._missing(exc, path) from None
         body = data if isinstance(data, bytes) else str(data).encode("utf-8")

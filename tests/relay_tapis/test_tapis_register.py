@@ -69,7 +69,22 @@ async def test_register_installs_a_working_key_and_removal_leaves_nothing(
     found = system_id(site)
     comment = key_comment(found)
     assert not ssh.has_key(comment)
+    try:
+        await _register_and_remove(stub, fx, tmp_path, adapter, ssh, found)
+    finally:
+        # A failed run must not leave a line in the shared fixture's authorized_keys.
+        ssh.remove_key(comment)
 
+
+async def _register_and_remove(
+    stub: TapisStub,
+    fx: dict[str, str],
+    tmp_path: Path,
+    adapter: TapisAdapter,
+    ssh: SshHost,
+    found: str,
+) -> None:
+    comment = key_comment(found)
     registered = await register_host(adapter, ssh)
     print(f"LQ40 registration {registered}")
     assert registered.system_id == found

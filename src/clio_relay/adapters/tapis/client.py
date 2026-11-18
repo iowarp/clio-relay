@@ -92,7 +92,7 @@ def _message(exc: BaseException) -> str:
     return str(getattr(exc, "message", None) or exc)
 
 
-def call(client: Any, service: str, operation: str, **kwargs: Any) -> Any:
+def call(client: Any, service: str, operation: str, /, **kwargs: Any) -> Any:
     """Run ``client.<service>.<operation>(**kwargs)`` and return the plain result."""
     from tapipy.errors import BaseTapyException  # pyright: ignore[reportMissingTypeStubs]
 
@@ -117,9 +117,10 @@ def call(client: Any, service: str, operation: str, **kwargs: Any) -> Any:
                     return cast(dict[str, Any], body).get("result")
                 return body
             return bytes(response.content)
+        return cast(object, pair)
     return out
 
 
-async def acall(client: Any, service: str, operation: str, **kwargs: Any) -> Any:
+async def acall(client: Any, service: str, operation: str, /, **kwargs: Any) -> Any:
     """Run :func:`call` in a thread."""
     return await asyncio.to_thread(call, client, service, operation, **kwargs)

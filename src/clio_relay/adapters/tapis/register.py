@@ -25,7 +25,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.client import TapisCallError
@@ -64,7 +64,8 @@ class SshHost:
                 RefusalReason.INVALID_CONFIG,
                 "the site's ssh alternative names no ssh_profile",
             )
-        options: list[str] = [str(item) for item in config.get("ssh_options") or []]
+        raw = cast(list[Any], config.get("ssh_options") or [])
+        options = [str(item) for item in raw]
         return cls(
             ssh_profile=profile,
             ssh_config=config.get("ssh_config"),
@@ -285,7 +286,10 @@ async def register_host(
         created_system=created,
         authn=authn,
         host=str(existing.get("host") or "") or None,
-        queues=[str(item.get("name")) for item in existing.get("batchLogicalQueues") or []],
+        queues=[
+            str(item.get("name"))
+            for item in cast(list[dict[str, Any]], existing.get("batchLogicalQueues") or [])
+        ],
         login_user=target.user if target is not None else None,
     )
     if authn == "tms":

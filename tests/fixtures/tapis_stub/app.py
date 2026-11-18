@@ -8,6 +8,9 @@ person or TACC would: approving a device code, holding or forcing a job state,
 refusing a credential or a refresh. Every request is recorded.
 """
 
+# FastAPI registers the route functions through their decorators.
+# pyright: reportUnusedFunction=false
+
 from __future__ import annotations
 
 import base64
@@ -28,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jwt
 from fastapi import FastAPI, Request, Response
@@ -267,10 +270,11 @@ class JobRunner:
                 job.released.wait(0.05)
             if not self._move(job, "RUNNING"):
                 return
-            params = request.get("parameterSet") or {}
-            args = [str(item["arg"]) for item in params.get("appArgs") or []]
+            params = cast(dict[str, Any], request.get("parameterSet") or {})
+            app_args = cast(list[dict[str, Any]], params.get("appArgs") or [])
+            args = [str(item["arg"]) for item in app_args]
             env = dict(os.environ)
-            for item in params.get("envVariables") or []:
+            for item in cast(list[dict[str, Any]], params.get("envVariables") or []):
                 env[str(item["key"])] = str(item.get("value") or "")
             env.update(
                 {

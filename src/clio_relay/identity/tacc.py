@@ -20,6 +20,7 @@ mirrored here with the same names and fields.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import threading
@@ -166,10 +167,8 @@ class KeyringStore:
         import keyring
         from keyring.errors import PasswordDeleteError
 
-        try:
+        with contextlib.suppress(PasswordDeleteError):
             keyring.delete_password(self.service, name)
-        except PasswordDeleteError:
-            pass
 
 
 def default_store() -> SecretStore:
@@ -561,10 +560,8 @@ class TaccIdentity:
         for token in (record.access_token, record.refresh_token):
             if not token:
                 continue
-            try:
+            with contextlib.suppress(TapisCallError):
                 await acall(self._client(), "authenticator", "revoke_token", token=token)
-            except TapisCallError:
-                pass
         self.store.delete(self.key)
 
 

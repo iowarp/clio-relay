@@ -185,9 +185,10 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         status = await self.identity.status()
         facts["signed_in"] = status.state == "signed_in"
         facts["account"] = status.account
-        info = SiteInfo(adapter=self.name, verbs=sorted(self.implements), facts=facts)
+        info = SiteInfo(adapter=self.name, verbs=sorted(self.implements))
         if status.state != "signed_in":
             facts["system_id"] = self.config.system_id
+            info.facts = facts
             return info
         system = await self.system()
         system_id = str(system["id"])
@@ -219,6 +220,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             facts["credential"] = f"refused: {exc.message}"
         app_id, app_version = await self.app_ref()
         facts["app"] = {"id": app_id, "version": app_version}
+        info.facts = facts
         return info
 
     # the launcher app

@@ -29,13 +29,15 @@ def archive() -> bytes:
     """Return the launcher as a gzip tar. The bytes depend only on the script."""
     body = script()
     buffer = io.BytesIO()
-    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as zipped:
-        with tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as tar:
-            info = tarfile.TarInfo(SCRIPT_NAME)
-            info.size = len(body)
-            info.mode = 0o755
-            info.mtime = 0
-            tar.addfile(info, io.BytesIO(body))
+    with (
+        gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as zipped,
+        tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as tar,
+    ):
+        info = tarfile.TarInfo(SCRIPT_NAME)
+        info.size = len(body)
+        info.mode = 0o755
+        info.mtime = 0
+        tar.addfile(info, io.BytesIO(body))
     return buffer.getvalue()
 
 
@@ -64,9 +66,7 @@ def decode(arg: str) -> list[str]:
     return [part.decode("utf-8") for part in raw.split(b"\x00")[:-1]]
 
 
-def record(
-    spec: JobSpec, *, content_dir: str, package_root: str, guarded: bool
-) -> list[str]:
+def record(spec: JobSpec, *, content_dir: str, package_root: str, guarded: bool) -> list[str]:
     """Build the launcher's fields for ``spec``. ``guarded`` refuses free-form jobs."""
     head = [
         LAUNCHER_FORMAT,
