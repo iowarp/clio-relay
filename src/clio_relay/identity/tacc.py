@@ -1,20 +1,20 @@
-"""The TACC identity (RL48): the Tapis device code grant, kept in the keyring.
+"""The TACC identity (RL48): the Tapis device code grant, kept in relay's store.
 
 The person signs in on TACC's own ``https`` page, never on relay's. Relay asks
 the Tapis authenticator for a device code (``authenticator.generate_device_code``),
 shows the person the verification address and the short user code, and polls
 ``authenticator.create_token`` until the tokens arrive. The device code and the
-tokens are kept in the operating system's keyring under relay's name and are
-never shown, logged or returned to the model. The user code is meant to be
-read by the person (RFC 8628) and is not a secret.
+tokens are kept in relay's one store (the operating system's keyring, or relay's
+private file when there is no usable keyring) and are never shown, logged or
+returned to the model. The user code is meant to be read by the person
+(RFC 8628) and is not a secret.
 
 Relay refreshes the access token on its own with the refresh grant, which needs
 the OAuth client's key. When the refresh is refused, the identity is signed
 out and the next call asks again.
 
-This module implements the provider interface W6 publishes in
-``clio_relay.identity``. Until that package is merged, the types it uses are
-mirrored here with the same names and fields.
+This module implements the provider interface in ``clio_relay.identity`` and
+keeps its record in :class:`clio_relay.identity.store.TokenStore`.
 """
 
 from __future__ import annotations
@@ -23,12 +23,11 @@ import base64
 import contextlib
 import json
 import os
-import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, cast
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -41,11 +40,11 @@ from clio_relay.identity.base import (
     SignInStep,
     Token,
 )
+from clio_relay.identity.store import TokenStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 PROVIDER = "tacc"
 TITLE = "TACC"
-KEYRING_SERVICE = "clio-relay"
 DEFAULT_BASE_URL = "https://tacc.tapis.io"
 DEFAULT_TENANT = "tacc"
 # Relay's OAuth client in the tacc tenant (owner blocker O4). Until it exists the
@@ -58,80 +57,18 @@ DEFAULT_POLL_S = 5.0
 DEFAULT_DEVICE_CODE_S = 600.0
 
 
-@runtime_checkable
-class SecretStore(Protocol):
-    """JSON entries by name, as W6's ``TokenStore``. Production is the OS keyring."""
-
-    def get(self, name: str) -> dict[str, Any] | None: ...
-
-    def set(self, name: str, value: dict[str, Any]) -> None: ...
-
-    def delete(self, name: str) -> None: ...
-
-
-class MemoryStore:
-    """Entries in this process only, for tests (``CLIO_RELAY_KEYRING=memory``)."""
+class MemoryStore(TokenStore):
+    """Relay's one store, held in this process's memory, for tests."""
 
     def __init__(self) -> None:
-        self.values: dict[str, str] = {}
-        self._lock = threading.Lock()
-
-    def get(self, name: str) -> dict[str, Any] | None:
-        with self._lock:
-            text = self.values.get(name)
-        return _entry(text)
-
-    def set(self, name: str, value: dict[str, Any]) -> None:
-        with self._lock:
-            self.values[name] = json.dumps(value, sort_keys=True)
-
-    def delete(self, name: str) -> None:
-        with self._lock:
-            self.values.pop(name, None)
+        super().__init__("memory")
 
 
-_shared_memory = MemoryStore()
-
-
-class KeyringStore:
-    """The operating system's keyring under relay's name, one JSON entry per name."""
-
-    def __init__(self, service: str = KEYRING_SERVICE) -> None:
-        self.service = service
-
-    def get(self, name: str) -> dict[str, Any] | None:
-        import keyring
-
-        return _entry(keyring.get_password(self.service, name))
-
-    def set(self, name: str, value: dict[str, Any]) -> None:
-        import keyring
-
-        keyring.set_password(self.service, name, json.dumps(value, sort_keys=True))
-
-    def delete(self, name: str) -> None:
-        import keyring
-        from keyring.errors import PasswordDeleteError
-
-        with contextlib.suppress(PasswordDeleteError):
-            keyring.delete_password(self.service, name)
-
-
-def default_store() -> SecretStore:
-    """The keyring, or this process's memory under ``CLIO_RELAY_KEYRING=memory``."""
+def default_store() -> TokenStore:
+    """Relay's one store: the keyring, its private file, or memory for tests (RL28)."""
     if os.environ.get("CLIO_RELAY_KEYRING") == "memory":
-        return _shared_memory
-    return KeyringStore()
-
-
-def _entry(text: str | None) -> dict[str, Any] | None:
-    if not text:
-        return None
-    try:
-        value: object = json.loads(text)
-    except ValueError:
-        return None
-    return cast(dict[str, Any], value) if isinstance(value, dict) else None
+        return MemoryStore()
+    return TokenStore()
 
 
 # Settings and the stored record.
@@ -252,15 +189,15 @@ class TaccIdentity:
         context: IdentityContext | None = None,
         *,
         settings: TaccSettings | None = None,
-        store: SecretStore | None = None,
+        store: TokenStore | None = None,
         clock: Callable[[], float] = time.time,
         client_factory: ClientFactory | None = None,
     ) -> None:
         context_store: Any = getattr(context, "store", None)
         self.settings = settings or TaccSettings.resolve(getattr(context, "settings", None))
         if store is not None:
-            self.store: SecretStore = store
-        elif isinstance(context_store, SecretStore):
+            self.store: TokenStore = store
+        elif isinstance(context_store, TokenStore):
             self.store = context_store
         else:
             self.store = default_store()
@@ -335,7 +272,9 @@ class TaccIdentity:
         record = self._load()
         now = self.clock()
         if record.access_token is None:
-            return IdentityStatus(provider=PROVIDER, title=TITLE, state="signed_out")
+            return IdentityStatus(provider=PROVIDER, title=TITLE, state="signed_out").with_store(
+                self.store
+            )
         expires = record.access_expires_at
         live = expires is not None and expires > now
         state: IdentityState = "signed_in" if live or self._can_refresh(record) else "expired"
@@ -343,10 +282,10 @@ class TaccIdentity:
             provider=PROVIDER,
             title=TITLE,
             state=state,
-            source="keyring",
+            source=self.store.source,
             account=record.account,
             expires_at=None if expires is None else datetime.fromtimestamp(expires, UTC),
-        )
+        ).with_store(self.store)
 
     def _can_refresh(self, record: TaccRecord) -> bool:
         if not record.refresh_token or self.settings.client_key is None:
@@ -582,16 +521,15 @@ def create(context: IdentityContext | None = None) -> TaccIdentity:
 __all__ = [
     "IdentityContext",
     "IdentityStatus",
-    "KeyringStore",
     "MemoryStore",
     "PendingCode",
-    "SecretStore",
     "SignInContext",
     "SignInResult",
     "SignInStep",
     "TaccIdentity",
     "TaccSettings",
     "Token",
+    "TokenStore",
     "create",
     "default_store",
     "jwt_claims",

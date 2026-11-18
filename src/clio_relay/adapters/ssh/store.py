@@ -33,7 +33,7 @@ def entry(item: InputRef) -> dict[str, object]:
     return {
         "name": item.name,
         "sha256": item.sha256,
-        "transient": bool(getattr(item, "transient", False)),
+        "transient": item.transient,
     }
 
 

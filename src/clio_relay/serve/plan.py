@@ -4,7 +4,9 @@ The job relay submits is the person's job wrapped by ``serve/launch.sh``. The
 wrapper, its port list, the frpc configuration and the secrets reach the job
 directory as ordinary content-addressed inputs (RL16). Secrets travel only in
 ``serve/secrets.env``, which the wrapper deletes once read, so they are in no
-argument list, environment block of a batch script, record or log.
+argument list, environment block of a batch script, record or log. That input
+is marked transient, so relay and the site drop their stored copies when the
+job ends.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from clio_relay.serve import frp
 from clio_relay.serve.config import Rendezvous, SiteServe
 
 SERVE_DIR = "serve"
+SECRETS_FILE = "secrets.env"
 SECRET_ENV_PREFIX = "secret_env:"
 _PLACEHOLDER = re.compile(r"\$\{(CLIO_RELAY_[A-Z0-9_]+)\}")
 
@@ -263,6 +266,7 @@ def site_frpc_config(plan: ServePlan) -> bytes:
         else None,
         server_name=rendezvous.tls_name(),
         proxy_url=proxy_url,
+        stun_server=(site.stun_server or rendezvous.stun_server) if rendezvous.direct else None,
     )
     ports = [(port.name, port.remote_port) for port in plan.ports]
     return frp.render_site(common, ports, plan.operation_id, direct=rendezvous.direct).encode()
@@ -299,7 +303,7 @@ def site_files(plan: ServePlan) -> dict[str, bytes]:
     files: dict[str, bytes] = {
         "launch.sh": site_file("launch.sh"),
         "ports": ports_file(plan),
-        "secrets.env": secrets_file(site_secrets(plan)),
+        SECRETS_FILE: secrets_file(site_secrets(plan)),
     }
     if plan.mode == "frp":
         files["frpc.toml"] = site_frpc_config(plan)
@@ -338,7 +342,12 @@ def wrapped_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, str]) -> J
     if job.directory:
         env["CLIO_RELAY_SERVICE_DIR"] = job.directory
     inputs = list(job.inputs) + [
-        InputRef(name=f"{SERVE_DIR}/{name}", sha256=digest) for name, digest in staged.items()
+        InputRef(
+            name=f"{SERVE_DIR}/{name}",
+            sha256=digest,
+            transient=name == SECRETS_FILE,
+        )
+        for name, digest in staged.items()
     ]
     return job.model_copy(
         update={

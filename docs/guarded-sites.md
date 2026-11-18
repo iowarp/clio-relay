@@ -1,0 +1,187 @@
+# Guarded sites
+
+A site is either open or guarded. On an open site the agent runs what it likes:
+a command, a script, a container. On a guarded site, such as a national lab
+machine where your account is on the line, relay runs only JARVIS packages that
+you have reviewed, lets `exec` only read, and asks before it spends your
+allocation.
+
+Mark a site guarded when you add it (guarded is the default):
+
+```powershell
+clio-relay-next site add polaris --adapter ssh --config '{ssh_profile: polaris}' --policy guarded --spend always
+```
+
+## What the agent can and cannot do
+
+| The agent asks for | On a guarded site |
+| --- | --- |
+| `run` of a command or script | Refused with `policy_refused`. The refusal says how to go on: write or pick a JARVIS package and run that. Nothing is recorded or submitted. |
+| `run` of a JARVIS package you have not reviewed | You get a review question first. Nothing is submitted until you say yes. |
+| `run` of a package you reviewed | Runs, after the spend question if the site asks one. |
+| `exec` of a read-only command (`squeue`, `ls`, `cat`, `module avail`, ...) | Runs. |
+| `exec` of anything else (`rm`, `sh -c`, `scancel`, `jarvis ppl run`, ...) | Refused with `policy_refused` and the list of commands that are allowed. |
+| A warm allocation | Held after the spend question; `exec` reaches it with `srun --jobid=<job> --overlap <read-only command>`. |
+
+## Running a package
+
+A package is one JARVIS package from a JARVIS repository, such as
+`clio_jarvis.gray_scott` from clio-jarvis, or one the agent writes with the
+JARVIS package skill. The agent builds its archive on the relay machine and
+puts it in relay's content store:
+
+```powershell
+python -m clio_relay.jarvis_site archive ~/src/clio-jarvis/clio_jarvis clio_jarvis.gray_scott --stage
+```
+
+That prints the archive's SHA-256, its size, its file count and where it came
+from (repository, tag, commit, and whether the checkout had uncommitted
+changes). The archive holds the package's own directory, the repository's
+shared Python modules, and the `schemas/` directory next to the repository.
+Building it twice from the same files gives the same hash.
+
+The agent then calls `run` with a package instead of an executable:
+
+```json
+{
+  "site": "polaris",
+  "spec": {
+    "package": {
+      "name": "clio_jarvis.gray_scott",
+      "version": "0.1.0",
+      "sha256": "<the printed hash>",
+      "parameters": {"nprocs": 4}
+    },
+    "attributes": {"queue_name": "debug", "account": "myproject"}
+  }
+}
+```
+
+Relay copies the archive to the site by its hash. A small runner script
+checks the hash again, unpacks the archive into the job directory, makes a
+private JARVIS environment for that job only, adds the package's repository,
+appends the package with the parameters, and runs the pipeline. Your own
+JARVIS configuration on the site is not touched.
+
+A package started as a service (such as pvserver) does not end when it is
+ready. The runner starts the pipeline, keeps the job running, and stops the
+pipeline when relay stops the service. An application package runs the
+pipeline once, from start to stop.
+
+The runner exits with a clear code when something is wrong: 64 for a package
+name that is not `<repository>.<package>`, 65 when the archive's hash does not
+match the reviewed one, 66 when the archive is missing or has no
+`<repository>/<repository>` directory, and 69 when `jarvis` is not on the
+site's `PATH`.
+
+## Reviewing a package
+
+The first time a package runs on a guarded site, relay asks you to review it.
+The question shows:
+
+- the package's name and version;
+- the SHA-256 of the archive;
+- where it came from: repository, tag, commit, path;
+- every file, with its own hash, size and whether it is executable;
+- the parameters of this run.
+
+You answer where you answer any relay question: in your MCP host if it can
+ask you, on the approval page relay links, or with `clio-relay-next asks
+answer`. A yes records the review for that site and that hash. The next run of
+the same archive needs no review. A changed file changes the hash, so an
+edited package is a new package and is reviewed again. A review on one site
+does not count on another.
+
+Reviews are kept under relay's state directory, in `guard/reviews/<site>/`,
+one file per package name, version and hash, each naming the question it came
+from.
+
+Relay checks the review again just before it submits, so a package can never
+run without one, even if something changes between the question and the
+submission.
+
+## Read-only exec
+
+`exec` on a guarded site takes an argument list, never a shell string, and runs
+only commands that read:
+
+- files: `ls`, `cat`, `head`, `tail`, `grep`, `wc`, `stat`, `du`, `df`,
+  `find` (without `-exec`, `-delete` and other actions), `sha256sum`;
+- the scheduler: `squeue`, `sinfo`, `sacct`, `sprio`, `sshare`,
+  `scontrol show`, `sacctmgr show`, `qstat`, `pbsnodes` (without the options
+  that change a node);
+- the machine: `hostname`, `uname`, `nproc`, `whoami`, `id`;
+- modules and quotas: `module avail`, `module list`, `module spider`, ...,
+  `quota`, `lfs quota`;
+- JARVIS reads: `jarvis ppl list`, `ppl status`, `repo list`, `pkg readme`,
+  and the like.
+
+A program must be named bare, so that a file called `/tmp/x/ls` cannot pass as
+`ls`. Add a site's own read-only tools in `guard.yaml` (below).
+
+## The spend question
+
+Each site's `spend.ask` decides when relay asks before it submits:
+
+- `always`: every job asks;
+- `never`: no job asks;
+- a number: a job asks when it may use more than that many node-hours.
+
+The question shows the queue, the account, the nodes, the walltime and the
+most the job may use. Relay never sets a walltime itself. A job with no
+walltime has an unknown cost: it always asks (unless the site is `never`), and
+the question says the scheduler's default limit applies. On a cloud site the
+adapter gives its own price, in US dollars.
+
+A no submits nothing. A question nobody answers leaves the operation waiting,
+with nothing submitted, until someone answers it. An approval covers exactly
+the job you saw: a changed job needs a new approval.
+
+## Warm allocations
+
+When the agent needs a few quick checks on compute nodes, it can ask for a
+warm allocation instead of queuing a job for each:
+
+```json
+{"site": "polaris", "spec": {"executable": "clio-relay-warm", "resources": {"node_count": 1}, "attributes": {"queue_name": "debug"}}}
+```
+
+It goes through the spend question like any job. Relay then holds the
+allocation, and `exec` reaches it with
+`srun --jobid=<job id> --overlap <command>`, where the command must itself be
+read-only on a guarded site. Only allocations relay holds on that site are
+reachable this way.
+
+A warm allocation releases itself once ten minutes have passed since anything
+last ran in it, counted from the end of the last command. That is an idle
+timer on an allocation, not a limit on anything running: while a step runs in
+the allocation it stays, and the holder never stops a running step. Cancel it
+sooner with `run` and `cancel`.
+
+## Adding clio-jarvis to a site
+
+The clio-jarvis packages can also live in the site's own JARVIS, at a tagged
+release. Relay's `clio_relay.jarvis_site.add_clio_jarvis` clones the tag into
+`~/.clio-relay/clio-jarvis/<tag>` on the site, checks the tag's commit when you
+give it, and runs `jarvis repo add` unless that repository is already there.
+Running it again changes nothing.
+
+## Settings
+
+`guard.yaml` in relay's configuration directory holds per-site settings. It is
+optional and read on every check, so an edit takes effect at once.
+
+```yaml
+sites:
+  polaris:
+    jarvis: ~/venvs/jarvis/bin/jarvis   # the jarvis command on the site
+    read_only: [myquota]                # more read-only programs, by exact name
+    warm_idle_s: 600                    # idle seconds before a warm allocation is released
+```
+
+## A limitation
+
+On a relay that runs over stdio on your own machine, the approval page is on
+`127.0.0.1`. An agent with a shell on that same machine could reach it. Use
+guarded sites from an MCP host that asks you directly, or from a relay served
+over HTTPS, where the page needs your operator credential.

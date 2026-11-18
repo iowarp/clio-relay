@@ -175,7 +175,7 @@ from typing import Any, NamedTuple
 # W8: deleting the held remote_mcp, scheduler_providers and browser_gateway
 # modules and their tests, with W9 at 5a01766 and integration at dae2774
 # merged, took it to 5076 (measured with `uv run` at 8b34a44).
-BASELINE_TOTAL = 5050
+BASELINE_TOTAL = 4929
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

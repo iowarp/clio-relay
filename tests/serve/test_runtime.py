@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 
-from clio_relay.jobs.handles import JobState, JobStatus, OutputRef
+from clio_relay.jobs.handles import JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.serve import config as serve_settings
@@ -169,6 +169,49 @@ def test_a_stops_outputs_carry_provenance(tmp_path: Path) -> None:
         "fx",
     )
     assert (block["uri"], block["size_bytes"]) == ("/scratch/jobs/op_test/state.pvsm", 12)
+
+
+def test_the_jobs_native_id_reaches_the_record_and_provenance(tmp_path: Path) -> None:
+    """The adapter's handle goes on the operation record, recovered or at the end."""
+    handle = JobHandle(
+        adapter="fixture", native_id="27810", data={"job_dir": "/scratch/jobs/op_test"}
+    )
+    plan = frp_plan(tmp_path).model_copy(
+        update={"job_dir": "/scratch/jobs/op_test", "handle": handle}
+    )
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    runtime.plans[plan.operation_id] = plan
+    record = OperationRecord(
+        operation_id=plan.operation_id,
+        kind="serve",
+        site="fx",
+        adapter="fixture",
+        spec={},
+        spec_digest="c" * 64,
+        state=OperationState.RUNNING,
+    )
+    runtime.records.put(plan.operation_id, record)
+    found = asyncio.run(runtime._handle(plan, None, record))  # pyright: ignore[reportPrivateUsage]
+    assert found == handle
+    assert record.handle == handle
+    stored = runtime.records.get(plan.operation_id)
+    assert stored is not None and stored.handle is not None
+    assert stored.handle.native_id == "27810"
+
+    runtime.records.put(plan.operation_id, record.model_copy(update={"handle": None}))
+
+    async def read(_plan: ServePlan, _adapter: Any, name: str, *, tail: int = 0) -> bytes | None:
+        del tail
+        return b"12\tstate.pvsm\n" if name == "artifacts.txt" else None
+
+    runtime._read = read  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    final = asyncio.run(
+        runtime._finish(plan, None, JobStatus(state=JobState.CANCELLED))  # pyright: ignore[reportPrivateUsage]
+    )
+    block = final.outputs[0].metadata["provenance"]
+    assert block["native_id"] == "27810"
+    stored = runtime.records.get(plan.operation_id)
+    assert stored is not None and stored.handle is not None
 
 
 def test_settings_cli_sets_shows_and_clears(tmp_path: Path) -> None:

@@ -104,11 +104,14 @@ class RelayAskProvider:
     # Shared pieces, made on first use
 
     def token_store(self) -> TokenStore:
-        """Return the keyring-backed store."""
+        """Return relay's store: the keyring, or the private file in the config directory."""
+        config_dir = self.paths().config_dir
         with self._lock:
             if self._store is None:
                 backend = self.context.settings.get("keyring")
-                self._store = TokenStore(backend if isinstance(backend, str) else None)
+                self._store = TokenStore(
+                    backend if isinstance(backend, str) else None, config_dir=config_dir
+                )
             return self._store
 
     def grants(self) -> GrantFiles:

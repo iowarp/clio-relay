@@ -324,6 +324,7 @@ class ServeRuntime:
         job_dir = handle.data.get("job_dir")
         plan.job_dir = str(job_dir) if job_dir else None
         self._save(plan)
+        self._record_handle(plan)
         return plan.endpoint(note="starting", connect_command=self.connect_command(plan))
 
     def _mode(self, adapter: Any, site: SiteServe, has_rendezvous: bool) -> Any:
@@ -432,7 +433,21 @@ class ServeRuntime:
                 job_dir = plan.handle.data.get("job_dir")
                 plan.job_dir = plan.job_dir or (str(job_dir) if job_dir else None)
                 self._save(plan)
+        if plan.handle is not None and record.handle is None:
+            record.handle = plan.handle
+            self._record_handle(plan)
         return plan.handle
+
+    def _record_handle(self, plan: ServePlan) -> None:
+        """Put the job's handle on the operation record, so its native id is reported."""
+        if plan.handle is None:
+            return
+        with self.records.locked(plan.operation_id):
+            record = self.records.get(plan.operation_id)
+            if record is None or record.handle is not None:
+                return
+            record.handle = plan.handle
+            self.records.put(plan.operation_id, record)
 
     def _path(self, plan: ServePlan, name: str) -> str:
         if not plan.job_dir:
@@ -521,6 +536,9 @@ class ServeRuntime:
             notes.append(mount_note)
         if plan.rebinds:
             notes.append(f"desktop port bound again {plan.rebinds} times")
+        direct = forward.direct_note()
+        if direct:
+            notes.append(self._redact(plan, direct))
         extra = self.notes.get(plan.operation_id)
         if extra:
             notes.append(extra)
@@ -630,6 +648,9 @@ class ServeRuntime:
                 outputs.append(OutputRef(name=name, path=path, size=size))
         record = self.records.get(plan.operation_id)
         if record is not None:
+            if record.handle is None and plan.handle is not None:
+                self._record_handle(plan)
+                record.handle = plan.handle
             outputs = with_provenance(record, outputs)
         await self._stop_hop(adapter, plan)
         message = self._final_message(plan, status, stopped)

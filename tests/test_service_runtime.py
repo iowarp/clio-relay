@@ -118,7 +118,9 @@ def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> N
             "from pathlib import Path",
             "started, stop, stopped = map(Path, sys.argv[1:4])",
             "started.write_text(str(os.getpid()), encoding='utf-8')",
-            "deadline = time.monotonic() + 10.0",
+            # A safety bound so a broken run cannot leave it behind; it is
+            # longer than the test's own stall guard below.
+            "deadline = time.monotonic() + 900.0",
             "while not stop.exists() and time.monotonic() < deadline:",
             "    time.sleep(0.05)",
             "stopped.write_text('stopped', encoding='utf-8')",
@@ -154,35 +156,35 @@ def test_local_connector_does_not_retain_captured_cli_pipes(tmp_path: Path) -> N
         stderr=subprocess.PIPE,
         text=True,
     )
-    timed_out = False
-    stdout = ""
-    stderr = ""
+    # The grandchild runs until the stop file appears, and only the finally
+    # block writes it. So if the CLI's pipes close while the grandchild has not
+    # stopped, the CLI did not wait for it, however slowly the machine runs.
+    # The timeouts are stall guards only.
+    stall_s = 600.0
     try:
         try:
-            stdout, stderr = cli.communicate(timeout=2.0)
+            stdout, stderr = cli.communicate(timeout=stall_s)
         except subprocess.TimeoutExpired:
-            timed_out = True
-            stop_path.touch()
-            stdout, stderr = cli.communicate(timeout=5.0)
+            pytest.fail("captured relay CLI waited for its long-lived connector grandchild")
 
-        assert not timed_out, (
+        assert not stopped_path.exists(), (
             "captured relay CLI waited for its long-lived connector grandchild to exit"
         )
         assert cli.returncode == 0, stderr
         assert stdout.strip().isdigit()
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + stall_s
         while not started_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert started_path.is_file()
         assert not stopped_path.exists()
     finally:
         stop_path.touch()
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + stall_s
         while not stopped_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         if cli.poll() is None:
             cli.kill()
-            cli.wait(timeout=2.0)
+            cli.wait()
 
 
 def test_subprocess_runner_delivers_private_input_and_immediate_eof(tmp_path: Path) -> None:

@@ -67,7 +67,9 @@ and the gate asks for it unless the site's `spend.ask` is `never`.
    An input already on the site is not sent again. If the job deletes an input
    from its directory, for example a file of secrets it reads once, relay
    removes the site's stored copy too when the job ends or is cancelled, unless
-   another job still uses it.
+   another job still uses it. An input marked `transient` goes when the job
+   ends in any case, both the job's copy and the stored one, even if the job
+   was cancelled before it started.
 3. One `ssh` call writes the script into the job's directory and submits it.
    The directory is `<remote_dir>/jobs/<operation id>/` and holds the script,
    the submit result, `stdout`, `stderr` and the exit code.
@@ -83,7 +85,8 @@ gets `SIGTERM` first, so a `trap` in it can clean up, and is killed only after
 the scheduler's grace period (Slurm's `KillWait`, PBS's `kill_delay`). Some
 Slurm sites signal only the batch shell; relay's Slurm script passes the
 signal on to your command and waits for it to finish its trap, so it behaves
-the same on every site.
+the same on every site. A command over several lines, such as a multi-line
+`bash -c` script, is handled the same way.
 
 On a shared filesystem such as NFS, a file written on one node can stay
 invisible on another for a minute or two. Relay lists a directory before it
@@ -118,7 +121,8 @@ never types into ssh itself.
   each prompt there. That starts an ssh master connection
   (`ControlMaster`), and every later call reuses it with `BatchMode=yes`, so
   you are asked once, not on every call. When the master closes, the site
-  asks you to sign in again.
+  asks you to sign in again. The master closes when relay stops, so none is
+  left running after it, and signing in again while one is up reuses it.
 
 `askpass` replaces the program that shows the prompts, for example with a
 program of your own that reads codes from a token. With such a program, relay

@@ -55,6 +55,7 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
         [(port.name, port.local_port) for port in plan.ports],
         plan.operation_id,
         direct=rendezvous.direct,
+        direct_wait_s=rendezvous.direct_wait_s,
     )
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "visitor.toml"
@@ -171,6 +172,17 @@ class Forward:
         except OSError:
             return None
         return lines[-1][-300:] if lines else None
+
+    def direct_note(self) -> str | None:
+        """Return which path an XTCP forward is on, or None when it is not direct."""
+        rendezvous = self.plan.rendezvous
+        if self.plan.mode != "frp" or rendezvous is None or not rendezvous.direct:
+            return None
+        try:
+            lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        return frp.direct_note(lines, rendezvous.direct_wait_s)
 
     def _command(self) -> tuple[list[str], dict[str, str]]:
         if self.plan.mode == "frp":

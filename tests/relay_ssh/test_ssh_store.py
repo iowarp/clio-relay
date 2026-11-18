@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from clio_relay.adapters.ssh import scripts, store
+from clio_relay.jobs.spec import InputRef
 
 pytestmark = pytest.mark.release_platform("posix")
 
@@ -72,3 +73,13 @@ def test_inputs_json_that_is_not_a_list_gives_no_inputs() -> None:
     assert store.input_entries(['[{"name": "x", "sha256": "not hex"}]']) == []
     old = store.input_entries([json.dumps([{"name": "x", "sha256": "a" * 64}])])
     assert old == [store.StagedInput("x", "a" * 64, False)]
+
+
+def test_inputs_json_carries_the_transient_mark() -> None:
+    digest = "ab" * 32
+    assert store.entry(InputRef(name="a", sha256=digest)) == {
+        "name": "a",
+        "sha256": digest,
+        "transient": False,
+    }
+    assert store.entry(InputRef(name="s", sha256=digest, transient=True))["transient"] is True

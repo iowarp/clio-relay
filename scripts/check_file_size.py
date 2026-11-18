@@ -471,7 +471,7 @@ RATCHET_BASELINE: dict[str, int] = {
     # body reasons that comment explains -- entered here rather than
     # force-split, per this file's own docstring ("a known-oversized
     # module still awaiting decomposition").
-    "src/clio_relay/adapters/worker/cli_owned_report_artifact.py": 878,
+    "src/clio_relay/adapters/worker/cli_owned_report_artifact.py": 876,
     # split/cli-session-teardown-w3: cli_session_teardown.py's own further
     # decomposition (the closure factory the comment above describes) into
     # a 266-line facade -- the Typer signature, preflight, and
@@ -626,7 +626,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # door_errors.py. Both sides are recorded exactly even below the default
     # cap so this decomposition cannot silently re-accrete.
     # Campaign merge: values are the MEASURED merged-tree counts.
-    "src/clio_relay/adapters/worker/door_error_adapters.py": 170,
     # door_errors.py: clio-relay#221/#259 (D3/D5) added two typed SSE
     # refusal reasons (744 -> 750) and clio-relay#179 added two owned-
     # session-channel-route reasons with compacted _http_row rows -- still
@@ -2004,7 +2003,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: cluster_config_windows_read_verify.py — the two landed on independent
 #: branches, each measuring 483/624 = 77.40% on its own tree; the merged
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 81.05
+SRC_DISTRIBUTION_BASELINE_PERCENT = 81.80
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -2015,7 +2014,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 81.05
 #: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
 #: and tests/conftest.py, both under 500 lines.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 75.92
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 77.13
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

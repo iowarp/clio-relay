@@ -38,6 +38,7 @@ async def test_open_site_runs_without_asking(relay_paths: RelayPaths) -> None:
     await service.close()
 
 
+@pytest.mark.usefixtures("stub_guard")
 async def test_guarded_site_refuses_without_a_guard(relay_paths: RelayPaths) -> None:
     guard: Any = RelayService(relay_paths).guard
     assert guard.context.settings["config_dir"] == str(relay_paths.config_dir)
