@@ -32,6 +32,7 @@ from clio_relay.asks.loopback import LoopbackServer
 from clio_relay.asks.pages import DEFAULT_PAGE_TTL_S, PageTokens
 from clio_relay.asks.runner import Runner
 from clio_relay.asks.signin import Mode, SignIns, mode_of
+from clio_relay import identity
 from clio_relay.identity import GrantFiles, GrantWatcher, Identities, IdentityContext, TokenStore
 from clio_relay.identity import get as identity_factory
 from clio_relay.identity.probe import probe_identity
@@ -126,6 +127,7 @@ class RelayAskProvider:
                 self._identities = Identities(
                     IdentityContext(store=store, grants=grants, settings=self.context.settings)
                 )
+                identity.use(self._identities)
             return self._identities
 
     def http(self) -> httpx.AsyncClient:
@@ -402,6 +404,8 @@ class RelayAskProvider:
             askpass.broker().remove_listener(self.signins.on_prompt)
             self._listening = False
         self.signins.close()
+        if self._identities is not None:
+            identity.release(self._identities)
         if self._loopback is not None:
             self._loopback.close()
             self._loopback = None

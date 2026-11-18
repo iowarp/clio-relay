@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+from clio_relay import identity
 from clio_relay.asks import askpass
 from clio_relay.asks.provider import RelayAskProvider
 from clio_relay.identity import store as token_store
@@ -45,7 +46,9 @@ def private_keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("CLIO_RELAY_OPERATOR_TOKEN", raising=False)
     memory = token_store._shared_memory  # pyright: ignore[reportPrivateUsage]
     memory._values.clear()  # pyright: ignore[reportPrivateUsage]
+    identity.use(None)
     yield
+    identity.use(None)
     memory._values.clear()  # pyright: ignore[reportPrivateUsage]
 
 

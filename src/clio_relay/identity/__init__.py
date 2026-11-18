@@ -49,6 +49,9 @@ __all__ = [
     "get",
     "names",
     "register",
+    "release",
+    "shared",
+    "use",
 ]
 
 logger = logging.getLogger(__name__)
@@ -164,3 +167,42 @@ class Identities:
                     )
                 )
         return found
+
+
+_shared: Identities | None = None
+
+
+def use(identities: Identities | None) -> None:
+    """Make ``identities`` the one :func:`shared` returns. Relay's ask provider calls this."""
+    global _shared
+    with _lock:
+        _shared = identities
+
+
+def release(identities: Identities) -> None:
+    """Stop :func:`shared` returning ``identities``, if it still does."""
+    global _shared
+    with _lock:
+        if _shared is identities:
+            _shared = None
+
+
+def shared() -> Identities:
+    """Return the identities relay is serving with, for an adapter that needs a token.
+
+    Inside a serving relay this is the ask provider's, so it sees ``--grant-file``.
+    Elsewhere it is built once from ``CLIO_RELAY_GRANT_FILE_<PROVIDER>`` and the
+    keyring.
+    """
+    global _shared
+    with _lock:
+        if _shared is not None:
+                return _shared
+    from clio_relay.surface.settings import RelayPaths
+
+    grants = GrantFiles.from_settings({"grant_files": dict(RelayPaths.from_env().grant_files)})
+    built = Identities(IdentityContext(store=TokenStore(), grants=grants))
+    with _lock:
+        if _shared is None:
+                _shared = built
+        return _shared

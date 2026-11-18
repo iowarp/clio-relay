@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -192,6 +193,33 @@ async def test_status_prefers_the_grant(tmp_path: Path) -> None:
     assert token is not None and token.access_token.get_secret_value() == "granted"
     await globus.sign_out()
     assert path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_shared_identities_follow_the_serving_relay(
+    relay_paths: RelayPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from_env = tmp_path / "env-globus.json"
+    write_grant(from_env, "globus", "from-env")
+    monkeypatch.setenv("CLIO_RELAY_GRANT_FILE_GLOBUS", str(from_env))
+    alone = identity.shared()
+    assert identity.shared() is alone
+    globus = alone.get("globus")
+    assert globus is not None
+    token = await globus.token()
+    assert token is not None and token.access_token.get_secret_value() == "from-env"
+
+    flag = tmp_path / "flag-globus.json"
+    write_grant(flag, "globus", "from-flag")
+    service = RelayService(replace(relay_paths, grant_files={"globus": flag}))
+    served = provider_of(service).identities()
+    assert identity.shared() is served
+    served_globus = served.get("globus")
+    assert served_globus is not None
+    token = await served_globus.token()
+    assert token is not None and token.access_token.get_secret_value() == "from-flag"
+    await service.close()
+    assert identity.shared() is not served
 
 
 # The keyring
