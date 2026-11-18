@@ -11,7 +11,7 @@ import urllib.parse
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1270,11 +1270,11 @@ def test_service_runtime_source_rejects_generic_unmarked_jarvis_call(
         )
 
 
-def test_registered_service_runtime_source_binds_exact_durable_result(
+def test_registered_service_runtime_source_is_refused(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An operator-registered JARVIS route uses its contract and artifact proof."""
+    """Relay no longer binds a result that came through a registered remote MCP route."""
     queue, definition, job, artifact, envelope = _source_result(
         tmp_path,
         server="/opt/operator/bin/registered-jarvis-mcp",
@@ -1282,19 +1282,15 @@ def test_registered_service_runtime_source_binds_exact_durable_result(
     )
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
 
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-
-    assert verified.binding.source_relay_job_id == job.job_id
-    assert verified.binding.source_relay_artifact_id == artifact.artifact_id
-    assert verified.binding.jarvis_execution_id == "execution-1"
-    assert verified.runtime.service_instance_id == "paraview-live-1"
+    with pytest.raises(ValueError, match="registered remote MCP route"):
+        resolve_jarvis_service_runtime(
+            queue=queue,
+            definition=definition,
+            source_job_id=job.job_id,
+            source_artifact_id=artifact.artifact_id,
+            package_id="paraview-1",
+            package_name="builtin.paraview",
+        )
 
 
 def test_registered_service_runtime_source_rejects_wrong_contract(
@@ -1351,54 +1347,6 @@ def test_registered_service_runtime_source_rejects_result_contract_mismatch(
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
 
     with pytest.raises(ValueError, match="result registered contract"):
-        resolve_jarvis_service_runtime(
-            queue=queue,
-            definition=definition,
-            source_job_id=job.job_id,
-            source_artifact_id=artifact.artifact_id,
-            package_id="paraview-1",
-            package_name="builtin.paraview",
-        )
-
-
-def test_registered_service_runtime_source_rejects_mismatched_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    queue, definition, job, artifact, envelope = _source_result(
-        tmp_path,
-        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
-    )
-    document = json.loads(base64.b64decode(envelope["data"], validate=True).decode("utf-8"))
-    document["server_artifact"]["install_artifact_sha256"] = "c" * 64
-    _replace_envelope_document(envelope, document)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-
-    with pytest.raises(ValueError, match="not the immutable registered route"):
-        resolve_jarvis_service_runtime(
-            queue=queue,
-            definition=definition,
-            source_job_id=job.job_id,
-            source_artifact_id=artifact.artifact_id,
-            package_id="paraview-1",
-            package_name="builtin.paraview",
-        )
-
-
-def test_registered_service_runtime_source_rejects_unverified_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    server_artifact = _registered_jarvis_server_artifact()
-    server_artifact["verified"] = False
-    queue, definition, job, artifact, envelope = _source_result(
-        tmp_path,
-        expected_registered_contract=REGISTERED_JARVIS_USER_CONTRACT,
-        server_artifact=server_artifact,
-    )
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-
-    with pytest.raises(ValueError, match="not the immutable registered route"):
         resolve_jarvis_service_runtime(
             queue=queue,
             definition=definition,
@@ -1508,7 +1456,7 @@ def test_internal_bind_override_rejects_occupied_loopback_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An internal/operator override must fail before creating connector state on collision."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     verified = resolve_jarvis_service_runtime(
         queue=queue,
@@ -1634,7 +1582,7 @@ def test_jarvis_bind_serializes_connector_creation_against_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bound-runtime stop cannot close before its connector producer publishes."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -1735,11 +1683,11 @@ def test_jarvis_bind_serializes_connector_creation_against_stop(
     assert stopped.canceled_scheduler_job is None
 
 
-def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
+def test_retired_allocation_connector_cleanup_reports_the_step_to_cancel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -1865,70 +1813,31 @@ def test_bound_runtime_detach_and_teardown_preserve_scheduler_by_default(
         "remote_connector": allocation_connector,
     }
     queue.update_gateway_session(started.session.session_id, gateway=gateway)
-    step_statuses = iter(["active", "active", "absent"])
     allocation_commands: list[str] = []
 
     def allocation_ssh(script: str) -> str:
         allocation_commands.append(script)
-        if "connector-step-status" in script:
-            state = next(step_statuses)
-            return json.dumps(
-                {
-                    "schema_version": "clio-relay.scheduler-connector-step-status.v1",
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "placement_host": "compute-07",
-                    "record_found": state == "active",
-                    "state": state,
-                    "observed_host": "compute-07" if state == "active" else None,
-                    "source": "slurm-squeue-steps",
-                    "verified": True,
-                    "observed_at": "2026-07-15T02:00:02Z",
-                }
-            )
-        if "connector-step-cancel" in script:
-            return json.dumps(
-                {
-                    "scheduler": "slurm",
-                    "scheduler_job_id": "12345",
-                    "scheduler_step_id": "12345.7",
-                    "cancel_requested": True,
-                    "accepted": True,
-                    "returncode": 0,
-                    "stdout": "",
-                    "stderr": "",
-                }
-            )
         raise AssertionError(f"unexpected allocation connector script: {script}")
 
     monkeypatch.setattr(supervisor, "_ssh", allocation_ssh)
 
     detached = supervisor.detach(session_id=started.session.session_id)
-    assert detached.stopped_local_pid == 555
-    assert detached.stopped_remote_pid is None
-    assert detached.canceled_scheduler_job is None
-    assert next(item for item in detached.resources if item.kind == "scheduler_job").action == (
-        "retain"
-    )
     detached_remote = next(item for item in detached.resources if item.kind == "remote_connector")
     assert detached_remote.resource_id == "12345.7"
-    assert detached_remote.location == "compute-07"
-    assert detached_remote.outcome == "retained"
+    assert detached_remote.outcome == "refused"
+    assert detached_remote.residual is True
+    assert "scancel 12345.7" in str(detached_remote.detail)
+    assert any("scancel 12345.7" in error for error in detached.errors)
 
     stopped = supervisor.stop(session_id=started.session.session_id)
     assert stopped.canceled_scheduler_job is None
-    scheduler = next(item for item in stopped.resources if item.kind == "scheduler_job")
-    assert scheduler.action == "retain"
-    assert scheduler.outcome == "retained"
     stopped_remote = next(item for item in stopped.resources if item.kind == "remote_connector")
     assert stopped_remote.resource_id == "12345.7"
-    assert stopped_remote.outcome == "stopped"
-    assert stopped_remote.metadata["parent_scheduler_job_retained"] is True
-    assert sum("connector-step-status" in command for command in allocation_commands) == 3
-    assert sum("connector-step-cancel" in command for command in allocation_commands) == 1
-    assert reverified == ["paraview-live-1", "paraview-live-1"]
-    assert reverified_settings == [supervisor.settings, supervisor.settings]
+    assert stopped_remote.outcome == "refused"
+    assert stopped_remote.residual is True
+    assert "scancel 12345.7" in str(stopped_remote.detail)
+    assert any("scancel 12345.7" in error for error in stopped.errors)
+    assert allocation_commands == []
 
 
 def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
@@ -2047,13 +1956,13 @@ def test_quiesced_owner_keep_scheduler_recovery_reverifies_without_stopped_api(
     assert observed_settings == [settings]
 
 
-def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
+def test_jarvis_bind_refuses_a_scheduler_backed_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A Slurm-backed JARVIS service is served with serve, not an allocation connector."""
     queue, definition, job, artifact, envelope = _source_result(tmp_path)
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
         queue=queue,
         definition=definition,
@@ -2062,12 +1971,9 @@ def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
         package_id="paraview-1",
         package_name="builtin.paraview",
     )
+    assert verified.binding.scheduler_native_id == "12345"
     supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(
-            core_dir=tmp_path / "core",
-            spool_dir=tmp_path / "spool",
-            frpc_bin="frpc-test",
-        ),
+        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
         queue=queue,
         cluster=definition.name,
         definition=definition,
@@ -2075,45 +1981,20 @@ def test_bound_runtime_scheduler_cancel_requires_fresh_binding_reverification(
         secret_key="secret",
         sleep=lambda _seconds: None,
     )
-    monkeypatch.setattr(supervisor, "_stop_local_connector", _fake_local_connector_stop)
-    monkeypatch.setattr(supervisor, "_ssh", _fake_connector_ssh)
-    canceled: list[str] = []
 
-    def request_cancel(*, provider: str, scheduler_job_id: str) -> None:
-        canceled.append(f"{provider}:{scheduler_job_id}")
+    def no_ssh(script: str) -> str:
+        raise AssertionError(f"a refused bind ran a remote command: {script}")
 
-    def scheduler_terminal(**_kwargs: object) -> str:
-        return "canceled"
+    monkeypatch.setattr(supervisor, "_ssh", no_ssh)
 
-    monkeypatch.setattr(supervisor, "_request_scheduler_provider_cancel", request_cancel)
-    monkeypatch.setattr(
-        supervisor,
-        "_wait_for_scheduler_terminal",
-        scheduler_terminal,
-    )
-    started = supervisor.bind_verified_jarvis_runtime(
-        name="paraview-live",
-        verified=verified,
-        desktop_bind_port=28777,
-    )
-    binding = dict(started.session.gateway["jarvis_runtime_binding"])
-    binding["service_revision"] = 4
-    queue.update_gateway_session(
-        started.session.session_id,
-        gateway={**started.session.gateway, "jarvis_runtime_binding": binding},
-    )
+    with pytest.raises(ConfigurationError, match="serve the service with the serve tool"):
+        supervisor.bind_verified_jarvis_runtime(
+            name="paraview-live",
+            verified=verified,
+            desktop_bind_port=28777,
+        )
 
-    stopped = supervisor.stop(
-        session_id=started.session.session_id,
-        cancel_scheduler_job=True,
-    )
-
-    assert canceled == []
-    scheduler = next(item for item in stopped.resources if item.kind == "scheduler_job")
-    assert scheduler.action == "cancel"
-    assert scheduler.outcome == "refused"
-    assert scheduler.residual is True
-    assert "re-verification failed" in str(scheduler.detail)
+    assert queue.list_gateway_sessions(cluster=definition.name) == []
 
 
 def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
@@ -2121,7 +2002,7 @@ def test_jarvis_bind_preserves_local_connector_intent_after_lost_start_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A local sidecar and intent survive ambiguity without cleanup or replacement."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -2230,7 +2111,7 @@ def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A retry may change observation bounds, but not connector side-effect policy."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -2281,66 +2162,6 @@ def test_jarvis_bind_rejects_policy_change_without_creating_another_gateway(
     assert sessions[0].state is GatewaySessionState.STARTING
 
 
-def test_jarvis_bind_fails_closed_on_definitive_scheduler_terminal_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A proven terminal allocation is failure evidence, not a pending observation."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
-    monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
-    verified = resolve_jarvis_service_runtime(
-        queue=queue,
-        definition=definition,
-        source_job_id=job.job_id,
-        source_artifact_id=artifact.artifact_id,
-        package_id="paraview-1",
-        package_name="builtin.paraview",
-    )
-    supervisor = ServiceRuntimeSupervisor(
-        settings=RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool"),
-        queue=queue,
-        cluster=definition.name,
-        definition=definition,
-        token="token",
-        secret_key="secret",
-        sleep=lambda _seconds: None,
-    )
-
-    def fail_connector(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise RelayError("scheduler connector placement is unavailable")
-
-    def completed_status(**_kwargs: object) -> SchedulerStatus:
-        return SchedulerStatus(
-            scheduler="slurm",
-            scheduler_job_id="12345",
-            phase=SchedulerPhase.COMPLETED,
-            record_found=True,
-            active_record_found=False,
-        )
-
-    def no_connectors(session: GatewaySession) -> GatewaySession:
-        return session
-
-    monkeypatch.setattr(supervisor, "_start_remote_connector", fail_connector)
-    monkeypatch.setattr(supervisor, "_poll_scheduler_provider", completed_status)
-    monkeypatch.setattr(supervisor, "_reconcile_ownership_intents", no_connectors)
-
-    with pytest.raises(
-        RelayError,
-        match="scheduler job reached a terminal state before its verified JARVIS service",
-    ):
-        supervisor.bind_verified_jarvis_runtime(
-            name="paraview-terminal",
-            verified=verified,
-            desktop_bind_port=28777,
-        )
-
-    persisted = queue.list_gateway_sessions(cluster=definition.name)[0]
-    assert persisted.state is GatewaySessionState.FAILED
-    assert persisted.scheduler_job_id == "12345"
-    assert "terminal state" in str(persisted.metadata["last_error"])
-
-
 @pytest.mark.parametrize("operation", ["stop", "detach"])
 def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_binding(
     tmp_path: Path,
@@ -2348,7 +2169,7 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
     operation: str,
 ) -> None:
     """Cleanup cannot close or detach without an exact scheduler disposition."""
-    queue, definition, job, artifact, envelope = _source_result(tmp_path)
+    queue, definition, job, artifact, envelope = _source_result(tmp_path, execution_mode="direct")
     monkeypatch.setattr(runtime_binding, "read_artifact_bytes", _envelope_reader(envelope))
     _patch_connector_start(monkeypatch)
     verified = resolve_jarvis_service_runtime(
@@ -2410,6 +2231,7 @@ def _source_result(
     bind_relay_jarvis: bool = True,
     expected_registered_contract: str | None = None,
     server_artifact: dict[str, Any] | None = None,
+    execution_mode: Literal["direct", "scheduler"] = "scheduler",
 ) -> tuple[ClioCoreQueue, ClusterDefinition, RelayJob, ArtifactRef, dict[str, Any]]:
     queue = ClioCoreQueue(tmp_path / "core")
     resolved_server_artifact = (
@@ -2455,6 +2277,7 @@ def _source_result(
         digest=digest,
         spec=cast(McpCallSpec, job.spec),
         server_artifact=resolved_server_artifact,
+        execution_mode=execution_mode,
     )
     payload = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     artifact = ArtifactRef(
@@ -2488,7 +2311,9 @@ def _mcp_result_document(
     digest: str,
     spec: McpCallSpec,
     server_artifact: dict[str, Any],
+    execution_mode: Literal["direct", "scheduler"] = "scheduler",
 ) -> dict[str, Any]:
+    scheduled = execution_mode == "scheduler"
     submission = {
         "schema_version": "jarvis.scheduler.submission.v1",
         "execution_id": "execution-1",
@@ -2498,32 +2323,32 @@ def _mcp_result_document(
         "submitted": True,
         "identity_source": "scheduler_submit_api",
     }
+    ownership: dict[str, Any] = {
+        "mode": execution_mode,
+        "scheduler_provider": "slurm" if scheduled else None,
+        "scheduler_native_id": "12345" if scheduled else None,
+        "cluster": "test-cluster" if scheduled else None,
+    }
     handle = {
         "schema_version": "jarvis.execution.handle.v1",
         "execution_id": "execution-1",
         "pipeline_id": "pipeline-1",
-        "mode": "scheduler",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "cluster": "test-cluster",
+        **ownership,
     }
     record = {
         "schema_version": "jarvis.execution.record.v1",
         "execution_id": "execution-1",
         "pipeline_id": "pipeline-1",
         "pipeline_name": "pipeline-1",
-        "mode": "scheduler",
-        "scheduler_provider": "slurm",
-        "scheduler_native_id": "12345",
-        "cluster": "test-cluster",
+        **ownership,
         "state": "running",
-        "submitted": True,
+        "submitted": scheduled,
         "terminal": False,
         "created_at": "2026-07-15T02:00:00Z",
         "updated_at": "2026-07-15T02:01:00Z",
         "return_code": None,
         "error": None,
-        "metadata": {"submission": submission},
+        "metadata": {"submission": submission} if scheduled else {},
     }
     progress = {
         "schema_version": "jarvis.execution.progress.v1",
