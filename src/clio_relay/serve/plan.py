@@ -170,7 +170,7 @@ def plan_ports(spec: ServiceSpec) -> list[PortPlan]:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env):
                 raise Refusal(
                     RefusalReason.INVALID_SPEC,
-                    f"port {port.name!r}: {port.protection!r} does not name an environment variable",
+                    f"port {port.name!r}: {port.protection!r} names no environment variable",
                 )
         ports.append(
             PortPlan(
@@ -211,7 +211,10 @@ def check_wrappable(spec: ServiceSpec) -> None:
 
 def substitute(values: list[str], env: dict[str, str]) -> list[str]:
     """Fill ``${CLIO_RELAY_...}`` in arguments from the service's environment."""
-    return [_PLACEHOLDER.sub(lambda match: env.get(match.group(1), match.group(0)), value) for value in values]
+    return [
+        _PLACEHOLDER.sub(lambda match: env.get(match.group(1), match.group(0)), value)
+        for value in values
+    ]
 
 
 def ports_file(plan: ServePlan) -> bytes:
@@ -228,7 +231,9 @@ def secrets_file(values: dict[str, str]) -> bytes:
     lines: list[str] = []
     for name, value in sorted(values.items()):
         if "'" in value or "\n" in value:
-            raise Refusal(RefusalReason.INVALID_CONFIG, f"secret {name} has a character it cannot carry")
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG, f"secret {name} has a character it cannot carry"
+            )
         lines.append(f"export {name}='{value}'")
     return ("\n".join(lines) + "\n").encode()
 
@@ -242,7 +247,10 @@ def site_frpc_config(plan: ServePlan) -> bytes:
     proxy_url: str | None = None
     if site.hop == "login" and plan.hop is not None:
         proxy_url = (
-            "http://relay:{{ .Envs." + frp.ENV_HOP_TOKEN + " }}@" + f"{plan.hop.host}:{plan.hop.port}"
+            "http://relay:{{ .Envs."
+            + frp.ENV_HOP_TOKEN
+            + " }}@"
+            + f"{plan.hop.host}:{plan.hop.port}"
         )
     elif site.hop == "http_proxy":
         proxy_url = site.proxy_url
@@ -250,7 +258,9 @@ def site_frpc_config(plan: ServePlan) -> bytes:
         address=site.address or rendezvous.address,
         port=site.port or rendezvous.port,
         protocol=rendezvous.protocol,
-        ca_file="{{ .Envs.CLIO_RELAY_JOB_DIR }}/serve/ca.pem" if rendezvous.protocol == "wss" else None,
+        ca_file="{{ .Envs.CLIO_RELAY_JOB_DIR }}/serve/ca.pem"
+        if rendezvous.protocol == "wss"
+        else None,
         server_name=rendezvous.tls_name(),
         proxy_url=proxy_url,
     )
@@ -279,7 +289,9 @@ def ca_bytes(rendezvous: Rendezvous) -> bytes:
     try:
         return Path(os.path.expanduser(path)).read_bytes()
     except OSError as exc:
-        raise Refusal(RefusalReason.INVALID_CONFIG, f"cannot read the CA file: {exc.strerror}") from exc
+        raise Refusal(
+            RefusalReason.INVALID_CONFIG, f"cannot read the CA file: {exc.strerror}"
+        ) from exc
 
 
 def site_files(plan: ServePlan) -> dict[str, bytes]:
@@ -296,8 +308,8 @@ def site_files(plan: ServePlan) -> dict[str, bytes]:
             if not site.frpc_binary:
                 raise Refusal(
                     RefusalReason.INVALID_CONFIG,
-                    f"site {plan.site!r} has no frp client: set its serve frpc (a path on the site) "
-                    "or frpc_binary (a local frpc built for the site, which relay stages)",
+                    f"site {plan.site!r} has no frp client: set its serve frpc (a site path), "
+                    "or frpc_binary (a local frpc built for the site, which relay copies in)",
                     site=plan.site,
                 )
             try:

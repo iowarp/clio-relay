@@ -26,7 +26,11 @@ SOURCE = {
 
 def schema_bytes() -> bytes:
     """Return the vendored schema file, with the line endings it was published with."""
-    data = resources.files("clio_relay.serve").joinpath("schemas", "view-descriptor.v1.json").read_bytes()
+    data = (
+        resources.files("clio_relay.serve")
+        .joinpath("schemas", "view-descriptor.v1.json")
+        .read_bytes()
+    )
     return data.replace(b"\r\n", b"\n")
 
 
@@ -42,8 +46,9 @@ def schema() -> dict[str, Any]:
 
 def problems(descriptor: Any) -> list[str]:
     """Return what is wrong with a descriptor, or nothing."""
-    validator = Draft202012Validator(schema())
+    validator: Any = Draft202012Validator(schema())
+    errors: list[Any] = list(validator.iter_errors(descriptor))
     return [
         f"{'/'.join(str(part) for part in error.absolute_path) or '(root)'}: {error.message}"
-        for error in sorted(validator.iter_errors(descriptor), key=lambda e: list(e.absolute_path))
+        for error in sorted(errors, key=lambda e: [str(part) for part in e.absolute_path])
     ]

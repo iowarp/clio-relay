@@ -261,7 +261,9 @@ class ServeRuntime:
         """Plan the service, stage its files and submit the wrapped job."""
         existing = self._cached(operation_id)
         if existing is not None and existing.handle is not None:
-            return existing.endpoint(note="starting", connect_command=self.connect_command(existing))
+            return existing.endpoint(
+                note="starting", connect_command=self.connect_command(existing)
+            )
         site_id = str(adapter.context.site_id)
         loaded = serve_settings.load(self.settings_file)
         entry = self.sites.get(site_id)
@@ -330,9 +332,10 @@ class ServeRuntime:
     async def _exec(
         self, adapter: Any, plan: ServePlan, argv: list[str], *, check: bool = True
     ) -> ExecResult:
-        hop_exec = getattr(adapter, "hop_exec", None)
+        hop_exec: Any = getattr(adapter, "hop_exec", None)
+        result: ExecResult
         if callable(hop_exec):
-            result: ExecResult = await hop_exec(plan.site, argv)
+            result = await hop_exec(plan.site, argv)
         else:
             result = await adapter.exec(
                 argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT
@@ -426,7 +429,9 @@ class ServeRuntime:
             )
         return f"{plan.job_dir.rstrip('/')}/{SERVE_DIR}/{name}"
 
-    async def _read(self, plan: ServePlan, adapter: Any, name: str, *, tail: int = 0) -> bytes | None:
+    async def _read(
+        self, plan: ServePlan, adapter: Any, name: str, *, tail: int = 0
+    ) -> bytes | None:
         try:
             files: FileAccess = await adapter.files()
             path = self._path(plan, name)
@@ -498,7 +503,9 @@ class ServeRuntime:
                 plan.forward_pid = pid
                 self._save(plan)
 
-            forward = Forward(plan, self.state_dir / "serve" / "forwards" / plan.operation_id, restarted)
+            forward = Forward(
+                plan, self.state_dir / "serve" / "forwards" / plan.operation_id, restarted
+            )
             self.forwards[plan.operation_id] = forward
         if adapter is not None and plan.mode == "ssh":
             transport = getattr(adapter, "transport", None)
@@ -602,8 +609,9 @@ class ServeRuntime:
         elif reason == "idle":
             parts.append("released after its idle time")
         elif reason == "port_taken":
+            node = plan.host or "the node"
             parts.append(
-                f"refused: a port the service needs was already in use on {plan.host or 'the node'}; "
+                f"refused: a port the service needs was already in use on {node}; "
                 "serve/launch.log in the job directory names it"
             )
         elif reason == "exited":

@@ -71,7 +71,9 @@ def proxy_name(operation_id: str, port_name: str) -> str:
     return f"relay-{operation_id}-{port_name}"
 
 
-def render_site(common: Common, ports: list[tuple[str, int]], operation_id: str, *, direct: bool) -> str:
+def render_site(
+    common: Common, ports: list[tuple[str, int]], operation_id: str, *, direct: bool
+) -> str:
     """The frpc beside the service: one STCP proxy per port, plus XTCP when direct."""
     lines = common.render()
     for name, port in ports:

@@ -46,7 +46,9 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
         raise Refusal(RefusalReason.INVALID_CONFIG, "no rendezvous host is set")
     ca_file: str | None = None
     if rendezvous.protocol == "wss":
-        ca_file = os.path.expanduser(rendezvous.ca_file) if rendezvous.ca_file else frp.default_ca_file()
+        ca_file = (
+            os.path.expanduser(rendezvous.ca_file) if rendezvous.ca_file else frp.default_ca_file()
+        )
     common = frp.desktop_common(rendezvous, ca_file)
     config = frp.render_visitor(
         common,
@@ -213,7 +215,9 @@ class Forward:
                     backoff = 1.0
                 continue
             self.restarts += 1
-            self._log(f"forward ended, starting it again on the same port (restart {self.restarts})")
+            self._log(
+                f"forward ended, starting it again on the same port (restart {self.restarts})"
+            )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_S)
             if self.closing:

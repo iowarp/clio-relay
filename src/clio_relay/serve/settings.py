@@ -98,7 +98,9 @@ class SiteServe(BaseModel):
     hop_advertise: str | None = Field(
         default=None, description="The login hop's address as compute nodes see it"
     )
-    frpc: str | None = Field(default=None, description="frpc on the site. Otherwise relay stages it")
+    frpc: str | None = Field(
+        default=None, description="frpc on the site. Otherwise relay stages it"
+    )
     frpc_binary: str | None = Field(
         default=None, description="A local frpc built for the site, to stage"
     )

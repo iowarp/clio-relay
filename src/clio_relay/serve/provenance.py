@@ -8,7 +8,7 @@ It replaces ``models_gateway``'s lifting of the CLIO-specific
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -56,12 +56,13 @@ def for_output(record: OperationRecord, output: OutputRef) -> Provenance:
     """Return the provenance of one output of an operation."""
     package: PackageProvenance | None = None
     raw_job: Any = record.spec.get("job", record.spec)
-    if isinstance(raw_job, dict):
-        raw_package: Any = raw_job.get("package")  # pyright: ignore[reportUnknownMemberType]
-        if isinstance(raw_package, dict):
-            package = PackageProvenance.model_validate(
-                {key: raw_package.get(key) for key in ("name", "version", "sha256")}  # pyright: ignore[reportUnknownMemberType]
-            )
+    job: dict[str, Any] = cast(dict[str, Any], raw_job) if isinstance(raw_job, dict) else {}
+    raw_package: Any = job.get("package")
+    if isinstance(raw_package, dict):
+        fields = cast(dict[str, Any], raw_package)
+        package = PackageProvenance.model_validate(
+            {key: fields.get(key) for key in ("name", "version", "sha256")}
+        )
     return Provenance(
         operation_id=record.operation_id,
         site=record.site,

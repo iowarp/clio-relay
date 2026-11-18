@@ -1,3 +1,5 @@
+# ruff: noqa
+# It runs on the site's own Python, which may be old: no walrus, no newer syntax.
 """A CONNECT proxy on a cluster's login side, for compute nodes that cannot dial out.
 
 Relay runs it with ``python3 -c`` through the adapter's login-side command
@@ -21,7 +23,8 @@ import threading
 import time
 
 target_host, target_port = sys.argv[1].lower(), int(sys.argv[2])
-bind_host, advertise = sys.argv[3], sys.argv[4].strip("-")
+bind_host = sys.argv[3]
+advertise = "" if sys.argv[4] == "-" else sys.argv[4]
 idle_exit = float(sys.argv[5])
 token = secrets.token_urlsafe(24)
 expected = "basic " + base64.b64encode(f"relay:{token}".encode()).decode()
@@ -50,7 +53,10 @@ last_used = time.monotonic()
 
 def pump(source: socket.socket, sink: socket.socket) -> None:
     try:
-        while data := source.recv(65536):
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
             sink.sendall(data)
     except OSError:
         pass
@@ -75,7 +81,7 @@ def handle(client: socket.socket) -> None:
         head, _, rest = request.partition(b"\r\n\r\n")
         lines = head.decode("latin-1").split("\r\n")
         parts = lines[0].split()
-        headers: "dict[str, str]" = {}
+        headers: dict[str, str] = {}
         for line in lines[1:]:
             name, _, value = line.partition(":")
             headers[name.strip().lower()] = value.strip()

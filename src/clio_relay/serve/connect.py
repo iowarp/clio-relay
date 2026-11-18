@@ -32,7 +32,9 @@ def decode(handle: str) -> dict[str, Any]:
     except ValueError as exc:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, "that is not a connect handle") from exc
     if not isinstance(payload, dict) or payload.get("v") != 1:  # pyright: ignore[reportUnknownMemberType]
-        raise Refusal(RefusalReason.INVALID_ARGUMENTS, "that connect handle is from another version")
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS, "that connect handle is from another version"
+        )
     return payload  # pyright: ignore[reportUnknownVariableType]
 
 
@@ -42,6 +44,9 @@ def visitor_plan(
     """Return the plan a desktop visitor needs, from a handle and the local setting."""
     payload = decode(handle)
     chosen = ports or {}
+    listed: list[tuple[str, Any, int]] = [
+        (str(name), protocol, int(local)) for name, protocol, local in payload["ports"]
+    ]
     return ServePlan(
         operation_id=str(payload["op"]),
         site="connect",
@@ -49,8 +54,10 @@ def visitor_plan(
         service="connect",
         mode="frp",
         ports=[
-            PortPlan(name=name, protocol=protocol, remote_port=0, local_port=chosen.get(name, local))
-            for name, protocol, local in payload["ports"]
+            PortPlan(
+                name=name, protocol=protocol, remote_port=0, local_port=chosen.get(name, local)
+            )
+            for name, protocol, local in listed
         ],
         secret_key=str(payload["sk"]),
         rendezvous=rendezvous.model_copy(update={"direct": bool(payload.get("direct"))}),

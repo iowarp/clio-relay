@@ -123,8 +123,12 @@ class Mounter:
             def factory() -> Client[Any]:
                 return client
 
+            # fastmcp leaves the client type parameter open in these signatures.
+            proxy_tool: Any = ProxyTool
+            proxy_resource: Any = ProxyResource
+            proxy_template: Any = ProxyTemplate
             tools: list[Tool] = [
-                ProxyTool.from_mcp_tool(factory, tool).model_copy(
+                proxy_tool.from_mcp_tool(factory, tool).model_copy(
                     update={"name": f"{prefix}{tool.name}"}
                 )
                 for tool in listed
@@ -133,17 +137,17 @@ class Mounter:
             templates: list[ResourceTemplate] = []
             with contextlib.suppress(Exception):
                 resources = [
-                    ProxyResource.from_mcp_resource(factory, item)
+                    proxy_resource.from_mcp_resource(factory, item)
                     for item in await client.list_resources()
                 ]
             with contextlib.suppress(Exception):
                 templates = [
-                    ProxyTemplate.from_mcp_template(factory, item)
+                    proxy_template.from_mcp_template(factory, item)
                     for item in await client.list_resource_templates()
                 ]
         except BaseException:
             with contextlib.suppress(Exception):
-                await client.__aexit__(None, None, None)
+                await _close(client)
             raise
         mount = Mount(operation_id, prefix, url, client, tools, resources, templates)
         self.provider.mounts[operation_id] = mount
@@ -156,7 +160,7 @@ class Mounter:
         if mount is None:
             return
         with contextlib.suppress(Exception):
-            await mount.client.__aexit__(None, None, None)
+            await _close(mount.client)
         await self._announce(resources=bool(mount.resources or mount.templates))
 
     async def _announce(self, *, resources: bool) -> None:
@@ -173,3 +177,7 @@ class Mounter:
         """Close every held client."""
         for operation_id in list(self.provider.mounts):
             await self.unmount(operation_id)
+
+
+async def _close(client: Any) -> None:
+    await client.__aexit__(None, None, None)
