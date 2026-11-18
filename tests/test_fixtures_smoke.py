@@ -433,7 +433,7 @@ def _structured(result: Any) -> dict[str, Any]:
 def test_counter_mcp_keeps_one_session_and_runs_a_task() -> None:
     _needs("counter")
     from fastmcp import Client
-    from fastmcp_tasks import ToolTask, call_tool_task
+    from fastmcp_tasks import ToolTask, call_tool_task  # pyright: ignore[reportUnknownVariableType]
 
     # fastmcp_tasks types its client parameter as a bare generic Client.
     start_task = cast(Callable[..., Awaitable[ToolTask]], call_tool_task)
