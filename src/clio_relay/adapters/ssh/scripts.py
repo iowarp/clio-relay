@@ -167,7 +167,10 @@ fi
         for name, digest in inputs
     )
     return (
-        _head(remote_dir, operation_id)
+        # A dropped connection must not stop a submit between the scheduler's answer
+        # and the record of it.
+        "trap '' HUP PIPE\n"
+        + _head(remote_dir, operation_id)
         + 'umask 077\nmkdir -p "$J" "$R/content/cas/sha256" "$R/psij"\n'
         + f"{move_blobs}\n{launcher}"
         + 'if [ -f "$J/submit.rc" ] && [ "$(cat "$J/submit.rc")" != 0 ]; then\n'
@@ -313,21 +316,14 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     return body
 
 
-def find_script(remote_dir: str, operation_id: str, scheduler: str, job_name: str) -> str:
-    """Find a submission from its job directory, else from the scheduler by name."""
-    name = q(job_name)
+def find_script(remote_dir: str, operation_id: str) -> str:
+    """Find a submission from its job directory, which is named by the operation (RL17)."""
     return (
         _head(remote_dir, operation_id)
         + 'echo "@@root $R"\n'
         + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; '
         + 'echo "@@used $(cat "$J/scheduler" 2>/dev/null)"; '
-        + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo; exit 0; fi\n'
-        + _detect(scheduler)
-        + 'case "$S" in\n'
-        + f'slurm) echo "@@ids"; squeue --me -h -t all -n {name} -o %i 2>/dev/null; '
-        + f"sacct -n -X -P --name {name} -o JobID 2>/dev/null ;;\n"
-        + f'pbs) echo "@@ids"; qselect -x -N {name} 2>/dev/null ;;\n'
-        + "esac\n"
+        + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo; fi\n'
     )
 
 

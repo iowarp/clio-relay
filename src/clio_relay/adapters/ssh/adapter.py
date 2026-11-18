@@ -219,6 +219,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 )
             blobs.append(self.context.content.path_for(digest))
 
+        if scheduler is not None:
+            _executor(scheduler, self.render_dir)  # import PSI/J on this thread, not a worker
         rendered = await asyncio.to_thread(self._render, spec, scheduler, root, job_dir, name)
         rendered.files["spec.json"] = spec.model_dump_json(indent=2)
         rendered.files["inputs.json"] = json.dumps(
@@ -360,7 +362,11 @@ class SshAdapter(BaseAdapter[SshConfig]):
         psij_context["script_dir"] = str(job_dir)
         buffer = io.StringIO()
         executor.generate_submit_script(job, context, buffer)
-        rendered.files["submit.sh"] = buffer.getvalue()
+        script = buffer.getvalue()
+        if scheduler == "pbs":
+            # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
+            script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
+        rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))
         rendered.launcher_dir = launcher_dir
@@ -368,36 +374,14 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return rendered
 
     async def find(self, operation_id: str) -> JobHandle | None:
-        name = job_name(operation_id)
         sections = parse_sections(
             await self._ssh(
-                scripts.find_script(
-                    self.config.remote_dir, operation_id, self.config.scheduler, name
-                ),
-                "finding the job",
+                scripts.find_script(self.config.remote_dir, operation_id), "finding the job"
             )
         )
         root = PurePosixPath(_one(sections, "root") or "")
         job_dir = root / "jobs" / operation_id
-        existing = self._existing(sections, root, job_dir, name)
-        if existing is not None:
-            return existing
-        detected = _one(sections, "scheduler") or "none"
-        ids = [line.strip() for line in sections.get("ids", []) if line.strip()]
-        if detected in _SCHEDULERS and ids:
-            scheduler = cast(SchedulerName, detected)
-            return JobHandle(
-                adapter=self.name,
-                native_id=ids[0],
-                data={
-                    "mode": "scheduler",
-                    "scheduler": scheduler,
-                    "root": str(root),
-                    "job_dir": str(job_dir),
-                    "job_name": name,
-                },
-            )
-        return None
+        return self._existing(sections, root, job_dir, job_name(operation_id))
 
     # status
 
