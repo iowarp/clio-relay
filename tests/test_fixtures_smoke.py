@@ -2,8 +2,9 @@
 
 They run against fixtures that ``scripts/ares/fixtures.sh up`` started, and read the
 env file it wrote: ``$CLIO_RELAY_FIXTURES_ENV``, or by default
-``~/clio-relay-rework/state/w2-fixtures/fixtures.env``. Without that file the module
-is skipped, so an ordinary run elsewhere is unaffected.
+``~/clio-relay-rework/state/w2-fixtures/fixtures.env``. Without that file
+``tests/conftest.py`` leaves the module uncollected, so an ordinary run elsewhere is
+unaffected; the module-level skip below only covers a direct import.
 """
 
 from __future__ import annotations
