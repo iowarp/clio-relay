@@ -688,12 +688,8 @@ class RelayServer:
             ] = 0,
             limit: Annotated[int | None, Field(ge=1)] = None,
             overwrite: bool = False,
-            final: Annotated[
-                bool, Field(description="False while more write chunks follow")
-            ] = True,
-            recursive: Annotated[
-                bool, Field(description="Delete a directory that is not empty")
-            ] = False,
+            final: Annotated[bool, Field(description="False while more chunks follow")] = True,
+            recursive: Annotated[bool, Field(description="Delete a non-empty directory")] = False,
             digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
         ) -> ToolResult:
             """Files up to 4 MiB move inline. A larger upload is chunks of up to 4 MiB:
