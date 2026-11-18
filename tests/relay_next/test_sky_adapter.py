@@ -187,7 +187,7 @@ def test_secrets_come_from_relays_token_store(
 
 
 def test_the_old_keyring_service_setting_is_refused(tmp_path: Path) -> None:
-    credentials = {"provider": "aws", "service": "clio-relay", "env": {}}
+    credentials: dict[str, object] = {"provider": "aws", "service": "clio-relay", "env": {}}
     with pytest.raises(ValidationError):
         SkyConfig.model_validate({**local_config(tmp_path), "credentials": credentials})
 
