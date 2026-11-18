@@ -44,6 +44,11 @@ _WORDS = {
 }
 
 
+# Labels a property name can't give. Globus's ``endpoint`` would read as the page's own
+# "Endpoint", so it names the Globus Compute endpoint it is.
+_LABELS = {("globus", "endpoint"): "Globus Compute endpoint ID"}
+
+
 def humanize(key: str) -> str:
     """Return a field label for a property name.
 
@@ -141,7 +146,7 @@ def form(adapter: str, schema: dict[str, Any], *, listed: bool = True) -> Form:
         fields.append(
             Field(
                 key=key,
-                label=humanize(key),
+                label=_LABELS.get((adapter, key)) or humanize(key),
                 kind=kind,
                 help=cast(str | None, own.get("description")),
                 required=key in required,

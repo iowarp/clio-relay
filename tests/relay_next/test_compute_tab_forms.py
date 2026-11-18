@@ -6,7 +6,7 @@ import asyncio
 
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui.components import Tree
-from clio_relay.surface.a2ui.forms import Field, Kind, field_components
+from clio_relay.surface.a2ui.forms import Field, Kind, field_components, form
 from clio_relay.surface.settings import RelayPaths
 
 from .a2ui_host import Host, a2ui_client
@@ -31,6 +31,14 @@ def test_every_field_carries_its_own_error_as_a_check() -> None:
     ids = field_components(tree, "c", Field("x", "X", "choice", options=("a",)), "/d/x", "Wrong")
     assert ids == ["c", "c-error"]
     assert "checks" not in tree.components[0]
+
+
+def test_globus_names_its_compute_endpoint() -> None:
+    """Globus's ``endpoint`` would read as the page's own word, so its label says which."""
+    schema = {"properties": {"endpoint": {"type": "string"}}, "required": ["endpoint"]}
+    assert form("globus", schema).fields[0].label == "Globus Compute endpoint ID"
+    assert form("globus", schema).fields[0].key == "endpoint"
+    assert form("other", schema).fields[0].label == "Endpoint"
 
 
 def test_add_from_catalog(relay_paths: RelayPaths) -> None:
