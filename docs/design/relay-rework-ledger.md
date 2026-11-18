@@ -444,9 +444,10 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 
 All of this is unit and mock evidence.
 
-- **Gate on Ares** at `83f81dc` (integration `14e8edd` merged), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
-  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 95 passed, none skipped. The kit now asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The four new globus tests cover the endpoint start: no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit.
-  - The earlier gate, at `3015e81`, gave 82 passed and 5 skipped, before the kit asserted refusals.
+- **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
+  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 99 passed, none skipped. The kit asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The globus endpoint-start tests cover no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit. The four W6 tests cover the `SecretStr` token and async `IdentityStatus`, `shared().get` over `identity.get`, cloud keys read from `TokenStore`, and the old `credentials.service` setting refused.
+  - The same modules, ruff and pyright on a scratch merge with `-w6` at `4bad7cb` (local, not pushed): exit 0, 99 passed, clean, 0 errors. A smoke script on that merge with `CLIO_RELAY_KEYRING=memory` showed `tokens.provider("globus")` returning W6's `GlobusIdentity`, status `signed_out`, the bearer refusing `needs_sign_in`, the sky adapter asking `keyring:aws-access-key-id`, and after `TokenStore().set_secret` the key handed to SkyPilot's environment.
+  - Earlier gates: `83f81dc` gave 95 passed; `3015e81` gave 82 passed and 5 skipped, before the kit asserted refusals.
   - `uv run ruff check` and `ruff format --check` on the W11 paths: clean.
   - `pyright` 1.1.411 on the W11 paths: 0 errors.
 - **What the mocks cover.**
