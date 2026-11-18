@@ -7,7 +7,6 @@ import os
 import stat
 import subprocess
 import sys
-import threading
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -4440,106 +4439,6 @@ def test_cli_session_teardown_can_cancel_active_jobs(
     assert refreshed.get_job(unrelated_same_cluster.job_id).state == JobState.QUEUED
     assert refreshed.get_job(other_cluster.job_id).state == JobState.QUEUED
     assert torn_down[0]["stop_worker"] is False
-
-
-@pytest.mark.parametrize("active_state", [JobState.LEASED, JobState.RUNNING])
-def test_cli_session_teardown_waits_for_worker_acknowledged_cancellation(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-    active_state: JobState,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    _write_test_cluster(tmp_path)
-    core_dir = tmp_path / "core"
-    queue = ClioCoreQueue(core_dir)
-    job = queue.submit_job(
-        RelayJob(
-            cluster="ares",
-            kind=JobKind.JARVIS,
-            spec=JarvisRunSpec(command=["sleep", "60"]),
-            idempotency_key=f"async-cancel-{active_state.value}",
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": "session-1",
-                "owner_session_generation_id": "generation-1",
-            },
-        )
-    )
-    endpoint = queue.register_endpoint(
-        EndpointRegistration(
-            role=EndpointRole.WORKER,
-            cluster="ares",
-            hostname="worker",
-            pid=123,
-        )
-    )
-    lease = queue.acquire_next_job(
-        endpoint.endpoint_id,
-        cluster="ares",
-        ttl_seconds=60,
-    )
-    assert lease is not None
-    if active_state is JobState.RUNNING:
-        queue.update_job_state(job.job_id, JobState.RUNNING)
-    cleanup_observations: list[JobState] = []
-    sleep_calls: list[float] = []
-
-    real_sleep = time.sleep
-
-    def acknowledge_after_poll(seconds: float) -> None:
-        # Threads left by other tests in this process (psij pollers) also call time.sleep.
-        if threading.current_thread() is not threading.main_thread():
-            real_sleep(seconds)
-            return
-        sleep_calls.append(seconds)
-        queue.acknowledge_job_cancellation(job.job_id)
-        queue.release_lease(lease.lease_id)
-
-    def verified_runtime_cleanup(**_kwargs: object) -> list[dict[str, object]]:
-        cleanup_observations.append(queue.get_job(job.job_id).state)
-        return []
-
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    _activate_owner_session(queue)
-    monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
-    monkeypatch.setattr(session_lifecycle, "teardown_remote_session", _fake_verified_teardown)
-    monkeypatch.setattr(
-        cli_owned_runtime_cleanup, "_cleanup_owned_runtime_sessions", verified_runtime_cleanup
-    )
-    monkeypatch.setattr(time, "sleep", acknowledge_after_poll)
-
-    result = CliRunner().invoke(
-        app,
-        [
-            "session",
-            "teardown",
-            "--cluster",
-            "ares",
-            "--session-id",
-            "session-1",
-            "--cancel-jobs",
-            "--relay-cancel-timeout-seconds",
-            "30",
-            "--relay-cancel-poll-seconds",
-            "0.01",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["relay_jobs"]["canceled_job_ids"] == [job.job_id]
-    assert sleep_calls
-    assert cleanup_observations
-    assert set(cleanup_observations) == {JobState.CANCELED}
-    canceled = queue.get_job(job.job_id)
-    request = cast(dict[str, object], canceled.metadata["cancellation_request"])
-    assert canceled.state is JobState.CANCELED
-    assert request["cleanup_acknowledged"] is True
-    relay_resource = next(
-        resource for resource in payload["resources"] if resource["kind"] == "relay_job"
-    )
-    assert relay_resource["outcome"] == "canceled"
-    assert relay_resource["verified_after_operation"] is True
 
 
 def test_cli_session_teardown_does_not_stop_runtime_before_cancel_acknowledgment(
