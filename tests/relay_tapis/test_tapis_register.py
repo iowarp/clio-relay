@@ -13,7 +13,7 @@ import contextlib
 import os
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Generator
 from pathlib import Path
 from typing import cast
 
@@ -68,7 +68,7 @@ def _record_open(event: str, args: tuple[object, ...]) -> None:
 
 
 @contextlib.contextmanager
-def _files_opened() -> Iterator[list[str]]:
+def _files_opened() -> Generator[list[str]]:
     """Record every file this process opens inside the block (an audit hook)."""
     global _hooked
     if not _hooked:

@@ -254,6 +254,27 @@ async def test_refresh_replaces_the_access_token(
 
 
 @pytest.mark.asyncio
+async def test_lifetimes_and_a_forced_refresh_show_no_token(
+    stub: TapisStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_memory_keyring(monkeypatch)
+    found = await sign_in(stub)
+    first = await found.access_token()
+    assert first is not None
+    times = found.lifetimes()
+    assert times["account"] == USERNAME and times["can_refresh"]
+    assert times["access"]["remaining_s"] > 29 * 86400
+    assert times["refresh"]["expires_at"] is not None
+    assert await found.refresh_now()
+    second = await found.access_token()
+    assert second is not None and second != first
+    shown = json.dumps(found.lifetimes())
+    store = cast(MemoryStore, found.store)
+    for secret in _secrets(stub, store) | {first, second}:
+        assert secret not in shown
+
+
+@pytest.mark.asyncio
 async def test_without_the_client_key_there_is_no_refresh(
     stub: TapisStub, monkeypatch: pytest.MonkeyPatch
 ) -> None:

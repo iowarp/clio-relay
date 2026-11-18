@@ -7,6 +7,9 @@ from relay's ``sites.yaml``. Commands:
   and wait until the person approves it. The tokens go to the keyring and are
   never printed.
 - ``status``: the TACC sign-in state, without tokens.
+- ``lifetimes``: when each stored token was issued and expires, read from its
+  claims. No token is printed.
+- ``refresh``: refresh the access token now, to check the refresh grant.
 - ``describe``: what the adapter reports for the site.
 - ``register-host`` and ``unregister-host``: register or remove the site's
   Tapis system and the person's credential (RL48, RL49).
@@ -96,6 +99,14 @@ async def _main(args: argparse.Namespace) -> int:
     if args.command == "status":
         _print((await adapter.identity.status()).model_dump(mode="json"))
         return 0
+    if args.command == "lifetimes":
+        _print(adapter.identity.lifetimes())
+        return 0
+    if args.command == "refresh":
+        refreshed = await adapter.identity.refresh_now()
+        _say("A new access token was issued." if refreshed else "No refresh was possible.")
+        _print(adapter.identity.lifetimes())
+        return 0 if refreshed else 1
     if args.command == "describe":
         _print((await adapter.describe()).model_dump(mode="json"))
         return 0
@@ -112,7 +123,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m clio_relay.adapters.tapis")
     parser.add_argument(
         "command",
-        choices=["sign-in", "sign-out", "status", "describe", "register-host", "unregister-host"],
+        choices=[
+            "sign-in",
+            "sign-out",
+            "status",
+            "lifetimes",
+            "refresh",
+            "describe",
+            "register-host",
+            "unregister-host",
+        ],
     )
     parser.add_argument("--site", required=True, help="The site's id in sites.yaml")
     args = parser.parse_args(argv)

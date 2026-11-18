@@ -370,6 +370,132 @@ Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `j
 
 ## W10. Tapis
 
+Branch `jaimecernuda-relay-rework-w10`; the commit sent to W1 is named in the report to the coordinator. Rows: RL46 to RL49 (RL50's plugin row is W14's), LQ35 to LQ40, and the live rows LQ-L14, LQ-L15 and LQ-L17. Page: [docs/adapters/tapis.md](../adapters/tapis.md).
+
+Files: `src/clio_relay/adapters/tapis/` (adapter, client, files, launcher, mapping, register, the `python -m clio_relay.adapters.tapis` driver and `tapisjob_app.sh`), `src/clio_relay/identity/tacc.py`, `catalog/sites/{chameleon-tapis,ares-tapis,vista,stampede3}.yaml` and their skills, `tests/fixtures/tapis_stub/` and `tests/relay_tapis/`.
+
+### Decisions
+
+- **Every Tapis call goes through tapipy 25.4.0, in a worker thread.** `client.TapisClient.tapis_call(service, operation, **kwargs)` builds one `Tapis` object per call from the keyring token, with no spec download (`resource_set="local"`). An HTTP 401 becomes `needs_sign_in`; other errors become typed refusals carrying Tapis's own message. Reason: tapipy is synchronous, and a stored client would hold a token past its refresh.
+- **The launcher is one shell script in a gzip tar, run by Tapis's `ZIP` runtime (RL47).** The tar is byte-stable (mtime 0, USTAR, fixed mode). The app id is the system id for a relay-made system, otherwise `clio-relay.<username>.<system id>`, and the version is `1.0-<first 10 hex of the script's SHA-256>`, so a changed launcher is a new app version and an old job keeps its own. The archive goes to `<work dir>/launcher/` through Tapis Files.
+- **The job spec travels as one base64 argument** of NUL-terminated fields. Reason: nothing is quoted through a shell, and Tapis's argument handling cannot split it.
+- **Inputs are staged by content into `<work dir>/content/<sha256>` and passed as `tapislocal` file inputs.** Tapis does not copy them; the launcher links them into the job's directory. The launcher writes `relay.exitcode`, which `status` reads once the job ends.
+- **`find` searches Tapis jobs for the description `clio-relay op <operation id>`** (`getJobSearchList` with `description.eq`), so a retried `run` after a restart finds the job it already submitted.
+- **Job type:** `BATCH` on a Slurm system, `FORK` on a system with no scheduler and `canExec`. Any other scheduler is refused with `verb_not_implemented`.
+- **`exec` and `serve` are not implemented** and route to the site's `ssh` or `worker` alternative. The catalog's `ares-tapis` and `chameleon-tapis` name `ssh`; `vista` and `stampede3` name `worker`, because those hosts ask for a second factor.
+- **Guarded sites refuse a free-form `run` in the adapter, before any Tapis call,** with `policy_refused` and `next_step: package_review`. The service's own guard (W13) refuses first when it is installed.
+- **Own host (`authn: pki`).** Relay reads the login, home and Slurm partitions through the site's `ssh` alternative, creates `clio-relay.<username>.<site id>` (job working directory `~/.clio-relay/tapis`, one logical queue per partition), makes a new RSA 4096 pair in a private temp file, appends the public key to `authorized_keys` with the comment `clio-relay-tapis:<system id>`, gives the pair to Tapis with `createUserCredential`, and deletes the private file. If Tapis's credential check fails, the key line is taken back out. `unregister-host` removes the credential, the system only when relay made it, and the key line.
+- **TACC host (`authn: tms`).** Relay calls `createUserCredential` with `createTmsKeys=true` and makes no key. It never creates or deletes a TACC system.
+- **The TACC identity is the device code grant, kept in the keyring (RL48).** `TaccIdentity` implements W6's `IdentityProvider` with `relay_page=False`: the ask carries TACC's own `https` page and the short user code. The device code, the access token and the refresh token stay in the keyring (service `clio-relay`) and are never logged, written to relay's files or returned. Refresh uses the `refresh_token` grant and needs the client key; a refused refresh signs out and the next call asks again. The types are mirrored from W6's published interface until W6 merges, and become imports then.
+- **No hard limits.** Jobs, sign-ins and transfers have none. The device code's own 600 s expiry is Tapis's, and an expired code fails the step so a new one is issued.
+- **A driver for live runs:** `python -m clio_relay.adapters.tapis {status,sign-in,sign-out,lifetimes,refresh,describe,register-host,unregister-host} --site <id>`. It prints the page, the code and token expiry times, never a token. It is the run sheets' tool and the TACC demo's.
+
+### Facts
+
+- **tapipy 25.4.0 operations behind each call** (read from the 25.4.0 wheel's bundled specs):
+
+  | Call | Operations |
+  | --- | --- |
+  | sign-in | `authenticator.generate_device_code`, `authenticator.create_token` (`grant_type=device_code`) |
+  | refresh | `authenticator.create_token` (`grant_type=refresh_token`, client id and key) |
+  | sign-out | `authenticator.revoke_token` (access and refresh) |
+  | describe | `systems.getSystem`, `systems.checkUserCredential` |
+  | run | `apps.getApp`, `apps.createAppVersion`, `files.insert`, `files.mkdir`, `files.getStatInfo`, `jobs.submitJob` |
+  | status, cancel | `jobs.getJob`, `jobs.getJobStatus`, `jobs.cancelJob` |
+  | find | `jobs.getJobSearchList` |
+  | files | `files.listFiles`, `files.getContents`, `files.insert`, `files.mkdir`, `files.moveCopy`, `files.delete`, `files.getStatInfo` |
+  | register-host | `systems.createSystem` (`skipCredentialCheck`), `systems.createUserCredential` (PKI pair or `createTmsKeys`) |
+  | unregister-host | `systems.removeUserCredential`, `systems.deleteSystem` |
+
+- **Token lifetimes.** The Tapis authenticator issues device-code access tokens for 30 days, against the plan's assumed 4 h. A device code lives 600 s, and the authenticator sends no `interval` and no `slow_down`, so relay polls every 5 s (RFC 8628's default). The device code response's `expires_in` is a date string, not seconds. **The refresh-token lifetime is not yet known**; it is recorded at LQ-L14.
+- **TACC pages behind the catalog entries** (each fetched with HTTP 200):
+  - `vista`: https://docs.tacc.utexas.edu/hpc/vista/
+  - `stampede3`: https://docs.tacc.utexas.edu/hpc/stampede3/
+  - TACC's second factor: https://docs.tacc.utexas.edu/basics/mfa/
+  - `ares-tapis`: https://tapis.readthedocs.io/en/latest/technical/systems.html
+  - the sign-in: https://tapis.readthedocs.io/en/latest/technical/authentication.html
+  - `chameleon-tapis`: https://chameleoncloud.readthedocs.io/en/latest/getting-started/index.html
+- **Registration results for Ares and Chameleon: pending.** They need O5, O6 and the person's sign-in. Recorded at LQ-L14 and LQ-L17.
+- **Not yet confirmed against the real Tapis** (the stub follows the specs; each is checked in the live rows):
+  - `description.eq` in a job search;
+  - `getContents`'s `range` semantics, and `listFiles`'s size unit;
+  - whether `containerImage` for a `ZIP` app may be a path on the system;
+  - that `tapislocal` inputs are not copied;
+  - whether `batchLogicalQueues` must be set on a Slurm system;
+  - `${apiUserId}` in `effectiveUserId` together with a `loginUser` credential;
+  - that Tapis accepts the RSA PEM relay writes.
+
+### Evidence
+
+All on Ares, in `~/clio-relay-rework/clio-relay-w10` with its own venv (`uv sync --extra tapis`, plus `keyrings.alt`), against the stub in `tests/fixtures/tapis_stub` and W2's `fx-ssh` and `fx-slurm`. Ruff, format and pyright are clean on the W10 paths. Branch at 5adb058 (integration 14e8edd merged) plus the conformance and LQ40 test changes in the next commit.
+
+| Row | State | Command | What was read |
+| --- | --- | --- | --- |
+| LQ35 | Passed | `pytest tests/relay_tapis/test_tapis_conformance.py` | 11 of 11 with W1's kit at 14e8edd, including `test_exec_bounded`, `test_exec_without_time_limit` and `test_unimplemented_verbs_refuse` asserting `verb_not_implemented` for `exec` and `serve` |
+| LQ36 | Passed | `test_tapis_service.py::test_run_survives_a_restart`, `::test_find_reconciles_through_tapis_search` | The service is closed and reopened mid-job; the task completes. Operation states `awaiting_input, submitting, queued, running, completed`. Stub job history `PENDING` to `FINISHED` through Tapis's states. The task result carries the Tapis UUID. The request named `appId clio-relay.alice.tp`, `jobType FORK`, and a `tapislocal://exec.tapis/.../content/<sha256>` input with target `input.txt`. `find` returns the same job |
+| LQ37 | Passed with W7 | `test_tapis_service.py::test_describe_routes_exec_and_serve_to_ssh` | In a scratch worktree with `jaimecernuda-relay-rework-w7` (b44a2a8) merged: `exec` and `serve` route `{adapter: ssh, via: alternative}`; `describe`, `run` and `files` stay on `tapis`. On the integration branch alone it fails with `unavailable: {ssh: adapter_unavailable}`, because the ssh adapter is not merged |
+| LQ38 | Passed | `test_tapis_service.py::test_guarded_site_refuses_a_free_form_run` | The service refuses with `guard_unavailable` until W13's guard is installed; the adapter's own `run` refuses with `policy_refused`, `next_step: package_review`. The stub log has no `/v3/jobs` request |
+| LQ39 | Passed | `pytest tests/relay_tapis/test_tapis_identity.py` | 9 of 9. One URL elicitation: `https://tapis-stub.invalid/v3/oauth2/device?client_id=clio-relay-test`, "Sign in to TACC. Open the TACC page, enter the code XXXX and sign in with your TACC account." No password asked. The access token, refresh token, device code and client key are absent from the ask records, relay's log, relay's state files and the MCP transcript. A client without elicitation gets `needs_sign_in` with the same `https` page and resumes once the ask is answered. Throttled polling, an expired code, refresh, no client key, a refused refresh, sign-out, and the driver's `lifetimes` and `refresh` (no token in their output) each pass |
+| LQ40 | Passed | `pytest tests/relay_tapis/test_tapis_register.py` | 3 of 3. `Registration(system_id='clio-relay.alice.lq40', created_system=True, authn='pki', login_user='relay', key_installed=True, private_key_deleted=True)`. The stub's credential check logs in to `fx-ssh` with the registered key, and the public key is in `authorized_keys`. An audit hook on `open` during registration saw 5 files, none under `~/.ssh` or the fixture's ssh directory. Removal `{credential: True, system: True, key_line: True}`. A refused credential gives `submit_failed` "Credential check failed: no login" and the key line is gone. On `fx-slurm` the queues are `[compute, debug]` and the job type is `BATCH` |
+
+Also on Ares:
+- **The TMS path** (`test_a_tacc_host_gets_a_tms_credential_and_no_key`): `Registration(system_id='stampede3-tapis-stub', created_system=False, authn='tms', key_installed=False)`. Unregistering removes the credential only.
+- **The live driver against the standalone stub** (`python -m tests.fixtures.tapis_stub --port 47180`, file keyring in scratch, `fx-ssh` as the host): `status` signed_out; `sign-in` prints the page and the code, then "Signed in." with source keyring, account alice, expiry 30 days out; `register-host` and `describe` report credential ok, job type `FORK` and app `clio-relay.alice.fx-tapis` version `1.0-540fce7250`; `unregister-host` returns all true; `sign-out` returns to signed_out. No token appears in the output.
+
+### Run sheets for the live rows
+
+All three are **pending**, never passed. They wait on the owner blockers below. The person signs in and supplies credentials; W10 runs the rows. Before each run: `ssh ares`, `cd ~/clio-relay-rework/clio-relay-w10`, `git pull`, `~/.local/bin/uv sync --extra tapis`. The person sets the OAuth client in the shell themselves (`export CLIO_RELAY_TACC_CLIENT_ID=...` and `CLIO_RELAY_TACC_CLIENT_KEY=...`); neither is pasted into a chat. `T=python -m clio_relay.adapters.tapis`.
+
+**Sign-in (shared by all three).**
+1. `uv run $T sign-in --site chameleon-tapis`. It prints TACC's page and a code.
+2. The person opens the page, enters the code, and signs in with their TACC account and second factor. The driver prints "Signed in."
+3. `uv run $T status --site chameleon-tapis`. Record `account` and `expires_at`, never a token.
+4. `uv run $T lifetimes --site chameleon-tapis`. It prints, from the tokens' claims, when each token expires and the seconds left, and no token text. Record the access lifetime (expected 30 days) and **the refresh-token lifetime**, the ledger fact still open.
+5. `uv run $T refresh --site chameleon-tapis`. Expect "A new access token was issued." This confirms the refresh grant with relay's client key.
+
+**LQ-L14, `chameleon-tapis`.** Needs O3, O4, O5.
+1. Add `chameleon-tapis` from the catalog, with `alternatives.ssh.ssh_profile` set to the person's profile for the node. Check `ssh <profile> hostname` first.
+2. `uv run $T register-host --site chameleon-tapis`. Record the whole `Registration` (system id, login user, key installed, private key deleted, Tapis's message).
+3. `uv run $T describe --site chameleon-tapis`. Expect credential ok and job type `FORK`.
+4. Start relay's MCP server on that site list and, from an MCP client, call `run` with `/bin/sh -c "hostname; date; echo relay-l14 > out.txt"`. Poll the task to completion.
+5. Record the Tapis job UUID from the task result, and the time from `submitting` to `running` from the operation's history.
+6. Read `out.txt` back with the `files` tool and check it says `relay-l14`.
+7. Keep the system for LQ-L15. After LQ-L15: `uv run $T unregister-host --site chameleon-tapis`, then check `grep clio-relay-tapis ~/.ssh/authorized_keys` on the node is empty.
+
+**LQ-L15, the TACC demo on `chameleon-tapis`.** Needs LQ-L14, and on the node: `jarvis` on PATH with the `clio_jarvis` repo added (W5, O1), ADIOS2 and MPI for the solvers. Needs W14's ParaView tab (and W15's follow) on the desktop side.
+1. From the agent, ask: "Run Gray-Scott on Chameleon through Tapis and show me the field."
+2. Expect a package `run` (`clio_jarvis.gray_scott`, version and SHA-256), a Tapis job UUID, the outputs read back through Tapis Files, and the BP5 output opening in the ParaView tab.
+3. Repeat with Xcompact3d (`clio_jarvis.xcompact3d`, TGV).
+4. Record both UUIDs, both submit-to-running times, and a screenshot of each field, in the science log.
+
+**LQ-L17, `ares-tapis`.** Needs O3, O4, O6.
+1. Add `ares-tapis` from the catalog (`alternatives.ssh.ssh_profile: ares`).
+2. `uv run $T register-host --site ares-tapis`. Record the `Registration`, including the queues (Ares's Slurm partitions).
+3. **The contract exception.** If Tapis's credential check cannot log in to Ares from TACC, the driver prints `submit_failed` with Tapis's own message, and the key line is removed. Record that message verbatim as the row's result; LQ-L14 then carries the adapter. Stop here.
+4. Otherwise `describe` (job type `BATCH`), then `run` from an MCP client with `/bin/sh -c "hostname; echo relay-l17 > out.txt"` on queue `debug`.
+5. Record the Tapis job UUID, the Slurm job id Tapis reports (`remoteJobId` in `getJob`), and the submit-to-running time.
+6. Read `out.txt` back with `files`. Then `unregister-host` and check the key line is gone from `~/.ssh/authorized_keys` on Ares.
+
+### Owner blockers
+
+| Blocker | What the person supplies | Rows |
+| --- | --- | --- |
+| O3 | A TACC account, signed in once through the driver | LQ-L14, LQ-L15, LQ-L17 |
+| O4 | An OAuth client in the `tacc` tenant: its id and key, set as `CLIO_RELAY_TACC_CLIENT_ID` and `CLIO_RELAY_TACC_CLIENT_KEY` | All three. Without the key, sign-in works but refresh does not |
+| O5 | A leased Chameleon node with a floating IP, and an SSH profile for it | LQ-L14, LQ-L15 |
+| O6 | Confirmation that Ares accepts SSH from outside IIT with a key and no second factor, and that a key held by Tapis is acceptable | LQ-L17 |
+| O7 | TACC's answers on Vista and Stampede3: whether relay's TMS credential and a `ZIP` app are allowed there, and the allocation to use | Catalog entries `vista` and `stampede3`; no live row yet |
+
+### Open
+
+- **The service does not resume a no-elicitation client after a device-flow sign-in.** `RelayService.advance` treats a pending URL ask as waiting and never asks the adapter whether sign-in is still needed. With `relay_page=False` nothing answers the ask, so the client stays at `needs_sign_in` until someone answers it. Suggested: for a pending URL ask, resolve it as accepted when `sign_in_needed()` returns None. Owner of `surface/service.py`.
+- **W6:** with `relay_page=False`, the identity driver must call `poll` at `poll_interval_s` until done, and re-ask with a new code when `poll` reports the code expired.
+- **Adding a catalog site does not register the host yet.** Until an add-site hook calls `register_host`, the run sheets call `register-host` by hand.
+- **LQ37 passes only once W7 merges.**
+- **W13:** confirm the command the launcher's package mode runs (`jarvis` with the unpacked `clio_jarvis` package).
+- **W1:** link `docs/adapters/tapis.md` from the docs index; note `tests/relay_tapis/` as a test directory.
+- **Shared fixture:** LQ40 edits `fx-ssh`'s `authorized_keys` only on lines with the comment `clio-relay-tapis:<system id>`, and removes them in `finally`.
+
 ## W11. globus, iri and sky
 
 Branch `jaimecernuda-relay-rework-w11`, from `6b32300`. Code: `src/clio_relay/adapters/{globus,iri,sky}/`. Catalog: `catalog/sites/{polaris,aurora,deltaai}.yaml` and the skills `alcf-polaris`, `alcf-aurora` and `ncsa-deltaai`. Pages: `docs/adapters/{globus,iri,sky}.md`. hpc-bridge was read as a reference only; nothing is imported from it.

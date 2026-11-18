@@ -44,8 +44,11 @@ You can also sign in from a terminal:
 ```
 python -m clio_relay.adapters.tapis sign-in --site ares-tapis
 python -m clio_relay.adapters.tapis status --site ares-tapis
+python -m clio_relay.adapters.tapis lifetimes --site ares-tapis
 python -m clio_relay.adapters.tapis sign-out --site ares-tapis
 ```
+
+`lifetimes` prints when each stored token expires, without the tokens.
 
 ### The OAuth client
 

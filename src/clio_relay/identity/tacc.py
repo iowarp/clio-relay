@@ -358,10 +358,14 @@ class TaccIdentity:
         record.account = str(claims.get("tapis/username") or record.account or "") or None
         if refresh.get("refresh_token"):
             record.refresh_token = str(refresh["refresh_token"])
+            refresh_exp = jwt_claims(record.refresh_token).get("exp")
             refresh_in = refresh.get("expires_in")
-            record.refresh_expires_at = (
-                now + _seconds(refresh_in, 0) if refresh_in is not None else None
-            )
+            if isinstance(refresh_exp, int | float):
+                record.refresh_expires_at = float(refresh_exp)
+            else:
+                record.refresh_expires_at = (
+                    now + _seconds(refresh_in, 0) if refresh_in is not None else None
+                )
         record.pending = None
         return record
 
@@ -442,6 +446,44 @@ class TaccIdentity:
         """Return the access token text, for relay's own Tapis client only."""
         found = await self.token()
         return None if found is None else found.access_token.get_secret_value()
+
+    def lifetimes(self) -> dict[str, Any]:
+        """When each stored token was issued and expires, from its claims. No token text."""
+        record = self._load()
+
+        def times(token: str | None, expires_at: float | None) -> dict[str, Any] | None:
+            if token is None:
+                return None
+            claims = jwt_claims(token)
+            issued = claims.get("iat")
+            now = self.clock()
+            out: dict[str, Any] = {
+                "issued_at": issued,
+                "expires_at": expires_at,
+                "remaining_s": None if expires_at is None else round(expires_at - now),
+                "lifetime_s": (
+                    expires_at - issued
+                    if isinstance(issued, int | float) and expires_at is not None
+                    else None
+                ),
+            }
+            return out
+
+        return {
+            "account": record.account,
+            "access": times(record.access_token, record.access_expires_at),
+            "refresh": times(record.refresh_token, record.refresh_expires_at),
+            "can_refresh": self._can_refresh(record),
+        }
+
+    async def refresh_now(self) -> bool:
+        """Refresh the access token now, whatever its expiry. True when a new one arrived."""
+        record = self._load()
+        if not self._can_refresh(record):
+            return False
+        before = record.access_token
+        fresh = await self._refresh(record)
+        return fresh.access_token is not None and fresh.access_token != before
 
     def pending(self) -> PendingCode | None:
         pending = self._load().pending
