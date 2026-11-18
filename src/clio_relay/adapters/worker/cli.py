@@ -30,7 +30,6 @@ import clio_relay.adapters.worker.cli_cluster as cli_cluster
 import clio_relay.adapters.worker.cli_endpoint as cli_endpoint
 import clio_relay.adapters.worker.cli_init as cli_init
 import clio_relay.adapters.worker.cli_installation_receipt as cli_installation_receipt
-import clio_relay.adapters.worker.cli_jarvis_runtime_authority as cli_jarvis_runtime_authority
 import clio_relay.adapters.worker.cli_queue as cli_queue
 import clio_relay.adapters.worker.cli_relay_host as cli_relay_host
 import clio_relay.adapters.worker.cli_scheduler as cli_scheduler
@@ -97,9 +96,6 @@ worker_app.command("installation-write-receipt")(
 )
 worker_app.command("installation-info")(cli_installation_receipt.show_installation_info)
 worker_app.command("bootstrap-inspect", hidden=True)(cli_installation_receipt.bootstrap_inspect)
-worker_app.command("jarvis-runtime-authority", hidden=True)(
-    cli_jarvis_runtime_authority.jarvis_runtime_authority
-)
 worker_app.command("site-serve", hidden=True)(site_server.site_serve_command)
 
 

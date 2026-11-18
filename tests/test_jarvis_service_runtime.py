@@ -1,33 +1,25 @@
-"""JARVIS service runtime models, the retired binding, and the authority transport.
+"""JARVIS service runtime models and the retired binding.
 
 Relay no longer binds JARVIS service runtimes (their ``mcp_call`` source job
 kind is retired). These tests keep the stored-record models readable, prove a
-stored binding is refused with what a person must stop, and keep the private
-authority transport bounded.
+stored binding is refused with what a person must stop.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from fastapi.testclient import TestClient
 
 import clio_relay.jarvis_service_runtime as runtime_binding
-import clio_relay.remote_cli as remote_cli_module
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.cluster_config import (
-    CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
-    ClusterRegistry,
     FrpTransportConfig,
-    cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
@@ -39,12 +31,8 @@ from clio_relay.jarvis_service_runtime import (
     reverify_jarvis_service_runtime,
 )
 from clio_relay.models import (
-    ArtifactRef,
     GatewaySession,
     GatewaySessionState,
-    JobKind,
-    RelayJob,
-    RemoteAgentTaskSpec,
 )
 from clio_relay.service_runtime import ServiceRuntimePendingResult, ServiceRuntimeSupervisor
 from tests.test_service_runtime import (
@@ -89,8 +77,8 @@ def test_service_runtime_v1_remains_readable_but_cannot_smuggle_authorization() 
         JarvisServiceRuntime.model_validate(runtime)
 
 
-def test_owned_private_authority_api_cannot_start_without_api_token(tmp_path: Path) -> None:
-    """A secret-returning owned API must fail before serving without authentication."""
+def test_owned_session_api_cannot_start_without_api_token(tmp_path: Path) -> None:
+    """An owned session API must fail before serving without authentication."""
     settings = RelaySettings(
         core_dir=tmp_path / "core",
         spool_dir=tmp_path / "spool",
@@ -102,111 +90,6 @@ def test_owned_private_authority_api_cannot_start_without_api_token(tmp_path: Pa
 
     with pytest.raises(ConfigurationError, match="CLIO_RELAY_API_TOKEN"):
         create_app(settings)
-
-
-@pytest.mark.parametrize(
-    ("script", "maximum_stdout_bytes", "timeout_seconds", "expected_error"),
-    [
-        (
-            "import sys; "
-            "sys.stdout.write('a' * 64); sys.stdout.flush(); "
-            "sys.stderr.write('a' * 64); sys.exit(19)",
-            1024,
-            2.0,
-            "failed with exit code 19",
-        ),
-        (
-            "import sys; sys.stdout.write('a' * 4096); sys.stdout.flush()",
-            128,
-            2.0,
-            "response exceeded its byte limit",
-        ),
-        (
-            "import sys, time; sys.stdout.write('a' * 64); sys.stdout.flush(); time.sleep(5)",
-            1024,
-            0.05,
-            "timed out after 0.05 seconds",
-        ),
-    ],
-)
-def test_private_command_transport_bounds_and_redacts_all_failure_output(
-    script: str,
-    maximum_stdout_bytes: int,
-    timeout_seconds: float,
-    expected_error: str,
-) -> None:
-    """Exit, byte-limit, and timeout failures disclose no captured private output."""
-    token = "a" * 64
-
-    with pytest.raises(RelayError, match=expected_error) as caught:
-        remote_cli_module._run_bounded_private_command(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            [sys.executable, "-c", script],
-            timeout_seconds=timeout_seconds,
-            maximum_stdout_bytes=maximum_stdout_bytes,
-            label="private resolver",
-        )
-
-    assert token not in str(caught.value)
-
-
-def test_local_authority_invocation_is_bounded_and_exact(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The cluster-side wrapper invokes only JARVIS's identity-complete JSON resolver."""
-    commands: list[tuple[list[str], int | None]] = []
-    payload = json.dumps(_service_runtime_authority_document(token="a" * 64))
-
-    class FakeProvider:
-        def __init__(self, *, jarvis_bin: str) -> None:
-            assert jarvis_bin == "/released/bin/jarvis"
-
-        def require_available(self) -> None:
-            return None
-
-        def run_command_streaming(
-            self,
-            command: list[str],
-            *,
-            timeout_seconds: int | None = None,
-        ) -> subprocess.CompletedProcess[str]:
-            commands.append((command, timeout_seconds))
-            return subprocess.CompletedProcess(command, 0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(runtime_binding, "JarvisCdProvider", FakeProvider)
-    digest = hashlib.sha256(("a" * 64).encode("ascii")).hexdigest()
-    authority = runtime_binding.resolve_local_jarvis_service_runtime_authority(
-        jarvis_bin="/released/bin/jarvis",
-        execution_id="execution-1",
-        pipeline_id="pipeline-1",
-        package_id="paraview-1",
-        service_instance_id="paraview-live-1",
-        revision=3,
-        token_sha256=digest,
-    )
-
-    assert authority.token_sha256 == digest
-    assert commands == [
-        (
-            [
-                "/released/bin/jarvis",
-                "execution",
-                "resolve-service-runtime-authority",
-                "execution-1",
-                "--pipeline-id",
-                "pipeline-1",
-                "--package-id",
-                "paraview-1",
-                "--service-instance-id",
-                "paraview-live-1",
-                "--revision",
-                "3",
-                "--token-sha256",
-                digest,
-                "+json",
-            ],
-            30,
-        )
-    ]
 
 
 def test_dataset_descriptor_accepts_producer_null_optionals_but_canonicalizes_them() -> None:
@@ -287,108 +170,6 @@ def test_reverify_refuses_every_stored_binding(tmp_path: Path) -> None:
         )
 
     assert str(caught.value).startswith(_RETIRED)
-
-
-def test_owned_authority_endpoint_refuses_a_stored_binding(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The owned-session authority route answers a stored binding with a conflict."""
-    definition = _definition()
-    queue = ClioCoreQueue(tmp_path / "core")
-    job = queue.submit_job(
-        RelayJob(
-            cluster=definition.name,
-            kind=JobKind.REMOTE_AGENT,
-            spec=RemoteAgentTaskSpec(prompt_path="/remote/prompt.md"),
-            idempotency_key="retired-binding-source",
-            metadata={
-                "owner": "clio-relay",
-                "owner_session_id": "desktop-session-1",
-                "owner_session_generation_id": "generation-1",
-            },
-        )
-    )
-    source_root = tmp_path / "spool" / job.job_id
-    source_root.mkdir(parents=True)
-    source_path = source_root / "mcp-result.json"
-    source_path.write_bytes(b"{}")
-    artifact = queue.append_artifact(
-        ArtifactRef(
-            job_id=job.job_id,
-            uri=source_path.as_uri(),
-            kind="mcp_result",
-            size_bytes=2,
-            sha256=hashlib.sha256(b"{}").hexdigest(),
-        )
-    )
-    registry_path = tmp_path / "session-registry.json"
-    ClusterRegistry(clusters={definition.name: definition}).save(registry_path)
-    monkeypatch.setenv(CLUSTER_REGISTRY_ENV, str(registry_path))
-    monkeypatch.setenv(
-        "CLIO_RELAY_SESSION_REGISTRY_SHA256",
-        hashlib.sha256(registry_path.read_bytes()).hexdigest(),
-    )
-    monkeypatch.setenv("CLIO_RELAY_SESSION_ROUTE_REVISION", cluster_route_revision(definition))
-    settings = RelaySettings(
-        core_dir=tmp_path / "core",
-        spool_dir=tmp_path / "spool",
-        api_token="session-api-token",
-        owner_session_id="desktop-session-1",
-        owner_session_generation_id="generation-1",
-        owner_session_cluster=definition.name,
-        session_owner_token="o" * 32,
-        jarvis_bin="/released/bin/jarvis",
-    )
-    binding = _binding_document(
-        source_relay_job_id=job.job_id,
-        source_relay_artifact_id=artifact.artifact_id,
-        source_relay_artifact_sha256=artifact.sha256,
-        scheduler_provider="slurm",
-        scheduler_native_id="12345",
-    )
-
-    def forbidden(*_args: object, **_kwargs: object) -> Any:
-        raise AssertionError("a retired binding must not reach the JARVIS authority resolver")
-
-    monkeypatch.setattr(runtime_binding, "JarvisCdProvider", forbidden)
-    client = cast(Any, TestClient(create_app(settings)))
-    with client:
-        response = client.post(
-            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
-            headers={
-                "Authorization": "Bearer session-api-token",
-                "X-Clio-Relay-Owner-Session-Id": "desktop-session-1",
-                "X-Clio-Relay-Session-Generation-Id": "generation-1",
-            },
-            json={"binding": binding},
-        )
-
-    assert response.status_code == 409, response.text
-    assert _RETIRED in response.text
-    assert "Cancel slurm job 12345" in response.text
-
-
-def test_private_runtime_authority_endpoint_is_unavailable_on_non_owned_api(
-    tmp_path: Path,
-) -> None:
-    """An ordinary relay API never exposes the private authority transport."""
-    settings = RelaySettings(
-        core_dir=tmp_path / "ordinary-core",
-        spool_dir=tmp_path / "ordinary-spool",
-    )
-
-    client = cast(Any, TestClient(create_app(settings)))
-    with client:
-        response = client.post(
-            runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH,
-            json={"binding": _binding_document()},
-        )
-        paths = client.get("/openapi.json").json()["paths"]
-
-    assert runtime_binding.OWNED_SESSION_JARVIS_RUNTIME_AUTHORITY_PATH not in paths
-    assert response.status_code == 404
-    assert response.json()["detail"] == "owned JARVIS runtime authority resolver is unavailable"
 
 
 def _bound_session(tmp_path: Path) -> tuple[ServiceRuntimeSupervisor, ClioCoreQueue, str, str]:
@@ -544,20 +325,6 @@ def _service_runtime_document() -> dict[str, Any]:
         "dataset_descriptor": _dataset_descriptor(),
         "message": "service ready",
         "observed_at_epoch": 1_784_080_860.125,
-    }
-
-
-def _service_runtime_authority_document(*, token: str) -> dict[str, Any]:
-    """Return one exact private JARVIS authority response for the test runtime."""
-    return {
-        "authorization": {"scheme": "bearer", "token": token},
-        "execution_id": "execution-1",
-        "package_id": "paraview-1",
-        "pipeline_id": "pipeline-1",
-        "revision": 3,
-        "schema_version": "jarvis.execution.service-runtime-authority.v1",
-        "service_instance_id": "paraview-live-1",
-        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
     }
 
 

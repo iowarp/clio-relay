@@ -334,9 +334,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("session_status_unavailable", 404, "Session status unavailable"),
             _http_row("session_intake_quiescence_unavailable", 404, "Session intake unavailable"),
             _http_row("session_admission_status_unavailable", 404, "Session admission unavailable"),
-            _http_row(
-                "jarvis_runtime_authority_unavailable", 404, "JARVIS runtime authority unavailable"
-            ),
             _http_row("input_ingest_unavailable", 404, "Input ingest unavailable"),
             _http_row("job_not_found", 404, "Job not found"),
             _http_row("task_not_found", 404, "Task not found"),
@@ -355,11 +352,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("unbound_session_api", 409, "Unbound session API"),
             _http_row("job_cluster_mismatch", 409, "Job cluster mismatch"),
             _http_row("job_submission_conflict", 409, "Job submission conflict"),
-            _http_row(
-                "jarvis_runtime_authority_conflict",
-                409,
-                "JARVIS runtime authority conflict",
-            ),
             _http_row("jarvis_artifact_conflict", 409, "JARVIS artifact conflict"),
             _http_row("input_ingest_conflict", 409, "Input ingest conflict", retryable=True),
             _http_row("transform_conflict", 409, "Transform conflict"),

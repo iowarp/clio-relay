@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clio_relay.config import MAX_INPUT_FILE_MAX_BYTES
 from clio_relay.identifiers import DurableRecordId
-from clio_relay.jarvis_service_runtime import JarvisServiceRuntimeBinding
 from clio_relay.models import (
     ArtifactUse,
     GatewaySessionState,
@@ -317,11 +316,3 @@ class GatewaySessionUpdateRequest(BaseModel):
 
     _gateway_is_not_runtime_owned = field_validator("gateway")(_validate_generic_gateway_payload)
     _metadata_is_not_runtime_owned = field_validator("metadata")(_validate_generic_gateway_metadata)
-
-
-class JarvisRuntimeAuthorityRequest(BaseModel):
-    """Private exact-binding request accepted only by an owned session API."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    binding: JarvisServiceRuntimeBinding
