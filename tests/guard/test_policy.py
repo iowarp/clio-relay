@@ -7,12 +7,12 @@ from typing import Any, ClassVar
 import pytest
 
 from clio_relay.adapters import registry
+from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.hooks import Charge, GuardHook
 from clio_relay.guard import WARM_EXECUTABLE, Guard
 from clio_relay.jarvis_site import ARCHIVE_DIR
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
-from clio_relay.adapters.base import AdapterContext
 from clio_relay.testing.fixture_adapter import FixtureAdapter, FixtureConfig
 
 from .conftest import answer, make_repo, site, stage
@@ -159,8 +159,8 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
     lowered = await guard.prepare(hpc, package_spec(digest), adapter=adapter)
     assert lowered.package is None
     assert lowered.executable == "/bin/bash"
-    assert lowered.arguments[3:8] == ["clio-relay-package", digest, "demo.hello", "jarvis", ""]
-    assert lowered.arguments[8:] == ["out=result.txt", "steps=3"]
+    assert lowered.arguments[2:7] == ["clio-relay-package", digest, "demo.hello", "jarvis", ""]
+    assert lowered.arguments[7:] == ["out=result.txt", "steps=3"]
     assert [(item.name, item.sha256) for item in lowered.inputs] == [
         (f"{ARCHIVE_DIR}/{digest}.tar.gz", digest)
     ]
@@ -189,9 +189,7 @@ async def test_prepare_refuses_a_free_form_job_on_a_guarded_site(guard: Guard) -
 async def test_a_warm_allocation_is_allowed_everywhere_and_becomes_its_holder(
     guard: Guard,
 ) -> None:
-    warm = JobSpec.model_validate(
-        {"executable": WARM_EXECUTABLE, "resources": {"node_count": 2}}
-    )
+    warm = JobSpec.model_validate({"executable": WARM_EXECUTABLE, "resources": {"node_count": 2}})
     assert (await guard.check_run(site(), warm)).allowed
     with_args = warm.model_copy(update={"arguments": ["sleep", "1"]})
     assert not (await guard.check_run(site(), with_args)).allowed

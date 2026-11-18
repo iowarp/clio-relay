@@ -80,7 +80,9 @@ def test_srun_reaches_only_a_held_warm_allocation() -> None:
         ["srun", "--jobid=12", "--overlap", "srun", "--jobid=12", "--overlap", "ls"],
         warm_jobs=warm,
     )
-    assert execlist.refusal(["srun", "--jobid=12", "--overlap", "--export=ALL", "ls"], warm_jobs=warm)
+    assert execlist.refusal(
+        ["srun", "--jobid=12", "--overlap", "--export=ALL", "ls"], warm_jobs=warm
+    )
 
 
 def test_a_site_can_add_its_own_read_only_programs() -> None:

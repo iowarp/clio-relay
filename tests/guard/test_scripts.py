@@ -45,7 +45,8 @@ def _env(tmp_path: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in ("SLURM_JOB_ID", "SLURM_JOB_NODELIST", "PBS_NODEFILE", "PBS_JOBID", "JARVIS_ROOT")
+        if key
+        not in ("SLURM_JOB_ID", "SLURM_JOB_NODELIST", "PBS_NODEFILE", "PBS_JOBID", "JARVIS_ROOT")
     }
     env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     env["JARVIS_LOG"] = str(tmp_path / "jarvis.log")
@@ -150,7 +151,9 @@ def test_the_runner_expands_a_home_jarvis_path(tmp_path: Path) -> None:
     assert done.stdout.strip() == f"ran in {job}"
 
 
-def _holder(env: dict[str, str], cwd: Path, limit: int, step: int) -> subprocess.CompletedProcess[str]:
+def _holder(
+    env: dict[str, str], cwd: Path, limit: int, step: int
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["/bin/sh", "-c", HOLDER, WARM_EXECUTABLE, str(limit), str(step)],
         cwd=cwd,
@@ -202,7 +205,17 @@ def _clio_jarvis_remote(tmp_path: Path) -> tuple[Path, str]:
 
     git("init", "-q")
     git("add", ".")
-    git("-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "commit", "-qm", "x")
+    git(
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "x",
+    )
     git("tag", "v0.1.0")
     return remote, git("rev-parse", "HEAD")
 
@@ -231,10 +244,17 @@ async def test_rl42_adds_a_tagged_clio_jarvis_once(
         adapter, url=str(remote), tag="v0.1.0", base=str(base), jarvis=str(jarvis)
     )
     assert again["added"] is False
-    adds = [line for line in (tmp_path / "jarvis.log").read_text().splitlines() if "repo add" in line]
+    adds = [
+        line for line in (tmp_path / "jarvis.log").read_text().splitlines() if "repo add" in line
+    ]
     assert adds == [f"JARVIS_ROOT= repo add {repo}"]
     with pytest.raises(Refusal) as raised:
         await add_clio_jarvis(
-            adapter, url=str(remote), tag="v0.1.0", commit="0" * 40, base=str(base), jarvis=str(jarvis)
+            adapter,
+            url=str(remote),
+            tag="v0.1.0",
+            commit="0" * 40,
+            base=str(base),
+            jarvis=str(jarvis),
         )
     assert "not " + "0" * 40 in raised.value.message

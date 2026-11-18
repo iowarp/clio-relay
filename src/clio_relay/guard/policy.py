@@ -40,6 +40,7 @@ from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import route
 
 _MAX_LISTED_FILES = 40
+_PRICE: str = "price"  # an optional adapter method (sky); not on BaseAdapter
 
 PROCEED = (
     "Write or pick a JARVIS package for the work (the clio-jarvis packages, or a new one "
@@ -255,7 +256,7 @@ class Guard:
             cls = registry.load(name)
         except Refusal:
             return None
-        if not callable(getattr(cls, "price", None)):
+        if not callable(getattr(cls, _PRICE, None)):
             return None
         context = AdapterContext(
             site_id=site.id,
@@ -263,7 +264,7 @@ class Guard:
             content=self.content,
         )
         adapter = registry.build(name, config, context)
-        price = cast(Callable[[JobSpec], object], getattr(adapter, "price"))
+        price = cast(Callable[[JobSpec], object], getattr(adapter, _PRICE))
         result: object = price(spec)
         if inspect.isawaitable(result):
             result = await result
