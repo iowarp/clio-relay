@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import base64
+import contextlib
 import hashlib
 import importlib
 import json
@@ -46,6 +47,7 @@ from clio_relay.jobs.handles import (
     FileEntry,
     JobHandle,
     JobStatus,
+    StallReport,
 )
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -58,6 +60,9 @@ READY_MARKER = "CLIO_RELAY_WORKER_READY "
 _READ_CHUNK_BYTES = 4 * 1024 * 1024
 _MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024
 _CONNECT_ATTEMPTS = 20
+_CALL_S = 120.0
+# How long one exec poll waits on the site for output news before answering.
+_EXEC_POLL_WAIT_S = 20.0
 _REMOTE_DIR_PATTERN = re.compile(r"^(~/)?[A-Za-z0-9_./-]+$")
 
 
@@ -671,28 +676,61 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return None if reported is None else self._wrap(JobHandle.model_validate(reported))
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
-        reported = await self.call(
-            "/exec",
+        started = await self.call(
+            "/exec/start",
             {
                 "command": command,
                 "timeout_s": timeout_s,
                 "max_output_bytes": min(max_output_bytes, _MAX_EXEC_OUTPUT_BYTES),
             },
-            timeout_s=timeout_s + 120,
+            timeout_s=_CALL_S,
         )
-        return ExecResult.model_validate(reported)
+        exec_id = str(started["exec_id"])
+        seen = 0
+        try:
+            while True:
+                reply = await self.call(
+                    "/exec/poll",
+                    {"exec_id": exec_id, "after": seen, "wait_s": _EXEC_POLL_WAIT_S},
+                    timeout_s=_EXEC_POLL_WAIT_S + _CALL_S,
+                )
+                stalls: list[list[float]] = reply.get("stalls") or []
+                seen += len(stalls)
+                if on_stall is not None:
+                    for idle_s, next_s in stalls:
+                        await on_stall(float(idle_s), float(next_s))
+                if reply.get("done"):
+                    return ExecResult.model_validate(reply["result"])
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(
+                    self.call("/exec/cancel", {"exec_id": exec_id}, timeout_s=_CALL_S)
+                )
+            raise
 
     async def files(self) -> FileAccess:
         await self._connection()
         return WorkerFileAccess(self)
 
     async def hop_exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
         """Run a command on the worker's host. The serve hook uses it for its hop."""
-        return await self.exec(command, timeout_s=timeout_s, max_output_bytes=max_output_bytes)
+        return await self.exec(
+            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+        )
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
         try:

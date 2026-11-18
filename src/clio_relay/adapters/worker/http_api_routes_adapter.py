@@ -11,10 +11,13 @@ bytes travel as base64.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +29,22 @@ from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.local import LocalAdapter, LocalConfig
 from clio_relay.adapters.worker.http_api_context import RelayApiContext
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import FileAccess, JobHandle
+from clio_relay.jobs.handles import ExecResult, FileAccess, JobHandle
+from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
 ADAPTER_ROUTE_PREFIX = "/adapter"
+_POLL_WAIT_S = 20.0
+
+
+@dataclass
+class _RunningExec:
+    """One command started by ``exec/start``, until a poll collects its result."""
+
+    task: asyncio.Task[ExecResult] | None = None
+    stalls: list[tuple[float, float]] = field(default_factory=list[tuple[float, float]])
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 _NAMESPACE = re.compile(r"^[0-9a-f]{8,64}$")
@@ -181,8 +195,12 @@ def register_adapter_routes(
 
         return await _answer(action)
 
-    @app.post(f"{prefix}/exec", dependencies=[auth_dependency])
-    async def adapter_exec(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    running: dict[str, _RunningExec] = {}
+
+    @app.post(f"{prefix}/exec/start", dependencies=[auth_dependency])
+    async def adapter_exec_start(
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
         async def action() -> Any:
             command = body.get("command")
             timeout_s = body.get("timeout_s")
@@ -193,17 +211,81 @@ def register_adapter_routes(
                 or not all(isinstance(part, str) for part in command)
             ):
                 raise Refusal(RefusalReason.INVALID_ARGUMENTS, "command must be a list of strings")
-            if not isinstance(timeout_s, int | float) or timeout_s <= 0:
+            if timeout_s is not None and (
+                not isinstance(timeout_s, int | float) or timeout_s <= 0
+            ):
                 raise Refusal(RefusalReason.INVALID_ARGUMENTS, "timeout_s must be positive")
             if not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS, "max_output_bytes must be a positive integer"
                 )
             argv: list[str] = [str(part) for part in command]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
-            result = await _site_adapter(ctx, body).exec(
-                argv, timeout_s=float(timeout_s), max_output_bytes=max_output_bytes
+            adapter = _site_adapter(ctx, body)
+            exec_id = new_id("exec")
+            entry = _RunningExec()
+
+            async def on_stall(idle_s: float, next_s: float) -> None:
+                entry.stalls.append((idle_s, next_s))
+                entry.changed.set()
+
+            entry.task = asyncio.create_task(
+                adapter.exec(
+                    argv,
+                    timeout_s=None if timeout_s is None else float(timeout_s),
+                    max_output_bytes=max_output_bytes,
+                    on_stall=on_stall,
+                )
             )
-            return result.model_dump(mode="json")
+            entry.task.add_done_callback(lambda _: entry.changed.set())
+            running[exec_id] = entry
+            return {"exec_id": exec_id}
+
+        return await _answer(action)
+
+    @app.post(f"{prefix}/exec/poll", dependencies=[auth_dependency])
+    async def adapter_exec_poll(
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        async def action() -> Any:
+            exec_id = _text(body, "exec_id")
+            entry = running.get(exec_id)
+            if entry is None or entry.task is None:
+                raise Refusal(RefusalReason.OPERATION_NOT_FOUND, f"no command {exec_id} is running here")
+            after = body.get("after", 0)
+            wait_s = body.get("wait_s", _POLL_WAIT_S)
+            if not isinstance(after, int) or after < 0:
+                raise Refusal(RefusalReason.INVALID_ARGUMENTS, "after must be a count")
+            if not isinstance(wait_s, int | float) or wait_s < 0:
+                raise Refusal(RefusalReason.INVALID_ARGUMENTS, "wait_s must not be negative")
+            if len(entry.stalls) <= after and not entry.task.done():
+                entry.changed.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        entry.changed.wait(), timeout=min(float(wait_s), _POLL_WAIT_S)
+                    )
+            stalls = [list(item) for item in entry.stalls[after:]]
+            if not entry.task.done():
+                return {"done": False, "stalls": stalls}
+            running.pop(exec_id, None)
+            if entry.task.cancelled():
+                raise Refusal(RefusalReason.OPERATION_NOT_FOUND, f"command {exec_id} was cancelled")
+            result = entry.task.result()
+            return {"done": True, "stalls": stalls, "result": result.model_dump(mode="json")}
+
+        return await _answer(action)
+
+    @app.post(f"{prefix}/exec/cancel", dependencies=[auth_dependency])
+    async def adapter_exec_cancel(
+        body: dict[str, Any] = Body(default_factory=dict),
+    ) -> dict[str, Any]:
+        async def action() -> Any:
+            entry = running.pop(_text(body, "exec_id"), None)
+            if entry is None or entry.task is None:
+                return False
+            entry.task.cancel()
+            with contextlib.suppress(BaseException):
+                await entry.task
+            return True
 
         return await _answer(action)
 
