@@ -171,7 +171,7 @@ def require_frp_server_addr(server_addr: str, cluster: str) -> str:
         return server_addr
     raise ConfigurationError(
         f"frp server address is not configured for cluster {cluster}; "
-        "set it with `clio-relay cluster add --frp-server-addr ...`"
+        "set it with `clio-relay worker cluster add --frp-server-addr ...`"
     )
 
 

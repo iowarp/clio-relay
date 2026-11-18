@@ -103,6 +103,11 @@ def test_wrapped_job_keeps_secrets_out_of_arguments_and_environment(tmp_path: Pa
     assert job.environment["CLIO_RELAY_FRPC"] == "/opt/frp/frpc"
     assert job.attributes.duration is None
     assert [item.name for item in job.inputs] == ["serve/launch.sh"]
+    staged = wrapped_job(spec, plan, {"launch.sh": DIGEST, "secrets.env": DIGEST})
+    assert {item.name: item.transient for item in staged.inputs} == {
+        "serve/launch.sh": False,
+        "serve/secrets.env": True,
+    }
     dumped = json.dumps(job.model_dump(mode="json"))
     for secret in [*plan.secrets.values(), plan.secret_key, "frp-token-value"]:
         assert secret not in dumped
