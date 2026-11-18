@@ -215,6 +215,24 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
     asyncio.run(scenario())
 
 
+def test_a_reread_with_nothing_changed_is_identical(relay_paths: RelayPaths) -> None:
+    """The host re-renders a surface whose content changed, which resets a half-filled form."""
+    add_site(relay_paths)
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            first = await host.open()
+            assert await host.open() == first
+            name, context = host.action("relay-sites", "s-fx-probe-button")
+            assert not (await client.call_tool(name, context, raise_on_error=False)).is_error
+            await host.open()
+            _, fresh = host.action("relay-sites", "s-fx-probe-button")
+            assert fresh["token"] != context["token"], "a spent token is replaced"
+
+    asyncio.run(scenario())
+
+
 def test_a_token_rendered_by_one_relay_is_spent_by_another_once(
     relay_paths: RelayPaths,
 ) -> None:

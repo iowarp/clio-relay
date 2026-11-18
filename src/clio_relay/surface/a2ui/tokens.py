@@ -11,6 +11,12 @@ so each a separate relay process. Tokens therefore live in relay's state
 directory, one file per token named by the token's SHA-256, and spending one
 claims its file with an atomic rename: of two processes spending the same token,
 exactly one wins. Without a directory they live in memory (tests).
+
+A render asks for a token per button, and gets back the one it rendered before
+while that token is unspent and has most of its life left. So a re-read with
+nothing changed gives identical surfaces, and the host doesn't re-render them
+(which would reset a half-filled form). Once a token is spent, the next render
+mints a new one.
 """
 
 from __future__ import annotations
@@ -54,11 +60,32 @@ class ActionTokens:
         self._ttl_s = ttl_s
         self._capacity = capacity
         self._grants: OrderedDict[str, Grant] = OrderedDict()
+        self._issued: dict[tuple[str, str], tuple[str, float]] = {}
         self._lock = threading.Lock()
         self._minted = 0
 
     def mint(self, action: str, subject: str = "") -> str:
-        """Return a new token for ``action`` on ``subject``."""
+        """Return a token for ``action`` on ``subject``: the last one, while it is unspent."""
+        with self._lock:
+            issued = self._issued.get((action, subject))
+        if issued is not None:
+            token, expires = issued
+            if expires - time.time() > self._ttl_s / 2 and self._live(token):
+                return token
+        token = self._mint(action, subject)
+        with self._lock:
+            self._issued[(action, subject)] = (token, time.time() + self._ttl_s)
+            if len(self._issued) > self._capacity:
+                self._issued.pop(next(iter(self._issued)))
+        return token
+
+    def _live(self, token: str) -> bool:
+        if self._dir is None:
+            with self._lock:
+                return token in self._grants
+        return self._path(token).is_file()
+
+    def _mint(self, action: str, subject: str) -> str:
         token = secrets.token_urlsafe(24)
         grant = Grant(action, subject, time.time() + self._ttl_s)
         if self._dir is None:
