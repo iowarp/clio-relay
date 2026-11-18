@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, ClassVar, cast
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
@@ -27,6 +28,9 @@ from clio_relay.identity.tacc import PROVIDER, TaccIdentity, TaccSettings
 from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+
+if TYPE_CHECKING:
+    from clio_relay.sites.models import SiteEntry
 
 TAPIS_ID_MAX = 80
 _EXIT_IN_MESSAGE = re.compile(r"exit(?:ed)?(?: with)? code[ :=]*(-?\d+)", re.IGNORECASE)
@@ -138,8 +142,9 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
                 if exc.not_found:
                     raise Refusal(
                         RefusalReason.INVALID_CONFIG,
-                        f"Tapis has no system {system_id} for this person. Register the "
-                        "host first (python -m clio_relay.adapters.tapis register-host)",
+                        f"Tapis has no system {system_id} for this person. Add or switch to "
+                        "the site again to register the host, or run "
+                        "python -m clio_relay.adapters.tapis register-host",
                         site=self.context.site_id,
                         system=system_id,
                     ) from None
@@ -172,6 +177,28 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
 
     async def files(self) -> FileAccess:
         return await self._files()
+
+    # setting the site up
+
+    async def on_site_added(self, site: SiteEntry) -> dict[str, Any] | None:
+        """Register the person's host with Tapis, unless its credential already works.
+
+        Safe to run again: a credential that passes Tapis's check is left alone.
+        """
+        from clio_relay.adapters.tapis.register import register_host, ssh_for_site
+
+        username = await self.username()
+        system_id = await self.system_id()
+        try:
+            await self.tapis_call(
+                "systems", "checkUserCredential", systemId=system_id, userName=username
+            )
+        except TapisCallError:
+            pass
+        else:
+            return {"system_id": system_id, "registered": False, "credential": "ok"}
+        registration = await register_host(self, ssh_for_site(site))
+        return {"registered": True, "credential": "ok", **asdict(registration)}
 
     # describe
 
@@ -321,6 +348,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             job_dir=job_dir,
             content_dir_host=content_host,
             launcher_arg=launcher.encode(fields),
+            max_minutes=mapping.max_minutes(spec, system, kind),
         )
         try:
             submitted = cast(dict[str, Any], await self.tapis_call("jobs", "submitJob", **request))

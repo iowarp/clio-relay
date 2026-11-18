@@ -30,7 +30,12 @@ from typing import Any
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.config import TapisConfig
-from clio_relay.adapters.tapis.register import SshHost, register_host, unregister_host
+from clio_relay.adapters.tapis.register import (
+    SshHost,
+    register_host,
+    ssh_for_site,
+    unregister_host,
+)
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.sites.store import SiteStore
@@ -52,9 +57,7 @@ def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None]:
         content=ContentStore(paths.content_dir),
     )
     adapter = TapisAdapter(TapisConfig.model_validate(config), context)
-    ssh_config = entry.config if entry.adapter == "ssh" else entry.alternatives.get("ssh")
-    ssh = SshHost.from_alternative(ssh_config) if ssh_config else None
-    return adapter, ssh
+    return adapter, ssh_for_site(entry)
 
 
 def _print(value: Any) -> None:
