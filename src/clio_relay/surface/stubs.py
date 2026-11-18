@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from clio_relay.adapters.base import BaseAdapter, SignInNeed
 from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, HookContext
@@ -19,6 +19,11 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.loopback import LoopbackPages
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
+    from clio_relay.surface.changes import ServerChanges
 
 APPROVE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -150,6 +155,12 @@ class StubServe:
 
     def __init__(self, context: HookContext) -> None:
         self.context = context
+
+    def attach(self, server: FastMCP[Any], changes: ServerChanges) -> None:
+        return None
+
+    def ui_data(self, record: OperationRecord) -> dict[str, Any] | None:
+        return None
 
     def _refuse(self) -> Refusal:
         return Refusal(

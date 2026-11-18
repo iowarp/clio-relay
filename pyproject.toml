@@ -81,6 +81,7 @@ fixture = "clio_relay.testing.fixture_adapter:FixtureAdapter"
 
 [project.entry-points."clio_relay.hooks"]
 asks = "clio_relay.asks:create_provider"
+serve = "clio_relay.serve:factory"
 
 [project.optional-dependencies]
 tapis = ["tapipy==25.4.0"]
