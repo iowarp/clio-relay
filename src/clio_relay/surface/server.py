@@ -11,6 +11,7 @@ legacy one, and otherwise as a typed refusal that names the ask and its page.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from collections.abc import AsyncGenerator, Sequence
@@ -51,7 +52,8 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
-from clio_relay.surface.service import RelayService, endpoint_summary, service_ready
+from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
+from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
 PROTOCOL_VERSION = "2026-07-28"
@@ -258,6 +260,9 @@ class RelayTasksExtension(ServerExtension):
             return "waiting for a sign-in to finish"
         if service_ready(record):
             return f"the service is running: {endpoint_summary(record)}"
+        latest = service_message(record)
+        if latest is not None:
+            return f"the service is {record.state.value}: {latest}"
         return f"relay operation is {record.state.value}"
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
@@ -731,9 +736,13 @@ class RelayServer:
 
     @asynccontextmanager
     async def _lifespan(self, _server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
+        # A service that ended while relay was down is finished without anyone asking.
+        observing = asyncio.create_task(self.service.observe_open_services())
         try:
             yield {}
         finally:
+            observing.cancel()
+            await asyncio.gather(observing, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 

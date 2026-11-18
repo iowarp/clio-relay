@@ -41,6 +41,7 @@ from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.describing import relay_report, site_report
+from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 
@@ -78,32 +79,6 @@ def _approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
         f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
     )
 
-
-def _public_endpoint(endpoint: Endpoint) -> dict[str, Any]:
-    """Return what the record keeps of an endpoint: no port URLs.
-
-    A port URL may carry a secret, so only the serve hook's ``ui_data`` hands it
-    out, in the serve result's ``_meta`` (RL22).
-    """
-    return endpoint.model_dump(mode="json", exclude={"ports": {"__all__": {"url"}}})
-
-
-def service_ready(record: OperationRecord) -> bool:
-    """Return whether a service operation is running and has an endpoint."""
-    return (
-        record.kind == "serve"
-        and record.state == OperationState.RUNNING
-        and bool((record.result or {}).get("endpoint"))
-    )
-
-
-def endpoint_summary(record: OperationRecord) -> str | None:
-    """Name a service's ports as ``name host:port``. No URLs, which may carry secrets."""
-    endpoint: dict[str, Any] = (record.result or {}).get("endpoint") or {}
-    ports: list[dict[str, Any]] = endpoint.get("ports") or []
-    if not ports:
-        return None
-    return ", ".join(f"{port['name']} {port['host']}:{port['port']}" for port in ports)
 
 
 class RelayService:
@@ -567,7 +542,7 @@ class RelayService:
             if endpoint is not None:
                 record.result = {
                     **(record.result or {}),
-                    "endpoint": _public_endpoint(endpoint),
+                    "endpoint": public_endpoint(endpoint),
                 }
                 record.move(OperationState.RUNNING, "the service is ready")
             else:
@@ -630,8 +605,40 @@ class RelayService:
             ):
                 return self._finish(operation_id, OperationState.FAILED, refusal)
             logger.warning("observing service %s: %s", operation_id, refusal.message)
-            return record
+            return self._observation_failed(operation_id, refusal.message)
+        except Exception as exc:
+            # One failed look is not the service's end; it stays open and says why.
+            logger.warning("observing service %s", operation_id, exc_info=True)
+            return self._observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
         return await self._apply(operation_id, adapter, status, endpoint)
+
+    def _observation_failed(self, operation_id: str, error: str) -> OperationRecord:
+        with self.operations.locked(operation_id):
+            record = self.operation(operation_id)
+            if not record.state.final:
+                result = dict(record.result or {})
+                result["message"] = f"relay could not observe the service: {error}"
+                record.result = result
+                self.operations.put(operation_id, record)
+            return record
+
+    async def observe_open_services(self) -> None:
+        """Observe each open service once, so one that ended while relay was down ends."""
+        open_services = [
+            record.operation_id
+            for record in self.operations.all()
+            if record.kind == "serve"
+            and not record.state.final
+            and record.state != OperationState.AWAITING_INPUT
+        ]
+
+        async def observe(operation_id: str) -> None:
+            try:
+                await self.refresh(operation_id)
+            except Exception:
+                logger.warning("observing service %s at startup", operation_id, exc_info=True)
+
+        await asyncio.gather(*(observe(item) for item in open_services))
 
     async def _apply(
         self,
@@ -653,7 +660,7 @@ class RelayService:
             result = dict(record.result or {})
             if record.kind == "serve":
                 if endpoint is not None:
-                    result["endpoint"] = _public_endpoint(endpoint)
+                    result["endpoint"] = public_endpoint(endpoint)
                 if status.message is not None:
                     result["message"] = status.message
             if status.state.final:

@@ -121,7 +121,11 @@ def serve(
 
 
 @app.command()
-def connect(handle: Annotated[str, typer.Argument(help="A service's operation id")]) -> None:
+def connect(
+    handle: Annotated[
+        str, typer.Argument(help="The handle in the serve result's connect_command")
+    ],
+) -> None:
     """Forward a running service's ports to this machine and hold them open."""
     try:
         from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
