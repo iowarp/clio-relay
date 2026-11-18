@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.http_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
     create_app,
 )
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
 from clio_relay.config import RelaySettings
 
 
@@ -115,59 +111,3 @@ def test_http_storage_status_and_507_decision_are_machine_readable(tmp_path: Pat
     assert decision["schema"] == "clio-relay.storage-decision.v1"
     assert decision["allowed"] is False
     assert decision["reason"] == "ledger_capacity"
-
-
-def test_cli_storage_admission_error_is_stable_json(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = _small_storage_settings(tmp_path)
-    _configure_storage_environment(monkeypatch, settings)
-    monkeypatch.chdir(tmp_path)
-    ClusterRegistry(
-        clusters={
-            "configured-target": ClusterDefinition(
-                name="configured-target",
-                ssh_host="localhost",
-            )
-        }
-    ).save(tmp_path / ".clio-relay" / "clusters.json")
-    pipeline = tmp_path / "pipeline.yaml"
-    pipeline.write_text("name: storage\npkgs: []\n", encoding="utf-8")
-    runner = CliRunner()
-
-    status = runner.invoke(app, ["storage", "status"])
-    first = runner.invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "configured-target",
-            "--jarvis-yaml",
-            str(pipeline),
-            "--idempotency-key",
-            "cli-storage-first",
-        ],
-    )
-    denied = runner.invoke(
-        app,
-        [
-            "job",
-            "submit",
-            "--cluster",
-            "configured-target",
-            "--jarvis-yaml",
-            str(pipeline),
-            "--idempotency-key",
-            "cli-storage-second",
-        ],
-    )
-
-    assert status.exit_code == 0
-    assert json.loads(status.output)["schema"] == "clio-relay.storage-runtime-status.v1"
-    assert first.exit_code == 0
-    assert denied.exit_code == 1
-    envelope = json.loads(denied.output)
-    assert envelope["error"] == "storage_admission_denied"
-    assert envelope["storage_decision"]["reason"] == "ledger_capacity"

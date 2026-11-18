@@ -228,7 +228,10 @@ def test_linux_user_bootstrap_script_installs_required_components() -> None:
     assert 'JARVIS_MCP_UV_EXECUTABLE="$(command -v uv)"' in script
     assert '"$JARVIS_MCP_EXECUTABLE" --help' in script
     assert 'JARVIS_MCP_INSTALL_TARGET="$JARVIS_MCP_ARTIFACT_PATH"' in script
-    assert "from clio_relay.mcp_call.runner import mcp_server_artifact_identity" in script
+    assert (
+        "from clio_relay.adapters.worker.server_artifact_identity "
+        "import mcp_server_artifact_identity"
+    ) in script
     assert "clio_kit_server_artifact = mcp_server_artifact_identity(" in script
     assert "verify_relay_jarvis_cd_lock=True" in script
     assert 'locked_server_runtime.get("server_name") == "jarvis"' in script
@@ -322,7 +325,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
         '  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
     ) in script
     assert "import clio_relay.bounded_command.pkg" in script
-    assert "clio_relay.mcp_call.pkg" in script
+    assert "clio_relay.mcp_call.pkg" not in script
     assert "clio_relay.remote_agent.pkg" in script
     assert "write_install_receipt" in script
     assert "receipt = make_bootstrap_receipt(" in script
@@ -407,7 +410,6 @@ def test_wheel_embeds_jarvis_package_modules_in_the_installed_namespace() -> Non
         "jarvis-packages": "clio_relay/assets/jarvis-packages",
         "jarvis-packages/clio_relay/clio_relay/_jarvis_api.py": "clio_relay/_jarvis_api.py",
         "jarvis-packages/clio_relay/clio_relay/bounded_command": "clio_relay/bounded_command",
-        "jarvis-packages/clio_relay/clio_relay/mcp_call": "clio_relay/mcp_call",
         "jarvis-packages/clio_relay/clio_relay/remote_agent": "clio_relay/remote_agent",
     }
 
@@ -962,6 +964,8 @@ def test_bootstrap_refuses_dirty_git_checkout(tmp_path: Path) -> None:
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",
@@ -996,6 +1000,8 @@ def test_bootstrap_archive_uses_clean_git_checkout(tmp_path: Path) -> None:
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",
@@ -1086,6 +1092,8 @@ def test_bootstrap_archive_ignores_unrelated_git_checkout(tmp_path: Path) -> Non
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-m",
             "init",

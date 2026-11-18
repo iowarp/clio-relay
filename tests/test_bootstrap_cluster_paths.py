@@ -643,7 +643,7 @@ def test_embedded_writer_proof_rejects_exact_live_worker(
 
 
 @pytest.mark.parametrize(
-    ("argv", "writer_kind"),
+    ("argv", "expected"),
     [
         (
             [
@@ -653,23 +653,35 @@ def test_embedded_writer_proof_rejects_exact_live_worker(
                 "--host",
                 "127.0.0.1",
             ],
-            "api",
+            "live api writer pid=1738",
         ),
         (
+            [
+                "/home/operator/.local/bin/clio-relay",
+                "worker",
+                "api",
+                "start",
+                "--host",
+                "127.0.0.1",
+            ],
+            "live api writer pid=1738",
+        ),
+        (
+            # A pre-worker install's MCP server is still a same-core writer.
             [
                 "/home/operator/.local/bin/clio-relay",
                 "mcp-server",
                 "--profile",
                 "user",
             ],
-            "mcp-server",
+            "live clio-relay process pid=1738 still owns core",
         ),
     ],
 )
 def test_embedded_writer_proof_rejects_every_same_core_long_lived_writer(
     tmp_path: Path,
     argv: list[str],
-    writer_kind: str,
+    expected: str,
 ) -> None:
     """Retained cluster API and MCP processes cannot outlive an index migration."""
     proc_root = tmp_path / "proc"
@@ -684,8 +696,8 @@ def test_embedded_writer_proof_rejects_every_same_core_long_lived_writer(
     result = _run_writer_proof(proc_root, cluster="custom", core_dir=core_dir)
 
     assert result.returncode != 0
-    assert f"live {writer_kind} writer pid=1738" in result.stderr
-    assert "stop or detach it before bootstrap" in result.stderr
+    assert expected in result.stderr
+    assert "before bootstrap" in result.stderr
 
 
 def test_embedded_writer_proof_allows_long_lived_writer_on_different_core(

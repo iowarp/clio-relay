@@ -3404,7 +3404,9 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     assert 'action != "repair-legacy-cursors"' in script
     assert "export recovery_worker" not in recovery
     assert "printf '%s\\n' \"$recovery_worker\" | python3 -c" in recovery
-    assert script.count("endpoint worker-info") == 6
+    # Six calls plus the preamble's fallback for a pre-worker installed relay.
+    assert script.count("endpoint worker-info") == 7
+    assert script.count("worker endpoint worker-info") == 6
     assert script.count("--readiness-only") == 4
     assert "printf '%s\\n' \"bootstrap_reconcile_plan=$BOOTSTRAP_PLAN_JSON\" >&2" in script
     assert 'mv -Tf "$HOME/.local/share/clio-relay/.current.' not in script
