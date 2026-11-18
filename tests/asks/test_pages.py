@@ -11,7 +11,7 @@ import pytest
 from clio_relay.adapters.base import SignInNeed
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import origin_ok
-from clio_relay.asks.pages import SECURITY_HEADERS
+from clio_relay.asks.pages import SECURITY_HEADERS, binding_table
 from clio_relay.asks.provider import base_file, read_base
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec
@@ -280,3 +280,24 @@ async def test_a_bad_ask_id_is_not_found(relay_paths: RelayPaths) -> None:
     assert httpx.get(f"{base}/relay/asks/..%2Fetc?t=x", timeout=30).status_code == 404
     assert httpx.get(f"{base}/elsewhere", timeout=30).status_code == 404
     await service.close()
+
+def test_a_package_review_shows_the_package() -> None:
+    ask = Ask(ask_id="ask_pkg", kind="approve", site="fx", operation_id="op_pkg", message="Review")
+    ask.bind(
+        {
+            "kind": "package_review",
+            "site": "fx",
+            "package": "numpy<b>",
+            "version": "2.1.0",
+            "source": "pypi",
+            "package_hash": "sha256:abc",
+        }
+    )
+    table = binding_table(ask)
+    for row in ("<th>Package</th><td>numpy&lt;b&gt;</td>", "<th>Version</th><td>2.1.0</td>"):
+        assert row in table
+    assert "<th>Source</th><td>pypi</td>" in table
+    assert "<th>Package hash</th><td>sha256:abc</td>" in table
+    plain = Ask(ask_id="ask_job", kind="approve", site="fx", message="Run")
+    plain.bind({"site": "fx", "spec_digest": "d"})
+    assert "Package" not in binding_table(plain) and "Source" not in binding_table(plain)
