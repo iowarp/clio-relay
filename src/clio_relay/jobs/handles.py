@@ -44,12 +44,43 @@ class JobHandle(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict[str, Any])
 
 
+VIEW_METADATA = "view"
+"""The ``OutputRef.metadata`` key for an output's view descriptor (RL40, RL44)."""
+
+PROVENANCE_METADATA = "provenance"
+"""The ``OutputRef.metadata`` key for an output's provenance (RL40)."""
+
+
 class OutputRef(BaseModel):
-    """A file a job produced."""
+    """A file a job produced.
+
+    ``metadata`` is JSON the adapter or package attaches, and relay passes it on
+    unchanged. Two keys have a set meaning. ``view`` is the output's view
+    descriptor: the path or path pattern, the format, the ParaView reader and
+    that reader's configuration, and whether the output is still being written.
+    ``provenance`` is the package version and hash and the digests of its inputs.
+    """
 
     name: str
     path: str
     size: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict[str, Any])
+
+
+class JobProgress(BaseModel):
+    """The latest step a running job reported (RL40 progress, RL43).
+
+    Relay keeps it in the operation's ``result["progress"]``, names it in the
+    task's status message, and returns it with the operation. ``outputs`` are
+    what the step wrote, each with its view descriptor in ``metadata["view"]``.
+    ``data`` belongs to the adapter or package and must be JSON.
+    """
+
+    step: int | None = None
+    total: int | None = None
+    message: str | None = None
+    outputs: list[OutputRef] = Field(default_factory=list[OutputRef])
+    data: dict[str, Any] = Field(default_factory=dict[str, Any])
 
 
 class JobStatus(BaseModel):
@@ -61,6 +92,7 @@ class JobStatus(BaseModel):
     native_state: str | None = None
     observed_at: datetime = Field(default_factory=utc_now)
     outputs: list[OutputRef] = Field(default_factory=list[OutputRef])
+    progress: JobProgress | None = None
 
 
 class ExecResult(BaseModel):

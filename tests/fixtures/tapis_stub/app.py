@@ -14,44 +14,33 @@ refusing a credential or a refresh. Every request is recorded.
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
 import os
 import secrets
 import shutil
-import signal
 import subprocess
-import tarfile
 import tempfile
 import threading
 import time
 import uuid as uuidlib
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import jwt
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+
+from .runner import JobRunner, StubJob
 
 SECRET = "tapis-stub-signing-key-not-a-real-secret-0000"
 VERIFICATION_BASE = "https://tapis-stub.invalid"
 DEVICE_CODE_TTL_S = 600
 DEVICE_TOKEN_TTL_S = 30 * 24 * 3600
 REFRESH_TOKEN_TTL_S = 365 * 24 * 3600
-
-QUEUED_STATES = (
-    "PENDING",
-    "PROCESSING_INPUTS",
-    "STAGING_INPUTS",
-    "STAGING_JOB",
-    "SUBMITTING_JOB",
-    "QUEUED",
-)
-FINAL_STATES = ("FINISHED", "CANCELLED", "FAILED")
 
 
 def _envelope(result: Any, message: str = "ok", status: int = 200) -> JSONResponse:
@@ -80,21 +69,6 @@ class DeviceGrant:
     username: str | None = None
 
 
-@dataclass
-class StubJob:
-    uuid: str
-    request: dict[str, Any]
-    owner: str
-    status: str = "PENDING"
-    last_message: str = ""
-    created: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-    remote_job_id: str | None = None
-    process: subprocess.Popen[bytes] | None = None
-    released: threading.Event = field(default_factory=threading.Event)
-    forced: bool = False
-    history: list[str] = field(default_factory=list[str])
-
-
 class StubState:
     """Everything the stub knows. Tests read and drive it directly or over HTTP."""
 
@@ -111,6 +85,8 @@ class StubState:
         self.apps: dict[tuple[str, str], dict[str, Any]] = {}
         self.jobs: dict[str, StubJob] = {}
         self.hold = False
+        # Send BATCH jobs to the machine's real Slurm with sbatch, and cancel with scancel.
+        self.slurm = False
         self.access_ttl_s = DEVICE_TOKEN_TTL_S
         # Hosts the stub treats as itself: no SSH check, jobs run on this machine.
         self.local_hosts = {"localhost"}
@@ -224,108 +200,6 @@ def _ssh_login_check(system: dict[str, Any], login: str, private_key: str) -> st
         if done.returncode != 0:
             return f"SSH login as {login} failed: {done.stderr.strip() or done.returncode}"
     return None
-
-
-class JobRunner:
-    """Runs a job the way the ZIP runtime does, on the stub's own machine."""
-
-    def __init__(self, state: StubState) -> None:
-        self.state = state
-
-    def start(self, job: StubJob) -> None:
-        threading.Thread(target=self._run, args=(job,), daemon=True).start()
-
-    def _move(self, job: StubJob, status: str, message: str = "") -> bool:
-        with self.state.lock:
-            if job.status in FINAL_STATES or job.forced:
-                return False
-            job.status = status
-            job.history.append(status)
-            if message:
-                job.last_message = message
-            return True
-
-    def _run(self, job: StubJob) -> None:
-        request = job.request
-        system_id = str(request["execSystemId"])
-        state = self.state
-        try:
-            for status in QUEUED_STATES[1:5]:
-                if not self._move(job, status):
-                    return
-            app = state.apps[(str(request["appId"]), str(request["appVersion"]))]
-            exec_dir = state.host_path(system_id, str(request["execSystemExecDir"]))
-            out_dir = state.host_path(system_id, str(request["execSystemOutputDir"]))
-            exec_dir.mkdir(parents=True, exist_ok=True)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            image = state.host_path(system_id, str(app["containerImage"]))
-            with tarfile.open(image) as archive:
-                archive.extractall(exec_dir, filter="data")
-            if not self._move(job, "QUEUED"):
-                return
-            job.remote_job_id = str(10_000 + len(state.jobs))
-            while state.hold and not job.released.is_set():
-                if job.status in FINAL_STATES or job.forced:
-                    return
-                job.released.wait(0.05)
-            if not self._move(job, "RUNNING"):
-                return
-            params = cast(dict[str, Any], request.get("parameterSet") or {})
-            app_args = cast(list[dict[str, Any]], params.get("appArgs") or [])
-            args = [str(item["arg"]) for item in app_args]
-            env = dict(os.environ)
-            for item in cast(list[dict[str, Any]], params.get("envVariables") or []):
-                env[str(item["key"])] = str(item.get("value") or "")
-            env.update(
-                {
-                    "_tapisJobUUID": job.uuid,
-                    "_tapisExecSystemExecDir": str(exec_dir),
-                    "_tapisExecSystemOutputDir": str(out_dir),
-                    "_tapisExecSystemInputDir": str(
-                        state.host_path(system_id, str(request["execSystemInputDir"]))
-                    ),
-                    "_tapisSysRootDir": str(state.systems[system_id].get("rootDir") or "/"),
-                }
-            )
-            script = exec_dir / "tapisjob_app.sh"
-            script.chmod(0o755)
-            with (out_dir / "tapisjob.out").open("wb") as log:
-                # Tapis joins the app arguments with spaces in its wrapper script.
-                process = subprocess.Popen(
-                    ["/bin/bash", "-c", f"exec ./tapisjob_app.sh {' '.join(args)}"],
-                    cwd=exec_dir,
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                job.process = process
-                code = process.wait()
-            (out_dir / "tapisjob.exitcode").write_text(f"{code}\n", encoding="utf-8")
-            with state.lock:
-                if job.status == "CANCELLED" or job.forced:
-                    return
-            if code != 0:
-                self._move(job, "FAILED", f"application exited with code {code}")
-                return
-            if not self._move(job, "ARCHIVING"):
-                return
-            self._move(job, "FINISHED", "job finished")
-        except Exception as exc:  # the stub reports any failure as Tapis would
-            self._move(job, "FAILED", f"stub job failure: {exc}")
-
-    def cancel(self, job: StubJob) -> None:
-        with self.state.lock:
-            if job.status in FINAL_STATES:
-                return
-            job.status = "CANCELLED"
-            job.history.append("CANCELLED")
-            job.last_message = "job cancelled by user"
-        job.released.set()
-        process = job.process
-        if process is not None and process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
 
 
 def _file_info(path: Path, rel: str) -> dict[str, Any]:
@@ -591,6 +465,13 @@ def create_app(state: StubState) -> FastAPI:
             return _error(400, f"App not found: {app_key[0]} {app_key[1]}")
         merged = dict(data)
         merged.setdefault("execSystemId", state.apps[app_key]["jobAttributes"]["execSystemId"])
+        system = state.systems.get(str(merged["execSystemId"]), {})
+        if str(merged.get("cmdPrefix") or "").strip() and not system.get("enableCmdPrefix"):
+            return _error(
+                400,
+                "JOBS_CMD_PREFIX_NOT_ENABLED_FOR_SYSTEM: command prefixes are not "
+                f"enabled on system {merged['execSystemId']}",
+            )
         job = StubJob(uuid=f"{uuidlib.uuid4()}-007", request=merged, owner=owner)
         job.history.append("PENDING")
         with state.lock:

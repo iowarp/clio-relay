@@ -8,12 +8,13 @@
 #   version, mode, directory, stdin, stdout, stderr, content dir, package dir,
 #   input count, then (name, sha256) per input, then
 #   for mode exec:    executable, arguments...
-#   for mode package: name, version, sha256, key=value parameters...
+#   for mode package or package-service: name, version, sha256, key=value parameters...
 #
 # A package is `<repo>.<package>`, and its archive holds
 # `<repo>/<repo>/<package>/...`. The launcher runs it with JARVIS_ROOT in the
 # job's directory: jarvis init, repo add <unpacked>/<repo>, ppl create,
-# ppl append <name> pkg key=value..., ppl run.
+# ppl append <name> pkg key=value..., then ppl run. A package-service job runs
+# ppl start instead, holds until the job is cancelled, then runs ppl stop.
 #
 # The launcher writes the job's exit code to relay.exitcode in the job's
 # directory and exits with it.
@@ -66,7 +67,7 @@ exec)
     "${f[@]:i}" < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
     finish "$?"
     ;;
-package)
+package | package-service)
     name="${f[i]}"
     version="${f[i + 1]}"
     digest="${f[i + 2]}"
@@ -94,9 +95,30 @@ package)
             && jarvis repo add "$unpacked/$repo" \
             && jarvis ppl create "$pipeline" \
             && jarvis ppl append "$name" pkg ${params[@]+"${params[@]}"} \
-            && jarvis ppl run
+            || finish "$?"
+        if [ "$mode" = package ]; then
+            jarvis ppl run
+            finish "$?"
+        fi
+        # A service runs until the job is cancelled, then stops cleanly.
+        # A Slurm cancel sends TERM. A Tapis FORK cancel is `pkill -9 -P`, which
+        # kills only the sleep, so a sleep that dies early also stops the service.
+        sleeper=
+        stop_service() {
+            trap - TERM INT HUP
+            [ -z "$sleeper" ] || kill "$sleeper" 2> /dev/null
+            jarvis ppl stop
+            finish "$?"
+        }
+        trap stop_service TERM INT HUP
+        jarvis ppl start || { started=$?; jarvis ppl stop; finish "$started"; }
+        while :; do
+            sleep 60 &
+            sleeper=$!
+            wait "$sleeper" || break
+        done
+        stop_service
     } < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
-    finish "$?"
     ;;
 *)
     fail 64 "unknown mode $mode"
