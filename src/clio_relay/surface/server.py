@@ -55,6 +55,7 @@ from clio_relay.surface.endpoints import endpoint_summary, service_message, serv
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.surface.skills import SkillResources
 
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
@@ -70,7 +71,8 @@ INSTRUCTIONS = (
     "Relay runs work on the sites in its sites file. Call describe first. "
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
     "exec runs one short command; files lists, reads, writes and stages files; "
-    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal."
+    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal. "
+    "A site's skill, when it has one, is the resource relay://sites/<site>/skill."
 )
 
 
@@ -383,6 +385,7 @@ class RelayServer:
         self.service = service
         self.tasks = RelayTasksExtension(service)
         self.changes = ServerChanges()
+        self.skills = SkillResources(service.paths.config_dir, service.sites)
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
         modes = _elicitation_modes(ctx)
@@ -730,6 +733,7 @@ class RelayServer:
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
         server.add_extension(self.tasks)
+        server.add_provider(self.skills)
         self.changes.install(server)
         self.service.serve_hook.attach(server, self.changes)
         return server
@@ -738,11 +742,13 @@ class RelayServer:
     async def _lifespan(self, _server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
         # A service that ended while relay was down is finished without anyone asking.
         observing = asyncio.create_task(self.service.observe_open_services())
+        watching = asyncio.create_task(self.skills.watch(self.changes))
         try:
             yield {}
         finally:
             observing.cancel()
-            await asyncio.gather(observing, return_exceptions=True)
+            watching.cancel()
+            await asyncio.gather(observing, watching, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 

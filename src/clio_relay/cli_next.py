@@ -242,6 +242,9 @@ def site_add(
     name: str | None = None,
     policy: Annotated[str, typer.Option(help="open or guarded")] = "guarded",
     spend: Annotated[str, typer.Option(help="always, never, or a node-hour threshold")] = "always",
+    skill: Annotated[
+        str | None, typer.Option(help="A skill name, or the path of your own Markdown skill")
+    ] = None,
 ) -> None:
     """Add a site."""
     try:
@@ -260,6 +263,7 @@ def site_add(
                 "config": settings,
                 "policy": policy,
                 "spend": {"ask": ask},
+                "skill": skill,
             }
         )
         added = SiteStore(_paths().sites_file).add(entry)
