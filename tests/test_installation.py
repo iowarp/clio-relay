@@ -871,7 +871,6 @@ def test_remote_native_jarvis_component_requires_runtime_capability_provenance(
     capability = NativeJarvisExecutionCapability(
         operations=[
             "execution_handle.progress",
-            "execution_store.resolve_service_runtime_authority",
             "pipeline.get_execution",
             "pipeline.get_execution_progress",
             "pipeline.run",

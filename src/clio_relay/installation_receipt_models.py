@@ -12,6 +12,7 @@ imports from -- never the reverse.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime
 from typing import Literal
 
@@ -53,6 +54,11 @@ class NativeJarvisExecutionCapability(BaseModel):
     contract_id: str | None = None
     contract_schema_version: str | None = None
     contract_sha256: str | None = None
+
+    def without_operations(self, retired: Collection[str]) -> NativeJarvisExecutionCapability:
+        """Return a copy without retired operations, to compare across a retirement."""
+        operations = [operation for operation in self.operations if operation not in retired]
+        return self.model_copy(update={"operations": operations})
 
     @model_validator(mode="after")
     def validate_identity(self) -> NativeJarvisExecutionCapability:

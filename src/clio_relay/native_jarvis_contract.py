@@ -42,11 +42,12 @@ CLIO_KIT_NATIVE_OPERATIONS = (
 )
 JARVIS_CD_NATIVE_OPERATIONS = (
     "execution_handle.progress",
-    "execution_store.resolve_service_runtime_authority",
     "pipeline.get_execution",
     "pipeline.get_execution_progress",
     "pipeline.run",
 )
+# Older receipts still list these; matching ignores them so those installations pass.
+RETIRED_JARVIS_CD_OPERATIONS = frozenset({"execution_store.resolve_service_runtime_authority"})
 
 
 def probe_clio_kit_native_execution_contract(
@@ -144,7 +145,6 @@ import json
 
 from jarvis_cd.core.execution import (
     ExecutionHandle,
-    ExecutionStore,
     HANDLE_SCHEMA,
     PROGRESS_SNAPSHOT_SCHEMA,
     RECORD_SCHEMA,
@@ -153,9 +153,6 @@ from jarvis_cd.core.pipeline import Pipeline
 
 operations = {{
     "execution_handle.progress": callable(getattr(ExecutionHandle, "progress", None)),
-    "execution_store.resolve_service_runtime_authority": callable(
-        getattr(ExecutionStore, "resolve_service_runtime_authority", None)
-    ),
     "pipeline.get_execution": callable(getattr(Pipeline, "get_execution", None)),
     "pipeline.get_execution_progress": callable(
         getattr(Pipeline, "get_execution_progress", None)
@@ -489,7 +486,8 @@ def _native_capability_matches_component(
         )
     if component_name == "jarvis-cd":
         return (
-            capability.operations == list(JARVIS_CD_NATIVE_OPERATIONS)
+            capability.without_operations(RETIRED_JARVIS_CD_OPERATIONS).operations
+            == list(JARVIS_CD_NATIVE_OPERATIONS)
             and capability.contract_id is None
             and capability.contract_schema_version is None
             and capability.contract_sha256 is None
