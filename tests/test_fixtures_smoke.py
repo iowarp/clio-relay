@@ -20,7 +20,7 @@ import struct
 import subprocess
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -213,8 +213,9 @@ def test_pbs_site_runs_a_job_visible_to_qstat_json_history() -> None:
         result = _ssh("pbs", f"qstat -f -F json -x {job_id}")
         if result.returncode != 0:
             return None
-        jobs = cast(dict[str, Any], json.loads(result.stdout)).get("Jobs", {})
-        record = cast(dict[str, Any], next(iter(jobs.values()), {}))
+        jobs = cast(dict[str, dict[str, Any]], json.loads(result.stdout).get("Jobs") or {})
+        records = list(jobs.values())
+        record = records[0] if records else {}
         return record if record.get("job_state") == "F" else None
 
     record = _poll("pbs job", 120, finished)
@@ -330,7 +331,7 @@ rm -f {artifact}
 
 
 @contextmanager
-def _frpc(config: str, tmp_path: Path, name: str) -> Iterator[subprocess.Popen[str]]:
+def _frpc(config: str, tmp_path: Path, name: str) -> Generator[subprocess.Popen[str]]:
     path = tmp_path / f"{name}.toml"
     path.write_text(config, encoding="utf-8")
     path.chmod(0o600)
@@ -432,7 +433,10 @@ def _structured(result: Any) -> dict[str, Any]:
 def test_counter_mcp_keeps_one_session_and_runs_a_task() -> None:
     _needs("counter")
     from fastmcp import Client
-    from fastmcp_tasks import call_tool_task
+    from fastmcp_tasks import ToolTask, call_tool_task
+
+    # fastmcp_tasks types its client parameter as a bare generic Client.
+    start_task = cast(Callable[..., Awaitable[ToolTask]], call_tool_task)
 
     async def scenario() -> None:
         async with Client(FX["FX_COUNTER_URL"]) as client:
@@ -443,9 +447,7 @@ def test_counter_mcp_keeps_one_session_and_runs_a_task() -> None:
             assert [r["count"] for r in results] == [start + 1, start + 2, start + 3]
             assert len({r["session_id"] for r in results}) == 1
 
-            task = await call_tool_task(
-                client, "count_slowly", {"steps": 3, "delay_seconds": 0.2}
-            )
+            task = await start_task(client, "count_slowly", {"steps": 3, "delay_seconds": 0.2})
             assert task.task_id
             final = _structured(await task.result())
             assert final["background_task"] is True
