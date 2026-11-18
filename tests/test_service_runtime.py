@@ -18,18 +18,14 @@ import types
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from typing import BinaryIO, Literal, cast
 
 import httpx
 import pytest
-from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
-import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
-import clio_relay.remote_cli as remote_cli
 import clio_relay.service_runtime_command_runner as service_runtime_command_runner
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity
 import clio_relay.service_runtime_connector_step_scripts as service_runtime_connector_step_scripts
@@ -38,11 +34,9 @@ import clio_relay.service_runtime_local_start as service_runtime_local_start
 import clio_relay.service_runtime_primitives as service_runtime_primitives
 import clio_relay.service_runtime_readiness as service_runtime_readiness
 import clio_relay.service_runtime_types as service_runtime_types
-from clio_relay.adapters.worker import cli as relay_cli
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource
-from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
+from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.config import RelaySettings
 from clio_relay.errors import (
     ConfigurationError,
@@ -69,10 +63,7 @@ from clio_relay.service_runtime_types import (
     LocalConnectorIdentity,
 )
 from clio_relay.validation_report import (
-    EvidenceReference,
     LiveValidationReport,
-    ValidationRecorder,
-    ValidationResource,
     ValidationStatus,
 )
 from tests.gateway_ownership_crash_fixture import (

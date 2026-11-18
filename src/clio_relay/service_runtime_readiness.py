@@ -23,10 +23,8 @@ import secrets
 import socket
 import threading
 import time
-import urllib.parse
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -35,7 +33,7 @@ import httpx
 from clio_relay import service_runtime_types as _types
 from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.models import ServiceRuntimeSpec, utc_now
+from clio_relay.models import utc_now
 
 # #231 service-runtime split, slice 11: shared by the start/jarvis-bind/browser
 # mixins' local-health waits -- moved here (rather than duplicated three times)

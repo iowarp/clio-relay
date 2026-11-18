@@ -17,9 +17,6 @@ from __future__ import annotations
 import base64
 import shlex
 
-from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.remote_cli import remote_env
-
 
 def _remote_http_probe_script(
     host: str,

@@ -6,7 +6,6 @@ import base64
 import shlex
 
 from clio_relay.cluster_config import ClusterDefinition
-from clio_relay.errors import ConfigurationError
 from clio_relay.remote_cli import remote_env
 from clio_relay.remote_values import render_remote_shell_value
 

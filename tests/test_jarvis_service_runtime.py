@@ -7,7 +7,6 @@ import socket
 import subprocess
 import sys
 import threading
-import urllib.parse
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -15,7 +14,6 @@ from typing import Any, Literal, cast
 
 import pytest
 from fastapi.testclient import TestClient
-from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.http_api_routes_session as http_api_routes_session_module
 import clio_relay.jarvis_service_runtime as runtime_binding
@@ -24,8 +22,6 @@ import clio_relay.remote_cli as remote_cli_module
 import clio_relay.service_runtime_connector_identity as service_runtime_connector_identity_module
 import clio_relay.service_runtime_core as service_runtime_core_module
 import clio_relay.service_runtime_observation as service_runtime_observation_module
-import clio_relay.service_runtime_types as service_runtime_types_module
-from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.adapters.worker.remote_connection import validate_channel_request
@@ -56,9 +52,6 @@ from clio_relay.models import (
     JobState,
     McpCallSpec,
     RelayJob,
-    SchedulerConnectorStepIdentity,
-    SchedulerPhase,
-    SchedulerStatus,
     ServiceRuntimeSpec,
 )
 from clio_relay.service_runtime import (

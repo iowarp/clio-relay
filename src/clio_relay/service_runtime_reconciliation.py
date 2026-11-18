@@ -45,7 +45,6 @@ from clio_relay.models import (
     GatewaySession,
     GatewaySessionState,
     SchedulerConnectorPlacement,
-    SchedulerConnectorStepIdentity,
     utc_now,
 )
 from clio_relay.service_runtime_scheduler_names import allocation_connector_intent_residual
