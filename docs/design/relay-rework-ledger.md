@@ -385,7 +385,7 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
 
 All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, against W2's fixtures at 127.0.0.1:47100 to 47107 (`fixtures.env` sourced with `set -a`).
 
-- `uv run pytest tests/relay_ssh` at `3f31cf1`: `53 passed in 150.49s`. `ruff check`, `ruff format --check` and strict `pyright` are clean on the touched files.
+- `uv run pytest tests/relay_ssh` at `3f31cf1`: `53 passed in 150.49s`. Again after merging the integration branch at `4b72bf2`, at `164a2f6` with `tests/relay_next/test_serve.py`: `61 passed in 153.34s`. `ruff check`, `ruff format --check` and strict `pyright` are clean on the touched files.
 - LQ4 (`ssh`): `test_ssh_conformance.py` subclasses W1's `AdapterConformance` three times, on fx-ssh (detached), fx-slurm and fx-pbs: 30 of 30 passed.
 - LQ5: `test_lq5_a_slurm_job_completes_after_relay_restarts`. A 15 s Slurm job is submitted, the adapter is dropped with no ssh process left behind, and a new adapter with a fresh state directory finds the job by operation id, waits for `completed`, reads `lq5-done`, and a second `run` of the operation returns the same Slurm id.
 - LQ6: `test_lq6_the_pbs_script_and_status_come_from_psij`. On OpenPBS the job's `submit.sh` carries `#PBS -N relay-` and PSI/J's `single_launch.sh`, the job completes from PSI/J's status parsing, and stdout is `lq6 <PBS job id>`.
