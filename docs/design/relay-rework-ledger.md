@@ -556,7 +556,10 @@ All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, aga
 - Cancel signals, live with the adapter's `run` and `cancel`, a job whose command traps TERM and INT, in two shapes (a foreground `sleep` and `sleep & wait`):
   - Before the change, Ares jobs 27757 and 27758: the trap never ran; the jobs were final 4 to 8 s after the cancel.
   - After it, at `829d348`: Ares 27771 and 27772 on `ares-comp-10` log `stopping: signal TERM` 2 s after the cancel; fx-slurm 211 and 212 and fx-pbs `123.fx-pbs` and `124.fx-pbs` log it once, at 0 s. All four end `cancelled`.
-  - Units: `test_a_signal_to_the_batch_shell_reaches_the_command` (only the batch shell is signalled; the grandchild's trap runs and `.ec` reads 143) and `test_the_batch_shell_keeps_the_commands_exit_code` (7).
+    - Again at `6023709`, after the `signalled` record: Ares 27784 and 27785 (2 s), fx-slurm 273 and 274 and fx-pbs `165.fx-pbs` and `166.fx-pbs` (0 s); each trap ran once and every job ended `cancelled`.
+    - Units: `test_a_signal_to_the_batch_shell_reaches_the_command` (only the batch shell is signalled; the grandchild's trap runs and `.ec` reads 143) and `test_the_batch_shell_keeps_the_commands_exit_code` (7).
+  - A forgotten job whose batch shell wrote `.ec` 143 after a signal still asks `sacct`, so the forgotten-job test above keeps reading `cancelled`. Units: `test_a_forgotten_job_the_scheduler_stopped_asks_accounting[CANCELLED|TIMEOUT|none]`.
+- At `6023709` (on integration `87da62d`): `pytest tests/relay_ssh`, `87 passed in 479.31s`, none skipped. `ruff check`, `ruff format` and `pyright` clean.
 
 ## W8. The worker adapter and the old surface's removal
 
