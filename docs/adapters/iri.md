@@ -33,7 +33,8 @@ files live on a different resource, set `filesystem_resource_id`.
 The API takes a bearer token. Where the facility accepts Globus tokens, as
 NERSC does, the adapter asks relay's `globus` identity for one with the
 facility's scope. Where a facility issues its own tokens, set `token_command`
-to a command that prints one, for example the facility's own CLI. With no token
+to a command that prints one, for example the facility's own CLI. The command
+has no time limit; relay logs while it is quiet. With no token
 the site shows as needing sign-in and calls are refused with `needs_sign_in`.
 
 ## Settings

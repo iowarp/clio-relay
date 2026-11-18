@@ -432,7 +432,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - Submission uses `create_batch` and `batch_run`, and polling uses `get_task`. The SDK `Executor` is never opened, since it holds a long-lived connection.
 - **globus: `user_config_keys` maps the job onto the endpoint's template.** The defaults, `account`, `queue`, `walltime` and `nodes_per_block`, are ALCF's keys. Each facility names them differently.
 - **globus `files` is Globus Transfer between two collections.** One is the site's; the other is on relay's own machine, for example Globus Connect Personal. A transfer that keeps faulting is cancelled and refused. A transfer that is making progress has no time limit.
-- **globus: the person's own endpoint starts through another adapter.** `start` names `worker` or `ssh` and the start command, for Aurora. It goes through W1's `exec`, which requires `timeout_s` (default 900 s here). The start command daemonizes and returns. See Open.
+- **globus: the person's own endpoint starts through another adapter.** `start` names `worker` or `ssh` and the start command, for Aurora. It goes through W1's `exec` with no time limit (since `14e8edd`); quiet stretches are logged, and `start.timeout_s` sets a limit only if the site asks for one. A failed start refuses `unreachable` before anything is submitted. The IRI `token_command` runs the same way, with no limit.
 - **iri: v2 is the default, and v1 is supported.**
   - In v2, `run` sends an `Idempotency-Key`, uuid5 of `clio-relay:<site>:<operation id>`, so a retried submit returns the same job.
   - v1 has no key. Relay's own record under `state_dir/iri-jobs/` covers `find`.
@@ -484,8 +484,9 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 
 All of this is unit and mock evidence.
 
-- **Gate on Ares** at `3015e81`, in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
-  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: 82 passed, 5 skipped. The skips are the conformance kit's own: `exec` is not implemented on the four targets (globus, iri v2, iri v1, sky), and `files` is not implemented on sky.
+- **Gate on Ares** at `83f81dc` (integration `14e8edd` merged), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
+  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 95 passed, none skipped. The kit now asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The four new globus tests cover the endpoint start: no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit.
+  - The earlier gate, at `3015e81`, gave 82 passed and 5 skipped, before the kit asserted refusals.
   - `uv run ruff check` and `ruff format --check` on the W11 paths: clean.
   - `pyright` 1.1.411 on the W11 paths: 0 errors.
 - **What the mocks cover.**
@@ -598,7 +599,6 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
 
 - **Compute cancel is a marker.** The Compute service cannot cancel a submitted task. On a busy endpoint, the cancel task may wait behind the job it cancels. LQ-L2 step 7 measures this.
 - **A crash between submit and the record write loses the globus task id.** `find` returns nothing, and a retried `run` submits again. Compute has no idempotency key. The window is one local write.
-- **Endpoint start uses `exec`, whose Protocol requires `timeout_s`.** `StartConfig.timeout_s` defaults to 900 s and is settable. `globus-compute-endpoint start` daemonizes and returns, so the bound does not limit jobs. If the coordinator reads it as a hard limit on something the person waits on, W1's `exec` needs a stall-only form.
 - **Globus Compute status strings** beyond those in SDK 4.21.0's documentation are not verified live. Unknown strings map to queued. LQ-L2 records the strings it sees.
 - **ALCF's IRI Globus scope was not found** in ALCF's pages. Until it is, ALCF IRI uses `token_command`.
 - **The IRI download format varies by facility.** Binary round trips are checked in LQ-L5 step 4.
@@ -606,8 +606,8 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
 - **Aurora's endpoint setup is a one-time person step.** Relay starts the endpoint afterwards; it does not create it.
 - **Requests to W1:**
   - Add `docs/adapters/{globus,iri,sky}.md` to the docs index.
-  - RL5 routing cannot fall back to an alternative on a config-level refusal: Aurora with no `endpoint`, or `iri` with no `resource_id`, refuses `invalid_config` at build. Decide whether routing skips such an alternative or reports it.
   - O11's text says "paid cloud account for LQ-L8". The cloud row is LQ-L6, and LQ-L8 is DeltaAI.
+- **Settled by W1 at `14e8edd`:** routing now skips an alternative whose build refuses `invalid_config` (Aurora with no `endpoint`, `iri` with no `resource_id`) and records the skip; and `exec` takes no time limit, so the globus endpoint start and the IRI `token_command` have none.
 - **Requests to W6:**
   - Confirm the `Token` shape (`access_token`, `expires_at`) and whether `status()` is sync or async. `tokens.py` accepts either.
   - Confirm the keyring naming for cloud keys: service `clio-relay`, entries such as `aws-access-key-id`. Relay's page should write those entries.

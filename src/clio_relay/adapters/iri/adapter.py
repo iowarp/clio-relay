@@ -9,6 +9,7 @@ scope, from relay's identity layer, or from a command the facility provides.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +27,8 @@ from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, 
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+
+log = logging.getLogger(__name__)
 
 STATES = {
     "new": JobState.QUEUED,
@@ -155,7 +158,16 @@ class IriAdapter(BaseAdapter[IriConfig]):
     async def _token(self) -> str:
         command = self.config.token_command
         if command:
-            result = await run_bounded(list(command), timeout_s=300, max_output_bytes=65536)
+
+            async def quiet(silent_s: float, next_check_s: float) -> None:
+                log.info(
+                    "the token command %s has printed nothing for %.0f s; checking again in %.0f s",
+                    command[0],
+                    silent_s,
+                    next_check_s,
+                )
+
+            result = await run_bounded(list(command), max_output_bytes=65536, on_stall=quiet)
             token = result.stdout.strip().splitlines()[-1].strip() if result.stdout.strip() else ""
             if result.exit_code != 0 or not token:
                 raise Refusal(
