@@ -81,7 +81,7 @@ def stub_guard() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _stop_psij_queue_pollers() -> Iterator[None]:
+def stop_psij_queue_pollers() -> Iterator[None]:
     """Stop psij's queue polling threads a test leaves behind.
 
     psij keeps one daemon poller per batch executor until the executor is collected, and
