@@ -170,7 +170,7 @@ async def step_answer(args: argparse.Namespace) -> dict[str, Any]:
                 **{k: v for k, v in page(ask["page"], args.action).items() if k != "text"},
             }
             for ask in waiting.get("asks", [])
-            if ask.get("page")
+            if ask.get("page") and (not args.ask or ask["ask_id"] in args.ask)
         ]
         out["resume"] = brief(
             await tool(client, "run", {"resume": args.operation, "wait_s": args.wait})
@@ -272,6 +272,7 @@ def main() -> None:
     parser.add_argument("--operation")
     parser.add_argument("--action", default="accept", choices=["accept", "decline"])
     parser.add_argument("--wait", type=float, default=0)
+    parser.add_argument("--ask", action="append", help="answer only these asks")
     parser.add_argument("--queue", default="debug")
     parser.add_argument("--native-id")
     parser.add_argument("command", nargs="*")
