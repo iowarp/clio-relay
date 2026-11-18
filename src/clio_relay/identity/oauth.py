@@ -89,7 +89,7 @@ class OAuthIdentity:
         return env or default
 
     def stored(self) -> dict[str, Any] | None:
-        """Return relay's own sign-in, from the keyring."""
+        """Return relay's own sign-in, from the keyring or relay's private file."""
         return self.context.store.get(self.entry_name)
 
     def _stored_tokens(self) -> list[Token]:
@@ -98,7 +98,11 @@ class OAuthIdentity:
         tokens_value: list[Any] = list(cast(list[Any], entry.get("tokens") or []))
         for item in tokens_value:
             if isinstance(item, dict) and cast(dict[str, Any], item).get("access_token"):
-                found.append(Token.model_validate(item))
+                found.append(
+                    Token.model_validate(item).model_copy(
+                        update={"source": self.context.store.source}
+                    )
+                )
         return found
 
     async def refresh(self) -> bool:
@@ -136,7 +140,7 @@ class OAuthIdentity:
             provider=self.name,
             title=self.title,
             state="signed_in" if live else "expired",
-            source="keyring",
+            source=self.context.store.source,
             account=account,
             expires_at=min(expiry) if expiry else None,
             scopes=sorted({scope for token in (live or tokens) for scope in token.scopes}),

@@ -156,16 +156,15 @@ class Identities:
             if provider is None:
                 continue
             try:
-                found.append(await provider.status())
+                status = await provider.status()
             except Refusal as refusal:
-                found.append(
-                    IdentityStatus(
-                        provider=name,
-                        title=getattr(provider, "title", name),
-                        state="signed_out",
-                        detail=refusal.message,
-                    )
+                status = IdentityStatus(
+                    provider=name,
+                    title=getattr(provider, "title", name),
+                    state="signed_out",
+                    detail=refusal.message,
                 )
+            found.append(status.with_store(self.context.store))
         return found
 
 

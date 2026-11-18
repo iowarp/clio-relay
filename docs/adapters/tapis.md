@@ -34,8 +34,11 @@ you sign in on TACC's own page and never type a password into relay.
    page, with no limit on how long you take.
 
 Relay keeps the tokens in your operating system's keyring under the service
-name `clio-relay`. They are never shown to the model, logged or written to
-relay's files. The short code is meant for you to read and is not a secret.
+name `clio-relay`. On a machine with no usable keyring, such as a headless
+server, relay keeps them in `credentials.json` in its configuration directory
+instead, readable only by you (mode 0600). `describe` shows which one under
+`credentials`. The tokens are never shown to the model or logged. The short code
+is meant for you to read and is not a secret.
 
 TACC's access token lasts 30 days. Relay refreshes it on its own when it has
 the OAuth client's key. Without the key, or when TACC refuses the refresh,
