@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -25,7 +25,7 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui import surfaces
-from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, FormError, form
+from clio_relay.surface.a2ui.forms import FORM_ERROR, Form
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
     ADD_PATH,
@@ -251,8 +251,8 @@ class TabActions:
             saved = self.service.sites.edit(site_id, changes)
         except Refusal as refusal:
             known = rendered_keys(EDIT_FIELDS, "site.")
-            located = located(refusal.data.get("errors"), "site.", known)
-            return self._fail(site_id, located or {FORM_ERROR: refusal.message})
+            errors = located(refusal.data.get("errors"), "site.", known)
+            return self._fail(site_id, errors or {FORM_ERROR: refusal.message})
         self.state.editing.discard(site_id)
         self.state.errors.pop(site_id, None)
         done = f"Saved {saved.title}."

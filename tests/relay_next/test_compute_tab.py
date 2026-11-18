@@ -16,9 +16,9 @@ from fastmcp import Client
 from clio_relay.adapters import registry
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui import ACTIONS, BASIC_CATALOG_ID, RELAY_CATALOG_ID, TAB_URI
-from clio_relay.surface.a2ui.values import sentence
 from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
+from clio_relay.surface.a2ui.values import sentence
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
