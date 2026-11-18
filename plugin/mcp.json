@@ -11,6 +11,8 @@
         "serve"
       ],
       "env": {
+        "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
+        "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
         "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}"
       }
     }
