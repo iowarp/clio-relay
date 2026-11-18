@@ -150,7 +150,9 @@ class DefaultGuard:
             node_hours=None if node_hours is None else round(node_hours, 4),
         )
 
-    async def prepare(self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]) -> JobSpec:
+    async def prepare(
+        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+    ) -> JobSpec:
         return spec
 
 

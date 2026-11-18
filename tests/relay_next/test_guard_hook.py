@@ -9,21 +9,21 @@ import pytest
 
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import GuardDecision, HookContext, set_hook
-from clio_relay.jobs.handles import Endpoint
+from clio_relay.jobs.handles import Endpoint, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
-from clio_relay.surface.stubs import DefaultGuard, StubServe
+from clio_relay.surface.stubs import DefaultGuard
 
 from .conftest import add_site
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
 ECHO = JobSpec(executable="echo", arguments=["as-asked"])
-REVIEW = {
+REVIEW: dict[str, Any] = {
     "message": "Run hello 1.0 from the lab's package store?",
     "binding": {
         "kind": "package_review",
@@ -47,22 +47,45 @@ class ReviewingGuard(DefaultGuard):
     async def check_run(self, site: SiteEntry, spec: JobSpec) -> GuardDecision:
         return GuardDecision(allowed=True, data={"asks": [REVIEW]})
 
-    async def prepare(self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]) -> JobSpec:
+    async def prepare(
+        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+    ) -> JobSpec:
         self.prepared.append((site.id, spec, adapter.name))
         if self.refuse_prepare:
             raise Refusal(RefusalReason.POLICY_REFUSED, "the package store is unreachable")
         return spec.model_copy(update={"arguments": ["from-the-package"]})
 
 
-class StartedServe(StubServe):
+class StartedServe:
+    """A service runtime that remembers the spec it was asked to start."""
+
     def __init__(self, context: HookContext) -> None:
-        super().__init__(context)
+        self.context = context
         self.started: list[ServiceSpec] = []
+
+    def attach(self, server: Any, changes: Any) -> None:
+        return None
 
     async def start(
         self, site: SiteEntry, adapter: BaseAdapter[Any], spec: ServiceSpec, record: OperationRecord
     ) -> Endpoint | None:
         self.started.append(spec)
+        return None
+
+    async def status(
+        self, site: SiteEntry, adapter: BaseAdapter[Any], record: OperationRecord
+    ) -> tuple[JobStatus, Endpoint | None]:
+        return JobStatus(state=JobState.RUNNING), None
+
+    async def stop(
+        self, site: SiteEntry, adapter: BaseAdapter[Any], record: OperationRecord
+    ) -> JobStatus:
+        return JobStatus(state=JobState.CANCELLED)
+
+    def ui_data(self, record: OperationRecord) -> dict[str, Any] | None:
+        return None
+
+    async def close(self) -> None:
         return None
 
 
