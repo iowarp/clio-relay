@@ -51,6 +51,7 @@ INTERNAL_FILES = frozenset(
         "exit_code",
         "pid",
         "child_pid",
+        "signalled",
     }
 )
 
@@ -83,7 +84,15 @@ def parse_sections(text: str) -> dict[str, list[str]]:
     return sections
 
 
-_PRELUDE = """\
+# On NFS a file another node wrote can stay invisible to ``[ -f ]``, ``cat`` and
+# ``stat`` for the attribute cache's lifetime (two minutes on some sites). Reading
+# the directory makes the client look again, so every check of a file another
+# host may have written lists its directory first.
+FRESH = 'fresh() { for d in "$@"; do ls -f "$d" >/dev/null 2>&1; done; }\n'
+
+_PRELUDE = (
+    FRESH
+    + """\
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 sha() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
@@ -92,6 +101,18 @@ sha() {
 }
 cas() { printf '%s/content/cas/sha256/%s/%s' "$R" "$(printf %s "$1" | cut -c1-2)" "$1"; }
 """
+)
+
+# Enter the job directory, looking again at its parent when it seems missing.
+_ENTER_JOB = (
+    FRESH
+    + 'cd "$J" 2>/dev/null || { fresh "$(dirname "$J")"; cd "$J" 2>/dev/null; } '
+    + '|| { echo "@@nodir"; exit 0; }\nfresh .\n'
+)
+
+
+# The job and upload directories, and their parents when the job seems missing.
+_SEE_JOB = '[ -d "$J" ] || fresh "$R/jobs"\nfresh "$J" "$I"\n'
 
 
 def _head(remote_dir: str, operation_id: str | None = None) -> str:
@@ -99,7 +120,8 @@ def _head(remote_dir: str, operation_id: str | None = None) -> str:
     if operation_id is not None:
         lines.append(f'J="$R/jobs/"{q(operation_id)}')
         lines.append(f'I="$R/incoming/"{q(operation_id)}')
-    return "\n".join(lines) + "\n" + _PRELUDE
+    see = _SEE_JOB if operation_id is not None else ""
+    return "\n".join(lines) + "\n" + _PRELUDE + see
 
 
 def _detect(choice: str) -> str:
@@ -115,7 +137,8 @@ def _detect(choice: str) -> str:
 def check_script(remote_dir: str, operation_id: str, scheduler: str, digests: Iterable[str]) -> str:
     """Before a submit: the root, the scheduler, which inputs the site has, any submission."""
     have = "\n".join(
-        f'[ -f "$(cas {q(digest)})" ] && echo "@@have {digest}"' for digest in sorted(set(digests))
+        f'c=$(cas {q(digest)}); fresh "${{c%/*}}"; [ -f "$c" ] && echo "@@have {digest}"'
+        for digest in sorted(set(digests))
     )
     return (
         _head(remote_dir, operation_id)
@@ -156,12 +179,13 @@ fi"""
         launcher = f"""L="$R/psij"/{q(launcher_dir)}
 if [ ! -d "$L" ]; then
   mkdir -p "$L.$$" && {copies} && chmod 755 "$L.$$"/* && mv "$L.$$" "$L" 2>/dev/null
-  rm -rf "$L.$$"
+  # If another submit installed it first, mv put this copy inside theirs.
+  rm -rf "$L.$$" "$L/${{L##*/}}.$$"
 fi
 """
     moves = "\n".join(f'  mv -f "$I"/{q(name)} "$J"/{q(name)}' for name in job_files)
     links = "\n".join(
-        f"""  c=$(cas {q(digest)}); t="$J"/{q(name)}
+        f"""  c=$(cas {q(digest)}); t="$J"/{q(name)}; fresh "${{c%/*}}"
   if [ ! -f "$c" ]; then echo "@@missing {digest}"; ok=0
   else mkdir -p "$(dirname "$t")"; rm -f "$t"; ln "$c" "$t" 2>/dev/null || cp "$c" "$t"; fi"""
         for name, digest in inputs
@@ -185,13 +209,62 @@ fi
         + '  else rmdir "$J/.submit.lock"; fi\n'
         + "else\n"
         + "  n=0\n"
-        + '  while [ ! -f "$J/submit.rc" ] && [ $n -lt 600 ]; do sleep 1; n=$((n+1)); done\n'
+        + '  while [ ! -f "$J/submit.rc" ] && [ $n -lt 600 ]; do\n'
+        + '    sleep 1; fresh "$J"; n=$((n+1))\n  done\n'
         + "fi\n"
         + 'rm -rf "$I"\n'
         + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; fi\n'
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo\n'
         + 'echo "@@err"; cat "$J/submit.err" 2>/dev/null; echo\n'
     )
+
+
+_FORWARD_SIGNALS = """# Some Slurm sites signal only this shell on a cancel and kill the rest after
+# KillWait. Run the launch in its own process group, pass signals on to it and wait.
+# Where the scheduler signals every process itself, the launch has already ended,
+# so the signal is not sent twice.
+_relay_job=
+_relay_held=
+_relay_live() {{
+  command -v ps >/dev/null 2>&1 || return 0
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
+}}
+_relay_pass() {{
+  case $1 in TERM|INT) echo "$1" > {marker};; esac
+  if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
+  sleep 1
+  _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null
+}}
+trap '_relay_pass TERM' TERM
+trap '_relay_pass INT' INT
+trap '_relay_pass USR1' USR1
+trap '_relay_pass USR2' USR2
+set -m
+{launch} &
+_relay_job=$!
+[ -n "$_relay_held" ] && _relay_pass "$_relay_held"
+while :; do wait "$_relay_job"; _relay_rc=$?; kill -0 "$_relay_job" 2>/dev/null || break; done
+set +m
+_relay_return() {{ return "$1"; }}
+_relay_return "$_relay_rc"
+"""
+
+
+def forward_signals(script: str, launcher: str, job_dir: str) -> str:
+    """Wrap the launch line of a rendered batch script so a cancel reaches the command.
+
+    A TERM or INT is also recorded in the job's ``signalled`` file. The command's
+    exit code then says only that it was stopped, not whether by a cancel, the
+    time limit or preemption.
+    """
+    marker = q(f"{job_dir.rstrip('/')}/signalled")
+    lines = script.split("\n")
+    for index, line in enumerate(lines):
+        if launcher in line and not line.lstrip().startswith("#"):
+            wrapped = _FORWARD_SIGNALS.format(launch=line.rstrip(), marker=marker)
+            lines[index] = wrapped.rstrip("\n")
+            return "\n".join(lines)
+    raise ValueError("the rendered script has no launch line")
 
 
 DETACHED_SUBMIT = (
@@ -270,7 +343,7 @@ def status_script(
     ``accounting_command`` runs only when the queue no longer lists the job and
     the job wrote no exit code, as the last evidence of how it ended.
     """
-    body = f"J={q(job_dir)}\n" + 'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
+    body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
     body += 'echo "@@last"; tail -n 1 states 2>/dev/null\n'
     if mode == "scheduler" and status_command is not None and native_id is not None:
@@ -279,10 +352,11 @@ def status_script(
             f"out=$({status_command} 2>&1 </dev/null); rc=$?\n"
             'echo "@@schedrc $rc"; echo "@@sched"; printf "%s\\n" "$out"\n'
             f'echo "@@ec"; cat {ec} 2>/dev/null; echo\n'
+            '[ -s signalled ] && echo "@@signalled $(cat signalled)"\n'
         )
         if accounting_command is not None:
             body += (
-                f"if [ ! -s {ec} ] && ! printf '%s\\n' \"$out\" | "
+                f"if {{ [ ! -s {ec} ] || [ -s signalled ]; }} && ! printf '%s\\n' \"$out\" | "
                 f"awk '{{print $1}}' | grep -qxF {q(native_id)}; then\n"
                 f'  echo "@@acct"; {accounting_command} 2>/dev/null </dev/null; echo\n'
                 "fi\n"
@@ -314,9 +388,10 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     """Mark the job cancelled and stop it."""
     body = (
         f"J={q(job_dir)}\n"
-        'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
-        '[ -f final ] && { echo "@@final"; exit 0; }\n'
-        ": > cancel\nprintf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
+        + _ENTER_JOB
+        + '[ -f final ] && { echo "@@final"; exit 0; }\n'
+        + ": > cancel\n"
+        + "printf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
     )
     if cancel_command is not None:
         body += f'out=$({cancel_command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'

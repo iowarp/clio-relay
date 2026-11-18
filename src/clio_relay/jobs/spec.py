@@ -130,6 +130,13 @@ class PackageRef(_Spec):
     version: str = Field(min_length=1)
     sha256: str
     parameters: dict[str, CustomValue] = Field(default_factory=dict[str, CustomValue])
+    service: bool = Field(
+        default=False,
+        description=(
+            "Run the package as a service: start it and keep it up until it is stopped. "
+            "The guard sets it on the copy it submits for a service."
+        ),
+    )
 
     @field_validator("sha256")
     @classmethod

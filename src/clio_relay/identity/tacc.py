@@ -26,13 +26,21 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
+from clio_relay.identity.base import (
+    IdentityContext,
+    IdentityState,
+    IdentityStatus,
+    SignInContext,
+    SignInResult,
+    SignInStep,
+    Token,
+)
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 PROVIDER = "tacc"
@@ -48,70 +56,6 @@ SHIPPED_CLIENT_KEY: str | None = None
 DEFAULT_POLL_S = 5.0
 # The authenticator keeps a device code for 600 s (DeviceCode.CODE_TTL).
 DEFAULT_DEVICE_CODE_S = 600.0
-
-# The provider interface, mirrored field for field from clio_relay.identity.base
-# and clio_relay.identity.store (W6). When W6's package is merged this block is
-# replaced by imports from there.
-
-IdentityState = Literal["signed_in", "signed_out", "expired"]
-TokenSource = Literal["grant", "keyring"]
-SignInState = Literal["pending", "done", "failed", "slow_down", "expired"]
-
-
-class Token(BaseModel):
-    """One access token. ``access_token`` never prints."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    resource_server: str | None = None
-    access_token: SecretStr
-    token_type: str = "Bearer"
-    expires_at: datetime | None = None
-    scopes: list[str] = Field(default_factory=list[str])
-    source: TokenSource = "keyring"
-
-
-class IdentityStatus(BaseModel):
-    provider: str
-    title: str
-    state: IdentityState
-    source: TokenSource | None = None
-    account: str | None = None
-    expires_at: datetime | None = None
-    scopes: list[str] = Field(default_factory=list[str])
-    detail: str | None = None
-
-
-class SignInStep(BaseModel):
-    """Where the person goes. ``display`` is shown only on relay's own page."""
-
-    url: str
-    relay_page: bool = False
-    display: dict[str, str] = Field(default_factory=dict[str, str])
-    poll_interval_s: float | None = None
-    expires_at: datetime | None = None
-    accepts_code: bool = False
-    data: dict[str, Any] = Field(default_factory=dict[str, Any], exclude=True, repr=False)
-
-
-class SignInResult(BaseModel):
-    state: SignInState
-    message: str | None = None
-
-
-@dataclass
-class SignInContext:
-    store: Any = None
-    http: Any = None
-    redirect_uri: str | None = None
-    step: SignInStep | None = None
-
-
-@dataclass
-class IdentityContext:
-    store: Any = None
-    grants: Any = None
-    settings: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @runtime_checkable

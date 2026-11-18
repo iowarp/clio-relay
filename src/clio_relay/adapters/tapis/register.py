@@ -12,8 +12,10 @@ read.
 ``systems.createUserCredential`` with ``createTmsKeys=true``, and Tapis's trust
 manager makes and holds the key.
 
-Removing the site removes the credential, the system relay made and the
-``authorized_keys`` line.
+Relay does this when the site is added, edited or switched to
+(``on_site_added``), and again only while Tapis's check of the credential
+fails, so relay's key is not replaced each time. Removing the site removes the
+credential, the system relay made and the ``authorized_keys`` line.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from typing import Any, cast
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.client import TapisCallError
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.sites.models import SiteEntry
 
 KEY_BITS = 4096
 WORK_DIR_NAME = ".clio-relay/tapis"
@@ -114,14 +117,20 @@ class SshHost:
 
     def partitions(self) -> list[str]:
         """Slurm partitions, or an empty list when the host has no Slurm."""
+        return list(self.partition_limits())
+
+    def partition_limits(self) -> dict[str, int | None]:
+        """Slurm partitions and their time limits in minutes (None when unlimited)."""
         text = self.run(
-            "command -v sinfo >/dev/null 2>&1 && sinfo -h -o %P || true", "reading partitions"
+            "command -v sinfo >/dev/null 2>&1 && sinfo -h -o '%P %l' || true",
+            "reading partitions",
         )
-        found: list[str] = []
+        found: dict[str, int | None] = {}
         for line in text.splitlines():
-            name = line.strip().rstrip("*")
+            name, _, limit = line.strip().partition(" ")
+            name = name.rstrip("*")
             if name and name not in found:
-                found.append(name)
+                found[name] = slurm_minutes(limit)
         return found
 
     def add_key(self, public_key: str, comment: str) -> None:
@@ -194,6 +203,38 @@ def make_key_pair(comment: str) -> KeyPair:
     )
 
 
+def slurm_minutes(limit: str) -> int | None:
+    """A Slurm time limit (``2-00:00:00``, ``1:00:00``, ``30:00``) in whole minutes.
+
+    ``infinite``, ``UNLIMITED`` or anything unreadable is None: no limit is recorded.
+    """
+    text = limit.strip()
+    days = 0
+    if "-" in text:
+        head, _, text = text.partition("-")
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = text.split(":") if text else []
+    if not parts or not all(part.isdigit() for part in parts) or len(parts) > 3:
+        return None
+    numbers = [int(part) for part in parts]
+    if len(parts) == 3:
+        hours, minutes, seconds = numbers
+    elif len(parts) == 2:
+        hours, (minutes, seconds) = 0, numbers
+    else:
+        hours, minutes, seconds = 0, numbers[0], 0
+    total = days * 1440 + hours * 60 + minutes + (1 if seconds else 0)
+    return total if total > 0 else None
+
+
+def ssh_for_site(site: SiteEntry) -> SshHost | None:
+    """The site's ``ssh`` way in, whether it is the adapter in use or an alternative."""
+    config = site.config if site.adapter == "ssh" else site.alternatives.get("ssh")
+    return SshHost.from_alternative(config) if config else None
+
+
 @dataclass
 class Registration:
     """What a registration did, for the ledger and the compute tab. No secrets."""
@@ -216,8 +257,13 @@ def system_definition(
     home: str,
     queues: list[str],
     authn: str,
+    queue_limits: dict[str, int | None] | None = None,
 ) -> dict[str, Any]:
-    """The body of ``systems.createSystem`` for a person's host."""
+    """The body of ``systems.createSystem`` for a person's host.
+
+    A partition's Slurm time limit becomes its queue's ``maxMinutes``, so a job
+    with no walltime asks for that limit and not for more than Slurm allows.
+    """
     body: dict[str, Any] = {
         "id": system_id,
         "description": "Registered by clio-relay for its own jobs",
@@ -228,6 +274,8 @@ def system_definition(
         "defaultAuthnMethod": "TMS_KEYS" if authn == "tms" else "PKI_KEYS",
         "rootDir": "/",
         "canExec": True,
+        # Lets a batch job exec the launcher, so a cancel's TERM reaches it.
+        "enableCmdPrefix": True,
         "jobRuntimes": [{"runtimeType": "ZIP"}],
         "jobWorkingDir": f"{home.rstrip('/')}/{WORK_DIR_NAME}",
         "tags": ["clio-relay"],
@@ -238,6 +286,7 @@ def system_definition(
         body["batchDefaultLogicalQueue"] = queues[0]
         body["batchLogicalQueues"] = [
             {"name": name, "hpcQueueName": name, "maxJobs": -1, "maxJobsPerUser": -1}
+            | ({"maxMinutes": limit} if (limit := (queue_limits or {}).get(name)) else {})
             for name in queues
         ]
     return body
@@ -271,9 +320,13 @@ async def register_host(
             )
         assert ssh is not None
         home = home or await asyncio.to_thread(ssh.home)
+        limits: dict[str, int | None] = {}
         if queues is None:
-            queues = await asyncio.to_thread(ssh.partitions)
-        body = system_definition(system_id, target, home=home, queues=queues, authn=authn)
+            limits = await asyncio.to_thread(ssh.partition_limits)
+            queues = list(limits)
+        body = system_definition(
+            system_id, target, home=home, queues=queues, authn=authn, queue_limits=limits
+        )
         try:
             await adapter.tapis_call("systems", "createSystem", skipCredentialCheck=True, **body)
         except TapisCallError as exc:
