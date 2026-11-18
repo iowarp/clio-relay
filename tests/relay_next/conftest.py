@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,9 @@ import pytest
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.settings import RelayPaths
+
+# The Slurm suite needs a directory the compute nodes share; without one it is not collected.
+collect_ignore = [] if os.environ.get("RELAY_TEST_SLURM_DIR") else ["test_conformance_slurm.py"]
 
 
 @pytest.fixture
