@@ -8,6 +8,7 @@ processes. These are mock results, never live passes.
 from __future__ import annotations
 
 import asyncio
+import stat
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -340,6 +341,27 @@ async def test_a_task_that_never_changes_is_a_stall(tmp_path: Path) -> None:
         await (await adapter.files()).list(".")
     assert refused.value.reason == RefusalReason.UNREACHABLE
     assert "stayed active" in refused.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["v1", "v2"])
+async def test_mv_rm_and_lstat_reach_the_facility(tmp_path: Path, version: str) -> None:
+    adapter = _build(tmp_path, version)
+    root = Path(adapter.config.root or "")
+    (root / "a.txt").write_bytes(b"a")
+    (root / "d" / "e").mkdir(parents=True)
+    (root / "d" / "e" / "f.txt").write_bytes(b"f")
+    (root / "link").symlink_to(root / "d")
+    task = adapter.client.file_task
+    await task("mv", "compute", {"path": str(root / "a.txt"), "target_path": str(root / "b.txt")})
+    assert (root / "b.txt").read_bytes() == b"a"
+    assert not (root / "a.txt").exists()
+    lstat = await task("stat", "compute", {"path": str(root / "link"), "dereference": False})
+    assert stat.S_ISLNK(lstat["output"]["mode"])
+    await task("rm", "compute", {"path": str(root / "link")})
+    assert (root / "d" / "e" / "f.txt").is_file()
+    await task("rm", "compute", {"path": str(root / "d")})
+    assert not (root / "d").exists()
 
 
 @pytest.mark.asyncio

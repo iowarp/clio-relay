@@ -36,6 +36,18 @@ class TransferService(Protocol):
         """Copy one file between collections, making missing directories, and wait for it."""
         ...
 
+    async def delete(self, collection: str, path: str, *, recursive: bool) -> None:
+        """Delete a file, a symlink or a directory, and wait for it."""
+        ...
+
+    async def rename(self, collection: str, old: str, new: str) -> None:
+        """Move ``old`` to ``new`` on one collection."""
+        ...
+
+    async def mkdir(self, collection: str, path: str) -> None:
+        """Make one directory. A directory that exists already is fine."""
+        ...
+
 
 def _not_found(path: str) -> Refusal:
     return Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
@@ -131,12 +143,49 @@ class SdkTransferService:
             raise self._fail(exc, source_path, f"copying {source_path}") from exc
         return str(response["task_id"])
 
+    def _submit_delete(self, collection: str, path: str, recursive: bool) -> str:
+        try:
+            import globus_sdk
+        except ImportError as exc:  # pragma: no cover - _tc already imported it
+            raise Refusal(RefusalReason.ADAPTER_UNAVAILABLE, INSTALL_HINT) from exc
+        data = globus_sdk.DeleteData(collection, label="clio-relay files", recursive=recursive)
+        data.add_item(path)
+        try:
+            response: Any = self._tc().submit_delete(data)
+        except Exception as exc:
+            raise self._fail(exc, path, f"deleting {path}") from exc
+        return str(response["task_id"])
+
+    def _operation(self, name: str, path: str, doing: str, *args: str) -> None:
+        try:
+            getattr(self._tc(), name)(*args)
+        except Refusal:
+            raise
+        except Exception as exc:
+            if name == "operation_mkdir" and "Exists" in str(getattr(exc, "code", "")):
+                return
+            raise self._fail(exc, path, doing) from exc
+
     async def ls(self, collection: str, path: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self._ls, collection, path)
 
     async def copy(self, source: str, source_path: str, destination: str, dest_path: str) -> None:
         task_id = await asyncio.to_thread(self._submit, source, source_path, destination, dest_path)
         await self._wait(task_id, f"copying {source_path} to {dest_path}")
+
+    async def delete(self, collection: str, path: str, *, recursive: bool) -> None:
+        task_id = await asyncio.to_thread(self._submit_delete, collection, path, recursive)
+        await self._wait(task_id, f"deleting {path}")
+
+    async def rename(self, collection: str, old: str, new: str) -> None:
+        await asyncio.to_thread(
+            self._operation, "operation_rename", old, f"moving {old}", collection, old, new
+        )
+
+    async def mkdir(self, collection: str, path: str) -> None:
+        await asyncio.to_thread(
+            self._operation, "operation_mkdir", path, f"making {path}", collection, path
+        )
 
 
 def _modified(value: object) -> datetime | None:

@@ -455,6 +455,64 @@ def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPat
     assert asked == ["globus", "nobody"]
 
 
+@pytest.mark.asyncio
+async def test_transfer_stand_in_deletes_moves_and_makes_directories(tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    service = LocalTransferService({SITE_COLLECTION: site})
+    await service.mkdir(SITE_COLLECTION, "/d")
+    await service.mkdir(SITE_COLLECTION, "/d")
+    (site / "d" / "f.txt").write_bytes(b"f")
+    await service.rename(SITE_COLLECTION, "/d/f.txt", "/d/g.txt")
+    assert (site / "d" / "g.txt").read_bytes() == b"f"
+    with pytest.raises(Refusal):
+        await service.delete(SITE_COLLECTION, "/d", recursive=False)
+    await service.delete(SITE_COLLECTION, "/d", recursive=True)
+    assert not (site / "d").exists()
+
+
+class RecordingTransferClient:
+    """Stands in for ``globus_sdk.TransferClient`` and records the calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def submit_delete(self, data: Any) -> dict[str, str]:
+        self.calls.append(("submit_delete", dict(data)))
+        return {"task_id": "t-1"}
+
+    def get_task(self, task_id: str) -> dict[str, str]:
+        return {"status": "SUCCEEDED"}
+
+    def operation_rename(self, collection: str, old: str, new: str) -> None:
+        self.calls.append(("operation_rename", (collection, old, new)))
+
+    def operation_mkdir(self, collection: str, path: str) -> None:
+        self.calls.append(("operation_mkdir", (collection, path)))
+        error = RuntimeError("exists")
+        error.__dict__["code"] = "ExternalError.MkdirFailed.Exists"
+        raise error
+
+
+@pytest.mark.asyncio
+async def test_sdk_transfer_deletes_moves_and_makes_directories() -> None:
+    from clio_relay.adapters.globus.transfer import SdkTransferService
+
+    service = SdkTransferService("token", poll_s=0.01)
+    client = RecordingTransferClient()
+    service.__dict__["_client"] = client
+    await service.delete(SITE_COLLECTION, "/d", recursive=True)
+    await service.rename(SITE_COLLECTION, "/a", "/b")
+    await service.mkdir(SITE_COLLECTION, "/d")
+    name, data = client.calls[0]
+    assert name == "submit_delete"
+    assert data["DATA_TYPE"] == "delete"
+    assert data["endpoint"] == SITE_COLLECTION
+    assert data["recursive"] is True
+    assert [item["path"] for item in data["DATA"]] == ["/d"]
+    assert client.calls[1] == ("operation_rename", (SITE_COLLECTION, "/a", "/b"))
+    assert client.calls[2] == ("operation_mkdir", (SITE_COLLECTION, "/d"))
+
+
 def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:
     """The endpoint runs the function from its source text, with no relay installed."""
     import inspect

@@ -71,6 +71,18 @@ _STATES = {
     "failed": "failed",
     "cancelled": "canceled",
 }
+# The v1 methods of the file calls, from the facilities' published v1 specs.
+_V1_METHODS = {
+    "rm": "DELETE",
+    "chmod": "PUT",
+    "chown": "PUT",
+    "mkdir": "POST",
+    "symlink": "POST",
+    "compress": "POST",
+    "extract": "POST",
+    "mv": "POST",
+    "cp": "POST",
+}
 
 
 def problem(status: int, title: str, detail: str) -> httpx.Response:
@@ -256,20 +268,24 @@ class FakeIriFacility:
             return problem(404, "Not Found", f"no resource {resource}")
         if command == "upload":
             args: dict[str, Any] = {"path": request.url.params.get("path", "")}
-        elif version == "v2" or request.method == "POST":
+        elif version == "v2":
             if request.method != "POST":
                 return problem(405, "Method Not Allowed", f"{command} is a POST in {version}")
             loaded: Any = json.loads(request.content or b"{}")
             args = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
         else:
-            expected = "DELETE" if command == "rm" else "GET"
+            expected = _V1_METHODS.get(command, "GET")
             if request.method != expected:
                 return problem(405, "Method Not Allowed", f"{command} is a {expected} in v1")
-            args = dict(request.url.params)
+            if expected == "POST":
+                loaded = json.loads(request.content or b"{}")
+                args = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
+            else:
+                args = dict(request.url.params)
         target = self._local(str(args.get("path", "")))
         if target is None:
             return problem(403, "Forbidden", f"{args.get('path')} is outside the facility")
-        status, result = self._run_file(command, target, request)
+        status, result = self._run_file(command, target, request, args)
         task_id = str(uuid.uuid4())
         write_json_atomic(
             self.state_root / "tasks" / f"{task_id}.json",
@@ -280,10 +296,11 @@ class FakeIriFacility:
             code, json={"task_id": task_id, "task_uri": f"/api/{version}/task/{task_id}"}
         )
 
-    def _run_file(  # noqa: C901, PLR0911
-        self, command: str, target: Path, request: httpx.Request
+    def _run_file(  # noqa: C901, PLR0911, PLR0912
+        self, command: str, target: Path, request: httpx.Request, args: dict[str, Any]
     ) -> tuple[str, dict[str, Any]]:
         missing = ("failed", {"output": f"Error: {target}: No such file or directory"})
+        present = target.exists() or target.is_symlink()
         if command == "ls":
             if not target.is_dir():
                 return missing
@@ -304,9 +321,10 @@ class FakeIriFacility:
                 )
             return "completed", {"output": items}
         if command == "stat":
-            if not target.exists():
+            follow = str(args.get("dereference", "false")).lower() == "true"
+            if not (target.exists() if follow else present):
                 return missing
-            info = target.stat()
+            info = target.stat() if follow else target.lstat()
             fields = (
                 "mode",
                 "ino",
@@ -341,13 +359,22 @@ class FakeIriFacility:
             target.write_bytes(_multipart_file(request))
             return "completed", {"output": "uploaded"}
         if command == "rm":
-            if not target.exists():
+            # Like the facilities' rm: a directory goes with its contents.
+            if not present:
                 return missing
-            if target.is_dir():
+            if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target)
             else:
                 target.unlink()
             return "completed", {"output": "removed"}
+        if command == "mv":
+            destination = self._local(str(args.get("target_path", "")))
+            if destination is None:
+                return "failed", {"output": f"Error: {args.get('target_path')} is outside"}
+            if not present or not destination.parent.is_dir():
+                return missing
+            os.replace(target, destination)
+            return "completed", {"output": "moved"}
         return "failed", {"output": f"Error: {command} is not supported here"}
 
     def _task_status(self, task_id: str) -> httpx.Response:

@@ -24,7 +24,7 @@ TokenFn = Callable[[], Awaitable[str]]
 FILE_SIZE_LIMIT = 5 * 1024 * 1024
 
 # v1 uses these methods for the file calls; v2 posts them all.
-_V1_METHODS = {"rm": "DELETE", "mkdir": "POST", "upload": "POST"}
+_V1_METHODS = {"rm": "DELETE", "mkdir": "POST", "upload": "POST", "mv": "POST"}
 
 
 def problem_text(response: httpx.Response) -> str:
