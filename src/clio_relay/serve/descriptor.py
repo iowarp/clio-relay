@@ -25,8 +25,9 @@ SOURCE = {
 
 
 def schema_bytes() -> bytes:
-    """Return the vendored schema file."""
-    return resources.files("clio_relay.serve").joinpath("schemas", "view-descriptor.v1.json").read_bytes()
+    """Return the vendored schema file, with the line endings it was published with."""
+    data = resources.files("clio_relay.serve").joinpath("schemas", "view-descriptor.v1.json").read_bytes()
+    return data.replace(b"\r\n", b"\n")
 
 
 @cache
