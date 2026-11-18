@@ -127,7 +127,11 @@ finish() {
     for dir in "$JOB" "$SVC_DIR"; do
         [ -d "$dir" ] || continue
         if [ "$dir" = "$JOB" ]; then
+            # The package runner's archive and JARVIS tree are relay's own; package
+            # outputs land in .relay-jarvis/shared.
             (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
+                ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
+                ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
                 ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
                 ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
                 ! -name cancel ! -name states 2>/dev/null) |
