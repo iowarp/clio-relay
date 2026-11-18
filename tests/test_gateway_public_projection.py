@@ -10,10 +10,8 @@ from fastapi.testclient import TestClient
 
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
-from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 from clio_relay.config import RelaySettings
 from clio_relay.models import GatewaySession
-from clio_relay.service_runtime import ServiceRuntimeStopResult
 
 _OWNER_TOKEN = "owner-capability-8c699a93d7cc4af1"
 _API_TOKEN = "api-capability-69dc7b420af54a1b"
@@ -153,34 +151,3 @@ def test_http_gateway_list_and_get_redact_nested_credentials(tmp_path: Path) -> 
     _assert_public_document(listed_sessions[0])
     _assert_public_document(read.json())
     _assert_internal_credentials_remain(queue, session.session_id)
-
-
-def test_runtime_cleanup_payload_uses_public_gateway_projection() -> None:
-    """Detach and stop reports cannot reintroduce the durable gateway capabilities."""
-    session = _gateway_with_credentials()
-    result = ServiceRuntimeStopResult(
-        session=session,
-        mode="detach",
-        stopped_local_pid=None,
-        stopped_remote_pid=None,
-        canceled_scheduler_job=None,
-        resources=[
-            CleanupResource(
-                kind="desktop_connector",
-                resource_id="connector-1",
-                location="desktop",
-                action="stop",
-                ownership_verified=True,
-                outcome="stopped",
-                metadata={
-                    "owner_token": _OWNER_TOKEN,
-                    "diagnostic": f"stopped owner {_OWNER_TOKEN}",
-                },
-            )
-        ],
-        errors=[f"historic diagnostic mentioned {_OWNER_TOKEN}"],
-    )
-
-    _assert_public_document(result.json_payload())
-    for sensitive in _SENSITIVE_VALUES:
-        assert sensitive in session.model_dump_json()

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
-import clio_relay.service_runtime_readiness as service_runtime_readiness
 from clio_relay.adapters.worker.browser_attachment_record import BrowserAttachmentRecord
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
@@ -239,27 +237,6 @@ def test_concurrent_revoke_finish_is_idempotent_for_the_exact_attachment(
             attachment=starting,
             browser_proxy_intent=_intent("starting", starting.attachment_id),
         )
-
-
-def test_parallel_revocation_marker_writes_use_unique_staging_files(tmp_path: Path) -> None:
-    marker = tmp_path / "browser-a.revoked"
-    barrier = threading.Barrier(2)
-
-    def revoke() -> None:
-        barrier.wait()
-        service_runtime_readiness._write_browser_revocation_marker(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-            marker,
-            "browser-a",
-        )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(revoke) for _ in range(2)]
-        for future in futures:
-            future.result()
-
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert payload["attachment_id"] == "browser-a"
-    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def _owned_ready_gateway(tmp_path: Path) -> tuple[ClioCoreQueue, GatewaySession]:

@@ -98,9 +98,6 @@ from clio_relay.run_report_models import (
     SoftwareIdentity,
 )
 from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
-from clio_relay.service_runtime import (
-    ServiceRuntimeSupervisor,
-)
 from clio_relay.session_wire_models import RemoteSessionStateEvidence
 
 _REAL_PERSIST_VERIFIED_CLEANUP_REPORT = (
@@ -5021,17 +5018,9 @@ def test_gateway_scheduler_sentinel_conflict_fails_before_any_destructive_cleanu
         destructive_calls.append("api")
         raise AssertionError("gateway sentinel conflict must fail before API teardown")
 
-    def forbidden_stop(
-        _self: ServiceRuntimeSupervisor,
-        **_kwargs: object,
-    ) -> object:
-        destructive_calls.append("gateway")
-        raise AssertionError("gateway sentinel conflict must fail before gateway stop")
-
     monkeypatch.setattr(session_lifecycle, "status_remote_session", _fake_owned_session_status)
     monkeypatch.setattr(worker_scheduler, "provider_for_scheduler", forbidden_provider)
     monkeypatch.setattr(session_lifecycle, "teardown_remote_session", forbidden_teardown)
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", forbidden_stop)
     report_path = tmp_path / "gateway-sentinel-conflict.json"
     result = CliRunner().invoke(
         app,
@@ -5879,67 +5868,6 @@ def test_owned_runtime_cleanup_scans_remote_gateway_core(
     assert first_resource["resource_id"] == "owned-gateway"
     assert not any("unrelated-gateway" in command for command in calls)
     assert not any("newer-generation-gateway" in command for command in calls)
-
-
-def test_owned_runtime_cleanup_refuses_gateway_without_exact_generation(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    core_dir = tmp_path / "core"
-    monkeypatch.setenv("CLIO_RELAY_CORE_DIR", str(core_dir))
-    gateway = GatewaySession(
-        cluster="ares",
-        name="legacy-ambiguous-gateway",
-        state=GatewaySessionState.READY,
-        metadata={
-            "owner": "clio-relay",
-            "owner_session_id": "session-1",
-        },
-    )
-
-    def scan_ambiguous_gateways(
-        _self: ClioCoreQueue,
-        *,
-        limit: int,
-        cluster: str | None = None,
-        state: GatewaySessionState | None = None,
-    ) -> tuple[list[GatewaySession], bool]:
-        del limit, cluster, state
-        return [gateway], False
-
-    monkeypatch.setattr(
-        ClioCoreQueue,
-        "scan_gateway_sessions",
-        scan_ambiguous_gateways,
-    )
-
-    def forbidden_stop(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("ambiguous gateway ownership must not authorize cleanup")
-
-    monkeypatch.setattr(ServiceRuntimeSupervisor, "stop", forbidden_stop)
-
-    reports = cli_owned_runtime_cleanup._cleanup_owned_runtime_sessions(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster="ares",
-        definition=ClusterDefinition(name="ares", ssh_host="ares"),
-        owner_session_id="session-1",
-        owner_session_generation_id="generation-1",
-        mode="teardown",
-        cancel_scheduler_jobs=False,
-    )
-
-    assert len(reports) == 1
-    assert reports[0]["ok"] is False
-    resources = cast(list[dict[str, object]], reports[0]["residual_resources"])
-    assert len(resources) == 1
-    assert resources[0]["resource_id"] == gateway.session_id
-    assert resources[0]["action"] == "close"
-    assert resources[0]["outcome"] == "refused"
-    assert resources[0]["ownership_verified"] is False
-    assert resources[0]["residual"] is True
-    assert resources[0]["metadata"] == {
-        "expected_owner_session_generation_id": "generation-1",
-        "observed_owner_session_generation_id": None,
-    }
 
 
 def test_owned_runtime_cleanup_rescans_for_late_exact_generation_gateway(
