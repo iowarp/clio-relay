@@ -32,6 +32,7 @@ def _clean_remote(fx: dict[str, str]) -> Iterator[None]:  # pyright: ignore[repo
             timeout=120,
         )
 
+
 @pytest.mark.parametrize("profile", PROFILES)
 async def test_an_input_the_job_deletes_leaves_no_copy_in_the_store(
     fx: dict[str, str], tmp_path: Path, profile: str
@@ -44,7 +45,7 @@ async def test_an_input_the_job_deletes_leaves_no_copy_in_the_store(
     def on_site(path: str) -> bool:
         parent = path.rsplit("/", 1)[0]
         answer = site_shell(
-            fx, profile, f"ls -f {parent} >/dev/null 2>&1; test -e {path} && echo y"
+            fx, profile, f"ls -f {parent} >/dev/null 2>&1; test -e {path} && echo y || echo n"
         )
         return answer.strip() == "y"
 
