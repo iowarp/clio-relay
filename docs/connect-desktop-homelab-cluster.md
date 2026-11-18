@@ -13,9 +13,8 @@ connections from the desktop and the cluster.
 
 This walkthrough builds one connection: the desktop-local relay and the
 cluster-side relay joined by exactly one persistent link, which then carries
-every later operation. `docs/connection-model.md` is the normative statement of
-that model — the transport modes, the ssh budget, reconnect, and how run inputs
-reach the cluster. Read it before adapting these steps into automation.
+every later operation. `docs/adapters/worker.md` describes
+that link: placement, sign-in and reconnect. Read it before adapting these steps into automation.
 
 Install the released relay as a persistent tool on each operator host that runs
 `clio-relay`. Replace `<released-version>` with the exact version being deployed:
@@ -304,8 +303,7 @@ A compute node never opens transport of its own: it needs no outbound internet
 reachability, and the stream's semantics are identical in every transport mode.
 (The current implementation deviates — it launches a compute-node-side `frpc`
 that dials the relay host directly, which both bypasses the cluster relay and
-demands outbound internet access from compute nodes; tracked on the
-connection-model restoration, issue #179.)
+demands outbound internet access from compute nodes; tracked on issue #179.)
 
 The stream is pushed over the live transport. The relay core stores session,
 job, scheduler, lifecycle, and artifact metadata. It does not store bulk image

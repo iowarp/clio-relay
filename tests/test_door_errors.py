@@ -5,9 +5,8 @@ Each test below is written failing-first against
 deliberately-bare re-raise), the #218/#215 regressions re-pointed at the
 frozen ``REASONS`` table instead of their old ad hoc, per-site shapes, an
 adapter-contract proof of the ``launcher_resolution_failed`` shape, a
-sabotage twin proving unclassified exceptions never reach the wire, the
-browser_gateway fourth adapter replacing its bare ``{"error": message}``
-dict, and the opus re-review findings (F1-F16): the MCP-SDK code-band
+sabotage twin proving unclassified exceptions never reach the wire, and
+the opus re-review findings (F1-F16): the MCP-SDK code-band
 collision, silent truncation, the unenforced byte budget, a hostile
 ``__str__``, and the ``payload_too_large``/deviation-ownership gaps.
 """
@@ -114,13 +113,6 @@ _EXPECTED_REASONS = frozenset(
         "route_not_found",
         "method_not_allowed",
         "framework_http_error",
-        "browser_gateway_overloaded",
-        "browser_preflight_refused",
-        "browser_attachment_not_found",
-        "browser_origin_refused",
-        "browser_capability_refused",
-        "browser_method_not_allowed",
-        "browser_upstream_unavailable",
         "websocket_authentication_failed",
         "websocket_session_binding_failed",
         "websocket_page_limit_invalid",
@@ -200,12 +192,6 @@ _EXPECTED_R9_HTTP_STATUSES = {
     "route_not_found": 404,
     "method_not_allowed": 405,
     "framework_http_error": 500,
-    "browser_gateway_overloaded": 503,
-    **dict.fromkeys({"browser_preflight_refused", "browser_origin_refused"}, 403),
-    "browser_attachment_not_found": 404,
-    "browser_capability_refused": 401,
-    "browser_method_not_allowed": 405,
-    "browser_upstream_unavailable": 502,
     "websocket_authentication_failed": 401,
     "websocket_session_binding_failed": 409,
     "websocket_page_limit_invalid": 422,
@@ -218,7 +204,7 @@ _EXPECTED_R9_HTTP_STATUSES = {
 def test_every_reason_is_registered() -> None:
     """The frozen set is exactly the doc §6.3 table -- no more, no fewer."""
     assert set(door_errors.REASONS) == _EXPECTED_REASONS
-    assert len(door_errors.REASONS) == 75
+    assert len(door_errors.REASONS) == 68
     for reason, spec in door_errors.REASONS.items():
         assert spec.reason == reason
         assert len(reason) <= 64
@@ -227,7 +213,7 @@ def test_every_reason_is_registered() -> None:
         assert isinstance(spec.mcp_code, int) and spec.mcp_code < 0
         assert 400 <= spec.http_status < 600
         assert spec.title
-    assert len(_EXPECTED_R9_HTTP_STATUSES) == 61
+    assert len(_EXPECTED_R9_HTTP_STATUSES) == 54
     assert {
         reason: door_errors.REASONS[reason].http_status for reason in _EXPECTED_R9_HTTP_STATUSES
     } == _EXPECTED_R9_HTTP_STATUSES
@@ -557,7 +543,7 @@ def test_message_under_the_t1_budget_has_no_truncation_record() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# as_mcp_error / as_http_problem / as_browser_gateway_error
+# as_mcp_error / as_http_problem
 # --------------------------------------------------------------------------- #
 
 
@@ -691,14 +677,6 @@ def test_as_http_problem_measures_bytes_with_ensure_ascii_false() -> None:
     inflated = json.dumps(document, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     assert len(honest) < len(inflated)
     assert len(honest) <= door_errors.MAX_ENVELOPE_BYTES
-
-
-def test_as_browser_gateway_error_maps_onto_the_two_arg_shape() -> None:
-    fault = door_errors.classify(ConfigurationError("bad body"), reason="configuration_error")
-    status, document = door_errors.as_browser_gateway_error(fault)
-    assert status == fault.http_status == 400
-    assert document == door_errors.as_http_problem(fault)
-    assert "error" not in document  # not the old bare {"error": message} shape
 
 
 @pytest.mark.parametrize(
@@ -1204,8 +1182,3 @@ def test_deliberate_route_failure_uses_specific_handler_before_global_fallback(
     assert body["schema_version"] == door_errors.SCHEMA_VERSION
     assert body["reason"] == "job_not_found"
     assert body["status"] == 404
-
-
-# --------------------------------------------------------------------------- #
-# browser_gateway.py wiring: the fourth adapter
-# --------------------------------------------------------------------------- #

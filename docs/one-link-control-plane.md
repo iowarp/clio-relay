@@ -188,7 +188,7 @@ Deployment and lifecycle, not the runtime control plane:
 ## What still dials and should not
 
 These are outside the owned-session control plane restored here. They are
-deviations from `connection-model.md`, not sanctioned exceptions, and the
+deviations from the one-link model, not sanctioned exceptions, and the
 campaign issue [#182](https://github.com/iowarp/clio-relay/issues/182) carries
 them:
 
@@ -211,8 +211,7 @@ them:
 - a COLD `cluster bootstrap` still opens two SSH connections of its own
   (the lightweight preflight dial that tells warm from cold, plus one
   combined install pass), not the single deploy connection
-  `connection-model.md`'s mode (c) budget assumes for the deploy step; see
-  that page's "Known deviations" and
+  the one-link model assumes for the deploy step; see
   [#209](https://github.com/iowarp/clio-relay/issues/209). Closed by the same
   work: the six dials that combined pass used to cost after preflight
   (mkdir/scp/scp/exec/cat/rm) and the separate target-identity probe

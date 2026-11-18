@@ -2,9 +2,8 @@
 
 ``docs/design/relay-architecture-2026-08.md`` §6 is the governing design:
 four call surfaces -- ``fastmcp_server.py`` (SEP-2663 task handlers plus
-``intercept_tool_call``), ``http_api.py`` (FastAPI routes),
-``browser_gateway.py`` (``CapabilityProxyHandler._error``, the fourth
-surface named in §6.1 -- the shape with the least existing structure), and
+``intercept_tool_call``), ``http_api.py`` (FastAPI routes), the browser gateway (the fourth surface
+named in §6.1, removed with the old surface), and
 ``mcp_server.py`` (the stdio JSON-RPC ``_error`` helper, not yet wired
 through this module -- tracked as its own live issue,
 `iowarp/clio-relay#235 <https://github.com/iowarp/clio-relay/issues/235>`_)
@@ -95,9 +94,6 @@ import mcp_types
 
 from clio_relay.adapters.worker.door_error_adapters import MAX_ENVELOPE_BYTES as MAX_ENVELOPE_BYTES
 from clio_relay.adapters.worker.door_error_adapters import SCHEMA_VERSION as SCHEMA_VERSION
-from clio_relay.adapters.worker.door_error_adapters import (
-    as_browser_gateway_error as as_browser_gateway_error,
-)
 from clio_relay.adapters.worker.door_error_adapters import as_http_problem as as_http_problem
 from clio_relay.adapters.worker.door_error_adapters import as_mcp_error as as_mcp_error
 from clio_relay.adapters.worker.door_error_adapters import websocket_refusal as websocket_refusal
@@ -296,7 +292,7 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
                 title="Internal error",
             ),
             _row(
-                # F7+F14 (opus review): browser_gateway's own oversize
+                # F7+F14 (opus review): the old browser gateway's oversize
                 # request-body branch (_request_body's length > MAX_REQUEST_
                 # BODY_BYTES check) previously fell into configuration_error's
                 # 400 blanket mapping alongside three unrelated protocol
@@ -393,23 +389,6 @@ REASONS: Final[Mapping[str, ReasonSpec]] = MappingProxyType(
             _http_row("route_not_found", 404, "Route not found"),
             _http_row("method_not_allowed", 405, "Method not allowed"),
             _http_row("framework_http_error", 500, "Framework HTTP error"),
-            _http_row(
-                "browser_gateway_overloaded",
-                503,
-                "Browser gateway overloaded",
-                retryable=True,
-            ),
-            _http_row("browser_preflight_refused", 403, "Browser preflight refused"),
-            _http_row("browser_attachment_not_found", 404, "Browser attachment not found"),
-            _http_row("browser_origin_refused", 403, "Browser origin refused"),
-            _http_row("browser_capability_refused", 401, "Browser capability refused"),
-            _http_row("browser_method_not_allowed", 405, "Browser method not allowed"),
-            _http_row(
-                "browser_upstream_unavailable",
-                502,
-                "Browser upstream unavailable",
-                retryable=True,
-            ),
             _http_row("websocket_authentication_failed", 401, "WebSocket authentication failed"),
             _http_row("websocket_session_binding_failed", 409, "WebSocket session binding failed"),
             _http_row("websocket_page_limit_invalid", 422, "WebSocket page limit invalid"),
