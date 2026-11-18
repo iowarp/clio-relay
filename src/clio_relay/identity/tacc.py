@@ -28,6 +28,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -54,7 +55,7 @@ DEFAULT_DEVICE_CODE_S = 600.0
 
 IdentityState = Literal["signed_in", "signed_out", "expired"]
 TokenSource = Literal["grant", "keyring"]
-SignInState = Literal["pending", "done", "failed", "slow_down"]
+SignInState = Literal["pending", "done", "failed", "slow_down", "expired"]
 
 
 class Token(BaseModel):
@@ -88,6 +89,7 @@ class SignInStep(BaseModel):
     relay_page: bool = False
     display: dict[str, str] = Field(default_factory=dict[str, str])
     poll_interval_s: float | None = None
+    expires_at: datetime | None = None
     accepts_code: bool = False
     data: dict[str, Any] = Field(default_factory=dict[str, Any], exclude=True, repr=False)
 
@@ -270,11 +272,25 @@ def jwt_claims(token: str) -> dict[str, Any]:
 
 
 def _seconds(value: Any, default: float) -> float:
-    """Tapis sends ``expires_in`` as seconds, or for a device code as a timestamp."""
+    """Tapis sends ``expires_in`` as seconds, or for a device code as a date.
+
+    A date is turned into the seconds left from now on the wall clock.
+    """
     if isinstance(value, int | float):
         return float(value)
     if isinstance(value, str) and value.strip().isdigit():
         return float(value)
+    if isinstance(value, str) and value.strip():
+        when: datetime | None = None
+        with contextlib.suppress(TypeError, ValueError, IndexError):
+            when = parsedate_to_datetime(value)
+        if when is None:
+            with contextlib.suppress(ValueError):
+                when = datetime.fromisoformat(value.strip())
+        if when is not None:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            return max(0.0, when.timestamp() - time.time())
     return default
 
 
@@ -525,6 +541,7 @@ class TaccIdentity:
             relay_page=False,
             display={"user_code": pending.user_code},
             poll_interval_s=pending.interval_s,
+            expires_at=datetime.fromtimestamp(pending.expires_at, UTC),
         )
 
     @staticmethod
@@ -558,9 +575,7 @@ class TaccIdentity:
                 return SignInResult(state="done", message="signed in")
             return SignInResult(state="failed", message="no sign-in is in progress")
         if pending.expires_at <= now:
-            record.pending = None
-            self._save(record)
-            return SignInResult(state="failed", message="the TACC code expired; ask again")
+            return self._expired(record)
         if now < pending.next_poll_at and not force:
             return SignInResult(state="pending", message="waiting for the TACC sign-in")
         pending.next_poll_at = now + pending.interval_s
@@ -585,11 +600,19 @@ class TaccIdentity:
                 return SignInResult(state="slow_down", message="waiting for the TACC sign-in")
             if "not ready" in text or "authorization_pending" in text:
                 return SignInResult(state="pending", message="waiting for the TACC sign-in")
+            if "expired" in text:
+                return self._expired(record)
             record.pending = None
             self._save(record)
             return SignInResult(state="failed", message=f"TACC refused the sign-in: {exc.message}")
         self._save(self._store_tokens(record, result))
         return SignInResult(state="done", message="signed in to TACC")
+
+    def _expired(self, record: TaccRecord) -> SignInResult:
+        """Drop the dead code. Relay then calls ``begin`` for a new one on the same ask."""
+        record.pending = None
+        self._save(record)
+        return SignInResult(state="expired", message="the TACC code expired; a new one is needed")
 
     async def callback(self, ctx: SignInContext | None, params: Mapping[str, str]) -> SignInResult:
         return SignInResult(state="failed", message="the TACC sign-in uses a device code")

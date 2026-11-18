@@ -29,7 +29,9 @@ you sign in on TACC's own page and never type a password into relay.
    without it gets a `needs_sign_in` refusal carrying the same page.
 2. On TACC's page, enter the code and sign in with your TACC account and its
    second factor.
-3. Relay sees the sign-in within a few seconds and carries on.
+3. Relay sees the sign-in within a few seconds and carries on. A code lasts 10
+   minutes. If it runs out first, relay gets a new one and shows it on the same
+   page, with no limit on how long you take.
 
 Relay keeps the tokens in your operating system's keyring under the service
 name `clio-relay`. They are never shown to the model, logged or written to
