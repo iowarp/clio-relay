@@ -215,8 +215,11 @@ class PageCore:
             start = _button("start", f"Sign in with {label}")
             return f"<form method='post'>{fields}{start}</form>", None
         if not step.relay_page:
+            code = step.display.get("code")
+            shown = f"<p class='code'>{e(code)}</p>" if code else ""
             return (
                 _link(step.url, f"Continue to {label}")
+                + shown
                 + "<p class='note'>Come back here when you have signed in.</p>",
                 5,
             )

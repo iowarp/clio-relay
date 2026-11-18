@@ -206,7 +206,7 @@ def asks_identities() -> None:
 async def _sign_in(name: str) -> str:
     import httpx
 
-    from clio_relay.identity import SignInContext
+    from clio_relay.identity import SignInContext, SignInStep, device
 
     identities = _identities()
     identity = identities.get(name)
@@ -224,16 +224,20 @@ async def _sign_in(name: str) -> str:
             code = typer.prompt("Code", hide_input=True).strip()
             result = await identity.callback(ctx, {"code": code})
         else:
-            interval = step.poll_interval_s or 5.0
-            while True:
-                await asyncio.sleep(interval)
-                result = await identity.poll(ctx, step)
-                if result.state == "pending":
-                    continue
-                if result.state == "slow_down":
-                    interval += 5.0
-                    continue
-                break
+
+            def new_step(fresh: SignInStep) -> None:
+                typer.echo("The code expired. Here is a new one.")
+                typer.echo(fresh.display.get("link") or fresh.url)
+                if fresh.display.get("code"):
+                    typer.echo(f"Code: {fresh.display['code']}")
+
+            def error(refusal: Refusal) -> None:
+                typer.echo(f"{refusal.message}. Trying again.", err=True)
+
+            found = await device.follow(identity, ctx, step, on_new_step=new_step, on_error=error)
+            if found is None:
+                _fail("the sign-in did not finish")
+            result = found
     if result.state != "done":
         _fail(result.message or "the sign-in did not finish")
     return result.message or "Signed in."
