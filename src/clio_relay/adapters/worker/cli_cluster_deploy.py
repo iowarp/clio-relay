@@ -191,8 +191,8 @@ def cluster_bootstrap(
 ) -> None:
     """Bootstrap a configured cluster's tools, relay package, and endpoint directories."""
     import clio_relay.adapters.worker.cli as cli
-    from clio_relay.adapters.worker import cli_remote_collection_pagination
     import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+    from clio_relay.adapters.worker import cli_remote_collection_pagination
 
     report_path = report or default_report_path(cluster)
     try:

@@ -27,24 +27,26 @@ from filelock import FileLock
 
 import clio_relay.adapters.worker.cli_api as cli_api
 import clio_relay.adapters.worker.cli_cluster as cli_cluster
-from clio_relay.adapters.worker import cli_cluster_deploy  # noqa: F401 -- registers cluster_app's deployment commands
 import clio_relay.adapters.worker.cli_endpoint as cli_endpoint
 import clio_relay.adapters.worker.cli_init as cli_init
 import clio_relay.adapters.worker.cli_installation_receipt as cli_installation_receipt
 import clio_relay.adapters.worker.cli_jarvis_runtime_authority as cli_jarvis_runtime_authority
 import clio_relay.adapters.worker.cli_queue as cli_queue
-from clio_relay.adapters.worker import cli_queue_maintenance  # noqa: F401 -- registers queue_app's maintenance commands
 import clio_relay.adapters.worker.cli_relay_host as cli_relay_host
 import clio_relay.adapters.worker.cli_scheduler as cli_scheduler
 import clio_relay.adapters.worker.cli_session as cli_session
-from clio_relay.adapters.worker import cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
-from clio_relay.adapters.worker import cli_session_owned  # noqa: F401 -- registers session_app's owned-session commands
-from clio_relay.adapters.worker import cli_session_start  # noqa: F401 -- registers session_app's start command
-from clio_relay.adapters.worker import cli_session_teardown  # noqa: F401 -- registers session_app's teardown command
 import clio_relay.adapters.worker.cli_support as cli_support
 import clio_relay.adapters.worker.cli_worker as cli_worker
 import clio_relay.adapters.worker.site_server as site_server
 import clio_relay.remote_cli as remote_cli
+from clio_relay.adapters.worker import (
+    cli_cluster_deploy,  # noqa: F401 -- registers cluster_app's deployment commands
+    cli_queue_maintenance,  # noqa: F401 -- registers queue_app's maintenance commands
+    cli_session_attach,  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
+    cli_session_owned,  # noqa: F401 -- registers session_app's owned-session commands
+    cli_session_start,  # noqa: F401 -- registers session_app's start command
+    cli_session_teardown,  # noqa: F401 -- registers session_app's teardown command
+)
 from clio_relay.adapters.worker.storage_runtime import StorageManagedQueue
 from clio_relay.adapters.worker.worker_concurrency import parse_kind_concurrency_options
 from clio_relay.cluster_config import (

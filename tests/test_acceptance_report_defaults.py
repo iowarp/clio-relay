@@ -32,7 +32,6 @@ import clio_relay.adapters.worker.bootstrap as bootstrap
 import clio_relay.adapters.worker.cli_cleanup_report as cli_cleanup_report
 import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
 import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
-from clio_relay.adapters.worker import cli_remote_collection_pagination
 import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
 import clio_relay.adapters.worker.cli_session_teardown as cli_session_teardown
 import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
@@ -42,6 +41,7 @@ import clio_relay.relay_ops as relay_ops
 import clio_relay.remote_cli as remote_cli
 import clio_relay.remote_mcp as remote_mcp
 import clio_relay.scheduler_providers as scheduler_providers
+from clio_relay.adapters.worker import cli_remote_collection_pagination
 from clio_relay.adapters.worker.cli import app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import (

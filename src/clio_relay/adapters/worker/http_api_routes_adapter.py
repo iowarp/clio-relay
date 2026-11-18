@@ -32,12 +32,11 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import ExecResult, FileAccess, JobHandle
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-
-_BODY: Any = Body(default_factory=dict)
 from clio_relay.jobs.spec import JobSpec
 
 ADAPTER_ROUTE_PREFIX = "/adapter"
 _POLL_WAIT_S = 20.0
+_BODY: Any = Body(default_factory=dict)
 
 
 @dataclass
@@ -292,7 +291,5 @@ def register_adapter_routes(
         return await _answer(action)
 
     @app.post(f"{prefix}/files/{{op}}", dependencies=[auth_dependency])
-    async def adapter_files(
-        op: str, body: dict[str, Any] = _BODY
-    ) -> dict[str, Any]:
+    async def adapter_files(op: str, body: dict[str, Any] = _BODY) -> dict[str, Any]:
         return await _answer(lambda: _file_op(_site_adapter(ctx, body), op, body))

@@ -13,9 +13,9 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from clio_relay.adapters.worker import cli_remote_collection_pagination
 import clio_relay.adapters.worker.remote_channel_dispatch as remote_channel_dispatch
 import clio_relay.remote_cli as remote_cli
+from clio_relay.adapters.worker import cli_remote_collection_pagination
 from clio_relay.cluster_config import (
     ClusterDefinition,
 )

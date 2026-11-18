@@ -373,11 +373,11 @@ def session_detach(
     """Close the desktop attachment while retaining remote work and session processes."""
     import clio_relay.adapters.worker.cli as cli
     import clio_relay.adapters.worker.cli_owned_relay_jobs as cli_owned_relay_jobs
-    from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
     import clio_relay.adapters.worker.cli_owned_runtime_cleanup as cli_owned_runtime_cleanup
     import clio_relay.adapters.worker.cli_owned_scheduler_cancel as cli_owned_scheduler_cancel
     import clio_relay.adapters.worker.cli_owned_session_recovery as cli_owned_session_recovery
     import clio_relay.adapters.worker.cli_remote_worker_attach as cli_remote_worker_attach
+    from clio_relay.adapters.worker import cli_owned_relay_jobs_remote_listing
 
     canonical_report_path = validation_report or default_report_path(cluster)
     seed_report = cli_remote_worker_attach._new_cleanup_acceptance_report(
