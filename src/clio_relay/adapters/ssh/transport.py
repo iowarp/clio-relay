@@ -263,16 +263,20 @@ class SshTransport:
         return options
 
     def _use_askpass(self) -> bool:
-        return self.config.interactive_sign_in and _askpass_module() is not None
+        """Return whether a sign-in can answer the site's prompts (W6's page or a program)."""
+        return self.config.interactive_sign_in and (
+            _askpass_module() is not None or bool(self.config.askpass)
+        )
 
     def ssh_argv(self) -> list[str]:
         """Return the base ``ssh`` argv: program, options and host.
 
-        ``serve`` adds its own flags (``-N -L``, ``-J``) before the host.
+        Calls run with ``BatchMode=yes`` and reuse the signed-in master when there
+        is one. ``serve`` adds its own flags (``-N -L``, ``-J``) before the host.
         """
         return [
             self.config.ssh_command,
-            *self._common_options(batch=not self._use_askpass()),
+            *self._common_options(batch=True),
             self.config.ssh_profile,
         ]
 
@@ -280,18 +284,21 @@ class SshTransport:
         """Return the environment ssh and scp run with, or ``None`` for relay's own."""
         if not self._use_askpass():
             return None
-        askpass = _askpass_module()
-        assert askpass is not None
         env = dict(os.environ)
-        env.update(
-            askpass.environment(
-                site=self.site_id,
-                operation_id=operation_id,
-                title=f"Sign in to {self.site_id}",
+        askpass = _askpass_module()
+        if askpass is not None:
+            env.update(
+                askpass.environment(
+                    site=self.site_id,
+                    operation_id=operation_id,
+                    title=f"Sign in to {self.site_id}",
+                )
             )
-        )
+        else:
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            env.setdefault("DISPLAY", ":0")
         if self.config.askpass:
-            env["SSH_ASKPASS"] = self.config.askpass
+            env["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
         return env
 
     # ssh
@@ -388,7 +395,7 @@ class SshTransport:
             self.config.scp_command,
             "-q",
             "-p",
-            *self._common_options(batch=not self._use_askpass()),
+            *self._common_options(batch=True),
             *[str(path) for path in sources],
             f"{self.config.ssh_profile}:{destination.rstrip('/')}/",
         ]
@@ -455,7 +462,7 @@ class SshTransport:
             merged = dict(os.environ)
             merged.update(env)
             if self.config.askpass:
-                merged["SSH_ASKPASS"] = self.config.askpass
+                merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
             # The backgrounded master keeps its stderr, so a pipe would never close.
             with tempfile.TemporaryFile() as log:
                 process = await asyncio.create_subprocess_exec(
@@ -481,3 +488,16 @@ class SshTransport:
             return False
         askpass.register_sign_in(self.site_id, self.starter())
         return True
+
+    async def stop_master(self) -> None:
+        """Close the signed-in master connection, if one is up."""
+        if not self.config.interactive_sign_in or not self.control_path.exists():
+            return
+        argv = [
+            self.config.ssh_command,
+            *self._common_options(batch=True),
+            "-O",
+            "exit",
+            self.config.ssh_profile,
+        ]
+        await run_process(argv, timeout_s=30, max_output_bytes=4096)
