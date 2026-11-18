@@ -114,6 +114,7 @@ write_json() {
 finish() {
     reason=$1
     code=$2
+    extra=${3:-}
     : > "$S/artifacts.txt.tmp"
     for dir in "$JOB" "$SVC_DIR"; do
         [ -d "$dir" ] || continue
@@ -121,7 +122,7 @@ finish() {
             (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
                 ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
                 ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
-                ! -name cancel 2>/dev/null) |
+                ! -name cancel ! -name states 2>/dev/null) |
                 while IFS= read -r file; do
                     printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "${file#./}"
                 done >> "$S/artifacts.txt.tmp"
@@ -133,7 +134,9 @@ finish() {
         fi
     done
     mv -f "$S/artifacts.txt.tmp" "$S/artifacts.txt"
-    write_json stopped.json "{\"reason\": \"$reason\", \"exit_code\": $code, \"frpc_restarts\": $restarts}"
+    # A staged frpc is a copy of a content-addressed input; the site keeps the blob.
+    [ -f "$S/frpc" ] && rm -f "$S/frpc"
+    write_json stopped.json "{\"reason\": \"$reason\", \"exit_code\": $code, \"frpc_restarts\": $restarts$extra}"
     note "ended: $reason, program exit code $code"
 }
 
@@ -146,7 +149,7 @@ while read -r name port proto path; do
     [ -n "$name" ] || continue
     if listening "$port"; then
         note "port $port ($name) is already taken on $(hostname)"
-        finish port_taken 98
+        finish port_taken 98 ", \"port\": $port, \"port_name\": \"$name\", \"host\": \"$(hostname)\""
         exit 98
     fi
 done < "$S/ports"
