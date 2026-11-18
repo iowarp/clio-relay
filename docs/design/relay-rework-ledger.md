@@ -1749,17 +1749,25 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
   - The forms are `/drafts/add`, `/drafts/{site}` and `/catalog`. A catalog error names `catalog.site_id` (the Site ID field) or `catalog.id` (the picker).
   - An error that names no field stays a caption.
   - Pickers carry checks since W12's #1320 779fbc0e0, which draws a ChoicePicker's failed checks. Spend is a TextField, so it already had one.
+- **Compute is a left-bar page, laid out like Settings ? Tools (user-directed).**
+  - `plugin.json` declares `ai.iowarp.clio.navigation` = `{id: compute, title: Compute, icon: server, resource: a2ui://clio-relay/compute}` and no `tabs`, as W3 settled. The page is global and has its own hidden context session.
+  - A client that lists relay's catalog (`clio-relay-compute/v1`) gets one `clio.choice-table.v1`, agreed with W12 (renderer) and W3 (schema): a defaults row for new endpoints, then one row per endpoint with Protocol and Security pickers, Status (not editable, icon plus word), and a menu of Connect, Probe, Edit and Remove. "Add endpoint" is the table's header action and opens the add form. The edit form, the remove confirmation and the sign-in link render under their row through `rows[].detail`.
+  - A Basic-only client gets the same page as cards, with a defaults section and an "Add endpoint" button. An older host that rejects relay's catalog falls back to it.
+  - Visible copy says endpoint, Protocol (SSH, Worker, Tapis, Globus, IRI, SkyPilot, Local) and Security (Secure runs only reviewed packages; Open runs what the agent writes). Config keys (`adapter`, `policy`, `guarded`, `open`) don't change.
+  - A row pick edits the store directly. Security sets `policy`. Protocol switches to an alternative, or adds one when an empty config validates (local). Otherwise the edit form opens under the row on that protocol, and saving it switches.
+  - The defaults (protocol and security for new endpoints) shape the add form and live in the page's state file (`state/a2ui/compute-tab.json`), not in the site store. The CLI's `site add` doesn't read them.
+  - 12 app-only actions: an A2UI client sees 17 tools, a plain client 5.
 - **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
 
 ### Facts
 
 - The manifest (`plugin/plugin.json`, version 1.6.8):
-  - `ai.iowarp.clio.tabs`: tab `compute`, resource `a2ui://clio-relay/compute`.
+  - `ai.iowarp.clio.navigation`: page `compute`, resource `a2ui://clio-relay/compute` (it was `tabs` up to 3d0ff6b).
   - `accounts`: Globus, with the transfer and GCS scopes.
   - `elicitation`: loopback plus `https://tacc.tapis.io`.
-- The catalog is `plugin/ai.iowarp.clio/a2ui/clio-relay-compute/`. The tab uses only components CLIO already renders.
+- The catalog is `plugin/ai.iowarp.clio/a2ui/clio-relay-compute/`: CLIO's Basic components plus `clio.choice-table.v1`, which `catalog.clio.json` maps to the CLIO kernel component of the same name.
 - Surfaces (`src/clio_relay/surface/a2ui/`):
-  - Each site's card shows its status, identity, Probe, Connect, adapter switch, Edit and Remove.
+  - `table.py` builds the Tools-style table. `surfaces.py` builds the Basic cards: each endpoint's status, identity, Probe, Connect, protocol switch, Edit and Remove. `actions.py` holds every handler.
   - The add-site form is built from each adapter's `Config` JSON schema.
   - Remove asks for confirmation.
 - The tab watches the site store every 2 s (`tab.WATCH_INTERVAL_S`) and sends `notifications/resources/updated`, so a CLI change reaches an open tab.
