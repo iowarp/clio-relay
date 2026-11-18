@@ -2,7 +2,8 @@
 
 Extracted from ``service_runtime.py`` (#231 rework slice): the SSH-delivered
 script generators for probing a remote service's HTTP health endpoint
-(``_remote_http_probe_script``), and discovering/status-checking one remote frpc connector by its durable, race-safe identity sidecar
+(``_remote_http_probe_script``), and discovering/status-checking one remote
+frpc connector by its durable, race-safe identity sidecar
 (``_remote_connector_discovery_script``, ``_remote_connector_status_script``).
 Every returned string is Python source embedded as heredoc text the remote
 host runs, not live code in this module.
