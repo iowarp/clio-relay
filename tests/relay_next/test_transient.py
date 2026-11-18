@@ -37,12 +37,12 @@ async def test_the_store_drops_a_blob_once(relay_paths: RelayPaths) -> None:
 
 
 async def test_a_transient_input_is_dropped_when_its_job_ends(relay_paths: RelayPaths) -> None:
-    add_site(relay_paths)
+    add_site(relay_paths, "lab", adapter="local", config={"scheduler": "none"})
     service = RelayService(relay_paths)
     secret = service.content.put(b"token=1\n")
     kept = service.content.put(b"mesh\n")
-    first = await service.start_run("fx", _reads(secret, transient=True))
-    second = await service.start_run("fx", _reads(kept, transient=False))
+    first = await service.start_run("lab", _reads(secret, transient=True))
+    second = await service.start_run("lab", _reads(kept, transient=False))
     for record in (first, second):
         done = await service.wait(record.operation_id, 20, poll_s=0.1)
         assert done.state == OperationState.COMPLETED, done
@@ -59,11 +59,11 @@ async def test_a_transient_input_is_dropped_when_its_job_ends(relay_paths: Relay
 async def test_a_blob_another_open_job_lists_is_kept_until_it_ends(
     relay_paths: RelayPaths,
 ) -> None:
-    add_site(relay_paths)
+    add_site(relay_paths, "lab", adapter="local", config={"scheduler": "none"})
     service = RelayService(relay_paths)
     secret = service.content.put(b"token=2\n")
-    long = await service.start_run("fx", _reads(secret, transient=True, seconds=30))
-    short = await service.start_run("fx", _reads(secret, transient=True))
+    long = await service.start_run("lab", _reads(secret, transient=True, seconds=30))
+    short = await service.start_run("lab", _reads(secret, transient=True))
     done = await service.wait(short.operation_id, 20, poll_s=0.1)
     assert done.state == OperationState.COMPLETED, done
     assert service.content.has(secret)
