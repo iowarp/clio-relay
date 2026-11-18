@@ -71,6 +71,14 @@ Relay keeps no connection open between calls, so it can restart at any time.
 After a restart, `find` reads the job's directory and returns the same job, so
 a retried `run` never submits a second copy.
 
+Schedulers forget finished jobs; Slurm drops them from `squeue` after
+`MinJobAge`, often five minutes. When the scheduler no longer lists a job,
+`status` reads the exit code the job wrote into its directory. With no exit
+code, it asks Slurm accounting (`sacct`) if the site keeps it. With neither,
+the job stays open with `native_state` `unknown` and a message saying so,
+rather than being called failed. A later poll can still find an exit code, and
+`cancel` ends it.
+
 ### Hosts with no scheduler
 
 With `scheduler: none`, or on a host where `auto` finds none, the job runs
