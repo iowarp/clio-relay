@@ -74,7 +74,7 @@ async def test_a_packages_own_provenance_is_kept() -> None:
     own = {"schema": "package.v1"}
     status = JobStatus(
         state=JobState.COMPLETED,
-        outputs=[OutputRef(name="a", metadata={PROVENANCE_METADATA: own})],
+        outputs=[OutputRef(name="a", path="/run/a", metadata={PROVENANCE_METADATA: own})],
     )
     assert marked_status(_record(), status).outputs[0].metadata[PROVENANCE_METADATA] == own
 
