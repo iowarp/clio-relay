@@ -72,14 +72,16 @@ def _ask_answers(paths: RelayPaths) -> list[str | None]:
 
 def test_tools_are_the_five_verbs(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
-        async with Client(create_server(relay_paths), mode="auto") as client:
-            tools = {tool.name: tool for tool in await client.list_tools()}
-            assert set(tools) == {"describe", "run", "exec", "files", "serve"}
-            listed = tools["run"].model_dump(by_alias=True, mode="json", exclude_none=True)
-            assert listed["execution"]["taskSupport"] == "optional"
-            for name in ("describe", "exec", "files", "serve"):
-                listed = tools[name].model_dump(by_alias=True, mode="json", exclude_none=True)
-                assert listed.get("execution", {}).get("taskSupport", "forbidden") == "forbidden"
+        for mode in ("auto", "legacy"):
+            async with Client(create_server(relay_paths), mode=mode) as client:
+                tools = {tool.name: tool for tool in await client.list_tools()}
+                assert set(tools) == {"describe", "run", "exec", "files", "serve"}
+                for tool in tools.values():
+                    listed = tool.model_dump(by_alias=True, mode="json", exclude_none=True)
+                    # 2026-07-28 tasks are negotiated per call, not listed; 2025-11-25
+                    # core tasks are not served, so no tool may claim them.
+                    support = listed.get("execution", {}).get("taskSupport", "forbidden")
+                    assert support == "forbidden", (mode, tool.name)
 
     asyncio.run(scenario())
 
@@ -384,7 +386,8 @@ def test_exec_and_files(relay_paths: RelayPaths) -> None:
 
     async def scenario() -> None:
         async with Client(create_server(relay_paths), mode="legacy") as client:
-            ran = _structured(await client.call_tool("exec", {"site": "fx", "command": ["hostname"]}))
+            hostname = {"site": "fx", "command": ["hostname"]}
+            ran = _structured(await client.call_tool("exec", hostname))
             assert ran["exit_code"] == 0
             wrote = await client.call_tool(
                 "files", {"site": "fx", "op": "write", "path": "a/b.txt", "content": "hi"}

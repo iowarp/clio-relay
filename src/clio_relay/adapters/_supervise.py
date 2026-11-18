@@ -87,10 +87,8 @@ def supervise(job_dir: Path) -> int:
         write_state(job_dir, state="running", child_pid=child.pid, started_at=_now())
         code = child.wait()
     (job_dir / "exit_code").write_text(str(code), encoding="utf-8")
-    if (job_dir / "cancel").exists():
-        final = "cancelled"
-    else:
-        final = "completed" if code == 0 else "failed"
+    cancelled = (job_dir / "cancel").exists()
+    final = "cancelled" if cancelled else ("completed" if code == 0 else "failed")
     write_state(job_dir, state=final, exit_code=code, ended_at=_now())
     return 0
 

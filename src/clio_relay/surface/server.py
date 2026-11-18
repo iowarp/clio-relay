@@ -27,7 +27,7 @@ from fastmcp.server.extensions import (
     ServerExtension,
     read_client_extension_settings,
 )
-from fastmcp.tools import InputRequiredToolResult, ToolResult
+from fastmcp.tools import FunctionTool, InputRequiredToolResult, ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID, TaskConfig
 from fastmcp_tasks import wire_production
 from fastmcp_tasks.models import (
@@ -614,15 +614,7 @@ class RelayServer:
                 structured_content=described,
             )
 
-        @server.tool(
-            name="run",
-            title="Run a job on a site",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
-            task=TaskConfig(
-                mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
-            ),
-        )
-        async def run(  # pyright: ignore[reportUnusedFunction]
+        async def run(
             ctx: Context,
             site: Annotated[str | None, Field(description="The site id")] = None,
             spec: Annotated[
@@ -639,6 +631,20 @@ class RelayServer:
             """Submit a job. With tasks this returns a task; without, it waits up to
             wait_s and returns the operation, which describe(job=...) observes."""
             return await relay.run(ctx, site, spec, cancel, resume, wait_s)
+
+        run_tool = FunctionTool.from_function(
+            run,
+            name="run",
+            title="Run a job on a site",
+            annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
+            task=TaskConfig(
+                mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
+            ),
+        )
+        # Tasks are the 2026-07-28 extension only. A 2025-11-25 client gets the
+        # handle path, so its listing must not claim core task support.
+        run_tool.execution = mcp_types.ToolExecution(task_support="forbidden")
+        server.add_tool(run_tool)
 
         @server.tool(
             name="exec",
