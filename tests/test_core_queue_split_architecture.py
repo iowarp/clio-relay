@@ -1831,7 +1831,7 @@ def test_cq14_put_mcp_task_resolves_through_the_queue_tasks_mixin(
         job_id=task_id,
         state=JobState.QUEUED,
         projection=RelayMcpTaskProjection(
-            tool_name="relay_submit_agent",
+            tool_name="example_tool",
             profile="user",
             arguments={},
             initial_result={"job_id": task_id, "state": "queued", "terminal": False},

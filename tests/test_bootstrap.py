@@ -324,7 +324,6 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
         '  --refresh-package clio-relay "$RELAY_INSTALL_TARGET"'
     ) in script
     assert "import clio_relay.bounded_command.pkg" in script
-    assert "clio_relay.mcp_call.pkg" not in script
     assert "clio_relay.remote_agent.pkg" in script
     assert "write_install_receipt" in script
     assert "receipt = make_bootstrap_receipt(" in script

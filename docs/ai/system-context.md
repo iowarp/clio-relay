@@ -74,14 +74,6 @@ transport of its own.
 
 JARVIS-owned execution is authoritative only when it supplies the exact `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and `jarvis.execution.progress.v1` documents. The relay preserves those documents and projects them into `clio-relay.jarvis-runtime.v1` for job/task metadata, events, artifacts, and provenance. The older `jarvis.runtime.v1`, flexible structured payloads, and stdout scheduler patterns are compatibility evidence only and cannot authorize polling or cancellation or satisfy the 1.0 gate.
 
-Generic remote MCP protocol execution is endpoint-owned. An `mcp_call` runs the
-packaged client and registered stdio server directly under relay process
-containment, not inside an outer JARVIS pipeline and not in a scheduler
-allocation. It still uses durable job, lease, cancellation, timeout, log,
-artifact, and recovery semantics. If an exact registered JARVIS tool creates an
-application execution, the returned handle and all application/scheduler
-semantics remain JARVIS-owned.
-
 ## Progress
 
 JARVIS core owns execution IDs, durable `jarvis.progress.v1` events, and aggregate execution progress. Package-local code owns only application-specific interpretation. Native MCP notifications carry exact execution progress snapshots and remain distinct from MCP transport sequence numbers.

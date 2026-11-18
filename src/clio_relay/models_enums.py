@@ -23,7 +23,6 @@ class JobKind(StrEnum):
 
     JARVIS = "jarvis"
     REMOTE_AGENT = "remote_agent"
-    MCP_CALL = "mcp_call"
     INPUT_INGEST = "input_ingest"
 
 
