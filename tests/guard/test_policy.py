@@ -159,11 +159,20 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
     lowered = await guard.prepare(hpc, package_spec(digest), adapter=adapter)
     assert lowered.package is None
     assert lowered.executable == "/bin/bash"
-    assert lowered.arguments[2:7] == ["clio-relay-package", digest, "demo.hello", "jarvis", ""]
-    assert lowered.arguments[7:] == ["out=result.txt", "steps=3"]
+    assert lowered.arguments[2:8] == [
+        "clio-relay-package",
+        digest,
+        "demo.hello",
+        "jarvis",
+        "",
+        "run",
+    ]
+    assert lowered.arguments[8:] == ["out=result.txt", "steps=3"]
     assert [(item.name, item.sha256) for item in lowered.inputs] == [
         (f"{ARCHIVE_DIR}/{digest}.tar.gz", digest)
     ]
+    served = await guard.prepare(hpc, package_spec(digest), adapter=adapter, service=True)
+    assert served.arguments[7] == "service"
 
     class Runs(FixtureAdapter):
         runs_packages: ClassVar[bool] = True

@@ -140,9 +140,11 @@ def test_package_job_keeps_resources_and_inputs() -> None:
         "demo.hello",
         "~/jv/bin/jarvis",
         "/scratch/run",
+        "run",
         "flag=true",
         "n=2",
     ]
+    assert package_job(spec, service=True).arguments[7] == "service"
     assert [item.name for item in job.inputs] == ["in.dat", f".relay-package/{'b' * 64}.tar.gz"]
     assert job.resources.node_count == 2
     assert job.attributes.queue_name == "debug"

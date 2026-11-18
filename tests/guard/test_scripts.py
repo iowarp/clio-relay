@@ -7,7 +7,9 @@ They run under /bin/sh or bash with stand-in ``jarvis``, ``scontrol`` and
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -64,9 +66,11 @@ def _job_dir(tmp_path: Path) -> tuple[Path, str]:
     return job, digest
 
 
-def _runner(job: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+def _runner(
+    job: Path, env: dict[str, str], *args: str, mode: str = "run"
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["/bin/bash", "-c", RUNNER, "clio-relay-package", *args],
+        ["/bin/bash", "-c", RUNNER, "clio-relay-package", *args[:4], mode, *args[4:]],
         cwd=job,
         env=env,
         capture_output=True,
@@ -139,6 +143,50 @@ def test_the_runner_says_when_jarvis_is_missing(tmp_path: Path) -> None:
     )
     assert done.returncode == 69
     assert "no-such-jarvis is not on PATH" in done.stderr
+
+
+def test_the_runner_refuses_an_unknown_mode(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    bin_dir = tmp_path / "bin"
+    _program(bin_dir, "jarvis", FAKE_JARVIS)
+    done = _runner(job, _env(tmp_path, bin_dir), digest, "demo.hello", "jarvis", "", mode="up")
+    assert done.returncode == 64
+    assert "mode up is not run or service" in done.stderr
+    assert not (tmp_path / "jarvis.log").exists()
+
+
+def test_a_service_package_starts_then_stops_when_told(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    bin_dir = tmp_path / "bin"
+    _program(bin_dir, "jarvis", FAKE_JARVIS)
+    log = tmp_path / "jarvis.log"
+    runner = subprocess.Popen(
+        ["/bin/bash", "-c", RUNNER, "clio-relay-package"]
+        + [digest, "demo.hello", "jarvis", "", "service", "port=1"],
+        cwd=job,
+        env=_env(tmp_path, bin_dir),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while "ppl start" not in (log.read_text() if log.exists() else ""):
+            assert runner.poll() is None, runner.communicate()
+            assert time.monotonic() < deadline, "the runner never started the pipeline"
+            time.sleep(0.1)
+        time.sleep(0.5)
+        assert runner.poll() is None, "a service stays up after ppl start"
+        runner.send_signal(signal.SIGTERM)
+        _, err = runner.communicate(timeout=60)
+    finally:
+        if runner.poll() is None:
+            runner.kill()
+            runner.communicate()
+    assert runner.returncode == 0, err
+    commands = [line.split(" ", 1)[1] for line in log.read_text().splitlines()]
+    assert commands[-3:] == ["ppl append demo.hello pkg port=1", "ppl start", "ppl stop"]
+    assert "ppl run" not in commands
 
 
 def test_the_runner_expands_a_home_jarvis_path(tmp_path: Path) -> None:

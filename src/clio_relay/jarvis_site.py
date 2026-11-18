@@ -280,10 +280,11 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
 # The package runner
 
 RUNNER = r"""set -eu
-digest=$1 name=$2 jarvis=$3 workdir=$4
-shift 4
+digest=$1 name=$2 jarvis=$3 workdir=$4 mode=$5
+shift 5
 case $jarvis in "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
 fail() { echo "clio-relay package runner: $2" >&2; exit "$1"; }
+case $mode in run|service) ;; *) fail 64 "mode $mode is not run or service" ;; esac
 printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$' \
   || fail 64 "package name $name is not <repo>.<package>"
 archive="$PWD/.relay-package/$digest.tar.gz"
@@ -310,7 +311,10 @@ fi
 "$jarvis" ppl create "relay_$(printf %.12s "$digest")" >/dev/null
 "$jarvis" ppl append "$name" pkg "$@"
 [ -z "$workdir" ] || cd "$workdir"
-exec "$jarvis" ppl run
+[ "$mode" = run ] && exec "$jarvis" ppl run
+trap 'trap - TERM INT HUP; kill $! 2>/dev/null || true; "$jarvis" ppl stop; exit 0' TERM INT HUP
+"$jarvis" ppl start
+while :; do sleep 60 & wait $!; done
 """
 
 
@@ -320,11 +324,15 @@ def _parameter(key: str, value: CustomValue) -> str:
     return f"{key}={value}"
 
 
-def package_job(spec: JobSpec, *, jarvis: str = "jarvis") -> JobSpec:
+def package_job(spec: JobSpec, *, jarvis: str = "jarvis", service: bool = False) -> JobSpec:
     """Lower a package job to the bash job that runs it with JARVIS.
 
     The archive becomes an input, so the adapter stages it by digest. The
     runner checks the hash again on the site before it unpacks anything.
+
+    An application runs ``jarvis ppl run``, which is start then stop. A service
+    (``service=True``) runs ``jarvis ppl start`` and stays up until the job is
+    told to stop (TERM, INT or HUP), then runs ``jarvis ppl stop`` and exits 0.
     """
     package = spec.package
     if package is None:
@@ -346,6 +354,7 @@ def package_job(spec: JobSpec, *, jarvis: str = "jarvis") -> JobSpec:
         package.name,
         jarvis,
         spec.directory or "",
+        "service" if service else "run",
         *[_parameter(key, value) for key, value in sorted(package.parameters.items())],
     ]
     data["name"] = spec.name or package.name.replace(".", "-")

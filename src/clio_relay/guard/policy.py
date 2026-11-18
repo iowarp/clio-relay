@@ -273,7 +273,12 @@ class Guard:
     # prepare
 
     async def prepare(
-        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+        self,
+        site: SiteEntry,
+        spec: JobSpec,
+        *,
+        adapter: BaseAdapter[Any],
+        service: bool = False,
     ) -> JobSpec:
         settings = self.settings(site)
         if is_warm(spec):
@@ -300,4 +305,4 @@ class Guard:
                 )
         if adapter.runs_packages:
             return spec
-        return package_job(spec, jarvis=settings.jarvis)
+        return package_job(spec, jarvis=settings.jarvis, service=service)
