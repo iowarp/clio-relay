@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler
 
 def browser_gateway_error(reason: str, message: str) -> tuple[int, dict[str, object]]:
     """Render a gateway refusal without creating the gateway/core import cycle."""
-    from clio_relay import door_error_adapters, door_errors
+    from clio_relay.adapters.worker import door_error_adapters, door_errors
 
     fault = door_errors.fault_for_reason(reason, message)
     return door_error_adapters.as_browser_gateway_error(fault)

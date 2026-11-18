@@ -715,7 +715,7 @@ class CapabilityProxyHandler(BaseHTTPRequestHandler):
         fit for those, chosen over inventing three more unregistered reasons
         for this one file.
         """
-        from clio_relay import door_error_adapters, door_errors
+        from clio_relay.adapters.worker import door_error_adapters, door_errors
 
         is_oversized = isinstance(exc, _RequestBodyTooLargeError)
         reason = "payload_too_large" if is_oversized else "configuration_error"

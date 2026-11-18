@@ -57,7 +57,7 @@ from clio_relay.remote_mcp_cache import (
 from clio_relay.remote_mcp_tool_schema import _server_artifact_verified, is_remote_mcp_control_query
 
 if TYPE_CHECKING:
-    from clio_relay.core_queue import ClioCoreQueue
+    from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 
 
 def resolve_registered_remote_mcp_admission(

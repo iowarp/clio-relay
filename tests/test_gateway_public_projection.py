@@ -11,16 +11,15 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
-from clio_relay import cli as relay_cli
-from clio_relay.cli import app
+from clio_relay.adapters.worker import cli as relay_cli
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import create_app
+from clio_relay.adapters.worker.session_lifecycle import CleanupResource
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.http_api import create_app
-from clio_relay.mcp_server import handle_request
 from clio_relay.models import GatewaySession
 from clio_relay.service_runtime import ServiceRuntimeStopResult
-from clio_relay.session_lifecycle import CleanupResource
 
 _OWNER_TOKEN = "owner-capability-8c699a93d7cc4af1"
 _API_TOKEN = "api-capability-69dc7b420af54a1b"
@@ -198,39 +197,6 @@ def test_cli_remote_gateway_get_redacts_untrusted_remote_payload(
 
     assert read.exit_code == 0, read.output
     _assert_public_document(json.loads(read.output))
-
-
-def test_mcp_gateway_list_and_get_redact_nested_credentials(tmp_path: Path) -> None:
-    """MCP text and structured results share the same safe gateway projection."""
-    queue = ClioCoreQueue(tmp_path / "core")
-    session = queue.create_gateway_session(_gateway_with_credentials())
-    calls = (
-        ("relay_list_gateway_sessions", {"cluster": session.cluster}),
-        ("relay_get_gateway_session", {"session_id": session.session_id}),
-    )
-
-    for request_id, (name, arguments) in enumerate(calls, start=1):
-        response = handle_request(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            },
-            queue=queue,
-            profile="admin",
-        )
-        assert response is not None
-        assert "error" not in response
-        result = cast(dict[str, Any], response["result"])
-        structured = result["structuredContent"]
-        content = cast(list[dict[str, str]], result["content"])
-        text_payload = json.loads(content[0]["text"])
-        assert text_payload == structured
-        _assert_public_document(structured)
-        _assert_public_document(text_payload)
-
-    _assert_internal_credentials_remain(queue, session.session_id)
 
 
 def test_http_gateway_list_and_get_redact_nested_credentials(tmp_path: Path) -> None:

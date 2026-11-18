@@ -3,7 +3,7 @@
 These moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the four registry-CRUD ``cluster_app`` commands' (``list``/``add``/
 ``pin-target``/``pin-runtime``) extraction into
-``src/clio_relay/cli_cluster.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_cluster.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 ``test_mint_receipt_then_pin_runtime_passes_verify_remote_worker_info_matrix``
@@ -15,7 +15,7 @@ docstring already applied to that test).
 The six **deployment** ``cluster_app`` commands (``probe``/``bootstrap``/
 ``install-app``/``install-endpoint-service``/``restart-endpoint-service``/
 ``endpoint-service-status``) landed separately in
-``src/clio_relay/cli_cluster_deploy.py``; their tests moved to
+``src/clio_relay/adapters/worker/cli_cluster_deploy.py``; their tests moved to
 ``tests/test_cli_cluster_deploy.py``, not here.
 
 **Autouse-fixture parity.** ``test_cli.py`` defines its own module-scoped
@@ -34,7 +34,7 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
 from clio_relay.errors import ConfigurationError
 

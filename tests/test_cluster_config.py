@@ -22,7 +22,6 @@ from clio_relay import (
     cluster_config_windows_paths,
     cluster_config_windows_primitives,
     cluster_config_windows_read_verify,
-    mcp_remote_catalog,
 )
 from clio_relay.cluster_config import (
     MAX_CLUSTER_REGISTRY_BYTES,
@@ -773,35 +772,6 @@ def test_windows_read_bounded_configuration_bytes_never_calls_set_security_info(
     payload = read_bounded_configuration_bytes(path, max_bytes=MAX_CLUSTER_REGISTRY_BYTES)
 
     assert json.loads(payload)
-    assert calls["SetSecurityInfo"] == 0
-
-
-def test_windows_cluster_registry_load_and_mcp_catalog_never_call_set_security_info(
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    """D2 regression pin: the reviewer's blind spot was that the primitive-
-    level test above drove `read_bounded_configuration_bytes` directly, never
-    `ClusterRegistry.load` itself -- which called `ensure_private_
-    configuration_directory(path.parent)` (the unconditional-apply write
-    primitive) BEFORE the read, so the door (`_configured_cluster_names`,
-    the actual `tools/list` path) still paid one `SetSecurityInfo` per call
-    even after the primitive-level fix landed. Drives both real entry points
-    end to end against a clean, already-hardened registry.
-    """
-    if os.name != "nt":
-        return
-    path = tmp_path / "clusters.json"
-    registry = _registry("alpha")
-    registry.save(path)  # hardens both the parent directory and the file
-
-    calls = _install_set_security_info_counter(monkeypatch)
-    assert ClusterRegistry.load(path) == registry
-    assert calls["SetSecurityInfo"] == 0
-
-    calls["SetSecurityInfo"] = 0
-    configured_cluster_names = mcp_remote_catalog._configured_cluster_names  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-    assert configured_cluster_names(registry_path=path) == ["alpha"]
     assert calls["SetSecurityInfo"] == 0
 
 

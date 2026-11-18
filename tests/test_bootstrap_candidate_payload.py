@@ -14,8 +14,8 @@ from typing import Any, cast
 
 import pytest
 
-from clio_relay import bootstrap
-from clio_relay import bootstrap_provider_build_info as provider_build_info
+from clio_relay.adapters.worker import bootstrap
+from clio_relay.adapters.worker import bootstrap_provider_build_info as provider_build_info
 
 
 def _extract_candidate_sources(script: str) -> dict[str, bytes]:
@@ -33,6 +33,22 @@ def _extract_candidate_sources(script: str) -> dict[str, bytes]:
     return sources
 
 
+_STAGER = "adapters/worker/bootstrap_provider_build_info.py"
+
+
+def _write_candidate_sources(package: Path, sources: dict[str, bytes]) -> None:
+    """Lay the overlay out the way the bootstrap script does, subpackages included."""
+    for name, payload in sources.items():
+        path = package / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+
+def _source_names(sources: dict[str, bytes]) -> set[str]:
+    """File names the legacy copy must not carry, so the candidate's win."""
+    return {Path(name).name for name in sources}
+
+
 def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
     tmp_path: Path,
 ) -> None:
@@ -42,31 +58,33 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
     )
     assert set(sources) == {
         "__init__.py",
-        "bootstrap_full_activation_staging.py",
-        "bootstrap_jarvis_staging.py",
-        "bootstrap_provider_build_info.py",
-        "bootstrap_reconcile.py",
+        "adapters/__init__.py",
+        "adapters/worker/__init__.py",
+        "adapters/worker/bootstrap_full_activation_staging.py",
+        "adapters/worker/bootstrap_jarvis_staging.py",
+        "adapters/worker/bootstrap_provider_build_info.py",
+        "adapters/worker/bootstrap_reconcile.py",
         # #231 split/bootstrap-reconcile-w2: bootstrap_reconcile.py's own
         # owner modules must travel with the candidate too, or the facade's
         # sibling imports can't resolve inside a standalone deployment.
-        "bootstrap_reconcile_activation_paths.py",
-        "bootstrap_reconcile_builtin_repos.py",
-        "bootstrap_reconcile_constants.py",
-        "bootstrap_reconcile_execution_identity.py",
-        "bootstrap_reconcile_generation_staging.py",
-        "bootstrap_reconcile_inspection.py",
-        "bootstrap_reconcile_jarvis_wrapper_binding.py",
-        "bootstrap_reconcile_locks.py",
-        "bootstrap_reconcile_models.py",
-        "bootstrap_reconcile_planning.py",
-        "bootstrap_reconcile_planning_support.py",
-        "bootstrap_reconcile_primitives.py",
-        "bootstrap_reconcile_readiness.py",
-        "bootstrap_reconcile_receipt.py",
-        "bootstrap_reconcile_replacement_provider.py",
-        "bootstrap_reconcile_repository.py",
-        "bootstrap_reconcile_transaction.py",
-        "bootstrap_recovery.py",
+        "adapters/worker/bootstrap_reconcile_activation_paths.py",
+        "adapters/worker/bootstrap_reconcile_builtin_repos.py",
+        "adapters/worker/bootstrap_reconcile_constants.py",
+        "adapters/worker/bootstrap_reconcile_execution_identity.py",
+        "adapters/worker/bootstrap_reconcile_generation_staging.py",
+        "adapters/worker/bootstrap_reconcile_inspection.py",
+        "adapters/worker/bootstrap_reconcile_jarvis_wrapper_binding.py",
+        "adapters/worker/bootstrap_reconcile_locks.py",
+        "adapters/worker/bootstrap_reconcile_models.py",
+        "adapters/worker/bootstrap_reconcile_planning.py",
+        "adapters/worker/bootstrap_reconcile_planning_support.py",
+        "adapters/worker/bootstrap_reconcile_primitives.py",
+        "adapters/worker/bootstrap_reconcile_readiness.py",
+        "adapters/worker/bootstrap_reconcile_receipt.py",
+        "adapters/worker/bootstrap_reconcile_replacement_provider.py",
+        "adapters/worker/bootstrap_reconcile_repository.py",
+        "adapters/worker/bootstrap_reconcile_transaction.py",
+        "adapters/worker/bootstrap_recovery.py",
         "bounded_process.py",
         "errors.py",
         "process_containment.py",
@@ -89,21 +107,19 @@ def test_extracted_candidate_reconciler_runs_without_provider_bounded_process(
         "process_containment_termination.py",
         "process_containment_types.py",
         "process_containment_windows.py",
-        "safe_archive.py",
+        "adapters/worker/safe_archive.py",
     }
 
     candidate_root = tmp_path / "candidate-python"
     candidate_package = candidate_root / "clio_relay"
-    candidate_package.mkdir(parents=True)
-    for name, payload in sources.items():
-        (candidate_package / name).write_bytes(payload)
+    _write_candidate_sources(candidate_package, sources)
 
-    installed_package = Path(bootstrap.__file__).resolve().parent
+    installed_package = Path(bootstrap.__file__).resolve().parents[2]
     legacy_root = tmp_path / "legacy-provider"
     shutil.copytree(
         installed_package,
         legacy_root / "clio_relay",
-        ignore=shutil.ignore_patterns("__pycache__", *sources),
+        ignore=shutil.ignore_patterns("__pycache__", *_source_names(sources)),
     )
     probe = r"""
 import importlib.util
@@ -115,7 +131,7 @@ candidate_root = Path(sys.argv[1]).resolve()
 legacy_root = Path(sys.argv[2]).resolve()
 sys.path.insert(0, str(legacy_root))
 sys.path.insert(0, str(candidate_root))
-reconciler_path = candidate_root / "clio_relay/bootstrap_reconcile.py"
+reconciler_path = candidate_root / "clio_relay/adapters/worker/bootstrap_reconcile.py"
 name = "clio_relay.bootstrap_reconcile_candidate"
 spec = importlib.util.spec_from_file_location(name, reconciler_path)
 if spec is None or spec.loader is None:
@@ -173,18 +189,16 @@ def test_candidate_overlay_preserves_legacy_provider_install_identity(
     )
     candidate_root = tmp_path / "candidate-python"
     candidate_package = candidate_root / "clio_relay"
-    candidate_package.mkdir(parents=True)
-    for name, payload in sources.items():
-        (candidate_package / name).write_bytes(payload)
+    _write_candidate_sources(candidate_package, sources)
 
     legacy_version = "1.4.12"
     legacy_commit = "dc6d36682598d466f8512f8082edfaf5c92af02b"
     legacy_root = tmp_path / "legacy-provider"
-    installed_package = Path(bootstrap.__file__).resolve().parent
+    installed_package = Path(bootstrap.__file__).resolve().parents[2]
     shutil.copytree(
         installed_package,
         legacy_root / "clio_relay",
-        ignore=shutil.ignore_patterns("__pycache__", *sources),
+        ignore=shutil.ignore_patterns("__pycache__", *_source_names(sources)),
     )
     distribution_metadata = legacy_root / f"clio_relay-{legacy_version}.dist-info"
     distribution_metadata.mkdir()
@@ -269,7 +283,7 @@ print(json.dumps({
             "-I",
             "-c",
             probe,
-            str(candidate_package / "bootstrap_provider_build_info.py"),
+            str(candidate_package / _STAGER),
             str(candidate_root),
             str(legacy_root),
             str(receipt),
@@ -295,7 +309,7 @@ def test_provider_build_info_stager_rejects_hostile_provider_records(tmp_path: P
         bootstrap.render_linux_user_bootstrap_script(cluster="candidate-test")
     )
     stager = tmp_path / "bootstrap_provider_build_info.py"
-    stager.write_bytes(sources["bootstrap_provider_build_info.py"])
+    stager.write_bytes(sources[_STAGER])
     candidate_package = tmp_path / "candidate-python" / "clio_relay"
     candidate_package.mkdir(parents=True)
 
@@ -358,7 +372,7 @@ def test_provider_build_info_stager_keeps_fresh_bootstrap_free_of_candidate_iden
         bootstrap.render_linux_user_bootstrap_script(cluster="candidate-test")
     )
     stager = tmp_path / "bootstrap_provider_build_info.py"
-    stager.write_bytes(sources["bootstrap_provider_build_info.py"])
+    stager.write_bytes(sources[_STAGER])
     candidate_package = tmp_path / "candidate-python" / "clio_relay"
     candidate_package.mkdir(parents=True)
 

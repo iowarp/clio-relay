@@ -51,8 +51,8 @@ RATCHET_BASELINE: dict[str, int] = {
     # _ByHandleFileInformation and _FileDispositionInformation) moved
     # verbatim into wheel_snapshot_identity.py, mirrored here byte-identical
     # to src/clio_relay.
-    "jarvis-packages/clio_relay/clio_relay/wheel_snapshot_identity.py": 2,
-    "src/clio_relay/wheel_snapshot_identity.py": 2,
+    # Moved into adapters/worker by W8; the jarvis-packages mirror went with mcp_call.
+    "src/clio_relay/adapters/worker/wheel_snapshot_identity.py": 2,
     # process_containment.py split iowarp/clio-relay#231: the facade has zero
     # class-in-function violations; the 4 nested ctypes.Structure classes
     # (Windows Job Object accounting/limit structs) moved verbatim into

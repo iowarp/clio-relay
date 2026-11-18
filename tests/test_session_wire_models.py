@@ -3,7 +3,7 @@
 Two concerns:
 
 1. **Extraction seam** -- ``clio_relay.session_wire_models`` is the owner
-   module; ``clio_relay.session_lifecycle`` must re-export every moved name
+   module; ``clio_relay.adapters.worker.session_lifecycle`` must re-export every moved name
    under an identical binding (proven by identity, not structural equality)
    so existing callers, tests, and ``session_lifecycle.<Symbol>`` monkeypatch
    seams (the R8(i) lesson) keep resolving to the *same* class after the
@@ -27,7 +27,7 @@ import pytest
 from pydantic import ValidationError
 from pytest import MonkeyPatch
 
-import clio_relay.session_lifecycle as session_lifecycle
+import clio_relay.adapters.worker.session_lifecycle as session_lifecycle
 import clio_relay.session_wire_models as session_wire_models
 from clio_relay.session_wire_models import (
     MAX_OWNED_SESSION_CLEANUP_REPORT_BYTES,

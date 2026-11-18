@@ -20,9 +20,9 @@ from typing import IO, Any
 import pytest
 from pytest import MonkeyPatch
 
+import clio_relay.adapters.worker.transport_probe as transport_probe
 import clio_relay.control_channel as control_channel
 import clio_relay.frp_link as frp_link
-import clio_relay.transport_probe as transport_probe
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import (
@@ -770,7 +770,7 @@ def test_stderr_buffer_bound_matches_channel_event_detail_bound() -> None:
 def test_probe_and_transport_share_one_visitor_implementation(monkeypatch: MonkeyPatch) -> None:
     """``run_frp_http_probe`` constructs and drives a REAL ``HeldFrpVisitor``.
 
-    Patches ``clio_relay.transport_probe.HeldFrpVisitor`` -- the name the
+    Patches ``clio_relay.adapters.worker.transport_probe.HeldFrpVisitor`` -- the name the
     probe actually looks up at call time (``transport_probe.py`` imports the
     bare symbol from ``frp_link``, the same "patched where it's looked up"
     pattern ``tests/test_transport_probe.py`` already relies on for

@@ -12,9 +12,9 @@ from typing import Any, cast
 
 from pytest import MonkeyPatch
 
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.endpoint import EndpointWorker
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
-from clio_relay.endpoint import EndpointWorker
 from clio_relay.errors import RelayError
 from clio_relay.models import (
     Cursor,
@@ -647,7 +647,9 @@ def test_recovered_canceled_confirmation_survives_late_unknown_without_worker_er
     clock = [datetime(2026, 7, 14, 16, 0, tzinfo=UTC)]
     # endpoint_scheduler_cancel_actions.py owns the worker-side confirmation
     # poll's real utc_now() call sites now (clio-relay#231 endpoint split).
-    monkeypatch.setattr("clio_relay.endpoint_scheduler_cancel_actions.utc_now", lambda: clock[0])
+    monkeypatch.setattr(
+        "clio_relay.adapters.worker.endpoint_scheduler_cancel_actions.utc_now", lambda: clock[0]
+    )
     _accept_scheduler_cancellation_without_polling(
         setup_queue,
         job,

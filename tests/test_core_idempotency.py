@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from clio_relay import queue_jobs, queue_order_index
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker import queue_jobs, queue_order_index
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import JarvisRunSpec, JobKind, JobState, RelayJob
 

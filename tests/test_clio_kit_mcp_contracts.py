@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import importlib.util
 import json
 import os
 import queue
@@ -15,8 +14,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from pathlib import Path, PurePosixPath
-from types import ModuleType
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -944,96 +942,6 @@ def test_real_uv_tool_install_accepts_canonical_mount_aliases(
     assert Path(identity.uv_receipt_path).is_relative_to(environment.resolve())
 
 
-@pytest.mark.parametrize("server_name", ["jarvis", "spack"])
-def test_relay_runtime_identity_matches_exact_wheel_launcher(
-    clio_kit_wheel: Path,
-    tmp_path: Path,
-    server_name: str,
-) -> None:
-    """Match relay evidence to the exact v4 identity computed by the wheel launcher."""
-    project = _extract_wheel_server_project(clio_kit_wheel, server_name, tmp_path)
-    expected = _wheel_launcher_project_identity(clio_kit_wheel, project)
-    runner = _load_mcp_call_runner()
-    uvx = tmp_path / ("uvx.exe" if os.name == "nt" else "uvx")
-    uv = tmp_path / ("uv.exe" if os.name == "nt" else "uv")
-    uvx.write_bytes(b"exact-uvx-launcher")
-    uv.write_bytes(b"exact-uv-runtime")
-
-    artifact = cast(Any, runner)._server_artifact_identity(
-        str(uvx),
-        [
-            "--refresh",
-            "--no-config",
-            "--from",
-            str(clio_kit_wheel),
-            "clio-kit",
-            "mcp-server",
-            server_name,
-        ],
-    )
-    observed = cast(JSON, artifact["nested_runtime"])
-
-    assert expected["schema_version"] == observed["schema_version"] == ("clio-kit.locked-server.v4")
-    assert expected["server_name"] == observed["server_name"] == server_name
-    assert expected["project_sha256"] == observed["project_sha256"]
-    assert expected["lock_sha256"] == observed["lock_sha256"]
-    assert observed["runtime_policy"] == ("uv-run:materialized:frozen:no-editable:no-dev:v3")
-    assert observed["contract_source_verified"] is True
-    assert observed["locked_runtime_verified"] is True
-    assert artifact["server_process_artifact_verified"] is True
-    assert artifact["verified"] is True
-
-
-def test_runner_launches_exact_wheel_only_through_verified_snapshot(
-    clio_kit_wheel: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exercise the production runner and exact wheel through its private snapshot."""
-    uvx = shutil.which("uvx")
-    if uvx is None:
-        raise AssertionError("uvx is required for the exact-wheel runner probe")
-    runner = _load_mcp_call_runner()
-    server_args = [
-        "--refresh",
-        "--no-config",
-        "--from",
-        str(clio_kit_wheel),
-        "clio-kit",
-        "mcp-server",
-        "spack",
-    ]
-    discovery = cast(Any, runner)._server_artifact_identity(uvx, server_args)
-    expected_digest = cast(Any, runner)._server_artifact_digest(discovery)
-    monkeypatch.chdir(tmp_path)
-
-    return_code = cast(Any, runner).run_mcp_call_from_params(
-        {
-            "server": uvx,
-            "server_args": server_args,
-            "operation": "tools/list",
-            "timeout_seconds": 180,
-            "expected_server_artifact_digest": expected_digest,
-        }
-    )
-    result_payload = (tmp_path / "mcp-result.json").read_text(encoding="utf-8")
-    result = _json_object(result_payload.encode("utf-8"), label="runner result")
-
-    assert return_code == 0, result.get("protocol_error")
-    assert result["server_args"] == server_args
-    assert cast(JSON, result["server_artifact"])["install_spec"] == str(clio_kit_wheel)
-    assert result["observed_server_artifact_digest"] == expected_digest
-    execution = cast(JSON, result["server_execution_artifact"])
-    assert execution["private_snapshot"] is True
-    assert execution["source_sha256"] == hashlib.sha256(clio_kit_wheel.read_bytes()).hexdigest()
-    assert execution["snapshot_sha256"] == execution["source_sha256"]
-    assert execution["snapshot_verified_before_launch"] is True
-    assert execution["snapshot_verified_after_launch"] is True
-    assert execution["source_verified_after_launch"] is True
-    assert execution["cleanup_verified"] is True
-    assert "clio-relay-mcp-wheel-" not in result_payload
-
-
 @pytest.mark.parametrize("contract_id", sorted(ACTIVE_CONTRACT_IDS))
 def test_live_locked_stdio_matches_shipped_contract_artifact(
     contract_id: str,
@@ -1278,82 +1186,6 @@ def _wait_for_response(
             response = cast(JSON, decoded)
             if response.get("id") == response_id:
                 return response
-
-
-def _extract_wheel_server_project(wheel: Path, server_name: str, root: Path) -> Path:
-    """Extract one trusted exact-wheel server project for launcher identity comparison."""
-    project = root / "wheel-projects" / server_name
-    project.mkdir(parents=True)
-    suffix = f"/clio-kit-mcp-servers/{server_name}/uv.lock"
-    with zipfile.ZipFile(wheel) as archive:
-        lock_names = [
-            info.filename
-            for info in archive.infolist()
-            if info.filename.endswith(suffix)
-            or info.filename == f"clio-kit-mcp-servers/{server_name}/uv.lock"
-        ]
-        assert len(lock_names) == 1
-        prefix = lock_names[0][: -len("uv.lock")]
-        server_members = [
-            info
-            for info in archive.infolist()
-            if info.filename.startswith(prefix) and info.filename != prefix
-        ]
-        assert len(server_members) <= 20_000
-        assert sum(info.file_size for info in server_members) <= 512 * 1024 * 1024
-        for info in server_members:
-            relative_text = info.filename[len(prefix) :].rstrip("/")
-            relative = PurePosixPath(relative_text)
-            assert relative_text and relative.as_posix() == relative_text
-            assert not relative.is_absolute() and ".." not in relative.parts
-            target = project.joinpath(*relative.parts)
-            if info.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as source, target.open("wb") as destination:
-                shutil.copyfileobj(source, destination, length=1024 * 1024)
-            assert target.stat().st_size == info.file_size
-    return project
-
-
-def _wheel_launcher_project_identity(wheel: Path, project: Path) -> JSON:
-    """Ask clio-kit's exact wheel source to compute its own child identity."""
-    script = "\n".join(
-        [
-            "import json",
-            "import sys",
-            "from pathlib import Path",
-            "sys.path.insert(0, sys.argv[1])",
-            "import clio_kit",
-            "print(json.dumps(clio_kit.locked_server_project_identity(Path(sys.argv[2]))))",
-        ]
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(wheel), str(project)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return _json_object(completed.stdout.encode("utf-8"), label="launcher identity")
-
-
-def _load_mcp_call_runner() -> ModuleType:
-    path = (
-        Path(__file__).parents[1]
-        / "jarvis-packages"
-        / "clio_relay"
-        / "clio_relay"
-        / "mcp_call"
-        / "runner.py"
-    )
-    spec = importlib.util.spec_from_file_location("clio_relay_mcp_call_runner_contract", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("failed to load MCP call runner")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _relay_tool_schema(tool: JSON) -> RemoteMcpToolSchema:

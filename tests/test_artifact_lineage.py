@@ -10,8 +10,14 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clio_relay import queue_artifact_lineage, queue_idempotency, queue_jobs
-from clio_relay.cli import app
+from clio_relay.adapters.worker import queue_artifact_lineage, queue_idempotency, queue_jobs
+from clio_relay.adapters.worker.cli import worker_app as app
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.http_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    create_app,
+)
 from clio_relay.cluster_config import (
     CLUSTER_REGISTRY_ENV,
     ClusterDefinition,
@@ -19,14 +25,7 @@ from clio_relay.cluster_config import (
     cluster_route_revision,
 )
 from clio_relay.config import RelaySettings
-from clio_relay.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
-from clio_relay.http_api import (
-    OWNER_SESSION_ID_HEADER,
-    SESSION_GENERATION_ID_HEADER,
-    create_app,
-)
-from clio_relay.mcp_server import handle_request
 from clio_relay.models import (
     ArtifactRef,
     ArtifactUse,
@@ -596,7 +595,7 @@ def test_cli_submits_and_queries_content_pinned_lineage(
     def execute_locally(_definition: object) -> bool:
         return False
 
-    monkeypatch.setattr("clio_relay.cli._require_cluster", require_local_cluster)
+    monkeypatch.setattr("clio_relay.adapters.worker.cli._require_cluster", require_local_cluster)
     monkeypatch.setattr(
         "clio_relay.remote_cli.should_execute_on_cluster",
         execute_locally,
@@ -628,80 +627,3 @@ def test_cli_submits_and_queries_content_pinned_lineage(
     reverse_payload = cast(dict[str, Any], json.loads(reverse.output))
     assert forward_payload["used_artifacts"] == reverse_payload["used_by"]
     assert forward_payload["used_artifacts"][0]["consumer_job_id"] == consumer_id
-
-
-def test_user_mcp_can_submit_and_query_artifact_lineage(tmp_path: Path) -> None:
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
-    queue = ClioCoreQueue(settings.core_dir)
-    _producer, artifact = _producer_artifact(queue)
-    assert artifact.sha256 is not None
-    pin = {"artifact_id": artifact.artifact_id, "sha256": artifact.sha256}
-    listed = handle_request(
-        {"jsonrpc": "2.0", "id": 0, "method": "tools/list"},
-        queue=queue,
-        settings=settings,
-        profile="user",
-    )
-    assert listed is not None
-    tool_names = {tool["name"] for tool in listed["result"]["tools"]}
-    assert "relay_artifact_lineage" in tool_names
-    assert "relay_used_artifacts" not in tool_names
-    assert "relay_used_by" not in tool_names
-
-    submitted = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "relay_submit_agent",
-                "arguments": {
-                    "cluster": "test-cluster",
-                    "prompt_path": "/work/prompt.md",
-                    "idempotency_key": "lineage-mcp",
-                    "used_artifact_refs": [pin],
-                },
-            },
-        },
-        queue=queue,
-        settings=settings,
-        profile="user",
-    )
-    assert submitted is not None
-    consumer_id = submitted["result"]["structuredContent"]["job_id"]
-    queried = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "relay_artifact_lineage",
-                "arguments": {"artifact_id": artifact.artifact_id, "limit": 1},
-            },
-        },
-        queue=queue,
-        settings=settings,
-        profile="user",
-    )
-
-    assert queried is not None
-    edge = queried["result"]["structuredContent"]["used_by"][0]
-    assert edge["consumer_job_id"] == consumer_id
-    assert edge["artifact_id"] == artifact.artifact_id
-    assert edge["sha256"] == artifact.sha256
-    forward = handle_request(
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "relay_artifact_lineage",
-                "arguments": {"job_id": consumer_id, "limit": 1},
-            },
-        },
-        queue=queue,
-        settings=settings,
-        profile="user",
-    )
-    assert forward is not None
-    assert forward["result"]["structuredContent"]["used_artifacts"] == [edge]

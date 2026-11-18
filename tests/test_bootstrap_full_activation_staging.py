@@ -1,4 +1,4 @@
-"""Failing-first tests for clio_relay.bootstrap_full_activation_staging (clio-relay#257).
+"""Failing-first tests for bootstrap_full_activation_staging (clio-relay#257).
 
 The live defect: a full-mode `cluster bootstrap` reconcile chosen over a
 host whose `current` generation already exists (not just the #254
@@ -11,7 +11,7 @@ only two stable activation paths whose target actually changes between
 generations, so they are captured and promoted here instead of being
 required absent -- the same "stage beside the live installation, swap
 atomically at the fenced boundary, never observe it half-cleared" discipline
-clio_relay.bootstrap_jarvis_staging already established for jarvis-venv,
+clio_relay.adapters.worker.bootstrap_jarvis_staging already established for jarvis-venv,
 including under a sabotage-shaped interrupt between stage-complete and swap.
 
 Unlike jarvis-venv's owned staged directory, `current`/`relay_source` are
@@ -35,9 +35,11 @@ from typing import cast
 
 import pytest
 
-import clio_relay.bootstrap_full_activation_staging as bootstrap_full_activation_staging_module
-import clio_relay.bootstrap_reconcile as bootstrap_reconcile_module
-from clio_relay.bootstrap_full_activation_staging import (
+import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile_module
+from clio_relay.adapters.worker import (
+    bootstrap_full_activation_staging as bootstrap_full_activation_staging_module,
+)
+from clio_relay.adapters.worker.bootstrap_full_activation_staging import (
     FULL_MODE_ACTIVATION_NAMES,
     capture_full_mode_activation_paths,
     capture_full_mode_activation_paths_json,
@@ -424,7 +426,7 @@ def test_promote_from_manifest_rejects_a_tampered_manifest(
         raise AssertionError("tampered manifest reached promotion")
 
     monkeypatch.setattr(
-        "clio_relay.bootstrap_full_activation_staging.promote_full_mode_activation_links",
+        "clio_relay.adapters.worker.bootstrap_full_activation_staging.promote_full_mode_activation_links",
         unexpected_mutation,
     )
 

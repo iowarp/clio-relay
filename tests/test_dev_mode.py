@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.worker.session_install_identity import (
+    release_identity_from_receipt,
+    release_identity_is_accepted,
+)
 from clio_relay.dev_mode import (
     DEV_MODE_BANNER,
     DEV_MODE_ENV,
@@ -16,10 +20,6 @@ from clio_relay.dev_mode import (
 )
 from clio_relay.errors import ConfigurationError
 from clio_relay.installation import InstallReceipt
-from clio_relay.session_install_identity import (
-    release_identity_from_receipt,
-    release_identity_is_accepted,
-)
 from clio_relay.validation_report import SoftwareIdentity
 
 #: Modules protecting live state/other tenants -- clio-relay#211 requires these

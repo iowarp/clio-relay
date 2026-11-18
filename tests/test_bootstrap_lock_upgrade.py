@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from clio_relay.bootstrap import render_linux_user_bootstrap_script
+from clio_relay.adapters.worker.bootstrap import render_linux_user_bootstrap_script
 
 
 def _embedded_python(script: str, marker: str) -> str:

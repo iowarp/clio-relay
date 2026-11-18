@@ -14,20 +14,25 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-from clio_relay import bootstrap, bootstrap_receipt_validation, cli
-from clio_relay.bootstrap import (
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+from clio_relay.adapters.worker import (
+    bootstrap,
+    bootstrap_receipt_validation,
+    bootstrap_worker_proof_source,
+    cli,
+)
+from clio_relay.adapters.worker.bootstrap import (
     DEFAULT_REMOTE_CORE_DIR,
     DEFAULT_REMOTE_SPOOL_DIR,
     BootstrapArchive,
     render_linux_user_bootstrap_script,
 )
-from clio_relay.bootstrap_one_pass_script import (
+from clio_relay.adapters.worker.bootstrap_one_pass_script import (
     ONE_PASS_PERSISTENT_RECEIPT_MARKER,
     ONE_PASS_TARGET_IDENTITY_MARKER,
 )
+from clio_relay.adapters.worker.deployment import endpoint_user_service_name
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry
-from clio_relay.deployment import endpoint_user_service_name
 from clio_relay.errors import ConfigurationError
 
 
@@ -63,7 +68,7 @@ def test_managed_bootstrap_fences_worker_around_migration() -> None:
     writer_proof = 'if ! python3 - "$WORKER_CLUSTER_NAME"'
     install = 'install -m 0755 "frp_${FRP_VERSION}_linux_amd64/frpc"'
     relay_replace = "uv tool install --force --python 3.12 --no-config"
-    migrate = "clio-relay init --migrate-legacy-output"
+    migrate = "clio-relay worker init --migrate-legacy-output"
     restart = 'systemctl --user "$CLIO_RELAY_ENDPOINT_ACTIVATION_ACTION" --no-block'
     full = script[script.rindex("bootstrap_journal_action create") :]
     first_proof = full.index(writer_proof)
@@ -513,8 +518,8 @@ def test_standalone_bootstrap_cannot_mutate_legacy_output() -> None:
 
     assert "WORKER_SERVICE_NAME=''" in fresh_transaction
     assert "systemctl --user stop" not in fresh_transaction
-    assert "clio-relay init --migrate-legacy-output" not in fresh_transaction
-    assert "clio-relay init" in fresh_transaction
+    assert "clio-relay worker init --migrate-legacy-output" not in fresh_transaction
+    assert "clio-relay worker init" in fresh_transaction
 
 
 def _fake_proc_process(
@@ -594,7 +599,7 @@ def _run_writer_proof(
         [
             sys.executable,
             "-c",
-            vars(bootstrap)["_WORKER_WRITER_PROOF_PYTHON"],
+            vars(bootstrap_worker_proof_source)["_WORKER_WRITER_PROOF_PYTHON"],
             cluster,
             str(core_dir),
             str(proc_root),
@@ -743,7 +748,7 @@ def test_embedded_writer_proof_does_not_claim_python_module_argv(tmp_path: Path)
         argv=[
             "/usr/bin/python3",
             "-m",
-            "clio_relay.cli",
+            "clio_relay.adapters.worker.cli",
             "endpoint",
             "start",
             "--role=worker",
@@ -1317,7 +1322,7 @@ def test_cluster_bootstrap_cli_uses_configured_data_directories(
     )
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "cluster",
             "bootstrap",

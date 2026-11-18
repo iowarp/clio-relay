@@ -33,10 +33,10 @@ from uuid import uuid4
 import pytest
 from pytest import MonkeyPatch
 
-import clio_relay.bootstrap as bootstrap
-import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
-from clio_relay.bootstrap_constants import BOOTSTRAP_PERSISTENT_RECEIPT_PATH
-from clio_relay.bootstrap_one_pass_script import (
+import clio_relay.adapters.worker.bootstrap as bootstrap
+import clio_relay.adapters.worker.bootstrap_receipt_validation as bootstrap_receipt_validation
+from clio_relay.adapters.worker.bootstrap_constants import BOOTSTRAP_PERSISTENT_RECEIPT_PATH
+from clio_relay.adapters.worker.bootstrap_one_pass_script import (
     ONE_PASS_ARCHIVE_HEREDOC_DELIMITER,
     ONE_PASS_CLEANUP_TRAP_MARKER,
     ONE_PASS_CREATED_FLAG_NAME,
@@ -81,7 +81,7 @@ def _capture(monkeypatch: MonkeyPatch) -> _Captured:
 
 
 def _desired_state() -> Any:
-    from clio_relay.bootstrap_reconcile import BootstrapDesiredState
+    from clio_relay.adapters.worker.bootstrap_reconcile import BootstrapDesiredState
 
     return cast(
         Any,
@@ -319,7 +319,7 @@ def test_one_pass_script_runs_end_to_end_under_a_real_shell(tmp_path: Path) -> N
     writer's actual output shape. Capturing real bytes here means any future
     drift in that writer's format is caught here too.
     """
-    from clio_relay.bootstrap_reconcile_receipt import write_bootstrap_receipt
+    from clio_relay.adapters.worker.bootstrap_reconcile_receipt import write_bootstrap_receipt
 
     bash = _resolved_bash()
     remote_root = f"/tmp/clio-relay-bootstrap_test_{uuid4().hex}"

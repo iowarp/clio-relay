@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import QueueConflictError
 from clio_relay.models import (
     EndpointRegistration,

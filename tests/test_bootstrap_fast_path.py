@@ -23,18 +23,18 @@ from typing import NoReturn, cast
 import pytest
 from typer.testing import CliRunner
 
-import clio_relay.bootstrap as bootstrap
-import clio_relay.bootstrap_receipt_validation as bootstrap_receipt_validation
-import clio_relay.bootstrap_reconcile as bootstrap_reconcile
-import clio_relay.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
+import clio_relay.adapters.worker.bootstrap as bootstrap
+import clio_relay.adapters.worker.bootstrap_receipt_validation as bootstrap_receipt_validation
+import clio_relay.adapters.worker.bootstrap_reconcile as bootstrap_reconcile
+import clio_relay.adapters.worker.bootstrap_reconcile_inspection as bootstrap_reconcile_inspection
+import clio_relay.adapters.worker.cli as cli
+import clio_relay.adapters.worker.cli_installation_receipt as cli_installation_receipt
+import clio_relay.adapters.worker.cli_remote_worker_probe as cli_remote_worker_probe
+import clio_relay.adapters.worker.core_queue as core_queue
 import clio_relay.bounded_process as bounded_process
-import clio_relay.cli as cli
-import clio_relay.cli_installation_receipt as cli_installation_receipt
-import clio_relay.cli_remote_worker_probe as cli_remote_worker_probe
-import clio_relay.core_queue as core_queue
 import clio_relay.installation as installation
 from clio_relay import __version__
-from clio_relay.bootstrap_reconcile import (
+from clio_relay.adapters.worker.bootstrap_reconcile import (
     BootstrapDesiredState,
     BootstrapInspection,
     BootstrapReadinessEvidence,
@@ -1055,7 +1055,7 @@ from pathlib import Path
 
 import yaml
 
-from clio_relay.bootstrap_reconcile import (
+from clio_relay.adapters.worker.bootstrap_reconcile import (
     BootstrapActivationPath,
     BootstrapDesiredState,
     BootstrapReconcilePlan,
@@ -1736,7 +1736,7 @@ def test_legacy_preflight_classifies_receipt_before_invoking_old_relay(
     assert len(delivered) == 1
     remote_script = delivered[0].decode("utf-8")
     classifier = remote_script.index('relay.get("persistent_tool")')
-    old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" bootstrap-inspect')
+    old_relay = remote_script.index('"$HOME/.local/bin/clio-relay" worker bootstrap-inspect')
     assert classifier < old_relay
     assert "bootstrap_preflight_unsupported=legacy_relay_provider" in remote_script
     assert 'if ! BOOTSTRAP_RELAY_RECEIPT_CLASS="$(' in remote_script
@@ -1970,10 +1970,12 @@ import stat
 import tempfile
 from pathlib import Path
 
-from clio_relay.bootstrap_reconcile import repair_legacy_cursor_permissions_for_upgrade
-from clio_relay.core_queue import ClioCoreQueue
+from clio_relay.adapters.worker.bootstrap_reconcile import (
+    repair_legacy_cursor_permissions_for_upgrade,
+)
+from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.errors import ConfigurationError
-from clio_relay.worker_lifetime_lock import exclusive_migration_lifetime
+from clio_relay.adapters.worker.worker_lifetime_lock import exclusive_migration_lifetime
 
 with tempfile.TemporaryDirectory() as value:
     core = Path(value) / "core"
@@ -2115,7 +2117,7 @@ def test_public_cluster_bootstrap_noop_never_touches_nonexistent_wheel(
     monkeypatch.setattr(cli_remote_worker_probe, "_remote_target_identity", remote_target_identity)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "cluster",
             "bootstrap",
@@ -2181,7 +2183,7 @@ def test_public_release_bootstrap_requires_artifact_digest(
     monkeypatch.setattr(bootstrap.shutil, "which", _which)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         ["cluster", "bootstrap", "--cluster", "cluster-a"],
     )
 
@@ -2292,7 +2294,7 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
     monkeypatch.setattr(bootstrap_reconcile, "bootstrap_invocation_lock", invocation_lock)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         ["bootstrap-inspect", "--invocation-id", "bootstrap_fail_closed", "--repair"],
     )
 
@@ -2475,7 +2477,7 @@ def test_payload_free_inspector_short_circuits_proven_generation_mismatch(
         "--repair" if repair else "--inspect-only",
     ]
 
-    result = CliRunner().invoke(cli.app, arguments)
+    result = CliRunner().invoke(cli.worker_app, arguments)
 
     assert result.exit_code == 0, result.output
     payload_line = next(
@@ -2537,7 +2539,7 @@ def test_payload_free_inspector_keeps_deep_verification_for_matching_generation(
     monkeypatch.setattr(installation, "installation_info", deep_inspection)
 
     result = CliRunner().invoke(
-        cli.app,
+        cli.worker_app,
         [
             "bootstrap-inspect",
             "--invocation-id",
@@ -3273,9 +3275,9 @@ def test_payload_script_uses_digest_bound_safe_extractor() -> None:
 
     assert 'tar -xf "$SOURCE_ARCHIVE"' not in script
     assert "stream.extractall(destination" not in script
-    assert "from clio_relay.safe_archive import safe_extract_tar" in script
+    assert "from clio_relay.adapters.worker.safe_archive import safe_extract_tar" in script
     assert "candidate_safe_archive" not in script
-    assert "BOOTSTRAP_CANDIDATE_PACKAGE/safe_archive.py" in script
+    assert "BOOTSTRAP_CANDIDATE_PACKAGE/adapters/worker/safe_archive.py" in script
 
 
 def test_legacy_planning_attests_private_candidate_before_transaction_or_fence() -> None:
@@ -3317,7 +3319,7 @@ def test_legacy_planning_attests_private_candidate_before_transaction_or_fence()
     assert archive < archive_digest < extraction < wheel_digest < uv_copy < uv_digest
     assert uv_digest < install < chain_exec < attestation < plan < dispatch
     assert "spec_from_file_location" not in planning_heredoc
-    assert "from clio_relay.bootstrap_reconcile import (" in planning_heredoc
+    assert "from clio_relay.adapters.worker.bootstrap_reconcile import (" in planning_heredoc
     assert '"UV_TOOL_DIR": str(tool_directory)' in script
     assert '"UV_CACHE_DIR": str(cache_directory)' in script
     assert 'BOOTSTRAP_PREPARING_ROOT="$BOOTSTRAP_PREPARING_PARENT/active"' in script
@@ -3334,9 +3336,9 @@ def test_legacy_planning_attests_private_candidate_before_transaction_or_fence()
     assert 'bootstrap_provider_exec "$@"' in script
     assert '"$provider" -I - "$BOOTSTRAP_CANDIDATE_PYTHON_ROOT"' not in script
     assert "expected_provider_interpreter_sha256" in planning_heredoc
-    assert planning_heredoc.index("from clio_relay.bootstrap_reconcile import (") < (
-        planning_heredoc.index("prove_bootstrap_replacement_provider(")
-    )
+    assert planning_heredoc.index(
+        "from clio_relay.adapters.worker.bootstrap_reconcile import ("
+    ) < (planning_heredoc.index("prove_bootstrap_replacement_provider("))
     assert planning_heredoc.index("prove_bootstrap_replacement_provider(") < (
         planning_heredoc.index("plan_bootstrap_reconcile(desired, replacement_provider=evidence)")
     )
@@ -3371,7 +3373,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
 
     assert "bootstrap_use_staged_provider()" in script
     assert 'if os.environ.get("BOOTSTRAP_STAGED_GENERATION"):' in script
-    assert "from clio_relay import bootstrap_reconcile as module" in script
+    assert "from clio_relay.adapters.worker import bootstrap_reconcile as module" in script
     assert 'receipt_document.get("deployment_manifest")' in script
     assert "staged install receipt omitted its desired state" in script
     assert "journal-phase prepared_manifest" in script
@@ -3393,7 +3395,7 @@ def test_staged_upgrade_uses_journal_bound_idempotent_forward_activation() -> No
     cursor_repair = recovery.index("bootstrap_candidate_action repair-legacy-cursors")
     recovery_fence = recovery.index('bootstrap_fence_recovered_service "$service_name"')
     recovery_lock = recovery.index("exec 8<>")
-    queue_init = recovery.index('"$HOME/.local/bin/clio-relay" init --migrate-legacy-output')
+    queue_init = recovery.index('"$HOME/.local/bin/clio-relay" worker init --migrate-legacy-output')
     assert recovery_fence < recovery_lock < cursor_repair < queue_init
     cursor_repair_prefix = recovery[max(0, cursor_repair - 160) : cursor_repair]
     assert 'CLIO_RELAY_WORKER_LIFETIME_GUARD_FD="$WORKER_LIFETIME_GUARD_FD"' in (
@@ -3547,8 +3549,8 @@ def test_repair_recovery_replays_only_binding_queue_and_readiness_work() -> None
     end = script.index("\n}\n\nbootstrap_recover_previous_transaction()", start)
     recovery = script[start:end]
     binding = recovery.index("bootstrap_candidate_action repair-managed-binding")
-    queue_check = recovery.index('"$HOME/.local/bin/clio-relay" queue readiness-info')
-    queue_repair = recovery.index("clio-relay init --migrate-legacy-output")
+    queue_check = recovery.index('"$HOME/.local/bin/clio-relay" worker queue readiness-info')
+    queue_repair = recovery.index("clio-relay worker init --migrate-legacy-output")
     restart = recovery.index("if ! bootstrap_bounded_worker_restart", queue_repair)
 
     assert binding < queue_check < queue_repair < restart

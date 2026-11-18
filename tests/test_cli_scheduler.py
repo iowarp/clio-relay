@@ -2,7 +2,7 @@
 
 These moved out of ``tests/test_cli.py`` unchanged (beyond imports) alongside
 the ``scheduler_app`` commands' extraction into
-``src/clio_relay/cli_scheduler.py``, per ground rule 3 (SS2 of
+``src/clio_relay/adapters/worker/cli_scheduler.py``, per ground rule 3 (SS2 of
 ``docs/design/relay-architecture-2026-08.md``): a test reachable only
 through this command group moves with the logic it exercises.
 ``test_scheduler_phase_batch_uses_one_remote_command`` stays in
@@ -34,7 +34,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.scheduler_providers as scheduler_providers
-from clio_relay.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterRegistry
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 from tests.test_cli import (
