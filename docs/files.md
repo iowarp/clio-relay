@@ -63,7 +63,7 @@ asked for.
 | any adapter built on `SiteFiles` | yes | yes | yes | `SiteFiles` applies these rules over six primitives; see [adding an adapter](adding-an-adapter.md#files). |
 | worker | yes | yes | yes | The site side runs the local implementation. |
 | tapis | yes | yes | not yet | Tapis Files has no append. |
-| ssh | yes | not yet | not yet | Relative paths still resolve under the home directory. |
+| ssh | yes | yes | yes | One remote script per op, so each op costs one ssh round trip. |
 | globus | yes | not yet | not yet | |
 | iri | yes, up to the API's size limit | not yet | not yet | |
 
