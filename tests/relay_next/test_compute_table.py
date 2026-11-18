@@ -20,14 +20,10 @@ from clio_relay.surface.settings import RelayPaths
 from .a2ui_host import Host, a2ui_client, basic_client, said
 from .conftest import add_site
 
-
 # What CLIO's choice-table renderer accepts: rows and the table are strict.
-ROW_KEYS = frozenset(
-    ["id", "title", "subtitle", "caption", "icon", "values", "inherited", "error", "context", "menu"]
-)
+ROW_KEYS = frozenset("id title subtitle caption icon values inherited error context menu".split())
 TABLE_KEYS = frozenset(
-    ["id", "component", "label", "columns", "rows", "defaults", "onChoose", "rowMenu", "add"]
-    + ["empty", "accessibility", "weight"]
+    "id component label columns rows defaults onChoose rowMenu add empty accessibility weight".split()
 )
 
 
