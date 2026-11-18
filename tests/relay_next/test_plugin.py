@@ -1,0 +1,66 @@
+"""Relay's CLIO plugin agrees with the server it launches."""
+
+from __future__ import annotations
+
+import json
+import re
+import tomllib
+from pathlib import Path
+from typing import Any
+
+from clio_relay.surface.a2ui import RELAY_CATALOG_ID, TAB_URI
+from clio_relay.surface.a2ui.components import COMPONENTS
+from clio_relay.surface.settings import RelayPaths
+
+ROOT = Path(__file__).resolve().parents[2]
+PLUGIN = ROOT / "plugin"
+CATALOG = PLUGIN / "ai.iowarp.clio" / "a2ui" / "clio-relay-compute"
+
+
+def _json(path: Path) -> Any:
+    return json.loads(path.read_text("utf-8"))
+
+
+def test_the_shipped_catalog_is_the_components_the_tab_draws_with() -> None:
+    catalog = _json(CATALOG / "catalog.json")
+    clio = _json(CATALOG / "catalog.clio.json")
+    assert catalog["catalogId"] == clio["catalogId"] == RELAY_CATALOG_ID
+    assert set(catalog["components"]) == set(COMPONENTS)
+    assert set(clio["implements"]) == set(COMPONENTS)
+    assert all(row["kernel"] == name for name, row in clio["implements"].items())
+    assert "openUrl" in catalog["functions"]
+    refs = set(re.findall(r"#/components/(\w+)", json.dumps(catalog)))
+    assert refs <= set(COMPONENTS)
+    assert (CATALOG / clio["instructions"]).is_file()
+
+
+def test_the_manifest_names_the_tab_the_server_serves() -> None:
+    manifest = _json(PLUGIN / "plugin.json")
+    clio = manifest["extensions"]["ai.iowarp.clio"]
+    assert [tab["resource"] for tab in clio["tabs"]] == [TAB_URI]
+    assert [row["provider"] for row in clio["accounts"]] == ["globus"]
+    assert clio["elicitation"] == {"loopback": True, "origins": ["https://tacc.tapis.io"]}
+    assert "server" not in clio["tabs"][0]  # mcp.json has a single server
+
+
+def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
+    servers = _json(PLUGIN / "mcp.json")["mcpServers"]
+    assert list(servers) == ["relay"]
+    server = servers["relay"]
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]["scripts"]
+    assert server["args"][-2:] == ["clio-relay-next", "serve"]
+    assert "clio-relay-next" in scripts
+    source = server["args"][server["args"].index("--from") + 1]
+    assert re.fullmatch(r"clio-relay @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}", source)
+    assert server["env"] == {"CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}"}
+    launched = {"CLIO_RELAY_GRANT_FILE_GLOBUS": "/plugin-data/accounts/globus.json"}
+    assert RelayPaths.from_env(launched).grant_files == {
+        "globus": Path("/plugin-data/accounts/globus.json")
+    }
+
+
+def test_the_skills_index_points_at_the_skill_resources() -> None:
+    text = (PLUGIN / "skills" / "use-relay" / "SKILL.md").read_text("utf-8")
+    assert text.startswith("---\nname: use-relay\n")
+    assert "relay://sites/<site>/skill" in text
+    assert "relay://skills/<name>" in text

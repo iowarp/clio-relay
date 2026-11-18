@@ -1,0 +1,40 @@
+{
+  "catalogId": "https://iowarp.ai/a2ui/catalogs/clio-relay-compute/v1",
+  "protocolVersion": "0.9.1",
+  "trust": {
+    "source": "pack"
+  },
+  "implements": {
+    "Text": {
+      "kernel": "Text"
+    },
+    "Row": {
+      "kernel": "Row"
+    },
+    "Column": {
+      "kernel": "Column"
+    },
+    "Card": {
+      "kernel": "Card"
+    },
+    "Tabs": {
+      "kernel": "Tabs"
+    },
+    "Divider": {
+      "kernel": "Divider"
+    },
+    "Button": {
+      "kernel": "Button"
+    },
+    "TextField": {
+      "kernel": "TextField"
+    },
+    "CheckBox": {
+      "kernel": "CheckBox"
+    },
+    "ChoicePicker": {
+      "kernel": "ChoicePicker"
+    }
+  },
+  "instructions": "instructions.md"
+}

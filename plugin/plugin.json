@@ -1,0 +1,44 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "clio-relay",
+  "version": "1.6.8",
+  "description": "Relay: run jobs, commands, file transfers and services on your compute sites, and manage those sites in the Compute tab.",
+  "author": {
+    "name": "IoWarp Team"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hpc",
+    "compute",
+    "sites",
+    "slurm",
+    "globus"
+  ],
+  "extensions": {
+    "ai.iowarp.clio": {
+      "tabs": [
+        {
+          "id": "compute",
+          "title": "Compute",
+          "icon": "server",
+          "resource": "a2ui://clio-relay/compute"
+        }
+      ],
+      "accounts": [
+        {
+          "provider": "globus",
+          "scopes": [
+            "urn:globus:auth:scope:transfer.api.globus.org:all",
+            "https://auth.globus.org/scopes/facd7ccc-c5f4-42aa-916b-a0e270e2c2a9/all"
+          ]
+        }
+      ],
+      "elicitation": {
+        "loopback": true,
+        "origins": [
+          "https://tacc.tapis.io"
+        ]
+      }
+    }
+  }
+}
