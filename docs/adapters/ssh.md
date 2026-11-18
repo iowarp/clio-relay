@@ -67,7 +67,9 @@ and the gate asks for it unless the site's `spend.ask` is `never`.
    An input already on the site is not sent again. If the job deletes an input
    from its directory, for example a file of secrets it reads once, relay
    removes the site's stored copy too when the job ends or is cancelled, unless
-   another job still uses it.
+   another job still uses it. An input marked `transient` goes when the job
+   ends in any case, both the job's copy and the stored one, even if the job
+   was cancelled before it started.
 3. One `ssh` call writes the script into the job's directory and submits it.
    The directory is `<remote_dir>/jobs/<operation id>/` and holds the script,
    the submit result, `stdout`, `stderr` and the exit code.
