@@ -121,7 +121,8 @@ never types into ssh itself.
   each prompt there. That starts an ssh master connection
   (`ControlMaster`), and every later call reuses it with `BatchMode=yes`, so
   you are asked once, not on every call. When the master closes, the site
-  asks you to sign in again.
+  asks you to sign in again. The master closes when relay stops, so none is
+  left running after it, and signing in again while one is up reuses it.
 
 `askpass` replaces the program that shows the prompts, for example with a
 program of your own that reads codes from a token. With such a program, relay
