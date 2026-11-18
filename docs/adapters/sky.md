@@ -48,10 +48,11 @@ version.
 ```
 
 SkyPilot also reads the cloud profiles already on your machine, such as
-`~/.aws/credentials`. With `credentials`, relay instead reads the keys from your
-keyring, under the service `clio-relay`, and hands them to SkyPilot as those
-variables. A missing key shows the site as needing sign-in, and you add it on
-relay's page.
+`~/.aws/credentials`. With `credentials`, relay instead reads each key from its
+own secret store (the operating system's keyring, kept by relay's identity
+layer) under the name you give, and hands it to SkyPilot as that variable. A
+missing key shows the site as needing sign-in, and relay's page asks you to
+type it.
 
 ## Settings
 
@@ -65,7 +66,7 @@ relay's page.
 | `setup` | none | Commands run once on each node before the job |
 | `workdir` | none | A local directory SkyPilot copies to the job |
 | `env` | none | Variables for SkyPilot itself |
-| `credentials` | none | Keyring entries to hand to SkyPilot, as above |
+| `credentials` | none | Secret names to hand to SkyPilot as variables, as above |
 | `stall_s` | 1800 | How long SkyPilot may print nothing before relay stops waiting for it |
 
 A job can override any resource setting with a `sky.` custom attribute, such as

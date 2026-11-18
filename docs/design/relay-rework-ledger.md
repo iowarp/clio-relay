@@ -660,7 +660,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - The spend price goes through the same subprocess.
   - The install step is in `docs/adapters/sky.md`.
 - **globus-compute-sdk is pinned to 4.21.0 (W1, `6b32300`).** 4.22 is an alpha. Stable 4.21.0 is what the adapter and its tests were written against.
-- **Credentials come from W6's identity layer.** `tokens.provider("globus")` calls `clio_relay.identity.get("globus")` when that module exists. Until W6 merges, it uses `GrantFileProvider`, a stub with the same shape (`async token(resource_server=...)`, `status()`). The stub reads the grant file named by `CLIO_RELAY_GRANT_FILE_GLOBUS`. The adapters never start a sign-in. With no token, or an expired one, they refuse `needs_sign_in`, and `sign_in_needed()` names the provider.
+- **Credentials come from W6's identity layer.** `tokens.provider("globus")` calls `clio_relay.identity.shared().get("globus")`, the provider relay is serving with, so it sees `--grant-file`. `identity.get` is not used: it returns the factory. W6's `Token.access_token` is a `SecretStr` and is revealed only to build the `Authorization` header; `status()` is async and returns an `IdentityStatus` whose `state` the adapters report. Where `clio_relay.identity` is absent, `GrantFileProvider` stands in, reading the grant file named by `CLIO_RELAY_GRANT_FILE_GLOBUS`. The adapters never start a sign-in. With no token, or an expired one, they refuse `needs_sign_in`, and `sign_in_needed()` names the provider.
 - **globus: one Compute task per job, cancelled with a marker.** The task is `relay_task`, a self-contained function that uses only the standard library, because Compute ships functions by source.
   - The task writes the inputs and `relay-state.json` into `<job_root>/<operation id>/`. It runs the command in its own process group and polls for a `relay-cancel` marker.
   - `cancel` sends a second task that writes the marker, because the Compute service cannot cancel a submitted task.
@@ -681,7 +681,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - When the job ends, its log is downloaded as the output.
   - SkyPilot reports no exit code for a managed job. A failure is recorded with exit code 1, unless the failure reason names a code, and the message says so.
   - There is no hard limit on a SkyPilot call. Relay stops waiting only when SkyPilot prints nothing for `stall_s` (1800 s).
-- **sky cloud keys come from the keyring.** `credentials.env` maps variables to keyring entries under the service `clio-relay`, such as `AWS_ACCESS_KEY_ID: aws-access-key-id`. A missing entry refuses `needs_sign_in` with the provider. Without `credentials`, SkyPilot uses the cloud profiles already on the machine.
+- **sky cloud keys are secrets in W6's token store.** `credentials.env` maps variables to secret names, such as `AWS_ACCESS_KEY_ID: aws-access-key-id`, read with `TokenStore().secret(name)` (stored by W6 as `secret:<name>` under its keyring service; W11 writes nothing there). A missing secret refuses `needs_sign_in`, and `sign_in_needed()` returns `SignInNeed(provider="keyring:<name>")`, so relay's page asks the person to type it. Without `credentials`, SkyPilot uses the cloud profiles already on the machine.
 - **The spend price is `SkyAdapter.price(spec) -> Charge`, in US dollars.**
   - `amount` is SkyPilot's `Resources.get_cost(walltime)` times the node count.
   - `unit` is `"USD"`, and `nodes`, `walltime_s` and `node_hours` are filled in. `Charge.unit` is free text, so W13 needs no new field.
@@ -720,9 +720,10 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 
 All of this is unit and mock evidence.
 
-- **Gate on Ares** at `83f81dc` (integration `14e8edd` merged), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
-  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 95 passed, none skipped. The kit now asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The four new globus tests cover the endpoint start: no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit.
-  - The earlier gate, at `3015e81`, gave 82 passed and 5 skipped, before the kit asserted refusals.
+- **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
+  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 99 passed, none skipped. The kit asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The globus endpoint-start tests cover no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit. The four W6 tests cover the `SecretStr` token and async `IdentityStatus`, `shared().get` over `identity.get`, cloud keys read from `TokenStore`, and the old `credentials.service` setting refused.
+  - The same modules, ruff and pyright on a scratch merge with `-w6` at `4bad7cb` (local, not pushed): exit 0, 99 passed, clean, 0 errors. A smoke script on that merge with `CLIO_RELAY_KEYRING=memory` showed `tokens.provider("globus")` returning W6's `GlobusIdentity`, status `signed_out`, the bearer refusing `needs_sign_in`, the sky adapter asking `keyring:aws-access-key-id`, and after `TokenStore().set_secret` the key handed to SkyPilot's environment.
+  - Earlier gates: `83f81dc` gave 95 passed; `3015e81` gave 82 passed and 5 skipped, before the kit asserted refusals.
   - `uv run ruff check` and `ruff format --check` on the W11 paths: clean.
   - `pyright` 1.1.411 on the W11 paths: 0 errors.
 - **What the mocks cover.**
@@ -803,9 +804,9 @@ Needs an AWS account the person agrees to spend on (O11), and an IAM key pair wi
    uv venv ~/.clio-relay/sky
    uv pip install --python ~/.clio-relay/sky 'skypilot[aws]==0.14.3'
    ```
-2. Add a site with `adapter: sky`, `infra: aws`, `cpus: 2+` and the keyring entries `AWS_ACCESS_KEY_ID: aws-access-key-id` and `AWS_SECRET_ACCESS_KEY: aws-secret-access-key`.
+2. Add a site with `adapter: sky`, `infra: aws`, `cpus: 2+` and `credentials: {provider: aws, env: {AWS_ACCESS_KEY_ID: aws-access-key-id, AWS_SECRET_ACCESS_KEY: aws-secret-access-key}}`.
 3. Without the keys, `describe` reports `skypilot_version` and the site shows as needing sign-in. Type the two keys on relay's page.
-4. Check that they are in the OS keyring under the service `clio-relay`, and not in any file.
+4. Check that they are in the OS keyring, under W6's service `clio-relay` as `secret:aws-access-key-id` and `secret:aws-secret-access-key`, and not in any file.
 5. `run` `echo hello` with 1 node and 15 minutes. The spend gate must show SkyPilot's price in USD, about 0.024 for `m6i.large` on demand. Screenshot it, then approve.
 6. Check that the job completes with exit code 0, and that `run.log` is listed and contains `hello`.
 7. In the AWS console or `sky status`, check that the job's instance is terminated once the managed job ends. With W9, check that a `serve` cluster autostops when idle.
@@ -844,9 +845,7 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
   - Add `docs/adapters/{globus,iri,sky}.md` to the docs index.
   - O11's text says "paid cloud account for LQ-L8". The cloud row is LQ-L6, and LQ-L8 is DeltaAI.
 - **Settled by W1 at `14e8edd`:** routing now skips an alternative whose build refuses `invalid_config` (Aurora with no `endpoint`, `iri` with no `resource_id`) and records the skip; and `exec` takes no time limit, so the globus endpoint start and the IRI `token_command` have none.
-- **Requests to W6:**
-  - Confirm the `Token` shape (`access_token`, `expires_at`) and whether `status()` is sync or async. `tokens.py` accepts either.
-  - Confirm the keyring naming for cloud keys: service `clio-relay`, entries such as `aws-access-key-id`. Relay's page should write those entries.
+- **Answered by W6 (4bad7cb on `-w6`), and adopted:** the `Token` and `IdentityStatus` shapes, `shared().get`, and cloud keys as `TokenStore` secrets raised as `keyring:<name>`. Until W6 merges, the W11 tests check those shapes against stand-ins.
 - **Request to W13:** call `SkyAdapter.price(spec)` from `GuardHook.price` for sky sites. It returns a `Charge` with `unit: "USD"`, and `node_hours` is still filled in for the node-hour threshold.
 - **For W9:** SkyPilot autostop is the idle release for `serve`. The `sky` adapter does not implement `serve`.
 

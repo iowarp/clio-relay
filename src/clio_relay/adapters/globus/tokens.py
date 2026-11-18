@@ -1,13 +1,16 @@
 """Globus credentials for the adapters that use them (``globus`` and ``iri``).
 
-Relay's identity layer, ``clio_relay.identity``, owns sign-in. ``get("globus")``
-returns a provider whose ``token(resource_server=...)`` returns a token or
-``None``, reading the grant file first and then the keyring, and refreshing as
-needed. Adapters never start a sign-in. With no token they refuse with
-``needs_sign_in`` and relay's sign-in flow takes over.
+Relay's identity layer, ``clio_relay.identity``, owns sign-in.
+``identity.shared().get("globus")`` returns the provider relay is serving with,
+so it sees ``--grant-file``. Its async ``token(resource_server)`` returns a
+``Token`` (``access_token`` is a ``SecretStr``) or ``None``, reading the grant
+file first and then the keyring, and refreshing as needed. Its async
+``status()`` returns an ``IdentityStatus`` whose ``state`` is ``signed_in``,
+``signed_out`` or ``expired``. Adapters never start a sign-in. With no token
+they refuse with ``needs_sign_in`` and relay's sign-in flow takes over.
 
-Until the identity layer is installed, :class:`GrantFileProvider` stands in. It
-reads the grant file a host keeps current (``CLIO_RELAY_GRANT_FILE_GLOBUS``),
+Where the identity layer is not installed, :class:`GrantFileProvider` stands in.
+It reads the grant file a host keeps current (``CLIO_RELAY_GRANT_FILE_GLOBUS``),
 whose format is ``{version, provider, written_at, tokens: [{resource_server,
 access_token, token_type, expires_at, scopes}]}``.
 """
@@ -55,7 +58,7 @@ class TokenProvider(Protocol):
         ...
 
     def status(self) -> object:
-        """Return ``signed_in``, ``signed_out`` or ``expired``."""
+        """Return the state, or an awaitable of an object whose ``state`` is it."""
         ...
 
 
@@ -132,15 +135,18 @@ class GrantFileProvider:
 
 
 def provider(name: str = "globus") -> TokenProvider:
-    """Return relay's identity provider ``name``, or the grant-file stand-in."""
+    """Return the provider ``name`` relay is serving with, or the grant-file stand-in."""
     try:
         module = importlib.import_module("clio_relay.identity")
     except ImportError:
         return GrantFileProvider(name)
-    getter = getattr(module, "get", None)
-    if not callable(getter):
+    shared = getattr(module, "shared", None)
+    if not callable(shared):
         return GrantFileProvider(name)
-    return cast(TokenProvider, getter(name))
+    found: object = cast(Any, shared()).get(name)
+    if found is None:
+        return GrantFileProvider(name)
+    return cast(TokenProvider, found)
 
 
 def access_token(token: object | None) -> str | None:
@@ -149,15 +155,19 @@ def access_token(token: object | None) -> str | None:
         return None
     if isinstance(token, str):
         return token or None
-    value = getattr(token, "access_token", None)
+    value: object = getattr(token, "access_token", None)
+    reveal = getattr(value, "get_secret_value", None)
+    if callable(reveal):
+        value = reveal()
     return value if isinstance(value, str) and value else None
 
 
 async def status_of(source: TokenProvider) -> str:
-    """Return the provider's status as a plain string."""
+    """Return the provider's state as a plain string."""
     value: object = source.status()
     if inspect.isawaitable(value):
         value = await cast(Any, value)
+    value = getattr(value, "state", value)
     text = getattr(value, "value", value)
     return str(text)
 
