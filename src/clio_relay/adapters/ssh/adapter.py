@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import io
 import json
 import logging
@@ -570,16 +571,18 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
         try:
-            from clio_relay import serve as serve_module  # pyright: ignore
-        except ImportError as exc:
+            serve_module: Any = importlib.import_module("clio_relay.serve")
+        except ModuleNotFoundError as exc:
+            if exc.name not in ("clio_relay.serve", "clio_relay"):
+                raise
             raise Refusal(
-                RefusalReason.ADAPTER_UNAVAILABLE,
-                "this relay has no serve support installed",
-                adapter=self.name,
+                RefusalReason.VERB_NOT_IMPLEMENTED,
+                "serve needs the service runtime, and it is not installed",
                 verb="serve",
             ) from exc
-        start_for = cast(Any, serve_module).start_for
-        return cast(Endpoint, await start_for(self, spec, operation_id=operation_id))
+        return cast(
+            Endpoint, await serve_module.start_for(self, spec, operation_id=operation_id)
+        )
 
     # sign-in
 
