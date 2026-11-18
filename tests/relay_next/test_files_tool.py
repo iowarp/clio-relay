@@ -21,6 +21,7 @@ def _structured(result: Any) -> dict[str, Any]:
     assert isinstance(structured, dict), result
     return structured  # pyright: ignore[reportUnknownVariableType]
 
+
 def test_exec_and_files(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
 
