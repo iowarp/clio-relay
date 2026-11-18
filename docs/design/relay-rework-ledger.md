@@ -985,6 +985,8 @@ develop 034117b on a compute node gives 139 failed and 3 errors, which is 142 no
 
 ### The worker adapter
 
+The polish wave replaced most of this section; see "The polish wave" below. Placement, sign-in, the verbs and the hop still work as described. The operator commands and the old modules behind them are gone.
+
 - **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]` (`adapters/worker/adapter.py`). The config keys are:
   - `ssh_profile`, the Host in `~/.ssh/config` used for sign-in and placement (the key W11's catalog entries use), and `ssh_config_file`;
   - `scheduler`, `auto` or a psij executor name;
@@ -1138,6 +1140,66 @@ On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) 
   - 16 in kept files now pass.
   The 46 above remain. None of them is skipped or rerun to pass.
 
+### The polish wave
+
+The coordinator asked for the worker to be rebuilt around what the new surface needs: place the worker, hold the one frp link, run and track jobs, and move files. Everything else goes, and `adapters/worker` must be under 800 KB.
+
+**Sizes**, the branch against integration 70d3fc1 (W9's 378aaa7 included):
+
+| Tree | Before | After |
+|---|---|---|
+| `src/clio_relay/adapters/worker` | 268 files, 3,939,698 B | 9 files, 70,229 B |
+| `src/clio_relay` | 560 files, 7,599,946 B | 219 files, 1,737,815 B |
+| `tests` | 244 files, 4,341,453 B | 130 files, 983,589 B |
+
+The diff is 487 files, +1404 and -234331 lines.
+
+**What the worker is now.**
+- `adapter.py`: `WorkerConfig`, placement over the one ssh pass, the stored link, sign-in and the verbs.
+- `link.py`: the worker protocol and the identity check over frp.
+- `site_server.py`, `site_app.py` and `site_routes.py`: `clio-relay worker site-serve`, the only worker command. It serves `/healthz`, `/session-identity`, `/session-status` and the `/adapter` routes, which run the verbs through the `local` adapter.
+- `files.py`: `WorkerFileAccess`, including W1's `write-chunk` and `delete` ops.
+- `frpc_unit.py`, `cli.py` and `__init__.py`.
+
+**What went** (a1ec06a, 9234e44, d19e721):
+- In `adapters/worker`: the queue, bootstrap, endpoint, HTTP API, session, scheduler, jarvis and operator command modules: all but the 9 files above, which are new or rewritten. The operator groups (`endpoint`, `relay-host`, `cluster`, `api`, `session`, `queue`, `scheduler`, `installation-*`) went with them. Setting up a site needs no command: the person signs in once and relay places the worker.
+- At the top level: `_contracts/*.json` (13), `acceptance_facts`, `artifact_identity_verification`, `bounded_process`, `component_runtime_identity`, `component_verification_remote`, `contract_gate`, `distribution_source_identity`, `durable_validation_write`, `file_digest`, `install_identity`, `installation`, `installation_receipt_models`, `jarvis_mcp`, `jarvis_provider`, `lock_holder_sidecar`, `native_jarvis_contract`, `owner_session_admission`, `persistent_uv_tool_probe`, `process_ancestry`, `progress_provenance`, `public_records`, `python_distribution_probe`, `regular_file_identity`, `relay_ops`, `remote_cli`, `run_report*` (3), `runtime_metadata*` (11), `session_wire_models`, `uv_tool_receipt`, `validation_directory_windows`, `validation_limits`, `validation_writer_lock` and `wheel_record_closure`. Nothing in the new tree reached them.
+- 116 test files that tested only those modules.
+- W8 edited `control_channel.py` and `session_api.py` (a1ec06a) and `redaction.py` (9234e44) to drop imports of deleted modules.
+- W9 deleted the old service runtime in its own files (378aaa7, 992acee), merged here because it could not land before `cli_owned_runtime_cleanup.py` went.
+
+**W9's files.** W8's commits change no W9 source file. The only W9 files W8 touched are `tests/test_frp_link.py` and `tests/test_frp_transport_dials.py` (9234e44), under the coordinator's decision (a): drop the tests that drove the deleted owned-session layer and their module-level patches, and keep every `BrokeredTcpTransport` and `frp_link` case. Removed, so they are not brought back:
+- `test_frp_transport_dials.py`, 11: the atexit cleanup, the event report, the ten owned-session operations, `closed_at_exit`, the real interpreter exit, the unconfigured anchor, the identity anchor in the event report, and reaped orphans after a failed establish.
+- `test_frp_link.py`, 4: the probe share and the three cases built on it.
+
+**Older workers.** A link stored by an older relay has no `session_owner_token`. `_connection` refuses it with `needs_sign_in`: "the worker on <site> is from an older relay (its link was stored by an older relay); sign in again so relay can replace it". Signing in places the new worker in the same remote directory and stops the old `site-serve` and its frpc. Proven live below.
+
+**W1's file routes, reviewed** (merged at 191c7a5). `write-chunk` and `delete` in `site_routes.py` are right, and an older site answers both with `unknown file operation`, so a chunk is never taken for the whole file. One change (50c6bbb): JSON `true` arrives as `bool`, an `int` subclass, so the `read` and `write-chunk` offsets now refuse it. A negative offset is refused by `file_rules.check_offset`. New site-app tests cover a chunked write, a chunk out of place, a non-integer offset, delete with and without `recursive`, and an unknown op.
+
+**Live evidence, through the MCP surface** (`tests/worker/worker_live.py`, at 702cf19). On Ares, each step a new `clio-relay serve` over stdio, against fx-slurm over a tcp rendezvous, from a cold remote directory.
+- **Open site.**
+  - The cold sign-in placed the worker (op_fe7c6b39a4ac8f2abca7e101, Slurm 821).
+  - `files`: write, read, stat, list, a 300 KB stage and has.
+  - A job (op_daa3caec7e73c6b4517d21d1, Slurm 823) printed its input and the host fx-slurm.
+  - Dropped link, site side (the site's frpc killed): one `unreachable` ("Broken pipe"), recovered in about 4 s. Then a job (op_b9dbb0a552811391ed76148e, 824) and `files` passed.
+  - Dropped link, relay side (the relay's visitor killed with signal 9): the first call recovered with a new visitor. A job (op_65b21f81c060acbf8b3c2297, 826) and `files` passed.
+  - A new process described op_daa3caec7e73c6b4517d21d1 as completed and read the file written before.
+- **Guarded site** (guard.yaml, jarvis on fx-slurm, a demo package `w8demo.hello` at tag v0.1.0).
+  - Sign-in through a package run (op_58531cef598ed5192263284d, 828): the url ask, then the review ask (package hash and source), then the spend ask. Output "w8demo.hello says w8-signin".
+  - A free-form run and `exec rm` gave `policy_refused`; `exec ls` exited 0.
+  - `files` passed. A second package run (op_1c1da4e6db0e98e58f0aebeb, 829) asked only for spend, since the review is remembered.
+  - Site-side drop: one `unreachable`, then a package run (op_ffe7a04fb0a50e7219bb18a2, 830) and `files` passed.
+  - Relay-side drop: recovered at once; a package run (op_78773db25ee2b61ba1fef35b, 832) and `files` passed.
+- **Older worker.** The 1.6.8 relay built at integration 2a56c78 placed a worker (op_c28e9c13ae3e580c95b16b6a, 833). The new relay refused it with the message above. After `site edit` to the new wheel, the sign-in replaced it (op_274453fe252eca7b79c15073, 834); `files` and a job (op_b35c00833696d97c3e7afd76, 835) passed. Afterwards fx-slurm ran one `site-serve` and one frpc for that site.
+- **Cold conformance kit** (`tests/worker`, at de4d8e7, a fresh remote directory and wheel on fx-slurm): 23 passed, none failed or skipped.
+- **LQ1 and LQ32** (at 702cf19, wheel in a clean venv). `--help` lists serve, connect, adapters, site, rendezvous, asks and worker. `clio-relay` and `python -m clio_relay` list exactly the five tools on 2026-07-28 and 2025-11-25, with and without A2UI. No hits for the LQ32 names in the tree outside `docs/design`, in tracked paths, in the wheel (254 files) or in the installed package.
+- **After the files merge** (50c6bbb, Ares login node): `tests/worker` without the live kit, `tests/relay_next/test_files_tool.py` and `tests/relay_next/test_server.py`, 41 passed, none failed or skipped.
+- **Cold conformance kit after the files merge** (b7c2b4a, wheel sha256 `92ab672fb77f?`, remote directory `~/w8-live/cold-1795045324` on fx-slurm): `tests/worker`, 32 passed (18 unit, 14 conformance, including W1's files delete and chunked write), none failed or skipped.
+- **The full suite**, once, in Slurm job 27849 at 50c6bbb, serially, without the live kit (a compute node cannot reach the fixtures): 1094 passed, 82 failed, no errors, none skipped. Every failure has a cause:
+  - 69 need W2's fixtures on the login node's loopback: `relay_ssh` (51), `test_fixtures_smoke` (12), `relay_tapis/test_tapis_register` (4, it registers on fx-ssh) and `asks/test_askpass_otp` (2). On the login node at b7c2b4a, with the fixtures env, those modules passed 185 of 185, none skipped.
+  - 10 in `test_cli_cluster.py`, which drove the removed `worker cluster` group. Deleted (b7c2b4a).
+  - 3 ratchet tests read stale baseline entries in W1's scripts: `check_file_size.py` lists 8 deleted worker files, and `check_no_class_in_function.py` lists the deleted `wheel_snapshot_identity.py`. Requested from W1 below.
+
 ### Workflows
 
 There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `live-validation-attest`, `main-provenance`, `release-gate`, `release`, `released-validation-attest` and `stage-candidate`. `ci` is rewritten to run `uv run ruff check`, `uv run ruff format --check`, `uv run pyright` and `uv run pytest` on the new tree. `release` is reduced to building and publishing the wheel. The other six only served the old release gate, which reads the deleted `release_*`, `live_validation*` and `promotion_record` modules, so they are deleted. Neither workflow is enabled or waited on.
@@ -1163,6 +1225,12 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 - **W1, at 2cc93c2.**
   - Lower `BASELINE_TOTAL` to 4535.
   - `check_file_size.py` lines 385 and 986-993 describe the deleted `jarvis-runtime-authority` command, the authority resolver and `run_remote_jarvis_runtime_authority`. The script also offers ratchet-downs (for example `bootstrap.py` 924 to 922) and distribution raises.
+- **W1, for the polish wave** (at b7c2b4a).
+  - `check_file_size.py` RATCHET_BASELINE: remove the 8 entries for deleted worker files (`bootstrap.py`, `bootstrap_journal.py`, `cli_owned_report_artifact.py`, `jarvis_execution.py`, `retention.py`, `session_cleanup_execution.py`, `session_recovery_inspection.py`, `session_start_execution_core.py`).
+  - `check_no_class_in_function.py` RATCHET_BASELINE: remove `adapters/worker/wheel_snapshot_identity.py`.
+  - Lower `BASELINE_TOTAL` and the size floors to what the scripts report on this branch.
+  - `docs/ai/interface-context.md:40-43` lists the old worker tree and `clio-relay worker api start`. `docs/ai/README.md:14` calls operations.md "operator commands". The README should not name `worker cluster` or `installation-info`. The only worker command is `site-serve`.
+- **W9, for the polish wave.** `frp_check` is reached only from its own test, so it can go. Stale comments name deleted modules at `errors.py:101`, `bounded_payload.py:307`, `frp_visitor_reconciliation.py:8` and `session_attach.py:3`. `frp_transport` and `frp_link` still import `config`, `cluster_config` and `job_identity` for paths the worker no longer uses. The frp tests removed under decision (a) are listed under "The polish wave".
 - **Open findings for the coordinator.**
   - Resolved (b074925): the installation check stopped requiring jarvis-cd's `ExecutionStore.resolve_service_runtime_authority`.
   - Resolved (deec1d0): a fresh worker bootstrap cloned the private, archived `grc-iit/jarvis-util`, so it stopped at `git clone` on a host without GitHub credentials. The coordinator decided to drop it, and the bootstrap no longer needs it.
