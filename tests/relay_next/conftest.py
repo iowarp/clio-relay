@@ -6,7 +6,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -95,4 +95,4 @@ def _stop_psij_queue_pollers() -> Iterator[None]:
         return
     for thread in threading.enumerate():
         if isinstance(thread, poller):
-            thread.done = True
+            cast(Any, thread).done = True

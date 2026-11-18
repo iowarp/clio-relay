@@ -277,7 +277,11 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-            rest = [asyncio.ensure_future(process.wait()), stdout_task, stderr_task]
+            rest: list[asyncio.Future[Any]] = [
+                asyncio.ensure_future(process.wait()),
+                stdout_task,
+                stderr_task,
+            ]
             await asyncio.wait(rest, timeout=5)
             for step in rest:
                 step.cancel()
