@@ -162,6 +162,12 @@ def test_user_config_keys_follow_the_site(tmp_path: Path) -> None:
     }
 
 
+def test_user_config_sends_no_walltime_without_a_duration(tmp_path: Path) -> None:
+    adapter = _build(tmp_path)
+    spec = JobSpec(executable="hostname", attributes=JobAttributes(queue_name="debug"))
+    assert adapter.user_config(spec) == {"queue": "debug", "nodes_per_block": 1}
+
+
 @pytest.mark.asyncio
 async def test_job_reaches_the_endpoint_with_its_user_config(tmp_path: Path) -> None:
     adapter = _build(tmp_path)
