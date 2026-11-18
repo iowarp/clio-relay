@@ -128,6 +128,55 @@ async def test_lq5_a_slurm_job_completes_after_relay_restarts(
     assert again.native_id == handle.native_id
 
 
+async def test_a_job_the_scheduler_forgot_is_read_from_its_own_record(
+    fx: dict[str, str], tmp_path: Path
+) -> None:
+    """Relay is down longer than Slurm's MinJobAge (300 s on fx-slurm and Ares)."""
+    first = build(fx, tmp_path / "before", "fx-slurm")
+    done_op, killed_op = new_id("op"), new_id("op")
+    done = await first.run(
+        JobSpec(executable="sh", arguments=["-c", "echo purged-done"]), operation_id=done_op
+    )
+    killed = await first.run(
+        JobSpec(executable="sleep", arguments=["3600"]), operation_id=killed_op
+    )
+    for handle in (done, killed):
+        script = (await (await first.files()).read(f"{handle.data['job_dir']}/submit.sh")).decode()
+        assert f'#SBATCH --job-name="{handle.data["job_name"]}"' in script
+    del first
+    # Someone other than relay ends the second job, so it writes no exit code.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 1800
+    while killed.native_id not in site_shell(fx, "fx-slurm", "squeue -h --me -t R -o %i").split():
+        assert loop.time() < deadline
+        await asyncio.sleep(2)
+    site_shell(fx, "fx-slurm", f"scancel {killed.native_id}")
+    while True:
+        listed = site_shell(fx, "fx-slurm", "squeue -h --me -t all -o %i").split()
+        if done.native_id not in listed and killed.native_id not in listed:
+            break
+        assert loop.time() < deadline, "Slurm still lists the jobs"
+        await asyncio.sleep(10)
+
+    second = build(fx, tmp_path / "after", "fx-slurm")
+    found = await second.find(done_op)
+    assert found is not None and found.native_id == done.native_id
+    final = await second.status(found)
+    assert final.state.value == "completed", final
+    assert final.exit_code == 0
+    assert final.native_state == "gone"
+    stdout = await (await second.files()).read(f"{found.data['job_dir']}/stdout")
+    assert stdout.strip() == b"purged-done"
+
+    found = await second.find(killed_op)
+    assert found is not None and found.native_id == killed.native_id
+    ended = await second.status(found)
+    # fx-slurm keeps accounting, so sacct says how it ended. Without accounting
+    # the state is unknown rather than failed.
+    assert ended.state.value == "cancelled", ended
+    assert ended.native_state == "CANCELLED"
+
+
 def site_shell(fx: dict[str, str], profile: str, command: str) -> str:
     done = subprocess.run(
         ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", profile, command],
