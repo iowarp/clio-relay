@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from clio_relay.adapters.hooks import set_hook
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.surface.stubs import DefaultGuard
 
 # The Slurm suite needs a directory the compute nodes share; without one it is not collected.
 collect_ignore = [] if os.environ.get("RELAY_TEST_SLURM_DIR") else ["test_conformance_slurm.py"]
@@ -63,3 +66,13 @@ def answer_page(
             form["value"] = value
         posted = client.post(url.split("?", 1)[0], data=form)
         return posted.status_code
+
+
+@pytest.fixture
+def stub_guard() -> Iterator[None]:
+    """Use relay's guard stub even when a guard package is installed."""
+    set_hook("guard", DefaultGuard)
+    try:
+        yield
+    finally:
+        set_hook("guard", None)

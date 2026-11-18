@@ -141,6 +141,7 @@ def test_failed_job_is_an_error_result(relay_paths: RelayPaths) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.usefixtures("stub_guard")
 def test_refusals_are_typed(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, "guarded", policy="guarded")
 
