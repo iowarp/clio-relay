@@ -395,7 +395,7 @@ def test_slurm_scripts_pass_signals_on(tmp_path: Path, scheduler: str, wrapped: 
 
 def test_forward_signals_needs_a_launch_line() -> None:
     with pytest.raises(ValueError, match="no launch line"):
-        scripts.forward_signals("#!/bin/bash\n# /x/single_launch.sh\n", "/x/single_launch.sh")
+        scripts.forward_signals("#!/bin/bash\n# /x/single_launch.sh\n", "/x/single_launch.sh", "/j")
 
 
 def test_checks_of_remote_files_list_their_directory_first() -> None:
