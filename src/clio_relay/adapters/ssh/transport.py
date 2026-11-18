@@ -454,7 +454,7 @@ class SshTransport:
                 *self._common_options(batch=False, master=True),
                 "-o",
                 "ControlPersist=no",
-                "-M",
+                # ControlMaster=yes makes this the master; adding -M would turn it into "ask".
                 "-N",
                 "-f",
                 self.config.ssh_profile,
