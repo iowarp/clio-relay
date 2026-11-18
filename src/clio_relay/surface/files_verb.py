@@ -117,4 +117,3 @@ async def files_call(
             RefusalReason.VERB_NOT_IMPLEMENTED, f"files op {op!r} is not available yet", op=op
         )
     return structured, text
-

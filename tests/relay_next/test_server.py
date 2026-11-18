@@ -484,15 +484,11 @@ def test_files_chunks_and_delete(relay_paths: RelayPaths) -> None:
             assert done["size"] == 11
             read = await client.call_tool("files", call("read", path="up/big.txt"))
             assert _structured(read)["text"] == "hello world"
-            full = await client.call_tool(
-                "files", call("delete", path="up"), raise_on_error=False
-            )
+            full = await client.call_tool("files", call("delete", path="up"), raise_on_error=False)
             assert _structured(full)["refusal"]["reason"] == "invalid_arguments"
             gone = await client.call_tool("files", call("delete", path="up", recursive=True))
             assert _structured(gone)["deleted"] is True
-            missing = await client.call_tool(
-                "files", call("stat", path="up"), raise_on_error=False
-            )
+            missing = await client.call_tool("files", call("stat", path="up"), raise_on_error=False)
             assert _structured(missing)["refusal"]["reason"] == "path_not_found"
             escape = await client.call_tool(
                 "files", call("read", path="../outside"), raise_on_error=False
