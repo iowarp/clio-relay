@@ -117,7 +117,7 @@ async def test_cross_site_posts_are_refused(
     await service.close()
 
 
-def test_origin_rule() -> None:
+async def test_origin_rule() -> None:
     allowed = {"http://127.0.0.1:5000"}
     assert origin_ok({"origin": "http://127.0.0.1:5000"}, allowed)
     assert origin_ok({"referer": "http://127.0.0.1:5000/relay/asks/x"}, allowed)

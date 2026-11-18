@@ -88,6 +88,9 @@ def mount(server: Any, owner: RelayAskProvider, public_base: str) -> None:
     def token() -> str:
         return operator_token(owner.context.state_dir)
 
+    # Made now, so the operator can read it before the first request.
+    token()
+
     async def callback(request: Request) -> Response:
         if not authorized(request.headers.get("authorization"), token()):
             return _challenge()
