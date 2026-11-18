@@ -11,12 +11,14 @@ guarded one refuses that and runs a reviewed package.
 
 from __future__ import annotations
 
+import tarfile
 from pathlib import Path
 
 import pytest
 
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.tapis import TapisAdapter, TapisConfig, register
+from clio_relay.adapters.tapis.launcher import archive_name
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -42,8 +44,10 @@ TACC_HOST = "vista.tacc.utexas.edu"
 PICK_HOST = "stampede3.tacc.utexas.edu"
 
 
-def mode_adapter(stub: TapisStub, tmp_path: Path, authn: str, launcher: str) -> TapisAdapter:
-    site = f"{authn}-{launcher}"
+def mode_adapter(
+    stub: TapisStub, tmp_path: Path, authn: str, launcher: str, name: str = ""
+) -> TapisAdapter:
+    site = name or f"{authn}-{launcher}"
     work = tmp_path / "site"
     work.mkdir(parents=True, exist_ok=True)
     if authn == "tms":
@@ -150,3 +154,51 @@ async def test_a_tacc_site_with_no_system_id_names_the_systems_to_pick(
     added = await adapter.on_site_added(entry)
     assert added is not None and added["registered"] is True and added["authn"] == "tms"
     await register.unregister_host(adapter, None)
+
+
+async def test_the_launcher_app_is_made_once_and_reused(
+    stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher tar goes up once, and its app is made once, for every job after."""
+    use_memory_keyring(monkeypatch)
+    await sign_in(stub)
+    apps_before = len(stub.state.requests_to("/v3/apps", "POST"))
+    adapters = [mode_adapter(stub, tmp_path, "pki", "open", "reuse") for _ in range(2)]
+    for index, adapter in enumerate(adapters):
+        spec = JobSpec(executable="echo", arguments=[f"run {index}"])
+        _, status, _ = await run_package(stub, adapter, spec, f"op-reuse-{index}")
+        assert status.state == JobState.COMPLETED, status
+    assert len(stub.state.requests_to("/v3/apps", "POST")) == apps_before + 1
+    name = archive_name()
+    found = await adapters[0].system_id()
+    uploads = [
+        item
+        for item in stub.state.requests_to(f"/v3/files/ops/{found}/", "POST")
+        if item["path"].endswith(f"/launcher/{name}")
+    ]
+    assert len(uploads) == 1
+    (tar_path,) = (tmp_path / "site").rglob(name)
+    with tarfile.open(tar_path) as tar:
+        (member,) = tar.getmembers()
+    assert member.name == "tapisjob_app.sh"
+    assert member.mode == 0o755
+
+
+async def test_cancel_after_the_end_reports_the_end(
+    stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tapis answers 409 for a job that already ended; relay reports how it ended."""
+    use_memory_keyring(monkeypatch)
+    await sign_in(stub)
+    adapter = mode_adapter(stub, tmp_path, "pki", "open", "late")
+    spec = JobSpec(executable="true")
+    handle, status, _ = await run_package(stub, adapter, spec, "op-late-cancel")
+    assert status.state == JobState.COMPLETED
+    after = await adapter.cancel(handle)
+    assert after.state == JobState.COMPLETED
+    (refused,) = [
+        item
+        for item in stub.state.requests_to("/v3/jobs/", "POST")
+        if item["path"] == f"/v3/jobs/{handle.native_id}/cancel"
+    ]
+    assert refused["status"] == 409

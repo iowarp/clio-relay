@@ -35,7 +35,7 @@ from fastapi import FastAPI, Request, Response
 from .files_routes import add_file_routes
 from .replies import envelope as _envelope
 from .replies import error as _error
-from .runner import JobRunner, StubJob
+from .runner import FINAL_STATES, JobRunner, StubJob
 
 SECRET = "tapis-stub-signing-key-not-a-real-secret-0000"
 VERIFICATION_BASE = "https://tapis-stub.invalid"
@@ -507,6 +507,9 @@ def create_app(state: StubState) -> FastAPI:
         job = state.jobs.get(job_uuid)
         if job is None:
             return _error(404, f"Job not found: {job_uuid}")
+        if job.status in FINAL_STATES:
+            # tapis-java JobCancelResource: a job in a terminal state is a conflict.
+            return _error(409, f"Job {job_uuid} is already in a terminal state: {job.status}")
         runner.cancel(job)
         return _envelope({"message": "cancel requested"})
 
