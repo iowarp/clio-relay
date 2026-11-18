@@ -15,7 +15,8 @@ import pytest
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter, SshConfig, scripts
-from clio_relay.adapters.ssh.adapter import _accounted_status, _executor, walltime  # pyright: ignore[reportPrivateUsage]
+from clio_relay.adapters.ssh import adapter as ssh_adapter
+from clio_relay.adapters.ssh.adapter import accounted_status, walltime
 from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_process
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle
@@ -138,7 +139,7 @@ async def test_no_sign_in_without_interactive_sign_in(tmp_path: Path) -> None:
 def test_slurm_accounting_says_how_a_forgotten_job_ended(
     lines: list[str], state: str, exit_code: int
 ) -> None:
-    status = _accounted_status(lines)
+    status = accounted_status(lines)
     assert status is not None
     assert status.state.value == state
     assert status.exit_code == exit_code
@@ -146,7 +147,7 @@ def test_slurm_accounting_says_how_a_forgotten_job_ended(
 
 @pytest.mark.parametrize("lines", [[], [""], ["RUNNING|0:0"]])
 def test_no_accounting_is_no_evidence(lines: list[str]) -> None:
-    assert _accounted_status(lines) is None
+    assert accounted_status(lines) is None
 
 
 @pytest.mark.parametrize("recorded", ["running", "queued", None])
@@ -154,11 +155,9 @@ def test_a_forgotten_job_with_no_evidence_is_unknown_not_failed(
     tmp_path: Path, recorded: str | None
 ) -> None:
     adapter = _adapter(tmp_path)
-    handle = JobHandle(
-        adapter="ssh", native_id="53", data={"job_dir": "/j", "scheduler": "slurm"}
-    )
+    handle = JobHandle(adapter="ssh", native_id="53", data={"job_dir": "/j", "scheduler": "slurm"})
     sections = {"schedrc": ["0"], "sched": ["JOBID ST REASON"], "ec": [""], "acct": [""]}
-    executor = _executor("slurm", tmp_path)
+    executor = ssh_adapter._executor("slurm", tmp_path)  # pyright: ignore[reportPrivateUsage]
     status = adapter._scheduler_status(executor, handle, sections, recorded)  # pyright: ignore[reportPrivateUsage]
     assert not status.state.final
     assert status.state.value == ("queued" if recorded == "queued" else "running")
@@ -168,11 +167,9 @@ def test_a_forgotten_job_with_no_evidence_is_unknown_not_failed(
 
 def test_a_forgotten_job_with_an_exit_code_completes(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path)
-    handle = JobHandle(
-        adapter="ssh", native_id="53", data={"job_dir": "/j", "scheduler": "slurm"}
-    )
+    handle = JobHandle(adapter="ssh", native_id="53", data={"job_dir": "/j", "scheduler": "slurm"})
     sections = {"schedrc": ["0"], "sched": ["JOBID ST REASON"], "ec": ["0"]}
-    executor = _executor("slurm", tmp_path)
+    executor = ssh_adapter._executor("slurm", tmp_path)  # pyright: ignore[reportPrivateUsage]
     status = adapter._scheduler_status(executor, handle, sections, "running")  # pyright: ignore[reportPrivateUsage]
     assert status.state.value == "completed"
     assert status.exit_code == 0
@@ -180,7 +177,10 @@ def test_a_forgotten_job_with_an_exit_code_completes(tmp_path: Path) -> None:
 
 def test_the_status_script_asks_accounting_only_for_a_forgotten_job() -> None:
     script = scripts.status_script(
-        "/j", mode="scheduler", status_command="squeue", native_id="53",
+        "/j",
+        mode="scheduler",
+        status_command="squeue",
+        native_id="53",
         accounting_command="sacct -j 53",
     )
     assert "grep -qxF 53" in script

@@ -241,9 +241,7 @@ async def test_cancelling_exec_stops_the_remote_command(fx: dict[str, str], tmp_
     pid_file = f"{RUN_DIR}/exec-{new_id('x')}.pid"
     site_shell(fx, "fx-ssh", f"mkdir -p {RUN_DIR}")
     call = asyncio.ensure_future(
-        adapter.exec(
-            ["sh", "-c", f"echo $$ > {pid_file}; exec sleep 3600"], max_output_bytes=4096
-        )
+        adapter.exec(["sh", "-c", f"echo $$ > {pid_file}; exec sleep 3600"], max_output_bytes=4096)
     )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + DEADLINE_S

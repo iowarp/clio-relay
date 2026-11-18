@@ -503,7 +503,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 return JobStatus(state=state, exit_code=exit_code, native_state="gone")
             if cancelled:
                 return JobStatus(state=JobState.CANCELLED, native_state="gone")
-            accounted = _accounted_status(sections.get("acct", []))
+            accounted = accounted_status(sections.get("acct", []))
             if accounted is not None:
                 return accounted
             # Schedulers forget finished jobs (Slurm after MinJobAge). With no exit
@@ -710,7 +710,7 @@ _ACCOUNTED_FAILURES = (
 )
 
 
-def _accounted_status(lines: list[str]) -> JobStatus | None:
+def accounted_status(lines: list[str]) -> JobStatus | None:
     """Read Slurm accounting (``State|ExitCode``) for a job the queue has forgotten."""
     for line in lines:
         state, _, code = line.strip().partition("|")
