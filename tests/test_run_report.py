@@ -37,7 +37,6 @@ from clio_relay.adapters.worker.session_lifecycle import (
     SessionLifecycleReport,
 )
 from clio_relay.errors import ConfigurationError
-from clio_relay.models import GatewaySession, GatewaySessionState
 from clio_relay.run_report import (
     default_report_path,
     load_validation_report,
@@ -60,7 +59,6 @@ from clio_relay.run_report_models import (
     transport_probe_evidence_line,
 )
 from clio_relay.run_report_recorder import ValidationRecorder, new_live_validation_report
-from clio_relay.service_runtime import ServiceRuntimeStartResult, ServiceRuntimeStopResult
 
 _verify_running_artifact_identity = cast(
     Callable[..., bool],
@@ -1897,107 +1895,3 @@ def test_nonexistent_session_teardown_is_not_passing_acceptance_evidence() -> No
     assert canonical.status is ValidationStatus.FAILED
     assert checks["cleanup.relay-session"] is ValidationStatus.FAILED
     assert checks["cleanup.no-owned-resources"] is ValidationStatus.FAILED
-
-
-def test_gateway_start_and_stop_reports_record_their_checks() -> None:
-    ready = GatewaySession(
-        session_id="gateway_1",
-        cluster="ares",
-        name="service",
-        state=GatewaySessionState.READY,
-        scheduler="slurm",
-        scheduler_job_id="123",
-        queue_state="running",
-        node="compute-1",
-        gateway={
-            "transport": {
-                "remote_connector": {"pid": 11, "config_path": "/tmp/remote.toml"},
-                "desktop_connector": {"pid": 12, "config_path": "/tmp/local.toml"},
-            }
-        },
-    )
-    started = ServiceRuntimeStartResult(
-        session=ready,
-        connect_url="http://127.0.0.1:18080",
-        health_url="http://127.0.0.1:18080/healthz",
-        stream_url="http://127.0.0.1:18080/stream",
-        compatibility_urls={},
-        events_url=None,
-    ).to_live_validation_report()
-    stopped_session = ready.model_copy(
-        update={
-            "state": GatewaySessionState.CLOSED,
-            "gateway": {
-                **ready.gateway,
-                "teardown_intent": {
-                    "operation_id": "gateway_cleanup_00000000000000000000000000000000",
-                    "gateway_session_id": ready.session_id,
-                    "cancel_scheduler_job": False,
-                },
-            },
-        }
-    )
-    stopped = ServiceRuntimeStopResult(
-        session=stopped_session,
-        mode="teardown",
-        stopped_local_pid=12,
-        stopped_remote_pid=11,
-        canceled_scheduler_job=None,
-        resources=[
-            CleanupResource(
-                kind="desktop_connector",
-                resource_id="12",
-                location="desktop",
-                action="stop",
-                ownership_verified=True,
-                outcome="stopped",
-                verified_after_operation=True,
-                metadata={"gateway_session_id": "gateway_1"},
-            ),
-            CleanupResource(
-                kind="remote_connector",
-                resource_id="11",
-                location="primary",
-                action="stop",
-                ownership_verified=True,
-                outcome="stopped",
-                verified_after_operation=True,
-                metadata={"gateway_session_id": "gateway_1"},
-            ),
-            CleanupResource(
-                kind="scheduler_job",
-                resource_id="123",
-                location="primary",
-                provider="slurm",
-                action="retain",
-                ownership_verified=True,
-                outcome="retained",
-                verified_after_operation=True,
-                observed_state="running",
-            ),
-            CleanupResource(
-                kind="gateway_record",
-                resource_id="gateway_1",
-                location="core",
-                action="close",
-                ownership_verified=True,
-                outcome="closed",
-                verified_after_operation=True,
-            ),
-        ],
-        errors=[],
-    ).to_live_validation_report()
-
-    assert started.status is ValidationStatus.PASSED
-    assert stopped.status is ValidationStatus.PASSED
-    assert {check.check_id for check in started.checks} == {
-        "gateway.submit",
-        "gateway.allocated",
-        "gateway.ready",
-        "gateway.connect",
-    }
-    assert {check.check_id for check in stopped.checks} == {
-        "gateway.stop-connectors",
-        "gateway.jobs-preserved-default",
-        "gateway.closed-record",
-    }

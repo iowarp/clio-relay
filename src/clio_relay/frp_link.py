@@ -8,8 +8,7 @@ of ``transport_probe.py``'s ``run_frp_http_probe``/
 stay in that module -- only the LOCAL visitor lifecycle moves here) and the
 mode-agnostic held-process primitives ``control_channel.py``'s
 ``SshForwardTransport`` already carries. Issue #233 adds the durable service
-visitor profile here while keeping its remote shell programs in the sibling
-``frp_remote_scripts.py`` owner.
+visitor profile here.
 
 This module owns two concerns:
 
@@ -647,8 +646,7 @@ class HeldFrpVisitor:
             # keep this plaintext-secret-bearing file private.
             config_path.chmod(0o600)
             # Deliberately NOT isolated into its own process group
-            # (contrast service_runtime.py's isolate_process_group=True for
-            # its long-lived, independently-signalable connector): this
+            # (unlike a long-lived, independently-signalable connector): this
             # visitor's lifetime is scoped to its holder -- a transport_probe
             # call or a future held R5 connection -- and should die with
             # that parent rather than survive it as an orphan if cleanup

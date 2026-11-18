@@ -9,10 +9,8 @@ dependency: this module has zero imports from
 :mod:`clio_relay.frp_visitor_reconciliation`, which imports every public name
 here.
 
-POSIX reads ``/proc`` directly (this repository's existing pattern --
-``service_runtime_connector_identity._local_process_ids``); Windows runs the
-SAME ``Get-CimInstance Win32_Process`` PowerShell subprocess that module's
-``_windows_connector_descendants`` already uses for the identical "is this
+POSIX reads ``/proc`` directly; Windows runs one
+``Get-CimInstance Win32_Process`` PowerShell subprocess for the "is this
 process tree still owned" question -- not ``psutil`` (not a clio-relay
 dependency; see ``pyproject.toml``) and not a hand-rolled WMI query.
 
@@ -262,8 +260,7 @@ def _posix_single_process_record(pid: int, proc_root: Path | None = None) -> Pro
 def _windows_single_process_record(pid: int) -> ProcessRecord | None:
     """Query one Windows process fresh via a single-pid WMI filter; ``None`` if gone.
 
-    Mirrors ``service_runtime_connector_identity._observe_windows_process``'s
-    single-pid ``Get-CimInstance -Filter`` pattern -- a targeted query, not a
+    Uses a single-pid ``Get-CimInstance -Filter`` -- a targeted query, not a
     slice of the whole-table enumeration :func:`_windows_process_snapshot`
     already ran (D1: the whole point is a FRESH read, not a cached one).
     """

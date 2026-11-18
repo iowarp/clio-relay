@@ -940,16 +940,6 @@ _KNOWN_RAISING_FALSE_CROSS_PLATFORM_EXEMPTIONS: dict[str, str] = {
         "test fakes os.name = 'posix' on Windows to exercise the POSIX "
         "ownership branch; os.getuid must be created, not just overridden"
     ),
-    "clio_relay.service_runtime_connector_identity.signal.SIGKILL": (
-        "POSIX-only signal constant, absent on Windows"
-    ),
-    "clio_relay.service_runtime.os.pidfd_open": (
-        "Linux-only API (glibc >= 2.26), absent on Windows and older POSIX"
-    ),
-    "clio_relay.service_runtime_connector_identity.signal.pidfd_send_signal": (
-        "Linux-only API (glibc >= 2.26), absent on Windows and older POSIX"
-    ),
-    "clio_relay.service_runtime.os.killpg": "POSIX-only process-group signal, absent on Windows",
 }
 """Dotted ``module...attr`` targets where ``raising=False`` is load-bearing
 because the attribute genuinely does not exist on every platform this suite
