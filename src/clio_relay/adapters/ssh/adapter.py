@@ -89,6 +89,13 @@ def _executor(scheduler: SchedulerName, work_dir: Path) -> BatchSchedulerExecuto
         return found
 
 
+class _SitePath(PurePosixPath):
+    """A path on the site. PSI/J calls ``absolute()``, which must not touch this machine."""
+
+    def absolute(self) -> _SitePath:
+        return self
+
+
 def _remote_path(base: PurePosixPath, value: str | None) -> PurePosixPath | None:
     if value is None:
         return None
@@ -352,7 +359,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         buffer = io.StringIO()
         executor.generate_submit_script(job, context, buffer)
         rendered.files["submit.sh"] = buffer.getvalue()
-        script_path = cast(Path, job_dir / "submit.sh")
+        script_path = cast(Path, _SitePath(job_dir / "submit.sh"))
         rendered.submit_command = shlex.join(executor.get_submit_command(job, script_path))
         rendered.launcher_dir = launcher_dir
         rendered.launcher_files = launcher_files
