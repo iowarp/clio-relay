@@ -650,6 +650,8 @@ class RelayService:
             record.exit_code = status.exit_code
             record.outputs = status.outputs
             result = dict(record.result or {})
+            if status.progress is not None:
+                result["progress"] = status.progress.model_dump(mode="json")
             if record.kind == "serve":
                 if endpoint is not None:
                     result["endpoint"] = public_endpoint(endpoint)
