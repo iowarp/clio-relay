@@ -67,7 +67,6 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
     return name if isinstance(name, str) else None
 
 
-
 class RelayService:
     """One relay host's view of its sites and operations."""
 
