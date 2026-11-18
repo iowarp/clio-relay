@@ -76,7 +76,22 @@ For `wss`, set `"protocol": "wss"`, the port of the TLS endpoint, and
 `"server_name"` when the certificate carries a name other than `address`.
 
 Set `"direct": true` to try a direct peer-to-peer path (XTCP) first. When it
-can't be made, frp falls back to the path through the rendezvous host.
+can't be made, frp falls back to the path through the rendezvous host. Relay
+never switches silently: the service's status and `clio-relay connect` say
+which path is in use, and why the direct one failed.
+
+Two settings shape the direct path:
+
+- `stun_server` is the STUN server both ends ask for their public address.
+  The default is `stun.nextcloud.com:3478`. frp needs a server that supports
+  RFC 5780 (it answers from a second address), so general-purpose servers such
+  as Cloudflare's or Google's don't work. Use your own if you run one.
+- `direct_wait_s` is how long a connection waits for the direct path before it
+  goes through the rendezvous host. The default is 10 seconds, and the most is
+  19, because frp gives up on its own at 20. The punch starts as soon as the
+  forward starts, so the path is usually open before the first connection. If
+  the direct path never works from a place, turn `direct` off there so
+  connections don't wait.
 
 ## Per-site settings
 
@@ -90,6 +105,7 @@ host:
 | `hop` | `none`: compute nodes dial out themselves. `login`: relay starts a small proxy on the login node for the life of the service, and the node's frp client goes through it. `http_proxy`: use the site's own HTTP proxy, named in `proxy_url`. |
 | `hop_advertise` | The login node's address as compute nodes see it, when its host name doesn't resolve there. |
 | `path` | `auto` (the default) uses frp when a rendezvous host is set, and `ssh -L` otherwise. `frp` or `ssh` forces one. |
+| `stun_server` | The STUN server for this site's frp client, when the site can't reach the rendezvous one. |
 | `stop_grace_s` | Seconds a service gets to write its final files after a stop. 30 by default. |
 
 The login hop asks for a per-service password and only connects to the

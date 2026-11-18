@@ -263,6 +263,7 @@ def site_frpc_config(plan: ServePlan) -> bytes:
         else None,
         server_name=rendezvous.tls_name(),
         proxy_url=proxy_url,
+        stun_server=(site.stun_server or rendezvous.stun_server) if rendezvous.direct else None,
     )
     ports = [(port.name, port.remote_port) for port in plan.ports]
     return frp.render_site(common, ports, plan.operation_id, direct=rendezvous.direct).encode()

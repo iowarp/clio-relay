@@ -20,6 +20,9 @@ FrpProtocol = Literal["tcp", "kcp", "quic", "websocket", "wss"]
 Hop = Literal["none", "login", "http_proxy"]
 
 SETTINGS_FILE = "rendezvous.json"
+# Nextcloud's public STUN server. frp's own default, stun.easyvoip.com, timed out on 3 of
+# 10 tries from Ares; this one answered 10 of 10 and supports RFC 5780, which frp needs.
+DEFAULT_STUN_SERVER = "stun.nextcloud.com:3478"
 
 
 class Rendezvous(BaseModel):
@@ -41,6 +44,23 @@ class Rendezvous(BaseModel):
     )
     frpc: str = Field(default="frpc", description="frpc on this machine")
     direct: bool = Field(default=False, description="Try XTCP first, with STCP as the fallback")
+    stun_server: str = Field(
+        default=DEFAULT_STUN_SERVER,
+        min_length=1,
+        description=(
+            "STUN server both frpc ends ask for their public address when direct. It must "
+            "support RFC 5780 (it answers from a second address)"
+        ),
+    )
+    direct_wait_s: float = Field(
+        default=10,
+        gt=0,
+        le=19,
+        description=(
+            "How long a connection waits for the direct path before it goes through the "
+            "rendezvous host. frp gives up on its own at 20 s"
+        ),
+    )
 
     @model_validator(mode="after")
     def _token_source(self) -> Rendezvous:
@@ -105,6 +125,9 @@ class SiteServe(BaseModel):
         default=None, description="A local frpc built for the site, to stage"
     )
     python: str = Field(default="python3", description="Python on the login side, for the hop")
+    stun_server: str | None = Field(
+        default=None, description="STUN server for this site's frpc. Defaults to the rendezvous one"
+    )
     stop_grace_s: float = Field(default=30, gt=0)
 
     @model_validator(mode="after")

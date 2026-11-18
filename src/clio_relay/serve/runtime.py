@@ -521,6 +521,9 @@ class ServeRuntime:
             notes.append(mount_note)
         if plan.rebinds:
             notes.append(f"desktop port bound again {plan.rebinds} times")
+        direct = forward.direct_note()
+        if direct:
+            notes.append(self._redact(plan, direct))
         extra = self.notes.get(plan.operation_id)
         if extra:
             notes.append(extra)

@@ -95,7 +95,14 @@ async def hold(plan: ServePlan, directory: Path) -> None:
             await asyncio.sleep(1)
         for port in plan.ports:
             print(f"{port.name}: {port.url() or f'127.0.0.1:{port.local_port}'}", flush=True)
-        await stop.wait()
+        said: str | None = None
+        while not stop.is_set():
+            note = forward.direct_note()
+            if note and note != said:
+                said = note
+                print(note, file=sys.stderr, flush=True)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), 1)
     finally:
         await forward.close()
 

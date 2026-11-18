@@ -38,6 +38,7 @@ class Common:
     ca_file: str | None = None
     server_name: str | None = None
     proxy_url: str | None = None
+    stun_server: str | None = None
     extra: list[str] = field(default_factory=list[str])
 
     def render(self) -> list[str]:
@@ -55,6 +56,8 @@ class Common:
         ]
         if self.proxy_url:
             lines.append(f"transport.proxyURL = {_q(self.proxy_url)}")
+        if self.stun_server:
+            lines.append(f"natHoleStunServer = {_q(self.stun_server)}")
         if self.protocol == "wss":
             if not self.ca_file:
                 raise ValueError("a wss rendezvous needs a CA file to verify the server")
@@ -93,9 +96,20 @@ def render_site(
 
 
 def render_visitor(
-    common: Common, ports: list[tuple[str, int]], operation_id: str, *, direct: bool
+    common: Common,
+    ports: list[tuple[str, int]],
+    operation_id: str,
+    *,
+    direct: bool,
+    direct_wait_s: float = 10,
 ) -> str:
-    """The desktop frpc: one visitor per port, bound to loopback only (RL22)."""
+    """The desktop frpc: one visitor per port, bound to loopback only (RL22).
+
+    When direct, the XTCP visitor starts its punch as soon as it starts, so the
+    path is usually open before the first connection. A connection that arrives
+    while there is no direct path waits ``direct_wait_s``, then goes through
+    the rendezvous host.
+    """
     lines = common.render()
     for name, local_port in ports:
         base = proxy_name(operation_id, name)
@@ -110,9 +124,9 @@ def render_visitor(
                 f"secretKey = {_q(_env(ENV_SECRET_KEY))}",
                 'bindAddr = "127.0.0.1"',
                 f"bindPort = {local_port}",
-                "keepTunnelOpen = false",
+                "keepTunnelOpen = true",
                 f"fallbackTo = {_q(stcp)}",
-                "fallbackTimeoutMs = 2000",
+                f"fallbackTimeoutMs = {round(direct_wait_s * 1000)}",
             ]
         lines += [
             "",
@@ -135,7 +149,58 @@ def desktop_common(rendezvous: Rendezvous, ca_file: str | None) -> Common:
         protocol=rendezvous.protocol,
         ca_file=ca_file,
         server_name=rendezvous.tls_name(),
+        stun_server=rendezvous.stun_server if rendezvous.direct else None,
     )
+
+
+DIRECT_OPEN = "establishing nat hole connection successful"
+DIRECT_FAILED = (
+    "nathole precheck error",
+    "nathole prepare error",
+    "nathole exchange info error",
+    "make hole error",
+    "init tunnel session error",
+    "keepTunnelOpenWorker get tunnel connection error",
+)
+FELL_BACK = "open tunnel error"
+RESTARTED = ("start frpc service", "relay: forward ended")
+
+
+def direct_note(log_lines: list[str], wait_s: float) -> str:
+    """Say plainly which path the desktop visitor's log shows, so a fallback is never silent."""
+    state = "trying"
+    reason = ""
+    for line in log_lines:
+        if any(marker in line for marker in RESTARTED):
+            state, reason = "trying", ""
+        elif DIRECT_OPEN in line:
+            state, reason = "open", ""
+        elif FELL_BACK in line:
+            state = "fell_back"
+        elif any(marker in line for marker in DIRECT_FAILED):
+            state = "failed"
+            reason = _frp_message(line)
+    wait = f"{wait_s:g} s"
+    if state == "open":
+        return "direct path (XTCP) open"
+    if state == "trying":
+        return "trying the direct path (XTCP)"
+    because = f" ({reason})" if reason else ""
+    if state == "failed":
+        return (
+            f"the direct path (XTCP) failed{because}; a connection waits {wait} for it, "
+            "then goes through the rendezvous host (STCP)"
+        )
+    return (
+        f"a connection waited {wait} for the direct path (XTCP){because} and went "
+        "through the rendezvous host (STCP)"
+    )
+
+
+def _frp_message(line: str) -> str:
+    """Drop frp's time, level and source prefix: ``... [W] [xtcp.go:1] [id] message``."""
+    message = line.rsplit("] ", 1)[-1].strip()
+    return message[:200]
 
 
 def default_ca_file() -> str | None:

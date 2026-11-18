@@ -9,9 +9,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from clio_relay.serve import frp
+from clio_relay.serve.config import DEFAULT_STUN_SERVER, SiteServe
 from clio_relay.serve.forward import Forward, port_bound, ssh_command, visitor_command
+from clio_relay.serve.plan import site_frpc_config
 
 from .helpers import frp_plan
 
@@ -36,15 +39,88 @@ def test_site_config_has_stcp_and_xtcp_when_direct() -> None:
 
 
 def test_visitor_binds_loopback_and_falls_back_to_stcp() -> None:
-    text = frp.render_visitor(common(), [("web", 41000)], "op_1", direct=True)
+    text = frp.render_visitor(common(), [("web", 41000)], "op_1", direct=True, direct_wait_s=12)
     assert 'bindAddr = "127.0.0.1"' in text
     assert "0.0.0.0" not in text
     assert 'fallbackTo = "relay-op_1-web-visitor"' in text
+    assert "fallbackTimeoutMs = 12000" in text
+    assert "keepTunnelOpen = true" in text
     assert "bindPort = 41000" in text
     assert "bindPort = -1" in text
     plain = frp.render_visitor(common(), [("web", 41000)], "op_1", direct=False)
     assert "bindPort = 41000" in plain
     assert "xtcp" not in plain
+
+
+def test_both_ends_name_the_stun_server_only_when_direct(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path, direct=True)
+    site = site_frpc_config(plan).decode()
+    assert f'natHoleStunServer = "{DEFAULT_STUN_SERVER}"' in site
+    visitor_command(plan, tmp_path / "fwd")
+    visitor = (tmp_path / "fwd" / "visitor.toml").read_text(encoding="utf-8")
+    assert f'natHoleStunServer = "{DEFAULT_STUN_SERVER}"' in visitor
+    assert "fallbackTimeoutMs = 10000" in visitor
+    own = frp_plan(
+        tmp_path,
+        site=SiteServe(frpc="/opt/frp/frpc", stun_server="stun.site.example:3478"),
+        direct=True,
+        stun_server="stun.desk.example:3478",
+    )
+    assert 'natHoleStunServer = "stun.site.example:3478"' in site_frpc_config(own).decode()
+    visitor_command(own, tmp_path / "own")
+    assert 'natHoleStunServer = "stun.desk.example:3478"' in (
+        tmp_path / "own" / "visitor.toml"
+    ).read_text(encoding="utf-8")
+    assert "natHoleStunServer" not in site_frpc_config(frp_plan(tmp_path)).decode()
+
+
+def test_direct_wait_stays_under_frps_own_limit(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        frp_plan(tmp_path, direct=True, direct_wait_s=20)
+
+
+def test_direct_note_names_the_path_and_never_falls_back_silently() -> None:
+    start = "2026-01-01 00:00:00.000 [I] [sub/root.go:1] start frpc service for config file"
+    opened = (
+        "2026-01-01 00:00:03.000 [I] [visitor/xtcp.go:1] [abc] establishing nat hole "
+        "connection successful, sid [1], remoteAddr [1.2.3.4:5]"
+    )
+    failed = "2026-01-01 00:00:09.000 [W] [visitor/xtcp.go:1] [abc] make hole error: timeout"
+    fell = (
+        "2026-01-01 00:00:12.000 [E] [visitor/xtcp.go:1] [abc] open tunnel error: "
+        "context deadline exceeded"
+    )
+    assert frp.direct_note([start], 10) == "trying the direct path (XTCP)"
+    assert frp.direct_note([start, opened], 10) == "direct path (XTCP) open"
+    assert frp.direct_note([start, failed], 10) == (
+        "the direct path (XTCP) failed (make hole error: timeout); a connection waits 10 s "
+        "for it, then goes through the rendezvous host (STCP)"
+    )
+    assert frp.direct_note([start, failed, fell], 10) == (
+        "a connection waited 10 s for the direct path (XTCP) (make hole error: timeout) "
+        "and went through the rendezvous host (STCP)"
+    )
+    assert frp.direct_note([start, failed, fell, start], 10) == "trying the direct path (XTCP)"
+    assert frp.direct_note([start, opened, "relay: forward ended, starting it again"], 10) == (
+        "trying the direct path (XTCP)"
+    )
+
+
+def test_forward_reports_the_direct_path_only_when_direct(tmp_path: Path) -> None:
+    plain = Forward(frp_plan(tmp_path), tmp_path / "plain", lambda _c, _p: None)
+    assert plain.direct_note() is None
+    forward = Forward(frp_plan(tmp_path, direct=True), tmp_path / "fwd", lambda _c, _p: None)
+    assert forward.direct_note() == "trying the direct path (XTCP)"
+    (tmp_path / "fwd").mkdir()
+    forward.log_path.write_text(
+        "x [W] [visitor/xtcp.go:1] [abc] nathole prepare error: can not get enough addresses\n"
+        "x [E] [visitor/xtcp.go:1] [abc] open tunnel error: context deadline exceeded\n",
+        encoding="utf-8",
+    )
+    assert forward.direct_note() == (
+        "a connection waited 10 s for the direct path (XTCP) (nathole prepare error: can not "
+        "get enough addresses) and went through the rendezvous host (STCP)"
+    )
 
 
 def test_wss_always_verifies_the_server() -> None:
