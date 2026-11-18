@@ -137,9 +137,7 @@ async def test_adding_the_site_registers_the_host_once(
             "adapter": "tapis",
             "identity": "tacc",
             "config": tapis_config(stub),
-            "alternatives": {
-                "ssh": {"ssh_profile": "fx-ssh", "ssh_config": fx["FX_SSH_CONFIG"]}
-            },
+            "alternatives": {"ssh": {"ssh_profile": "fx-ssh", "ssh_config": fx["FX_SSH_CONFIG"]}},
         },
     )
     service = RelayService(relay_paths)

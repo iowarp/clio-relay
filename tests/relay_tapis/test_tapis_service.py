@@ -262,6 +262,25 @@ async def test_the_site_hook_on_a_tacc_host_registers_once(
     await register.unregister_host(adapter, None)
 
 
+async def test_the_site_hook_before_sign_in_asks_for_it(
+    stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Signed out, the hook refuses ``needs_sign_in`` and calls nothing that changes Tapis."""
+    use_memory_keyring(monkeypatch)
+    entry = SiteEntry.model_validate(
+        {"id": "vista", "adapter": "tapis", "config": tapis_config(stub, authn="tms")}
+    )
+    context = AdapterContext(
+        site_id="vista", state_dir=tmp_path / "relay", content=ContentStore(tmp_path / "c")
+    )
+    adapter = TapisAdapter(TapisConfig.model_validate(entry.config), context)
+    with pytest.raises(Refusal) as refused:
+        await adapter.on_site_added(entry)
+    print(f"site hook signed out {refused.value.to_dict()}")
+    assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+    assert not stub.state.credentials
+
+
 async def test_max_minutes_never_falls_to_the_tapis_default() -> None:
     """Tapis fails a job past ``maxMinutes`` and defaults it to 10, so relay always sends one."""
     fork = {"id": "s"}
@@ -276,7 +295,9 @@ async def test_max_minutes_never_falls_to_the_tapis_default() -> None:
     plain = JobSpec(executable="true")
     assert max_minutes(plain, fork, "FORK") == NO_WALLTIME_MINUTES
     assert max_minutes(plain, batch, "BATCH") == 2880
-    open_queue = JobSpec.model_validate({"executable": "true", "attributes": {"queue_name": "open"}})
+    open_queue = JobSpec.model_validate(
+        {"executable": "true", "attributes": {"queue_name": "open"}}
+    )
     assert max_minutes(open_queue, batch, "BATCH") == NO_WALLTIME_MINUTES
     timed = JobSpec.model_validate(
         {"executable": "true", "attributes": {"duration": 90.5, "queue_name": "open"}}
