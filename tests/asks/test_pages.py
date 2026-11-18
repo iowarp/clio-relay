@@ -281,6 +281,7 @@ async def test_a_bad_ask_id_is_not_found(relay_paths: RelayPaths) -> None:
     assert httpx.get(f"{base}/elsewhere", timeout=30).status_code == 404
     await service.close()
 
+
 def test_a_package_review_shows_the_package() -> None:
     ask = Ask(ask_id="ask_pkg", kind="approve", site="fx", operation_id="op_pkg", message="Review")
     ask.bind(
