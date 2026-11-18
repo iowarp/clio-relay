@@ -122,6 +122,29 @@ def _implements(target: ConformanceTarget, verb: str) -> bool:
     return verb in registry.load(target.adapter).implements
 
 
+async def _call(adapter: BaseAdapter[Any], target: ConformanceTarget, verb: str) -> Any:
+    if verb == "run":
+        return await adapter.run(target.ok_job, operation_id=new_id("op"))
+    if verb == "exec":
+        return await adapter.exec(target.echo, timeout_s=10, max_output_bytes=1024)
+    if verb == "files":
+        return await adapter.files()
+    from clio_relay.jobs.spec import ServicePort, ServiceSpec
+
+    spec = ServiceSpec(job=target.ok_job, ports=[ServicePort(name="main", port=8000)])
+    return await adapter.serve(spec, operation_id=new_id("op"))
+
+
+async def _refuses(target: ConformanceTarget, verb: str) -> bool:
+    """Check the typed refusal of a verb the adapter leaves out; True if it does."""
+    if _implements(target, verb):
+        return False
+    with pytest.raises(Refusal) as refused:
+        await _call(target.build(), target, verb)
+    assert refused.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED, verb
+    return True
+
+
 class AdapterConformance:
     """The suite. Subclasses provide the ``target`` fixture."""
 
@@ -149,29 +172,13 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_unimplemented_verbs_refuse(self, target: ConformanceTarget) -> None:
-        adapter = target.build()
-        missing = set(VERBS) - set(type(adapter).implements)
-        calls = {
-            "run": lambda: adapter.run(target.ok_job, operation_id=new_id("op")),
-            "exec": lambda: adapter.exec(target.echo, timeout_s=10, max_output_bytes=1024),
-            "files": lambda: adapter.files(),
-        }
-        for verb in sorted(missing & set(calls)):
-            with pytest.raises(Refusal) as refused:
-                await calls[verb]()
-            assert refused.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED, verb
-        if "serve" in missing:
-            from clio_relay.jobs.spec import ServicePort, ServiceSpec
-
-            spec = ServiceSpec(job=target.ok_job, ports=[ServicePort(name="main", port=8000)])
-            with pytest.raises(Refusal) as refused:
-                await adapter.serve(spec, operation_id=new_id("op"))
-            assert refused.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED
+        for verb in ("run", "exec", "files", "serve"):
+            await _refuses(target, verb)
 
     @pytest.mark.asyncio
     async def test_exec_bounded(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "exec"):
-            pytest.skip("exec is not implemented; its refusal is checked separately")
+        if await _refuses(target, "exec"):
+            return
         adapter = target.build()
         result = await adapter.exec(target.echo, timeout_s=30, max_output_bytes=4096)
         assert result.exit_code == 0, result
@@ -185,9 +192,19 @@ class AdapterConformance:
         assert slow.duration_s < 20
 
     @pytest.mark.asyncio
+    async def test_exec_without_time_limit(self, target: ConformanceTarget) -> None:
+        """No hard limit on agent actions: exec with no timeout runs to the end."""
+        if await _refuses(target, "exec"):
+            return
+        result = await target.build().exec(target.echo, max_output_bytes=4096)
+        assert result.exit_code == 0, result
+        assert not result.timed_out
+        assert target.ok_marker in result.stdout
+
+    @pytest.mark.asyncio
     async def test_files_round_trip(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "files"):
-            pytest.skip("files is not implemented; its refusal is checked separately")
+        if await _refuses(target, "files"):
+            return
         files = await target.build().files()
         payload = b"relay conformance \x00\x01 payload\n" * 64
         path = f"{target.files_dir}/{new_id('f')}.bin"
@@ -213,8 +230,8 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_job_lifecycle(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "run"):
-            pytest.skip("run is not implemented; its refusal is checked separately")
+        if await _refuses(target, "run"):
+            return
         adapter = target.build()
         handle = await adapter.run(target.ok_job, operation_id=new_id("op"))
         assert handle.adapter == target.adapter
@@ -227,8 +244,8 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_job_failure(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "run"):
-            pytest.skip("run is not implemented")
+        if await _refuses(target, "run"):
+            return
         adapter = target.build()
         handle = await adapter.run(target.fail_job, operation_id=new_id("op"))
         status, seen = await wait_final(adapter, handle, target.job_timeout_s, target.poll_s)
@@ -238,8 +255,8 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_job_cancel(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "run"):
-            pytest.skip("run is not implemented")
+        if await _refuses(target, "run"):
+            return
         adapter = target.build()
         handle = await adapter.run(target.long_job, operation_id=new_id("op"))
         first = await adapter.status(handle)
@@ -253,8 +270,8 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_job_observed_after_restart(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "run"):
-            pytest.skip("run is not implemented")
+        if await _refuses(target, "run"):
+            return
         operation_id = new_id("op")
         handle = await target.build().run(target.ok_job, operation_id=operation_id)
         stored = handle.model_dump_json()
@@ -270,8 +287,8 @@ class AdapterConformance:
 
     @pytest.mark.asyncio
     async def test_inputs_by_digest(self, target: ConformanceTarget) -> None:
-        if not _implements(target, "run"):
-            pytest.skip("run is not implemented")
+        if await _refuses(target, "run"):
+            return
         adapter = target.build()
         payload = f"input {new_id('x')}\n".encode()
         digest = target.context().content.put(payload)

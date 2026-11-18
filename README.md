@@ -256,6 +256,10 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
 - [release](docs/release.md)
 - [brand prompt](docs/brand.md)
 - [ai context](docs/ai/README.md)
+- adapters
+  - [globus](docs/adapters/globus.md): jobs through Globus Compute, files through Globus Transfer
+  - [iri](docs/adapters/iri.md): the IRI Facility API that NERSC, ALCF, OLCF and ESnet serve
+  - [sky](docs/adapters/sky.md): SkyPilot managed jobs on clouds, Kubernetes and Slurm
 
 ## Development
 

@@ -37,6 +37,7 @@ from clio_relay.jobs.handles import (
     JobState,
     JobStatus,
     OutputRef,
+    StallReport,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -496,13 +497,19 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 os.kill(child, signal.SIGTERM)
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
         return await run_bounded(
             command,
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
             cwd=self.work_dir if self.work_dir.is_dir() else None,
+            on_stall=on_stall,
         )
 
     async def files(self) -> FileAccess:
