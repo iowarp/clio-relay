@@ -62,8 +62,8 @@ def launch(task: Any, name: str | None = None, **_: Any) -> Request:
         except FileExistsError:
             job_id += 1
     job_dir = root / str(job_id)
-    resources = task.resources.fields if task.resources is not None else {}
-    spec = {"name": name, **task.fields, "resources": resources}
+    resources: dict[str, Any] = task.resources.fields if task.resources is not None else {}
+    spec: dict[str, Any] = {"name": name, **task.fields, "resources": resources}
     _write(job_dir / "task.json", spec)
     _write(job_dir / "state.json", {"status": "PENDING"})
     with open(job_dir / "worker.log", "ab") as log:

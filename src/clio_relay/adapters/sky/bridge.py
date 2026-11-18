@@ -13,18 +13,20 @@ Written against SkyPilot 0.14.3 (``sky.jobs.launch``, ``sky.jobs.queue_v2``,
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
 import traceback
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, cast
 
 MARKER = "CLIO_RELAY_SKY "
 
 
 def _value(item: Any, name: str) -> Any:
     if isinstance(item, dict):
-        return item.get(name)
+        return cast("dict[str, Any]", item).get(name)
     return getattr(item, name, None)
 
 
@@ -33,6 +35,14 @@ def _plain(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _first(value: Any) -> Any:
+    """Return the first item of a list or tuple, or the value itself."""
+    if isinstance(value, (list, tuple)):
+        items = cast("Sequence[Any]", value)
+        return items[0] if items else None
+    return value
 
 
 def _resources(sky: Any, request: dict[str, Any], instance_type: str | None = None) -> Any:
@@ -109,10 +119,8 @@ def op_launch(sky: Any, request: dict[str, Any]) -> dict[str, Any]:
         file_mounts=request.get("file_mounts") or None,
     )
     task.set_resources(_resources(sky, request))
-    result = sky.stream_and_get(sky.jobs.launch(task, name=request["name"]))
-    job_ids = result[0] if isinstance(result, (tuple, list)) else result
-    if isinstance(job_ids, (list, tuple)):
-        job_ids = job_ids[0] if job_ids else None
+    result: Any = sky.stream_and_get(sky.jobs.launch(task, name=request["name"]))
+    job_ids = _first(_first(result))
     if job_ids is None:
         raise RuntimeError("SkyPilot returned no managed job id")
     return {"job_id": int(job_ids)}
@@ -120,10 +128,10 @@ def op_launch(sky: Any, request: dict[str, Any]) -> dict[str, Any]:
 
 def op_queue(sky: Any, request: dict[str, Any]) -> dict[str, Any]:
     ids = [int(item) for item in request["job_ids"]]
-    result = sky.get(sky.jobs.queue_v2(refresh=False, job_ids=ids, all_users=False))
-    records = result[0] if isinstance(result, tuple) else result
+    result: Any = sky.get(sky.jobs.queue_v2(refresh=False, job_ids=ids, all_users=False))
+    records = _first(result) if isinstance(result, tuple) else result
     jobs: list[dict[str, Any]] = []
-    for record in records or []:
+    for record in cast("Sequence[Any]", records or []):
         jobs.append(
             {
                 "job_id": _plain(_value(record, "job_id")),
@@ -143,14 +151,15 @@ def op_cancel(sky: Any, request: dict[str, Any]) -> dict[str, Any]:
 
 
 def op_logs(sky: Any, request: dict[str, Any]) -> dict[str, Any]:
-    found = sky.jobs.download_logs(
+    found: Any = sky.jobs.download_logs(
         name=None,
         job_id=int(request["job_id"]),
         refresh=False,
         controller=False,
         local_dir=request["local_dir"],
     )
-    return {"paths": {str(key): str(value) for key, value in (found or {}).items()}}
+    paths = cast("dict[Any, Any]", found or {})
+    return {"paths": {str(key): str(value) for key, value in paths.items()}}
 
 
 OPS: dict[str, Any] = {
@@ -173,8 +182,8 @@ def main() -> None:
         if op not in OPS:
             raise ValueError(f"unknown operation {op!r}")
         try:
-            import sky
-            import sky.jobs  # noqa: F401
+            sky = importlib.import_module("sky")
+            importlib.import_module("sky.jobs")
         except ImportError as exc:
             answer = {"ok": False, "kind": "import", "error": f"cannot import sky: {exc}"}
         else:
