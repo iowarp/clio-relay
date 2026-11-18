@@ -12,9 +12,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import io
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import socket
@@ -56,8 +58,51 @@ _SUBMIT_COMMANDS: dict[SchedulerName, str] = {
 }
 
 _INTERNAL_FILES = frozenset(
-    {"job.json", "spec.json", "state.json", "exit_code", "submit.sh", "native_id", "cancel"}
+    {
+        "job.json",
+        "spec.json",
+        "state.json",
+        "exit_code",
+        "submit.sh",
+        "native_id",
+        "scheduler_id",
+        "cancel",
+    }
 )
+
+# The variable each scheduler sets to the job's own id, inside the job.
+_JOB_ID_VARIABLES: dict[SchedulerName, str] = {
+    "slurm": "SLURM_JOB_ID",
+    "pbs": "PBS_JOBID",
+    "lsf": "LSB_JOBID",
+    "cobalt": "COBALT_JOBID",
+}
+
+
+def name_submit(scheduler: SchedulerName, argv: list[str], name: str) -> list[str]:
+    """Add the job name to the submit command, so ``find`` can reconcile by name.
+
+    psij 0.9.11's templates read a ``job.name`` its ``Job`` does not have, so a
+    Slurm job is named after its script; relay names the job on the command line.
+    """
+    flags = {"slurm": [f"--job-name={name}"], "pbs": ["-N", name], "lsf": ["-J", name]}
+    return [argv[0], *flags.get(scheduler, []), *argv[1:]]
+
+
+def mark_script(script: str, scheduler: SchedulerName, job_dir: Path) -> str:
+    """Have the job write its scheduler id into its own directory when it starts.
+
+    That record survives the scheduler forgetting the job, and links the job
+    directory to psij's exit-code file when relay died before keeping the id.
+    """
+    variable = _JOB_ID_VARIABLES[scheduler]
+    target = shlex.quote(str(job_dir / "scheduler_id"))
+    line = f'printf "%s\\n" "${{{variable}:-}}" > {target}'
+    lines = script.split("\n")
+    at = 1
+    while at < len(lines) and (not lines[at].strip() or lines[at].startswith("#")):
+        at += 1
+    return "\n".join([*lines[:at], line, *lines[at:]])
 
 _executors: dict[tuple[str, str], BatchSchedulerExecutor] = {}
 _executors_lock = threading.Lock()
@@ -214,9 +259,10 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
         def _render() -> list[str]:
             context = executor._create_script_context(job)  # pyright: ignore[reportPrivateUsage]
-            with script.open("w", encoding="utf-8") as handle:
-                executor.generate_submit_script(job, context, handle)
-            return executor.get_submit_command(job, script)
+            rendered = io.StringIO()
+            executor.generate_submit_script(job, context, rendered)
+            script.write_text(mark_script(rendered.getvalue(), scheduler, job_dir), "utf-8")
+            return name_submit(scheduler, executor.get_submit_command(job, script), name)
 
         argv = await asyncio.to_thread(_render)
         result = await run_bounded(
@@ -294,11 +340,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     async def find(self, operation_id: str) -> JobHandle | None:
         job_dir = self._job_dir(operation_id)
-        native_file = job_dir / "native_id"
         scheduler = self.scheduler()
-        if native_file.is_file() and scheduler is not None:
+        for kept in ("native_id", "scheduler_id"):
+            native_file = job_dir / kept
+            if scheduler is None or not native_file.is_file():
+                continue
             native_id = native_file.read_text(encoding="utf-8").strip()
-            return self._batch_handle(scheduler, native_id, job_dir, self.job_name(operation_id))
+            if native_id:
+                name = self.job_name(operation_id)
+                return self._batch_handle(scheduler, native_id, job_dir, name)
         state_file = job_dir / "state.json"
         if state_file.is_file():
             state: dict[str, Any] = json.loads(state_file.read_text(encoding="utf-8"))
@@ -361,10 +411,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 return JobStatus(state=state, exit_code=exit_code, native_state="gone")
             if cancelled:
                 return JobStatus(state=JobState.CANCELLED, native_state="gone")
+            # The scheduler forgot the job and it left no exit code: there is
+            # no evidence it failed, so it stays open until someone cancels it.
             return JobStatus(
-                state=JobState.FAILED,
-                native_state="gone",
-                message="the job left the queue without writing an exit code",
+                state=JobState.RUNNING,
+                native_state="unknown",
+                message=(
+                    f"{argv[0]} no longer lists job {native_id} and it wrote no exit code, "
+                    "so relay cannot tell how it ended; cancel ends the operation"
+                ),
             )
         state = _PSIJ_STATES.get(observed.state.name, JobState.RUNNING)
         if state == JobState.COMPLETED and exit_code not in (None, 0):
