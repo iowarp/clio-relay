@@ -364,6 +364,46 @@ Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `j
 
 ## W7. The ssh adapter and scheduler jobs
 
+Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, tests in `tests/relay_ssh/`, user doc in `docs/adapters/ssh.md`, Ares entry in `catalog/sites/ares.yaml` and `catalog/skills/ares.md`.
+
+### Decisions
+
+- RL10 governs, per the coordinator: relay renders the submit script on this machine with psij-python, then sends the script, its PSI/J launcher and any missing inputs with one `scp`, and submits with one `ssh` command. The site needs a POSIX shell and its scheduler, not Python or psij. Status and cancel commands, and the parsing of their output, are PSI/J's executors, run over the same `ssh`.
+- The remote job directory (RL17) is `<remote_dir>/jobs/<operation_id>`. It holds `submit.sh`, `spec.json`, `inputs.json`, `scheduler`, `states`, `final`, `stdout` and `stderr`. Its name is the operation id, so `find(operation_id)` reconciles by looking at that directory, and a second `run` of the same operation returns the first job. A lock directory makes the submit happen once even if two relays race. `final` is written by the first poll that sees a final state, so later reads need no scheduler.
+- Staging (RL16) is content addressed on the site under `<remote_dir>/content/cas/sha256`. Each `run` first asks which digests the site already has, sends only the missing ones, checks every digest on arrival and refuses with `input_missing` on a mismatch. Inputs are hard links into the store (copies when the filesystem refuses links). An input the job did not replace is not listed as an output.
+- With no scheduler (`scheduler: none` or none detected), a small `sh` supervisor is started detached with `setsid` (`nohup` where there is no `setsid`). It records the pid, the child's pid and the exit code in the job directory, so a later poll from a new relay reads the result (LQ8). The native id is `pid:<n>`.
+- Every `ssh` and `scp` uses `BatchMode=yes`. A site that asks for a code refuses with `interactive_auth_required`, naming `worker` as the adapter to use, unless `interactive_sign_in` is set. Then `sign_in_needed()` returns `SignInNeed(provider="ssh")` and registers a starter with W6's `askpass.register_sign_in`; the starter brings up a ControlMaster through askpass, and every later call reuses it with `BatchMode=yes`. Until W6 merges, the adapter falls back to an `askpass:` program from the config.
+- serve: the adapter declares it and calls `clio_relay.serve.start_for` lazily, and exposes `ssh_argv()` for W9's `ssh -L`.
+- No time limits on jobs or transfers. Only the connection setup has one (`connect_timeout_s`, default 30 s), which refuses as `unreachable`.
+
+### Facts
+
+- psij-python 0.9.11 (the shared venv's pin):
+  - `Job` has no `name`, which its templates read; the adapter sets it from the operation.
+  - The pbspro template writes `#PBS -N="name"`, which `qsub` refuses; the adapter rewrites the line to `#PBS -N name`.
+  - `JobSpec` paths and the launch command are made absolute against the local machine; the adapter sets the site's paths after building the spec.
+  - With no `duration`, `JobAttributes` asks the scheduler for 10 minutes. The charge then reports `walltime_s: 600` and `node_hours: 0.1667` for a 30 s job. Any spec without a duration gets that limit, so W1 may want a site default.
+- OpenSSH: `-M` together with `-o ControlMaster=yes` is "ask" mode, which confirms every shared session through askpass ("Master refused session request" under BatchMode). Use `ControlMaster=yes` alone. This matters to W6's sign-in page.
+- Ares, from the [GRC Ares user guide](https://grc.iit.edu/docs/ares/ares-user-guide/) and live `sinfo`: partitions `compute` (default, 22 nodes, 2 days), `debug` (6 nodes, 4 days) and `datacrumbs`; 40 threads and about 47 GB per node; Ubuntu 22.04.5; `module` (Lmod 8.7.25) works only in a login shell, so the skill says to wrap commands in `bash -lc`.
+
+### Evidence
+
+All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, against W2's fixtures at 127.0.0.1:47100 to 47107 (`fixtures.env` sourced with `set -a`).
+
+- `uv run pytest tests/relay_ssh` at `3f31cf1`: `53 passed in 150.49s`. Again after merging the integration branch at `4b72bf2`, at `164a2f6` with `tests/relay_next/test_serve.py`: `61 passed in 153.34s`. `ruff check`, `ruff format --check` and strict `pyright` are clean on the touched files.
+- LQ4 (`ssh`): `test_ssh_conformance.py` subclasses W1's `AdapterConformance` three times, on fx-ssh (detached), fx-slurm and fx-pbs: 30 of 30 passed.
+- LQ5: `test_lq5_a_slurm_job_completes_after_relay_restarts`. A 15 s Slurm job is submitted, the adapter is dropped with no ssh process left behind, and a new adapter with a fresh state directory finds the job by operation id, waits for `completed`, reads `lq5-done`, and a second `run` of the operation returns the same Slurm id.
+- LQ6: `test_lq6_the_pbs_script_and_status_come_from_psij`. On OpenPBS the job's `submit.sh` carries `#PBS -N relay-` and PSI/J's `single_launch.sh`, the job completes from PSI/J's status parsing, and stdout is `lq6 <PBS job id>`.
+- LQ7: `test_lq7_a_rerun_stages_nothing`. A 200 MiB input is staged once (its blob is in the first upload) and a second job with it uploads no blob; every later upload is under 1 MiB. `sha256sum` on the site matches the digest both times.
+- LQ8: `test_lq8_a_detached_job_is_read_by_a_later_poll`. On fx-ssh with no scheduler, a job is started as `pid:<n>`, relay drops it, and a new adapter finds the same handle, reads `failed` with exit code 7 and separate stdout and stderr.
+- LQ9: `test_lq9_a_code_site_refuses_and_names_worker` (with and without `interactive_sign_in`; the second is skipped once W6's askpass is installed) refuses describe and run on fx-otp with `interactive_auth_required` and `adapter: worker`. `test_lq9_the_code_site_gets_in_once_askpass_answers` brings up the master through an askpass program that answers `Verification code:` with the TOTP; describe, run and files then work, and the person is prompted once.
+- LQ2 (SSH-fixture half): a plain `mcp.Client` over stdio to `clio-relay-next serve` negotiates `2026-07-28`; `describe()` lists the `fx-ssh` and `ares` sites with their adapter and verbs; `describe(site="fx-ssh")` gives facts (host fx-ssh, 40 cpus, scheduler none), a route for each of the five verbs and `sign_in: null`; `exec` returns `fx-ssh`. `describe()` with no site carries no per-site status; that is W1's service.
+- LQ-L1 (job and file half), real Ares Slurm, through MCP with the catalog's `ares` site and `remote_dir: clio-relay-rework/w7-scratch/relay-remote`, at `3f31cf1`:
+  - `files stage` of 530288 bytes, then `files write`.
+  - Handle path, `run` with `wait_s: 0`: `op_762577707ebfa2cb494c0e8c`, Slurm job 27722 on `debug`, `ares-comp-03`. The first poll, 3.00 s after submit, read `running`; `completed` with exit 0 at 31.43 s. stdout carries the staged input's sha256; outputs are exactly `result.txt`, `stderr` and `stdout`; `files read` and `files list` on the job directory work.
+  - Tasks path (`io.modelcontextprotocol/tasks`): `op_af3050dd70a6b3d5db8a5b81`, Slurm job 27723, task created in 1.53 s, completed with exit 0.
+  - The service half is W9's.
+
 ## W8. The worker adapter and the old surface's removal
 
 Branch `jaimecernuda-relay-rework-w8`, from `jaimecernuda-relay-rework` at 719104c (M1).

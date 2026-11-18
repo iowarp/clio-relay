@@ -1,0 +1,16 @@
+id: ares
+name: Ares
+address: ares.cs.iit.edu
+description: >-
+  The Gnosis Research Center's Slurm cluster at Illinois Tech. Relay reaches it
+  with your own ssh and an ssh key, from the IIT network or the IIT VPN.
+source: https://grc.iit.edu/docs/ares/ares-user-guide/
+adapter: ssh
+config:
+  ssh_profile: ares
+policy: open
+spend:
+  ask: never
+defaults:
+  queue: compute
+skill: ares
