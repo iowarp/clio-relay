@@ -187,6 +187,31 @@ async def test_a_job_without_a_duration_gets_the_schedulers_limit(
             await adapter.cancel(handle)
 
 
+async def test_cancelling_exec_stops_the_remote_command(fx: dict[str, str], tmp_path: Path) -> None:
+    adapter = build(fx, tmp_path, "fx-ssh")
+    pid_file = f"{RUN_DIR}/exec-{new_id('x')}.pid"
+    site_shell(fx, "fx-ssh", f"mkdir -p {RUN_DIR}")
+    call = asyncio.ensure_future(
+        adapter.exec(
+            ["sh", "-c", f"echo $$ > {pid_file}; exec sleep 3600"], max_output_bytes=4096
+        )
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DEADLINE_S
+    while not (pid := site_shell(fx, "fx-ssh", f"cat {pid_file} 2>/dev/null; true").strip()):
+        assert not call.done()
+        assert loop.time() < deadline
+        await asyncio.sleep(0.5)
+    alive = f"kill -0 {pid} 2>/dev/null && echo alive || echo gone"
+    assert site_shell(fx, "fx-ssh", alive).strip() == "alive"
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    while site_shell(fx, "fx-ssh", alive).strip() == "alive":
+        assert loop.time() < deadline, "the remote command outlived the cancelled exec"
+        await asyncio.sleep(0.5)
+
+
 async def test_lq6_the_pbs_script_and_status_come_from_psij(
     fx: dict[str, str], tmp_path: Path
 ) -> None:

@@ -24,12 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from clio_relay.adapters.ssh.config import SshConfig
-from clio_relay.jobs.handles import ExecResult
+from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 logger = logging.getLogger(__name__)
 
 POSIX = os.name == "posix"
+MAX_STALL_STEP_S = 600.0
 
 # ssh reports its own failures with exit code 255 and one of these on stderr.
 _INTERACTIVE_MARKERS = ("keyboard-interactive", "password", "verification code")
@@ -92,9 +93,11 @@ class _Sink:
         self.limit = limit
         self.data = bytearray()
         self.truncated = False
+        self.last = time.monotonic()
 
     async def pump(self, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(65536):
+            self.last = time.monotonic()
             if self.limit is None:
                 self.data += chunk
                 continue
@@ -120,16 +123,26 @@ async def run_process(
     max_output_bytes: int | None = None,
     stdin: bytes | None = None,
     env: Mapping[str, str] | None = None,
+    hold_stdin: bool = False,
+    on_stall: StallReport | None = None,
+    stall_s: float = STALL_S,
 ) -> Completed:
-    """Run ``argv`` with no shell. ``timeout_s=None`` waits as long as it takes."""
+    """Run ``argv`` with no shell. ``timeout_s=None`` waits as long as it takes.
+
+    With ``hold_stdin``, standard input stays open until the process ends, so the
+    other end sees it close only then. While the process is quiet for
+    ``stall_s``, ``on_stall`` is called, then again after waits that double up
+    to ``MAX_STALL_STEP_S``. Cancelling the caller kills the process group.
+    """
     command = list(argv)
     started = time.monotonic()
     out = _Sink(max_output_bytes)
     err = _Sink(max_output_bytes)
+    piped = stdin is not None or hold_stdin
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
-            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if piped else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=dict(env) if env is not None else None,
@@ -140,11 +153,14 @@ async def run_process(
     assert process.stdout is not None and process.stderr is not None
 
     async def _feed() -> None:
-        if stdin is None or process.stdin is None:
+        if process.stdin is None:
             return
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            process.stdin.write(stdin)
-            await process.stdin.drain()
+            if stdin:
+                process.stdin.write(stdin)
+                await process.stdin.drain()
+        if hold_stdin:
+            return
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             process.stdin.close()
 
@@ -152,15 +168,34 @@ async def run_process(
         asyncio.gather(out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait())
     )
     timed_out = False
+    deadline = None if timeout_s is None else started + timeout_s
+    report_at = stall_s
     try:
-        done, _ = await asyncio.wait({work}, timeout=timeout_s)
-        if not done:
-            timed_out = True
-            _kill(process)
-            # The whole process group is gone, so the pipes reach EOF and the pumps end.
-            done, _ = await asyncio.wait({work}, timeout=10)
-            if not done:
-                work.cancel()
+        while True:
+            now = time.monotonic()
+            idle = now - max(out.last, err.last)
+            if idle < stall_s:
+                report_at = stall_s
+            wait: float | None = None if on_stall is None else max(report_at - idle, 0.05)
+            if deadline is not None:
+                left = max(deadline - now, 0.0)
+                wait = left if wait is None else min(wait, left)
+            done, _ = await asyncio.wait({work}, timeout=wait)
+            if done:
+                break
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                timed_out = True
+                _kill(process)
+                # The whole process group is gone, so the pipes reach EOF and the pumps end.
+                done, _ = await asyncio.wait({work}, timeout=10)
+                if not done:
+                    work.cancel()
+                break
+            idle = now - max(out.last, err.last)
+            if on_stall is not None and idle >= report_at:
+                report_at += min(report_at, MAX_STALL_STEP_S)
+                await on_stall(idle, report_at - idle)
         with contextlib.suppress(asyncio.CancelledError):
             await work
     except asyncio.CancelledError:
@@ -168,6 +203,9 @@ async def run_process(
         work.cancel()
         raise
     finally:
+        if process.stdin is not None:
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
+                process.stdin.close()
         transport = getattr(process, "_transport", None)
         if transport is not None:
             transport.close()
@@ -312,24 +350,29 @@ class SshTransport:
         max_output_bytes: int | None = None,
         what: str = "the site",
         check_timeout: bool = True,
+        hold_stdin: bool = False,
+        on_stall: StallReport | None = None,
     ) -> Completed:
         """Run ``script`` with ``sh`` on the site and refuse on an ssh failure.
 
-        The script goes on standard input. With ``data``, the script goes on the
-        command line and ``data`` on standard input.
+        The script goes on standard input. With ``data`` or ``hold_stdin``, the
+        script goes on the command line and ``data`` on standard input, which
+        ``hold_stdin`` keeps open until the command ends.
         """
-        if data is None:
+        if data is None and not hold_stdin:
             argv = [*self.ssh_argv(), "sh -s"]
             stdin = script.encode()
         else:
             argv = [*self.ssh_argv(), f"sh -c {shlex.quote(script)}"]
-            stdin = data
+            stdin = data or b""
         result = await run_process(
             argv,
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
             stdin=stdin,
             env=self.environment(),
+            hold_stdin=hold_stdin,
+            on_stall=on_stall,
         )
         if result.timed_out and not check_timeout:
             return result

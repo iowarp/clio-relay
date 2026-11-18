@@ -44,6 +44,11 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 Jobs and transfers have no time limit. A long upload or a job that runs for
 days is allowed to finish.
 
+`exec` has no time limit either unless the call gives one. While a command
+prints nothing, the caller hears that it is still running. When the call ends,
+times out or is cancelled, or the connection drops, the command and everything
+it started are stopped on the site.
+
 Relay asks the scheduler for no walltime of its own. A job's walltime is its
 `duration`, or the site's `defaults.duration` when the job gives none. With
 neither, the batch script has no time line, and the scheduler's default for

@@ -345,15 +345,31 @@ def describe_script(scheduler: str) -> str:
     )
 
 
-def exec_script(command: Sequence[str], guard_s: int) -> str:
-    """Run one command from the home directory, with a cleanup guard on the site."""
+def exec_script(command: Sequence[str]) -> str:
+    """Run one command from the home directory, stopped when relay lets go.
+
+    Relay holds the session's standard input open. When it closes, because the
+    call ended, timed out or was cancelled, or the connection dropped, the
+    watchdog stops the command's process group.
+    """
     joined = shlex.join(list(command))
     return (
         'cd "$HOME" 2>/dev/null\n'
-        "if command -v timeout >/dev/null 2>&1; then\n"
-        f"  exec timeout -k 2 {guard_s} {joined} </dev/null\n"
+        "exec 3<&0\n"
+        "if command -v setsid >/dev/null 2>&1; then\n"
+        f"  setsid {joined} </dev/null 3<&- &\n"
+        "else\n"
+        f"  {joined} </dev/null 3<&- &\n"
         "fi\n"
-        f"exec {joined} </dev/null\n"
+        "c=$!\n"
+        '( cat <&3 >/dev/null 2>&1; kill -TERM -"$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null\n'
+        '  sleep 2; kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null ) '
+        ">/dev/null 2>&1 &\n"
+        "w=$!\n"
+        "exec 3<&-\n"
+        'wait "$c"; rc=$?\n'
+        'kill "$w" 2>/dev/null\n'
+        'exit "$rc"\n'
     )
 
 

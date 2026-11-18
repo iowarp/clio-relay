@@ -5,6 +5,8 @@ These run without a site. The live checks are in the fixture modules.
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 
@@ -14,7 +16,7 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter, SshConfig, scripts
 from clio_relay.adapters.ssh.adapter import walltime
-from clio_relay.adapters.ssh.transport import Completed, SshTransport
+from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_process
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobAttributes, JobSpec, PackageRef
@@ -120,6 +122,65 @@ async def test_a_package_job_is_an_invalid_spec(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_no_sign_in_without_interactive_sign_in(tmp_path: Path) -> None:
     assert await _adapter(tmp_path).sign_in_needed() is None
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_process_gets_stall_reports(tmp_path: Path) -> None:
+    flag = tmp_path / "go"
+    reports: list[float] = []
+
+    async def on_stall(idle_s: float, next_s: float) -> None:
+        reports.append(idle_s)
+        flag.touch()
+
+    # The process ends only once a report has come, so the test does not race.
+    wait = f"import os, time\nwhile not os.path.exists({str(flag)!r}): time.sleep(0.02)"
+    result = await run_process(
+        [sys.executable, "-c", wait], timeout_s=None, on_stall=on_stall, stall_s=0.1
+    )
+    assert result.exit_code == 0
+    assert not result.timed_out
+    assert reports and reports[0] >= 0.1
+
+
+@pytest.mark.asyncio
+async def test_the_exec_script_returns_the_exit_code_with_stdin_held(tmp_path: Path) -> None:
+    script = scripts.exec_script(["sh", "-c", "echo out; exit 7"])
+    result = await run_process(["sh", "-c", script], timeout_s=None, stdin=b"", hold_stdin=True)
+    assert result.exit_code == 7
+    assert result.text() == "out\n"
+
+
+def _alive(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+@pytest.mark.asyncio
+async def test_the_exec_watchdog_stops_the_command_when_stdin_closes(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    command = ["sh", "-c", f"echo $$ > {pid_file}; exec sleep 3600"]
+    shell = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        scripts.exec_script(command),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    assert shell.stdin is not None
+    while not pid_file.exists() or not pid_file.read_text().strip():
+        assert shell.returncode is None
+        await asyncio.sleep(0.05)
+    pid = int(pid_file.read_text())
+    assert _alive(pid)
+    # This is what the site sees when relay's ssh ends, is cancelled or drops.
+    shell.stdin.close()
+    assert await shell.wait() != 0
+    assert not _alive(pid)
 
 
 def test_parse_sections() -> None:
