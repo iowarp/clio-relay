@@ -38,7 +38,6 @@ from clio_relay.models import (
     McpOperation,
     RelayJob,
 )
-from clio_relay.remote_mcp import remote_mcp_server_artifact_binding_verified
 from clio_relay.runtime_metadata import JarvisNativeExecutionDocuments, native_execution_documents
 
 
@@ -111,12 +110,11 @@ def _validate_mcp_result(
     ):
         raise ValueError("JARVIS MCP result server artifact binding did not match")
     if spec.expected_registered_contract is not None:
-        artifact_verified = remote_mcp_server_artifact_binding_verified(
-            document.get("server_artifact"),
-            expected_digest=spec.expected_server_artifact_digest,
-        )
+        # Registered remote MCP routes came from the retired remote_mcp registry.
+        artifact_verified = False
         artifact_failure = (
-            "JARVIS MCP result server artifact identity is not the immutable registered route"
+            "JARVIS MCP result came through a registered remote MCP route, "
+            "which relay no longer supports"
         )
     else:
         artifact_verified = jarvis_mcp_server_artifact_binding_verified(

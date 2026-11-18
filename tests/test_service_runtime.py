@@ -576,7 +576,7 @@ class FakeRunner(CommandRunner):
                 json.dumps({"state": state, "service_host": "compute-01"}) + "\n",
                 "",
             )
-        if "clio-relay scheduler cancel 12345" in script:
+        if "clio-relay worker scheduler cancel 12345" in script:
             self.provider_canceled_jobs.append("12345")
             return subprocess.CompletedProcess(
                 command,
@@ -596,7 +596,7 @@ class FakeRunner(CommandRunner):
                 + "\n",
                 "",
             )
-        if "clio-relay scheduler status 12345" in script:
+        if "clio-relay worker scheduler status 12345" in script:
             state = "canceled" if self.provider_canceled_jobs else "running"
             return subprocess.CompletedProcess(
                 command,
@@ -1205,7 +1205,7 @@ class ProviderRetentionRunner(FakeRunner):
         input_text: str | None = None,
         timeout_seconds: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        if self.retention_status is not None and "clio-relay scheduler status 12345" in (
+        if self.retention_status is not None and "clio-relay worker scheduler status 12345" in (
             input_text or ""
         ):
             self.commands.append(list(command))
@@ -1318,7 +1318,7 @@ class LongPendingDeferredHostRunner(FakeRunner):
                 output,
                 "",
             )
-        if "clio-relay scheduler status 12345" in script:
+        if "clio-relay worker scheduler status 12345" in script:
             self.commands.append(list(command))
             self.inputs.append(input_text)
             self.scheduler_polls += 1
@@ -2401,8 +2401,8 @@ def test_service_runtime_uses_explicit_slurm_provider_for_tracking_and_cancel(
     provider_scripts = [
         script or "" for script in runner.inputs if "clio-relay scheduler" in (script or "")
     ]
-    assert any("clio-relay scheduler status 12345" in script for script in provider_scripts)
-    assert any("clio-relay scheduler cancel 12345" in script for script in provider_scripts)
+    assert any("clio-relay worker scheduler status 12345" in script for script in provider_scripts)
+    assert any("clio-relay worker scheduler cancel 12345" in script for script in provider_scripts)
     scheduler_resource = next(item for item in result.resources if item.kind == "scheduler_job")
     assert scheduler_resource.provider == "slurm"
     assert scheduler_resource.observed_state == "canceled"
@@ -2548,8 +2548,8 @@ def test_service_runtime_refuses_changed_scheduler_ownership_before_cancel(
     assert runner.provider_canceled_jobs == []
     assert "jarvis runtime cancel" not in scheduler_scripts
     assert "jarvis runtime status" not in scheduler_scripts
-    assert "clio-relay scheduler cancel" not in scheduler_scripts
-    assert "clio-relay scheduler status" not in scheduler_scripts
+    assert "clio-relay worker scheduler cancel" not in scheduler_scripts
+    assert "clio-relay worker scheduler status" not in scheduler_scripts
 
 
 def test_service_runtime_refuses_client_forged_scheduler_state_without_remote_anchor(

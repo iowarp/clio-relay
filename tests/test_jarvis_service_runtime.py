@@ -2381,7 +2381,7 @@ def test_bound_remote_connector_persists_verified_slurm_placement(
 
     def ssh(script: str) -> str:
         commands.append(script)
-        if "clio-relay scheduler connector-placement" in script:
+        if "clio-relay worker scheduler connector-placement" in script:
             return json.dumps(
                 {
                     "schema_version": "clio-relay.scheduler-connector-placement.v1",
@@ -2482,7 +2482,7 @@ def test_public_jarvis_bind_uses_the_durable_allocation_connector_revision(
     )
 
     def ssh(script: str) -> str:
-        if "clio-relay scheduler connector-placement" in script:
+        if "clio-relay worker scheduler connector-placement" in script:
             return json.dumps(
                 {
                     "schema_version": "clio-relay.scheduler-connector-placement.v1",
@@ -2638,7 +2638,7 @@ def test_jarvis_bind_preserves_and_resumes_allocation_connector_after_lost_start
         return session, intent, connector, step
 
     def ssh(script: str) -> str:
-        if "clio-relay scheduler connector-placement" in script:
+        if "clio-relay worker scheduler connector-placement" in script:
             events.append("placement")
             return json.dumps(
                 {
