@@ -162,6 +162,9 @@ class _ServiceRuntimeStopMixin:
                     detail=str(exc),
                 )
                 errors.append(str(exc))
+            else:
+                if remote_resource.residual:
+                    errors.append(remote_resource.detail or "allocation connector cleanup failed")
         elif remote_pid is None:
             absence_verified = _scheduler_contracts._intent_proves_absence(
                 ownership_intents,

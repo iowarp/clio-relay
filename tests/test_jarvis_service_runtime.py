@@ -2194,9 +2194,15 @@ def test_cleanup_refuses_a_missing_scheduler_id_that_remains_in_the_jarvis_bindi
         verified=verified,
         desktop_bind_port=28777,
     )
+    binding = {
+        **cast(dict[str, object], started.session.gateway["jarvis_runtime_binding"]),
+        "scheduler_provider": "slurm",
+        "scheduler_native_id": "12345",
+    }
     queue.update_gateway_session(
         started.session.session_id,
         scheduler_job_id=None,
+        gateway={**started.session.gateway, "jarvis_runtime_binding": binding},
     )
     local_cleanup_calls: list[str] = []
     ssh_calls: list[str] = []
