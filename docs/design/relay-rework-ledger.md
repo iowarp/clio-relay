@@ -1756,6 +1756,8 @@ All live on Ares, on my own stack:
   - Chips can't be deselected by a click, so the driver forced the empty pick and the bad policy by rewriting the action body in the browser.
   - Passed at 1440×900 and 390×844, in en and el. Screenshots `lq28-{1440,390}-{en,el}-07-catalog-pick-check.png`, `lq28-{1440,390}-{en,el}-08-policy-check.png` and `lq28-1440-el-09-checks-cleared.png`.
   - On Ares at b7b502d (integration 2db7d8d merged), `tests/relay_next tests/asks` gave 330 passed, 0 skipped. Ruff, the size ratchet and pyright are clean, and the pyright ratchet is at its 4558 baseline.
+  - Re-checked live on the pin c1cca62 (marketplace d07aa21) at 1440×900 in el. The catalog check, the policy check and the clear all pass. Screenshots `lq28-1440-el-c2-0{7,8,9}-*.png`. Since W1 hid the fixture adapter, the add form opens on globus, whose required Endpoint fails its own check first, so the policy run picks the local adapter.
+  - After a refused add, the re-rendered form shows its first adapter tab again. An error on a field of another adapter's tab would then be out of sight. The selection lives in the renderer, not in the surface's data, so this is for W12 and W3.
 
 ### Open items
 
