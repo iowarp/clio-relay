@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import scripts
+from clio_relay.adapters.ssh import pricing, scripts
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -187,29 +187,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # price
 
     async def price(self, spec: JobSpec) -> Charge:
-        """Return the most ``spec`` may use, in node-hours (RL25).
-
-        With no walltime the cost is unknown: the charge has no amount and no
-        node-hours, so the spend gate asks unless the site never asks.
-        """
-        duration = walltime(spec)
-        charge = Charge(
-            site=self.context.site_id,
-            queue=spec.attributes.queue_name,
-            account=spec.attributes.account,
-            nodes=spec.resources.nodes(),
-        )
-        node_hours = spec.node_hours()
-        if duration is None or node_hours is None:
-            return charge
-        node_hours = round(node_hours, 4)
-        return charge.model_copy(
-            update={
-                "walltime_s": duration.total_seconds(),
-                "node_hours": node_hours,
-                "amount": node_hours,
-            }
-        )
+        """Return the most ``spec`` may use, in node-hours (RL25)."""
+        return pricing.charge(self.context.site_id, spec)
 
     # run
 
