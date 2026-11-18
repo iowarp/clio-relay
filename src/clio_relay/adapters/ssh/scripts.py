@@ -252,7 +252,9 @@ cd {q(str(directory))} || exit 1
 """
 
 
-_LISTING = 'echo "@@outputs"; find . -type f -exec wc -c {} + 2>/dev/null\n'
+# Inputs are hard links into the content store, so an input the job left alone is
+# not an output. One the job replaced has a single link and is listed.
+_LISTING = 'echo "@@outputs"; find . -type f -links 1 -exec wc -c {} + 2>/dev/null\n'
 
 
 def status_script(
