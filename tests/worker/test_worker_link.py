@@ -75,6 +75,17 @@ def test_identity_document_refuses_a_nonce_that_is_not_256_bit_lowercase_hex(non
         )
 
 
+def test_site_answers_the_link_health_probe_without_a_credential(tmp_path: Path) -> None:
+    # frp_link.wait_for_channel_health polls /healthz for {"ok": true} before
+    # the identity check; without it the link never comes up.
+    client = TestClient(site_app(_settings(tmp_path)))
+
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+
+
 def test_site_answers_the_identity_challenge_without_a_credential(tmp_path: Path) -> None:
     client = TestClient(site_app(_settings(tmp_path)))
 

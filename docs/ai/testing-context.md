@@ -96,12 +96,8 @@ Refresh this evidence when changing the relevant code. Do not present old live e
 
 ## machine-readable evidence
 
-The report-producing acceptance commands sit under `clio-relay worker`:
-`relay-host test-frpc-connection`, `test-http-transport`, `test-direct-transport`, and
-`test-ssh-transport`; `cluster bootstrap`; and `session detach` and
-`session teardown`. Every invocation writes a collision-resistant default JSON report on
-success and after preflight or runtime failure unless the operator supplies an
-explicit path.
+The old report-producing acceptance commands are gone with the old surface.
+Live runs record their evidence in the ledger instead.
 
 The 1.0 release gate is gone. Release qualification is the LQ and RL rows in
 `docs/design/relay-rework-plan.md`, proven by live runs.

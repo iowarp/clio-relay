@@ -55,6 +55,11 @@ def site_app(settings: SiteSettings) -> FastAPI:
 
     auth = Depends(authorized)
 
+    # The link's bring-up polls this, before it has proved whose worker answers.
+    @app.get("/healthz")
+    def healthz() -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        return {"ok": True}
+
     @app.get("/session-identity")
     def session_identity(  # pyright: ignore[reportUnusedFunction]
         nonce: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
