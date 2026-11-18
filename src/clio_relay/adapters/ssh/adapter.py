@@ -30,7 +30,7 @@ from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, Si
 from clio_relay.adapters.ssh import scripts
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
-from clio_relay.adapters.ssh.scripts import parse_sections, q
+from clio_relay.adapters.ssh.scripts import parse_sections
 from clio_relay.adapters.ssh.transport import SshTransport
 from clio_relay.jobs.handles import (
     Endpoint,
@@ -116,9 +116,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
     name: ClassVar[str] = "ssh"
     Config: ClassVar[type[BaseModel]] = SshConfig
-    implements: ClassVar[frozenset[Verb]] = frozenset(
-        {"describe", "run", "exec", "files", "serve"}
-    )
+    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
 
     def __init__(self, config: SshConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
@@ -214,9 +212,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 )
             blobs.append(self.context.content.path_for(digest))
 
-        rendered = await asyncio.to_thread(
-            self._render, spec, scheduler, root, job_dir, name
-        )
+        rendered = await asyncio.to_thread(self._render, spec, scheduler, root, job_dir, name)
         rendered.files["spec.json"] = spec.model_dump_json(indent=2)
         rendered.files["inputs.json"] = json.dumps(
             [{"name": item.name, "sha256": item.sha256} for item in spec.inputs], indent=2
@@ -477,7 +473,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if observed is None:
             if exit_code is not None:
                 if cancelled and exit_code != 0:
-                    return JobStatus(state=JobState.CANCELLED, exit_code=exit_code, native_state="gone")
+                    return JobStatus(
+                        state=JobState.CANCELLED, exit_code=exit_code, native_state="gone"
+                    )
                 state = JobState.COMPLETED if exit_code == 0 else JobState.FAILED
                 return JobStatus(state=state, exit_code=exit_code, native_state="gone")
             if cancelled:

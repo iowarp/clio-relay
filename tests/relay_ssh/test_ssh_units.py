@@ -37,7 +37,7 @@ def test_ssh_argv_uses_the_profile_and_batch_mode(tmp_path: Path) -> None:
     argv = adapter.ssh_argv()
     assert argv[0] == "ssh"
     assert argv[-1] == "example"
-    assert ["-F", "/etc/fx_config"] == argv[1:3]
+    assert argv[1:3] == ["-F", "/etc/fx_config"]
     assert "BatchMode=yes" in argv
     assert "Port=2222" in argv
     assert not any(item.startswith("ControlPath=") for item in argv)

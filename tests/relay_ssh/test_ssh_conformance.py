@@ -46,8 +46,7 @@ def _clean_remote(fx: dict[str, str]) -> Iterator[None]:  # pyright: ignore[repo
         return
     for profile in ("fx-ssh", "fx-slurm", "fx-pbs"):
         subprocess.run(
-            ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", profile,
-             f"rm -rf {RUN_DIR}"],
+            ["ssh", "-F", fx["FX_SSH_CONFIG"], "-o", "BatchMode=yes", profile, f"rm -rf {RUN_DIR}"],
             check=False,
             capture_output=True,
             timeout=120,

@@ -337,10 +337,10 @@ class SshTransport:
             and result.argv[0] in local_programs
         ):
             raise Refusal(
-                    RefusalReason.ADAPTER_UNAVAILABLE,
-                    f"{result.argv[0]} is not installed on this machine",
-                    site=self.site_id,
-                )
+                RefusalReason.ADAPTER_UNAVAILABLE,
+                f"{result.argv[0]} is not installed on this machine",
+                site=self.site_id,
+            )
         if not is_ssh_failure(result):
             return
         detail = result.error_text().strip().splitlines()

@@ -112,9 +112,7 @@ def _detect(choice: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def check_script(
-    remote_dir: str, operation_id: str, scheduler: str, digests: Iterable[str]
-) -> str:
+def check_script(remote_dir: str, operation_id: str, scheduler: str, digests: Iterable[str]) -> str:
     """Before a submit: the root, the scheduler, which inputs the site has, any submission."""
     have = "\n".join(
         f'[ -f "$(cas {q(digest)})" ] && echo "@@have {digest}"' for digest in sorted(set(digests))
@@ -194,7 +192,7 @@ fi
 
 
 DETACHED_SUBMIT = (
-    'if command -v setsid >/dev/null 2>&1; then '
+    "if command -v setsid >/dev/null 2>&1; then "
     '(setsid sh "$J/supervise.sh" </dev/null >"$J/supervisor.log" 2>&1 &); '
     'else (nohup sh "$J/supervise.sh" </dev/null >"$J/supervisor.log" 2>&1 &); fi; '
     'n=0; while [ ! -s "$J/pid" ] && [ $n -lt 300 ]; do '
@@ -274,7 +272,7 @@ def status_script(
     else:
         body += (
             'echo "@@exit"; cat exit_code 2>/dev/null; echo\n'
-            'pid=$(cat pid 2>/dev/null)\n'
+            "pid=$(cat pid 2>/dev/null)\n"
             'if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "@@alive"; fi\n'
             '[ -s child_pid ] && echo "@@started"\n'
         )
@@ -299,13 +297,11 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     body = (
         f"J={q(job_dir)}\n"
         'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
-        "[ -f final ] && { echo \"@@final\"; exit 0; }\n"
-        ': > cancel\nprintf \'%s cancel requested\\n\' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> states\n'
+        '[ -f final ] && { echo "@@final"; exit 0; }\n'
+        ": > cancel\nprintf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
     )
     if cancel_command is not None:
-        body += (
-            f'out=$({cancel_command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'
-        )
+        body += f'out=$({cancel_command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'
     else:
         body += (
             "c=$(cat child_pid 2>/dev/null)\n"
@@ -317,9 +313,7 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     return body
 
 
-def find_script(
-    remote_dir: str, operation_id: str, scheduler: str, job_name: str
-) -> str:
+def find_script(remote_dir: str, operation_id: str, scheduler: str, job_name: str) -> str:
     """Find a submission from its job directory, else from the scheduler by name."""
     name = q(job_name)
     return (
@@ -330,7 +324,7 @@ def find_script(
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo; exit 0; fi\n'
         + _detect(scheduler)
         + 'case "$S" in\n'
-        + f"slurm) echo \"@@ids\"; squeue --me -h -t all -n {name} -o %i 2>/dev/null; "
+        + f'slurm) echo "@@ids"; squeue --me -h -t all -n {name} -o %i 2>/dev/null; '
         + f"sacct -n -X -P --name {name} -o JobID 2>/dev/null ;;\n"
         + f'pbs) echo "@@ids"; qselect -x -N {name} 2>/dev/null ;;\n'
         + "esac\n"
