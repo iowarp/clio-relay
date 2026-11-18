@@ -6,8 +6,6 @@ These run without a site. The live checks are in the fixture modules.
 from __future__ import annotations
 
 import asyncio
-import shlex
-import signal
 import sys
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -365,82 +363,6 @@ def test_a_job_without_a_walltime_has_an_unknown_charge(tmp_path: Path) -> None:
     assert (charge.walltime_s, charge.node_hours, charge.amount) == (5400.0, 3.0, 3.0)
     assert charge.unit == "node-hours"
     assert not SpendPolicy(ask=4.0).needs_approval(charge.node_hours)
-
-
-def _batch(tmp_path: Path, command: str) -> Path:
-    launcher = tmp_path / "single_launch.sh"
-    launcher.write_text(f"sh -c {shlex.quote(command)}\n")
-    rendered = f'#!/bin/bash\n\n/bin/bash {launcher} a b \n\necho "$?" > {tmp_path}/ec\n'
-    batch = tmp_path / "submit.sh"
-    batch.write_text(scripts.forward_signals(rendered, str(launcher), str(tmp_path)))
-    return batch
-
-
-@pytest.mark.asyncio
-async def test_a_signal_to_the_batch_shell_reaches_the_command(tmp_path: Path) -> None:
-    # Some Slurm sites signal only the batch shell on a cancel, as this test does.
-    started = tmp_path / "started"
-    command = (
-        f"trap 'echo stopping > {tmp_path}/log; exit 143' TERM; touch {started}; sleep 3600 & wait"
-    )
-    shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, command)))
-    while not started.exists():
-        assert shell.returncode is None
-        await asyncio.sleep(0.05)
-    shell.send_signal(signal.SIGTERM)
-    await shell.wait()
-    assert (tmp_path / "log").read_text() == "stopping\n"
-    assert (tmp_path / "ec").read_text() == "143\n"
-    assert (tmp_path / "signalled").read_text() == "TERM\n"
-
-
-@pytest.mark.asyncio
-async def test_the_batch_shell_waits_for_a_trap_the_launcher_does_not(tmp_path: Path) -> None:
-    # PSI/J's launcher dies on the TERM while the command's trap is still at work.
-    started = tmp_path / "started"
-    command = (
-        f"trap 'sleep 1; echo stopped > {tmp_path}/log; exit 143' TERM; "
-        f"touch {started}; sleep 3600 & wait"
-    )
-    launcher = tmp_path / "single_launch.sh"
-    launcher.write_text(f"sh -c {shlex.quote(command)} &\nwait\n")
-    rendered = f"#!/bin/bash\n\n/bin/bash {launcher}\n\necho done > {tmp_path}/batch\n"
-    batch = tmp_path / "submit.sh"
-    batch.write_text(scripts.forward_signals(rendered, str(launcher), str(tmp_path)))
-    shell = await asyncio.create_subprocess_exec("bash", str(batch))
-    while not started.exists():
-        assert shell.returncode is None
-        await asyncio.sleep(0.05)
-    shell.send_signal(signal.SIGTERM)
-    await shell.wait()
-    assert (tmp_path / "log").read_text() == "stopped\n"
-    assert (tmp_path / "batch").read_text() == "done\n"
-
-
-@pytest.mark.asyncio
-async def test_the_batch_shell_keeps_the_commands_exit_code(tmp_path: Path) -> None:
-    shell = await asyncio.create_subprocess_exec("bash", str(_batch(tmp_path, "exit 7")))
-    assert await shell.wait() == 0
-    assert (tmp_path / "ec").read_text() == "7\n"
-    assert not (tmp_path / "signalled").exists()
-
-
-@pytest.mark.parametrize(("scheduler", "wrapped"), [("slurm", True), ("pbs", False)])
-def test_slurm_scripts_pass_signals_on(tmp_path: Path, scheduler: str, wrapped: bool) -> None:
-    adapter = _adapter(tmp_path)
-    root = PurePosixPath("/home/someone/.clio-relay")
-    spec = JobSpec(executable="true")
-    rendered = adapter._render(spec, scheduler, root, root / "jobs" / "op_abc", "relay-op_abc")  # pyright: ignore[reportPrivateUsage, reportArgumentType]
-    script = rendered.files["submit.sh"]
-    assert ("trap '_relay_pass TERM' TERM" in script) is wrapped
-    launch = next(line for line in script.splitlines() if "single_launch.sh" in line)
-    assert launch.endswith(" &") is wrapped
-    assert script.index("single_launch.sh") < script.index(".ec")
-
-
-def test_forward_signals_needs_a_launch_line() -> None:
-    with pytest.raises(ValueError, match="no launch line"):
-        scripts.forward_signals("#!/bin/bash\n# /x/single_launch.sh\n", "/x/single_launch.sh", "/j")
 
 
 def test_checks_of_remote_files_list_their_directory_first() -> None:

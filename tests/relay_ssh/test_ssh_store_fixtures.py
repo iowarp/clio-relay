@@ -31,6 +31,7 @@ def on_site(fx: dict[str, str], profile: str, path: str) -> bool:
 def store(profile: str, digest: str) -> str:
     return f"{RUN_DIR}/{profile}/content/cas/sha256/{digest[:2]}/{digest}"
 
+
 @pytest.fixture(scope="module", autouse=True)
 def _clean_remote(fx: dict[str, str]) -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
     yield
@@ -53,7 +54,6 @@ async def test_an_input_the_job_deletes_leaves_no_copy_in_the_store(
     adapter = build(fx, tmp_path, profile)
     files = await adapter.files()
     kept = adapter.context.content.put(f"kept {new_id('k')}\n".encode())
-
 
     async def start(body: str) -> tuple[JobHandle, str]:
         secret = adapter.context.content.put(f"TOKEN={new_id('s')}\n".encode())
@@ -100,7 +100,6 @@ async def test_a_transient_input_is_dropped_however_the_job_ends(
     """A transient input goes at the final state even if the job kept it or never started."""
     adapter = build(fx, tmp_path, profile)
     kept = adapter.context.content.put(f"kept {new_id('k')}\n".encode())
-
 
     async def start(body: str) -> tuple[JobHandle, str]:
         secret = adapter.context.content.put(f"TOKEN={new_id('s')}\n".encode())
