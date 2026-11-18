@@ -16,6 +16,7 @@ import yaml
 
 from clio_relay import catalog
 from clio_relay.adapters import registry
+from clio_relay.adapters.worker.cli import worker_app
 from clio_relay.cli_asks import app as asks_app
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.sites.models import SiteEntry
@@ -31,6 +32,7 @@ app.add_typer(rendezvous_app, name="rendezvous")
 
 
 app.add_typer(asks_app, name="asks")
+app.add_typer(worker_app, name="worker")
 
 
 def _paths() -> RelayPaths:
