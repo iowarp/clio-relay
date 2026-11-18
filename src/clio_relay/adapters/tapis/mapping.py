@@ -84,8 +84,16 @@ def job_request(
     content_dir_host: str,
     launcher_arg: str,
     max_minutes: int,
+    exec_prefix: bool = False,
 ) -> dict[str, Any]:
-    """Build the body of ``jobs.submitJob``."""
+    """Build the body of ``jobs.submitJob``.
+
+    ``exec_prefix`` makes a batch job's script ``exec`` the launcher, so the
+    launcher is the batch step's own process and gets a cancel's TERM. Without
+    it Slurm's TERM ends the batch shell, and the step's cleanup kills the
+    launcher before it can stop a service. Tapis accepts a ``cmdPrefix`` only
+    on a system with ``enableCmdPrefix``.
+    """
     resources = spec.resources
     params: dict[str, Any] = {
         "appArgs": [{"name": "relay", "arg": launcher_arg}],
@@ -128,6 +136,8 @@ def job_request(
         if spec.attributes.queue_name:
             request["execSystemLogicalQueue"] = spec.attributes.queue_name
         params["schedulerOptions"] = scheduler_options(spec)
+        if exec_prefix:
+            request["cmdPrefix"] = "exec"
     return request
 
 
