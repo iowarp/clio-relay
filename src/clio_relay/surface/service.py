@@ -42,8 +42,10 @@ from clio_relay.sites.store import SiteStore
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.guarding import approval_message, review_asks
+from clio_relay.surface.outputs import marked_status
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
+from clio_relay.surface.transient import drop_transient
 
 logger = logging.getLogger(__name__)
 
@@ -452,6 +454,7 @@ class RelayService:
                     record.error = refusal.to_dict()
                 record.move(state, None if refusal is None else refusal.message)
                 self.operations.put(operation_id, record)
+                drop_transient(self.content, self.operations, record)
         return record
 
     async def submit(self, operation_id: str) -> OperationRecord:
@@ -573,6 +576,7 @@ class RelayService:
                     ).to_dict()
                     record.move(OperationState.FAILED, "lost during submission")
                 self.operations.put(operation_id, record)
+                drop_transient(self.content, self.operations, record)
             return record
         try:
             status = await adapter.status(handle)
@@ -648,8 +652,11 @@ class RelayService:
                 return record
             record.move(_JOB_TO_OPERATION[status.state], status.message)
             record.exit_code = status.exit_code
+            status = marked_status(record, status)
             record.outputs = status.outputs
             result = dict(record.result or {})
+            if status.progress is not None:
+                result["progress"] = status.progress.model_dump(mode="json")
             if record.kind == "serve":
                 if endpoint is not None:
                     result["endpoint"] = public_endpoint(endpoint)
@@ -661,6 +668,7 @@ class RelayService:
                     result["stdout_tail"] = tail
             record.result = result
             self.operations.put(operation_id, record)
+            drop_transient(self.content, self.operations, record)
         return record
 
     async def _stdout_tail(self, adapter: BaseAdapter[Any], status: JobStatus) -> str | None:

@@ -351,6 +351,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             content_dir_host=content_host,
             launcher_arg=launcher.encode(fields),
             max_minutes=mapping.max_minutes(spec, system, kind),
+            exec_prefix=bool(system.get("enableCmdPrefix")),
         )
         try:
             submitted = cast(dict[str, Any], await self.tapis_call("jobs", "submitJob", **request))

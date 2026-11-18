@@ -259,6 +259,7 @@ async def test_slurm_partitions_become_logical_queues(
         print(f"LQ40 slurm registration {registered}")
         system = stub.state.systems[system_id(site)]
         assert system["batchScheduler"] == "SLURM"
+        assert system["enableCmdPrefix"] is True
         assert [item["name"] for item in system["batchLogicalQueues"]] == partitions
         assert {
             item["name"]: item.get("maxMinutes") for item in system["batchLogicalQueues"]

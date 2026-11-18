@@ -23,6 +23,8 @@ GRACE=${CLIO_RELAY_STOP_GRACE:-30}
 IDLE=${CLIO_RELAY_IDLE_S:-0}
 FRPC=${CLIO_RELAY_FRPC:-}
 SVC_DIR=${CLIO_RELAY_SERVICE_DIR:-$JOB}
+# One directory can reach the job under two names (a /home link to /mnt/common).
+[ "$(cd "$SVC_DIR" 2>/dev/null && pwd -P)" = "$(pwd -P)" ] && SVC_DIR=$JOB
 
 note() {
     printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$S/launch.log"
@@ -124,27 +126,25 @@ finish() {
     code=$2
     extra=${3:-}
     : > "$S/artifacts.txt.tmp"
-    for dir in "$JOB" "$SVC_DIR"; do
-        [ -d "$dir" ] || continue
-        if [ "$dir" = "$JOB" ]; then
-            # The package runner's archive and JARVIS tree are relay's own; package
-            # outputs land in .relay-jarvis/shared.
-            (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
-                ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
-                ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
-                ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
-                ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
-                ! -name cancel ! -name states 2>/dev/null) |
-                while IFS= read -r file; do
-                    printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "${file#./}"
-                done >> "$S/artifacts.txt.tmp"
-        elif [ "$SVC_DIR" != "$JOB" ]; then
-            find "$SVC_DIR" -maxdepth 2 -type f -newer "$S/started" 2>/dev/null | head -n 200 |
-                while IFS= read -r file; do
-                    printf '%s\t%s\n' "$(wc -c < "$file" | tr -d ' ')" "$file"
-                done >> "$S/artifacts.txt.tmp"
-        fi
-    done
+    # The package runner's archive and JARVIS tree are relay's own; package
+    # outputs land in .relay-jarvis/shared. The adapter's own records and the
+    # scheduler's <job id>.* files are not the program's.
+    (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
+        ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
+        ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
+        ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
+        ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
+        ! -name cancel ! -name states ! -name signalled ! -name final \
+        ! -name "${SLURM_JOB_ID:-/}.*" ! -name "${PBS_JOBID:-/}.*" 2>/dev/null) |
+        while IFS= read -r file; do
+            printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "${file#./}"
+        done >> "$S/artifacts.txt.tmp"
+    if [ "$SVC_DIR" != "$JOB" ] && [ -d "$SVC_DIR" ]; then
+        find "$SVC_DIR" -maxdepth 2 -type f -newer "$S/started" 2>/dev/null | head -n 200 |
+            while IFS= read -r file; do
+                printf '%s\t%s\n' "$(wc -c < "$file" | tr -d ' ')" "$file"
+            done >> "$S/artifacts.txt.tmp"
+    fi
     mv -f "$S/artifacts.txt.tmp" "$S/artifacts.txt"
     # A staged frpc is a copy of a content-addressed input; the site keeps the blob.
     [ -f "$S/frpc" ] && rm -f "$S/frpc"
