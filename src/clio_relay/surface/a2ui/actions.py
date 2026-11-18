@@ -25,15 +25,7 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui import surfaces
-from clio_relay.surface.a2ui.forms import (
-    FORM_ERROR,
-    Field,
-    Form,
-    FormError,
-    form,
-    parse,
-    parse_value,
-)
+from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, FormError, form
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
     ADD_PATH,
@@ -50,6 +42,16 @@ from clio_relay.surface.a2ui.surfaces import (
     TabState,
     protocol_name,
 )
+from clio_relay.surface.a2ui.values import (
+    as_dict,
+    config_values,
+    first,
+    located,
+    pointer,
+    rendered_keys,
+    sentence,
+    site_values,
+)
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -63,106 +65,6 @@ class Outcome:
 
     ok: bool
     resend: dict[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
-
-
-def pointer(data: dict[str, Any], path: str) -> Any:
-    """Return the value at a JSON Pointer in ``data``, or None."""
-    current: Any = data
-    for part in path.strip("/").split("/"):
-        if not isinstance(current, dict):
-            return None
-        current = cast(dict[str, Any], current).get(part.replace("~1", "/").replace("~0", "~"))
-    return current
-
-
-def _rendered_keys(fields: Sequence[Field], prefix: str) -> set[str]:
-    return {prefix + item.key for item in fields}
-
-
-def _located(errors: object, prefix: str, known: set[str]) -> dict[str, str]:
-    """Return validation errors by the form field they belong to."""
-    found: dict[str, str] = {}
-    for raw in cast(list[Any], errors) if isinstance(errors, list) else []:
-        if not isinstance(raw, dict):
-            continue
-        item = cast(dict[str, Any], raw)
-        loc = [str(part) for part in cast(list[Any], item.get("loc") or [])]
-        message = str(item.get("msg") or "Not valid")
-        key = f"{prefix}{loc[0]}" if loc else FORM_ERROR
-        if key not in known:
-            key, message = FORM_ERROR, f"{' '.join(loc)} {message}".strip()
-        found.setdefault(key, message)
-    return found
-
-
-def spend_ask(raw: Any) -> str | float:
-    """Return the spend gate's setting from what the person typed."""
-    text = str(raw or "").strip().lower() or "always"
-    if text in ("always", "never"):
-        return text
-    try:
-        value = float(text)
-    except ValueError:
-        raise FormError("spend", "Enter always, never, or a number of node-hours") from None
-    if value <= 0:
-        raise FormError("spend", "Enter a number of node-hours above 0")
-    return value
-
-
-def _common(
-    fields: Sequence[Field], values: dict[str, Any], errors: dict[str, str]
-) -> dict[str, Any]:
-    """Parse the site fields of a form. Errors go to ``errors`` under ``site.<key>``."""
-    parsed: dict[str, Any] = {}
-    for item in fields:
-        try:
-            if item.key == "spend":
-                parsed[item.key] = spend_ask(values.get(item.key))
-            else:
-                parsed[item.key] = parse_value(item, values.get(item.key))
-        except FormError as exc:
-            errors[f"site.{item.key}"] = str(exc)
-    return parsed
-
-
-def _config(
-    adapter: str, values: dict[str, Any], errors: dict[str, str], prefix: str
-) -> dict[str, Any] | None:
-    """Parse and validate one adapter's settings, or return None with ``errors`` filled."""
-    try:
-        fields = form(adapter, registry.config_schema(adapter)).fields
-    except Refusal as refusal:
-        errors[FORM_ERROR] = refusal.message
-        return None
-    try:
-        config = parse(fields, values)
-    except FormError as exc:
-        errors[prefix + exc.key] = str(exc)
-        return None
-    try:
-        registry.validate_config(adapter, config)
-    except Refusal as refusal:
-        errors.update(_located(refusal.data.get("errors"), prefix, _rendered_keys(fields, prefix)))
-        if not errors:
-            errors[FORM_ERROR] = refusal.message
-        return None
-    return config
-
-
-def _first(value: Any) -> str:
-    if isinstance(value, list):
-        items = cast(list[Any], value)
-        return str(items[0]) if items else ""
-    return "" if value is None else str(value)
-
-
-def as_dict(value: Any) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
-
-
-def _sentence(text: str) -> str:
-    """Uppercase the first letter only; ``str.capitalize`` lowercases names like TACC."""
-    return text[:1].upper() + text[1:]
 
 
 class TabActions:
@@ -213,7 +115,7 @@ class TabActions:
             return self.service.sites.get(site_id)
         except Refusal as refusal:
             self.state.forget(site_id)
-            self.state.notice = _sentence(refusal.message) + "."
+            self.state.notice = sentence(refusal.message) + "."
             return None
 
     async def _saved(self, site: SiteEntry, done: str) -> None:
@@ -236,10 +138,10 @@ class TabActions:
 
     async def add_site(self, adapter: str, values: dict[str, Any]) -> Outcome:
         errors: dict[str, str] = {}
-        common = _common(ADD_FIELDS, as_dict(values.get("site")), errors)
+        common = site_values(ADD_FIELDS, as_dict(values.get("site")), errors)
         if not common.get("id") and "site.id" not in errors:
             errors["site.id"] = "Enter an endpoint ID"
-        config = _config(
+        config = config_values(
             adapter,
             as_dict(as_dict(values.get("config")).get(adapter)),
             errors,
@@ -247,7 +149,7 @@ class TabActions:
         )
         if errors or config is None:
             return self._fail(ADD_SURFACE, errors)
-        known = _rendered_keys(ADD_FIELDS, "site.")
+        known = rendered_keys(ADD_FIELDS, "site.")
         try:
             entry = SiteEntry.model_validate(
                 {
@@ -262,7 +164,7 @@ class TabActions:
             )
             added = self.service.sites.add(entry)
         except ValidationError as exc:
-            return self._fail(ADD_SURFACE, _located(exc.errors(include_url=False), "site.", known))
+            return self._fail(ADD_SURFACE, located(exc.errors(include_url=False), "site.", known))
         except Refusal as refusal:
             if refusal.reason is RefusalReason.SITE_EXISTS:
                 message = f"An endpoint named {common['id']} exists"
@@ -273,7 +175,7 @@ class TabActions:
         return Outcome(ok=True, resend={ADD_SURFACE: ("/drafts/add",), SITES_SURFACE: ("/switch",)})
 
     async def add_from_catalog(self, _subject: str, values: dict[str, Any]) -> Outcome:
-        catalog_id = _first(values.get("id"))
+        catalog_id = first(values.get("id"))
         site_id = str(values.get("site_id") or "").strip() or None
         if not catalog_id:
             return self._fail(
@@ -290,7 +192,7 @@ class TabActions:
                 return self._fail(
                     ADD_SURFACE, {CATALOG_ID_ERROR: f"An endpoint named {taken} exists"}
                 )
-            return self._fail(ADD_SURFACE, {CATALOG_ERROR: _sentence(refusal.message)})
+            return self._fail(ADD_SURFACE, {CATALOG_ERROR: sentence(refusal.message)})
         self._close_add()
         await self._saved(added, f"Added {added.title}.")
         return Outcome(ok=True, resend={ADD_SURFACE: ("/catalog",), SITES_SURFACE: ("/switch",)})
@@ -308,12 +210,12 @@ class TabActions:
         if site is None:
             return Outcome(ok=False)
         errors: dict[str, str] = {}
-        common = _common(EDIT_FIELDS, as_dict(values.get("site")), errors)
+        common = site_values(EDIT_FIELDS, as_dict(values.get("site")), errors)
         drafts = as_dict(values.get("adapters"))
         config = site.config
         if site.adapter in drafts:
             prefix = f"adapters.{site.adapter}."
-            config = _config(site.adapter, as_dict(drafts[site.adapter]), errors, prefix)
+            config = config_values(site.adapter, as_dict(drafts[site.adapter]), errors, prefix)
         alternatives: dict[str, dict[str, Any]] = {}
         order = [*site.alternatives, *(name for name in drafts if name not in site.alternatives)]
         for name in order:
@@ -326,7 +228,7 @@ class TabActions:
                 continue
             if not as_dict(draft).get("use"):
                 continue
-            parsed = _config(name, as_dict(draft), errors, f"adapters.{name}.")
+            parsed = config_values(name, as_dict(draft), errors, f"adapters.{name}.")
             if parsed is not None:
                 alternatives[name] = parsed
         if errors or config is None:
@@ -348,8 +250,8 @@ class TabActions:
         try:
             saved = self.service.sites.edit(site_id, changes)
         except Refusal as refusal:
-            known = _rendered_keys(EDIT_FIELDS, "site.")
-            located = _located(refusal.data.get("errors"), "site.", known)
+            known = rendered_keys(EDIT_FIELDS, "site.")
+            located = located(refusal.data.get("errors"), "site.", known)
             return self._fail(site_id, located or {FORM_ERROR: refusal.message})
         self.state.editing.discard(site_id)
         self.state.errors.pop(site_id, None)
@@ -360,7 +262,7 @@ class TabActions:
                 saved = self.service.sites.switch(site_id, wanted)
                 done += f" It now uses {protocol_name(wanted)}."
             except Refusal as refusal:
-                done += f" {_sentence(refusal.message)}."
+                done += f" {sentence(refusal.message)}."
         await self._saved(saved, done)
         return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
 
@@ -396,7 +298,7 @@ class TabActions:
             removed = self.service.sites.remove(site_id)
         except Refusal as refusal:
             self.state.forget(site_id)
-            self.state.notice = _sentence(refusal.message) + "."
+            self.state.notice = sentence(refusal.message) + "."
             return Outcome(ok=False)
         self.state.forget(site_id)
         self.state.notice = f"Removed {removed.title}."
@@ -422,14 +324,14 @@ class TabActions:
         site = self._site(site_id)
         if site is None:
             return Outcome(ok=False)
-        adapter = _first(values.get("adapter")) or site.adapter
+        adapter = first(values.get("adapter")) or site.adapter
         if adapter == site.adapter:
             self.state.notice = f"{site.title} already uses {protocol_name(adapter)}."
             return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
         try:
             switched = self.service.sites.switch(site_id, adapter)
         except Refusal as refusal:
-            return self._fail(site_id, {FORM_ERROR: _sentence(refusal.message)})
+            return self._fail(site_id, {FORM_ERROR: sentence(refusal.message)})
         self.state.errors.pop(site_id, None)
         await self._saved(switched, f"{switched.title} now uses {protocol_name(adapter)}.")
         return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
@@ -442,7 +344,7 @@ class TabActions:
         if site is None:
             return Outcome(ok=False)
         column = str(values.get("column") or "")
-        value = _first(values.get("value"))
+        value = first(values.get("value"))
         if column == "security":
             return await self._set_security(site, value)
         if column == "protocol":
@@ -458,7 +360,7 @@ class TabActions:
         listed = {name for name, item in self.forms().items() if item.listed}
         changed: dict[str, str] = {}
         for column, raw in picked.items():
-            value = _first(raw)
+            value = first(raw)
             if (column == "protocol" and value in listed) or (
                 column == "security" and value in SECURITY
             ):
@@ -478,7 +380,7 @@ class TabActions:
         try:
             saved = self.service.sites.edit(site.id, {"policy": value})
         except Refusal as refusal:
-            return self._fail(site.id, {FORM_ERROR: _sentence(refusal.message)})
+            return self._fail(site.id, {FORM_ERROR: sentence(refusal.message)})
         self.state.errors.pop(site.id, None)
         await self._saved(saved, f"{saved.title} is now {SECURITY[value][0]}.")
         return Outcome(ok=True)
@@ -507,7 +409,7 @@ class TabActions:
                 site.id, {"alternatives": site.alternatives | {value: settings}}
             )
         except Refusal as refusal:
-            return self._fail(site.id, {FORM_ERROR: _sentence(refusal.message)})
+            return self._fail(site.id, {FORM_ERROR: sentence(refusal.message)})
         return await self.switch_adapter(site.id, {"adapter": [value]})
 
     async def connect_site(self, site_id: str, _values: dict[str, Any]) -> Outcome:
@@ -526,7 +428,7 @@ class TabActions:
                 ask = await self.service.ask_provider.url(site=site, operation_id=None, need=need)
                 url = ask.url
         except Refusal as refusal:
-            return self._fail(site_id, {FORM_ERROR: _sentence(refusal.message)})
+            return self._fail(site_id, {FORM_ERROR: sentence(refusal.message)})
         if not url:
             return self._fail(site_id, {FORM_ERROR: "Relay has no sign-in page to offer here"})
         self.state.links[site_id] = url

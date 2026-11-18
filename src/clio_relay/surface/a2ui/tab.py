@@ -37,8 +37,8 @@ from clio_relay.identity.probe import probes_file
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface.a2ui import adding, protocol, surfaces, table
-from clio_relay.surface.a2ui.actions import Outcome, TabActions, as_dict, pointer
+from clio_relay.surface.a2ui import adding, cards, protocol, surfaces, table
+from clio_relay.surface.a2ui.actions import Outcome, TabActions
 from clio_relay.surface.a2ui.forms import Form, form
 from clio_relay.surface.a2ui.protocol import (
     MIME_TYPE,
@@ -54,6 +54,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SiteView,
     TabState,
 )
+from clio_relay.surface.a2ui.values import as_dict, pointer
 from clio_relay.surface.a2ui.tokens import ActionTokens
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.describing import site_status
@@ -225,7 +226,7 @@ class ComputeTab(TabActions):
         forms = self.forms()
         build = table.endpoints_surface
         if client.catalog_id != RELAY_CATALOG_ID:
-            build = surfaces.sites_surface
+            build = cards.sites_surface
         return {
             SITES_SURFACE: build(views, self.state, forms, self.tokens),
             ADD_SURFACE: adding.add_surface(forms, self._catalog(), self.state, self.tokens),

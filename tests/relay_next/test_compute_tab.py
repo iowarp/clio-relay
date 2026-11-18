@@ -16,7 +16,7 @@ from fastmcp import Client
 from clio_relay.adapters import registry
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui import ACTIONS, BASIC_CATALOG_ID, RELAY_CATALOG_ID, TAB_URI
-from clio_relay.surface.a2ui.actions import _sentence  # pyright: ignore[reportPrivateUsage]
+from clio_relay.surface.a2ui.values import sentence
 from clio_relay.surface.a2ui.components import COMPONENTS
 from clio_relay.surface.a2ui.forms import form
 from clio_relay.surface.server import create_server
@@ -82,8 +82,8 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
 
 def test_notices_keep_the_case_of_names() -> None:
     message = "relay has no OAuth client for the TACC tenant yet; set CLIO_RELAY_TACC_CLIENT_ID"
-    assert _sentence(message) == "R" + message[1:]
-    assert _sentence("") == ""
+    assert sentence(message) == "R" + message[1:]
+    assert sentence("") == ""
 
 
 def test_a_reread_with_nothing_changed_is_identical(relay_paths: RelayPaths) -> None:
