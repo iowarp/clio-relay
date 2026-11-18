@@ -25,6 +25,7 @@ from clio_relay.jobs.handles import (
     JobState,
     JobStatus,
     OutputRef,
+    StallReport,
 )
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -193,7 +194,12 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
         return await self.status(handle)
 
     async def exec(
-        self, command: list[str], *, timeout_s: float, max_output_bytes: int
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> ExecResult:
         await self._require_sign_in()
         started = time.monotonic()
@@ -213,11 +219,16 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
             stdout = "y\n" * count
         elif name == "sleep":
             seconds = float(arguments[0]) if arguments else 1.0
-            if seconds > timeout_s:
+            if timeout_s is not None and seconds > timeout_s:
                 await asyncio.sleep(timeout_s)
                 exit_code, timed_out = None, True
             else:
                 await asyncio.sleep(seconds)
+        elif name == "quiet":
+            # A command that goes quiet once: the stall report fires, then it ends.
+            if timeout_s is None and on_stall is not None:
+                await on_stall(30.0, 30.0)
+            stdout = "done\n"
         elif name == "false":
             exit_code = 1
         else:

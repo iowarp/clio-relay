@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -74,6 +75,14 @@ class ExecResult(BaseModel):
     timed_out: bool = False
     duration_s: float
 
+
+STALL_S = 30.0
+"""Seconds without output before a command with no time limit is reported quiet."""
+
+StallReport = Callable[[float, float], Awaitable[None]]
+"""Called while a command is quiet, with the seconds since its last output and
+the seconds until the next check. The command keeps running; the person may
+cancel the call."""
 
 class EndpointPort(BaseModel):
     """One reachable port of a service."""

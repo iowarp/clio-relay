@@ -25,7 +25,7 @@ from clio_relay.adapters.hooks import (
     hook_factory,
 )
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, utc_now
+from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
 from clio_relay.jobs.records import (
     OperationKind,
     OperationRecord,
@@ -37,7 +37,7 @@ from clio_relay.jobs.records import (
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
-from clio_relay.sites.routing import route, routes
+from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
@@ -145,9 +145,17 @@ class RelayService:
             self._adapters[key] = adapter
         return adapter
 
+    def route(self, site: SiteEntry, verb: Verb) -> Routed:
+        """Route ``verb`` on ``site``, skipping adapters whose settings do not build (RL5)."""
+        return route(site, verb, lambda name, config: self._build(site, name, config))
+
+    def site_routes(self, site: SiteEntry) -> list[Route]:
+        """Return every verb's route on ``site``, with what was skipped and why."""
+        return routes(site, lambda name, config: self._build(site, name, config))
+
     def adapter_for(self, site: SiteEntry, verb: Verb) -> BaseAdapter[Any]:
         """Return the adapter that serves ``verb`` on ``site`` (RL5)."""
-        name, config = route(site, verb)
+        name, config, _skipped = self.route(site, verb)
         return self._build(site, name, config)
 
     def adapter_named(self, site: SiteEntry, name: str) -> BaseAdapter[Any]:
@@ -187,7 +195,7 @@ class RelayService:
         site = self.site(site_id)
         described: dict[str, Any] = {
             "site": site.model_dump(mode="json"),
-            "routes": [item.model_dump(mode="json") for item in routes(site)],
+            "routes": [item.model_dump(mode="json") for item in self.site_routes(site)],
         }
         try:
             adapter = self.adapter_for(site, "describe")
@@ -241,7 +249,7 @@ class RelayService:
     ) -> OperationRecord:
         """Check and price a service's job, record it, ask, and start it if nothing must."""
         site = self.site(site_id)
-        route(site, "serve")
+        self.route(site, "serve")
         if isinstance(self.serve_hook, StubServe):
             raise Refusal(
                 RefusalReason.VERB_NOT_IMPLEMENTED,
@@ -274,8 +282,8 @@ class RelayService:
         task: bool,
     ) -> OperationRecord:
         verb: Verb = "serve" if kind == "serve" else "run"
-        adapter_name, _config = route(site, verb)
-        adapter = self.adapter_for(site, verb)
+        adapter_name, config, skipped = self.route(site, verb)
+        adapter = self._build(site, adapter_name, config)
         (await self.guard.check_run(site, job)).raise_if_refused()
         charge = await self.guard.price(site, job)
         operation_id = new_id("op")
@@ -292,6 +300,8 @@ class RelayService:
             task=task,
             result={"charge": charge.model_dump(mode="json")},
         )
+        if skipped:
+            record.result["skipped"] = [item.model_dump() for item in skipped]
         asks: list[Ask] = []
         need = await adapter.sign_in_needed()
         if need is not None:
@@ -674,17 +684,24 @@ class RelayService:
         site_id: str,
         command: list[str],
         *,
-        timeout_s: float,
+        timeout_s: float | None = None,
         max_output_bytes: int,
+        on_stall: StallReport | None = None,
     ) -> dict[str, Any]:
-        """Run one short command (RL9)."""
+        """Run one command (RL9). With no ``timeout_s`` it runs until it ends."""
         site = self.site(site_id)
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
         (await self.guard.check_exec(site, command)).raise_if_refused()
-        adapter = self.adapter_for(site, "exec")
-        result = await adapter.exec(command, timeout_s=timeout_s, max_output_bytes=max_output_bytes)
-        return result.model_dump(mode="json")
+        name, config, skipped = self.route(site, "exec")
+        adapter = self._build(site, name, config)
+        result = await adapter.exec(
+            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+        )
+        shown = result.model_dump(mode="json")
+        if skipped:
+            shown["skipped"] = [item.model_dump() for item in skipped]
+        return shown
 
     # views
 
