@@ -181,6 +181,11 @@ def _dict(value: Any) -> dict[str, Any]:
     return cast(dict[str, Any], value) if isinstance(value, dict) else {}
 
 
+def _sentence(text: str) -> str:
+    """Uppercase the first letter only; ``str.capitalize`` lowercases names like TACC."""
+    return text[:1].upper() + text[1:]
+
+
 class ComputeTab:
     """The tab's state, rendering and actions for one relay server."""
 
@@ -456,7 +461,7 @@ class ComputeTab:
             return self.service.sites.get(site_id)
         except Refusal as refusal:
             self.state.forget(site_id)
-            self.state.notice = refusal.message.capitalize() + "."
+            self.state.notice = _sentence(refusal.message) + "."
             return None
 
     async def _saved(self, site: SiteEntry, done: str) -> None:
@@ -523,7 +528,7 @@ class ComputeTab:
                 ADD_SURFACE, {"catalog": "A site ID takes lowercase letters, digits, - and _"}
             )
         except Refusal as refusal:
-            return self._fail(ADD_SURFACE, {"catalog": refusal.message.capitalize()})
+            return self._fail(ADD_SURFACE, {"catalog": _sentence(refusal.message)})
         self.state.errors.pop(ADD_SURFACE, None)
         await self._saved(added, f"Added {added.title}.")
         return Outcome(ok=True, resend={ADD_SURFACE: ("/catalog",), SITES_SURFACE: ("/switch",)})
@@ -606,7 +611,7 @@ class ComputeTab:
             removed = self.service.sites.remove(site_id)
         except Refusal as refusal:
             self.state.forget(site_id)
-            self.state.notice = refusal.message.capitalize() + "."
+            self.state.notice = _sentence(refusal.message) + "."
             return Outcome(ok=False)
         self.state.forget(site_id)
         self.state.notice = f"Removed {removed.title}."
@@ -639,7 +644,7 @@ class ComputeTab:
         try:
             switched = self.service.sites.switch(site_id, adapter)
         except Refusal as refusal:
-            return self._fail(site_id, {FORM_ERROR: refusal.message.capitalize()})
+            return self._fail(site_id, {FORM_ERROR: _sentence(refusal.message)})
         self.state.errors.pop(site_id, None)
         await self._saved(switched, f"{switched.title} now uses {adapter}.")
         return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
@@ -660,7 +665,7 @@ class ComputeTab:
                 ask = await self.service.ask_provider.url(site=site, operation_id=None, need=need)
                 url = ask.url
         except Refusal as refusal:
-            return self._fail(site_id, {FORM_ERROR: refusal.message.capitalize()})
+            return self._fail(site_id, {FORM_ERROR: _sentence(refusal.message)})
         if not url:
             return self._fail(site_id, {FORM_ERROR: "Relay has no sign-in page to offer here"})
         self.state.links[site_id] = url
