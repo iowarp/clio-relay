@@ -945,6 +945,130 @@ W12, gact-tui host semantics and removals: done (draft PR iowarp/gact-tui#1320).
 
 ## W14. Relay's CLIO plugin and the Compute tab
 
+Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on clio-agent-marketplace `jaimecernuda-relay-rework` (48536f8 pins relay a1b1b6f).
+
+### Decisions
+
+- **Action tools (coordinator decision B, LQ1 as amended in 956f7e8).**
+  - The tab's actions are real tools marked `_meta.ui.visibility: ["app"]`.
+  - Relay lists them only when that `tools/list` request's `_meta` declares `org.a2ui/a2ui`. A client without A2UI sees exactly the five verbs.
+  - Every call needs the single-use action token from the surface relay rendered. A missing, unknown, spent or wrong-action token is refused.
+  - Reason: this is the standard MCP Apps pattern, and it needs no host change.
+- **Tokens.**
+  - Tokens are minted per rendered surface and kept in relay's state dir, so a re-read after a restart still has working buttons.
+  - A token presented to the wrong action is spent and refused, rather than kept. A token can't be probed for the actions it allows.
+- **One store.** Every action calls W1's `sites/store.py` and the `SiteAdded.on_site_added` hook, as the CLI's `site add`, `edit` and `switch` do. The tab does nothing the command line can't.
+- **Relay's dirs come from the plugin.**
+  - `plugin/mcp.json` sets `CLIO_RELAY_CONFIG_DIR=${PLUGIN_DATA}/config` and `CLIO_RELAY_STATE_DIR=${PLUGIN_DATA}/state`, so a CLIO install keeps its sites in its own plugin data dir.
+  - A terminal that should share the tab's sites sets the same two variables.
+  - `CLIO_RELAY_GRANT_FILE_GLOBUS=${CLIO_ACCOUNT_GLOBUS_FILE}` is HS4a's mapping. Relay's code reads no CLIO name.
+- **Per-site degrade.** A site whose adapter or identity can't be read becomes one "Unavailable" row with Edit and Remove. The rest of the tab still renders.
+- **Server command (O9).** The server command lives in `plugin/mcp.json` beside `plugin.json`. clio-agent has no connector entry for relay.
+- **Skills (RL34).** `plugin/skills/use-relay/SKILL.md` points at `relay://skills/{name}` and `relay://sites/{site}/skill` and copies no skill text.
+- **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
+
+### Facts
+
+- The manifest (`plugin/plugin.json`, version 1.6.8):
+  - `ai.iowarp.clio.tabs`: tab `compute`, resource `a2ui://clio-relay/compute`.
+  - `accounts`: Globus, with the transfer and GCS scopes.
+  - `elicitation`: loopback plus `https://tacc.tapis.io`.
+- The catalog is `plugin/ai.iowarp.clio/a2ui/clio-relay-compute/`. The tab uses only components CLIO already renders.
+- Surfaces (`src/clio_relay/surface/a2ui/`):
+  - Each site's card shows its status, identity, Probe, Connect, adapter switch, Edit and Remove.
+  - The add-site form is built from each adapter's `Config` JSON schema.
+  - Remove asks for confirmation.
+- The tab watches the site store every 2 s (`tab.WATCH_INTERVAL_S`) and sends `notifications/resources/updated`, so a CLI change reaches an open tab.
+- A2UI goes out only when the request carries `org.a2ui/a2ui`, and always alongside the full text result.
+
+### Evidence
+
+All live on Ares, on my own stack:
+- clio-agent at 489c557, with gact-tui `bcdecb4` from iowarp/gact-tui#1320.
+- Agent on :18914, UI on :15914, `CLIO_AGENT_HOME=~/clio-relay-rework/w14-live/agent-home`.
+- Plugin installed from the marketplace clone.
+
+- **Option B gate.**
+  - Over stdio, a plain `mcp` client sees 5 tools.
+  - A client whose `tools/list` `_meta` declares `org.a2ui/a2ui` sees 15: the 5 verbs plus 10 app-only action tools.
+  - An action call with no token is refused, and so is one with a made-up token.
+- **LQ27 (local flow), passed live in the browser.**
+  - Covered: open the Compute tab, add a local site from the form, Probe, Edit and save, Remove and confirm.
+  - Add Stampede3 from the catalog, switch its adapter, remove it.
+  - Screenshots `lq27-00` to `lq27-12` (`.png`) are in the session artifacts.
+- **LQ28 (visual QA).** Screenshots at 390×844 in en, 1440×900 in el and 390×844 in el.
+- **Keyring.** Stampede3 first degraded to "Unavailable (NoKeyringError)" on Ares, which has no keyring backend. W6 fixed this at 723c9a2: a 0600 file fallback, and `describe` shows `facts.credentials.stored_in`.
+
+### Open items
+
+- **CLI change with the tab open (part of LQ27).** Relay sends the update, and the host re-reads and publishes it. It doesn't show for two host bugs, routed to W3:
+  - The per-surface revision doesn't move on a re-read.
+  - The resource watch isn't set up again after a namespace remount.
+  - Screenshots `lq27-13` and `lq27-14` show the failure. I'll re-run them on W3's fix.
+- **Connect on Stampede3.** To re-run once W6 723c9a2 is in integration and the pin moves to it.
+- **The pin.** `plugin/mcp.json` and the marketplace pin a W14 commit. Repin to the integration commit after W1 merges.
+
+### Run sheets for the person rows
+
+Each sheet lists what the person needs, the steps, and what to record. Results go in W16's summary.
+
+**LQ-L7. The Windows fence (LQ5, LQ10, LQ12 and LQ29 from Windows).**
+
+Needs:
+- A Windows laptop with CLIO Desktop built from the integration branches, with the clio-relay plugin installed from the marketplace and turned on for an agent.
+- The W2 fixtures, from `scripts/ares/fixtures.sh up` on Ares. From Windows, reach each fixture through an SSH tunnel to Ares or an `ssh_config` `ProxyJump ares` entry. The ports are fx-ssh 47100, fx-slurm 47101, fx-otp 47103, fx-frps 47104 and 47105.
+- A `~/.ssh/config` on Windows with the hosts `fx-slurm` and `fx-otp`, reached through Ares.
+
+Steps:
+1. In the Compute tab, add `fx-slurm` as an `ssh` site with `ssh_profile` set to `fx-slurm` and the scheduler set to `slurm`. Probe it. Record the card's status.
+2. **LQ5.**
+   - Ask the agent to `run` `sleep 5400; hostname` (90 minutes) on `fx-slurm`, and note the handle.
+   - Close CLIO, then close the lid for an hour.
+   - Open it, open CLIO, and ask for the handle's status.
+   - It must complete from the site's job record.
+   - While the lid was closed and between polls, `Get-Process ssh -ErrorAction SilentlyContinue` must show no SSH process.
+3. **LQ10.**
+   - Add `fx-otp` as a `worker` site (rendezvous at fx-frps) and press Connect.
+   - Exactly one question arrives, with a loopback address. Type the code on that page.
+   - The worker must dial the rendezvous.
+   - Afterwards no SSH process remains (`Get-Process ssh`).
+   - The code must not appear in the transcript.
+4. **LQ12.**
+   - Ask the agent to `serve` `clio-fixture-secret-service` on `fx-slurm`.
+   - The task reaches `working` with an endpoint.
+   - `Invoke-WebRequest` to the loopback port with the secret answers. Without it, the request is refused.
+5. **LQ29.**
+   - In CLIO's fenced shell, run `ssh fx-slurm hostname`.
+   - It must succeed, and the session's events must show a `net.egress` event naming the host and port 22.
+6. In `describe` for an SSH site and the Stampede3 site, read `facts.credentials.stored_in` ("keyring" with Windows Credential Manager).
+
+Record for each row:
+- Pass or fail, with the handle, the times, the `Get-Process ssh` output and screenshots of the tab and the transcript.
+- Any Windows path or quoting problem in the fence (ssh `known_hosts`, control sockets, the ProxyCommand shim).
+
+**LQ-L18. A third-party agent host.**
+
+Needs:
+- Claude Code or the Copilot CLI, at a recorded version.
+- `uv` on PATH.
+- An Ares account the person can `ssh ares` to.
+
+Steps:
+1. Add relay with the host's documented command, using the integration commit `<sha>`:
+   - Claude Code: `claude mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay-next serve`.
+   - Copilot CLI: `copilot mcp add clio-relay -- uvx --from "clio-relay @ git+https://github.com/iowarp/clio-relay@<sha>" clio-relay-next serve`.
+2. In a terminal, run `uvx --from "clio-relay @ git+…@<sha>" clio-relay-next site add-from-catalog ares`, then `site show ares`. Before step 4, `ssh ares hostname` must work without a prompt.
+3. Start the host and list its tools. It must show exactly the five relay verbs and no action tools, because it doesn't declare A2UI.
+4. Ask: "submit hostname to Ares and tell me the node".
+
+Record:
+- The host and its version.
+- The tool list.
+- The handle.
+- The node name, checked against `sacct` on Ares.
+- The full transcript.
+- Every question the host showed.
+
 ## W15. ParaView follows a growing source (RL44, LQ-L12)
 
 Branch: iowarp/clio-kit `jaimecernuda-relay-rework`, commit 202ce174 (paraview-mcp 3.1.0 to 3.2.0 bump, docs/mcps/paraview.md regenerated) on top of 538703d0 (RL44), on origin/main 490269fb. Scope: mcp-servers/paraview/ only.
