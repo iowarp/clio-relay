@@ -243,7 +243,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         rendered = await asyncio.to_thread(self._render, spec, scheduler, root, job_dir, name)
         rendered.files["spec.json"] = spec.model_dump_json(indent=2)
         rendered.files["inputs.json"] = json.dumps(
-            [{"name": item.name, "sha256": item.sha256} for item in spec.inputs], indent=2
+            [store.entry(item) for item in spec.inputs], indent=2
         )
         rendered.files["scheduler"] = (scheduler or "none") + "\n"
 

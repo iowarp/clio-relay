@@ -222,11 +222,13 @@ fi
 
 
 _FORWARD_SIGNALS = """# Some Slurm sites signal only this shell on a cancel and kill the rest after
-# KillWait. Run the launch in its own process group, pass signals on to it and wait.
+# KillWait. Run the launch in its own process group, pass signals on to it and wait,
+# for the whole group once a signal went on, so the command's traps can finish.
 # Where the scheduler signals every process itself, the launch has already ended,
 # so the signal is not sent twice.
 _relay_job=
 _relay_held=
+_relay_sent=
 _relay_live() {{
   command -v ps >/dev/null 2>&1 || return 0
   case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
@@ -235,7 +237,8 @@ _relay_pass() {{
   case $1 in TERM|INT) echo "$1" > {marker};; esac
   if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
   sleep 1
-  _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null
+  _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null &&
+    case $1 in TERM|INT) _relay_sent=1;; esac
 }}
 trap '_relay_pass TERM' TERM
 trap '_relay_pass INT' INT
@@ -246,6 +249,9 @@ set -m
 _relay_job=$!
 [ -n "$_relay_held" ] && _relay_pass "$_relay_held"
 while :; do wait "$_relay_job"; _relay_rc=$?; kill -0 "$_relay_job" 2>/dev/null || break; done
+if [ -n "$_relay_sent" ]; then
+  while kill -0 -- "-$_relay_job" 2>/dev/null; do sleep 1; done
+fi
 set +m
 _relay_return() {{ return "$1"; }}
 _relay_return "$_relay_rc"
@@ -382,11 +388,11 @@ def record_script(
     *,
     final: bool,
     root: str | None = None,
-    inputs: Sequence[tuple[str, str]] = (),
+    inputs: Sequence[store.StagedInput] = (),
 ) -> str:
     """Append a state change. With ``final``, standard input becomes the ``final`` file.
 
-    A final record also drops the inputs the job deleted from the content store
+    A final record also drops spent and transient inputs from the content store
     (see :mod:`clio_relay.adapters.ssh.store`).
     """
     body = f"J={q(job_dir)}\n" + 'cd "$J" || exit 3\n'
