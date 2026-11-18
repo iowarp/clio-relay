@@ -1,9 +1,8 @@
 """The durable relay job record and its full lifecycle, admission through GC.
 
 Covers :class:`RelayJob` itself, the bounded terminal-wait outcome models
-(:class:`WaitObservation`, :class:`JobWaitResult`), the owned-JARVIS-run
-execution-ID admission binder (:func:`prepare_owned_jarvis_run_submission`),
-and the crash-resumable terminal-job garbage-collection/closure records
+(:class:`WaitObservation`, :class:`JobWaitResult`), and the crash-resumable
+terminal-job garbage-collection/closure records
 (:class:`TerminalJobGcPlan`, :class:`JobTombstone`, :class:`TerminalJobGcResult`,
 :class:`OwnerSessionClosure`) that retire a terminal job.
 """
@@ -20,10 +19,6 @@ from clio_relay.models_artifact_provenance import ArtifactUse, validate_artifact
 from clio_relay.models_enums import TERMINAL_STATES, JobGcPhase, JobKind, JobState
 from clio_relay.models_job_specs import (
     JobSpec,
-    McpCallSpec,
-    deterministic_jarvis_execution_id,
-    is_owned_jarvis_run_spec,
-    validate_jarvis_execution_id,
 )
 from clio_relay.models_shared import new_id, utc_now
 
@@ -122,50 +117,6 @@ class JobWaitResult(RelayJob):
         if self.observation.outcome != expected:
             raise ValueError("wait observation outcome disagrees with durable job state")
         return self
-
-
-def prepare_owned_jarvis_run_submission(job: RelayJob) -> RelayJob:
-    """Bind a newly admitted trusted JARVIS run to one durable execution ID.
-
-    This is intentionally an admission operation rather than a model validator.
-    Durable jobs written by older relay releases must remain readable during an
-    upgrade even when their historical public contract exposed ``wait`` or did
-    not yet accept a caller-owned ``execution_id``.
-    """
-    if not is_owned_jarvis_run_spec(job.kind, job.spec):
-        return job
-    assert isinstance(job.spec, McpCallSpec)
-    if "wait" in job.spec.arguments:
-        raise ValueError(
-            "trusted jarvis_run does not accept internal wait; query the returned "
-            "execution with jarvis_get_execution"
-        )
-    expected_execution_id = deterministic_jarvis_execution_id(
-        cluster=job.cluster,
-        idempotency_key=job.idempotency_key,
-        job_id=job.job_id,
-    )
-    supplied_execution_id = job.spec.arguments.get("execution_id")
-    if supplied_execution_id is not None:
-        validated_execution_id = validate_jarvis_execution_id(supplied_execution_id)
-        if validated_execution_id != expected_execution_id:
-            raise ValueError(
-                "trusted jarvis_run execution_id must match the relay-owned "
-                "cluster and idempotency identity"
-            )
-    execution_id = expected_execution_id
-    return job.model_copy(
-        update={
-            "spec": job.spec.model_copy(
-                update={
-                    "arguments": {
-                        **job.spec.arguments,
-                        "execution_id": execution_id,
-                    }
-                }
-            )
-        }
-    )
 
 
 class TerminalJobGcPlan(BaseModel):

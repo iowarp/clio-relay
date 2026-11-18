@@ -223,7 +223,7 @@ def test_endpoint_start_rejects_concurrency_one_against_a_registered_cluster(
     running on ares (PID 3261405) was started with
     ``endpoint start --role worker --cluster ares-p5run2 --concurrency 4
     --control-query-concurrency 1 --kind-concurrency jarvis=2
-    --kind-concurrency mcp_call=3 --scheduler-provider slurm`` -- no live
+    --scheduler-provider slurm`` -- no live
     worker uses --concurrency 1, so this refusal matches how the flag is
     actually operated in the accepted deployment, not merely how it once
     defaulted.
@@ -279,7 +279,7 @@ def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
         worker_capacity=WorkerCapacityPolicy(
             concurrency=5,
             control_query_concurrency=1,
-            kind_concurrency={JobKind.MCP_CALL: 2},
+            kind_concurrency={JobKind.JARVIS: 2},
         ),
     )
 
@@ -310,7 +310,7 @@ def test_endpoint_start_inherits_registered_kind_concurrency_when_unpinned(
     )
 
     assert result.exit_code == 0, result.output
-    assert captured["kind_concurrency"] == {JobKind.MCP_CALL: 2}
+    assert captured["kind_concurrency"] == {JobKind.JARVIS: 2}
 
 
 def test_endpoint_worker_info_exposes_bounded_readiness_mode(

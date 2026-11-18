@@ -84,7 +84,6 @@ from clio_relay.models import (
     JarvisRunSpec,
     JobKind,
     JobState,
-    McpCallSpec,
     OwnerSessionClosure,
     RelayJob,
     RelayTask,
@@ -5130,8 +5129,8 @@ def test_cli_session_cancels_owned_scheduler_after_relay_job_is_terminal(
     job = queue.submit_job(
         RelayJob(
             cluster="ares",
-            kind=JobKind.MCP_CALL,
-            spec=McpCallSpec(server="jarvis-mcp", tool="jarvis_run"),
+            kind=JobKind.JARVIS,
+            spec=JarvisRunSpec(command=["true"]),
             idempotency_key="terminal-relay-owned-scheduler",
             metadata={
                 "owner": "clio-relay",
