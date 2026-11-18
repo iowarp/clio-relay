@@ -54,7 +54,7 @@ from clio_relay.adapters.worker.bootstrap_pin import (
     BOOTSTRAP_PRODUCED_INSTALL_RECEIPT,
     BOOTSTRAP_PRODUCED_RELAY_EXECUTABLE,
 )
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
 from tests.test_cli import (
     _write_test_cluster,  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001

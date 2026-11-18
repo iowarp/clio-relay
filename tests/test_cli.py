@@ -47,7 +47,7 @@ from clio_relay.adapters.worker import (
     cli_owned_relay_jobs_remote_listing,
     cli_owner_session_teardown_verify,
 )
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.session_lifecycle import (
     CleanupResource,

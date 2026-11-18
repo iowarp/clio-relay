@@ -34,7 +34,7 @@ import pytest
 from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, ClusterTargetIdentity
 from clio_relay.errors import ConfigurationError
 

@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.http_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,

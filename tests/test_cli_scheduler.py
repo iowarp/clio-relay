@@ -34,7 +34,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.scheduler_providers as scheduler_providers
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterRegistry
 from clio_relay.models import SchedulerPhase, SchedulerStatus
 from tests.test_cli import (

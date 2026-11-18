@@ -31,7 +31,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from typer.testing import CliRunner
 
 import clio_relay.adapters.worker.storage_runtime as storage_runtime
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import ClusterRegistry
 
 

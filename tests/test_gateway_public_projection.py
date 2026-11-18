@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 import clio_relay.remote_cli as remote_cli
 from clio_relay.adapters.worker import cli as relay_cli
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.adapters.worker.session_lifecycle import CleanupResource

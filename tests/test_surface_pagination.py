@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.config import RelaySettings

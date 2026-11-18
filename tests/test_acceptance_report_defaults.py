@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 import clio_relay.frp_check as frp_check
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.cluster_config import (
     ClusterDefinition,
     ClusterRegistry,

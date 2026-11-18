@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from clio_relay.adapters.worker import deployment
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.deployment import render_endpoint_user_service
 from clio_relay.cluster_config import (
     ClusterDefinition,

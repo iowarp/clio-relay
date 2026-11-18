@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from clio_relay.adapters.worker import queue_artifact_lineage, queue_idempotency, queue_jobs
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import (
     OWNER_SESSION_ID_HEADER,

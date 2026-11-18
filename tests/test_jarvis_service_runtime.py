@@ -25,7 +25,7 @@ import clio_relay.service_runtime_connector_identity as service_runtime_connecto
 import clio_relay.service_runtime_core as service_runtime_core_module
 import clio_relay.service_runtime_observation as service_runtime_observation_module
 import clio_relay.service_runtime_types as service_runtime_types_module
-from clio_relay.adapters.worker.cli import app
+from clio_relay.adapters.worker.cli import worker_app as app
 from clio_relay.adapters.worker.core_queue import ClioCoreQueue
 from clio_relay.adapters.worker.http_api import create_app
 from clio_relay.adapters.worker.remote_connection import validate_channel_request
