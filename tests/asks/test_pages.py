@@ -46,9 +46,9 @@ async def test_get_shows_the_binding_and_changes_nothing(relay_paths: RelayPaths
     assert url.startswith("http://127.0.0.1:")
     assert read_base(relay_paths.state_dir) == origin_of(url)
     assert base_file(relay_paths.state_dir).is_file()
-    for _ in range(3):
-        page = httpx.get(url, timeout=30)
-        assert page.status_code == 200
+    pages = [httpx.get(url, timeout=30) for _ in range(3)]
+    assert [item.status_code for item in pages] == [200, 200, 200]
+    page = pages[-1]
     for key, value in SECURITY_HEADERS.items():
         assert page.headers[key] == value
     assert ask.binding["spec_digest"] in page.text

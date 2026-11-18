@@ -90,7 +90,10 @@ def test_helper_prints_the_answer(
 
 
 def test_helper_exits_1_on_decline(
-    person: Person, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    person: Person,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     person.answer = None
     _env(monkeypatch, "helper-site", tmp_path)
@@ -99,7 +102,10 @@ def test_helper_exits_1_on_decline(
 
 
 def test_helper_confirm_prints_yes(
-    person: Person, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    person: Person,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _env(monkeypatch, "helper-site", tmp_path)
     monkeypatch.setenv("SSH_ASKPASS_PROMPT", "confirm")
@@ -109,7 +115,10 @@ def test_helper_confirm_prints_yes(
 
 
 def test_helper_notice_holds_until_seen(
-    person: Person, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    person: Person,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _env(monkeypatch, "helper-site", tmp_path)
     monkeypatch.setenv("SSH_ASKPASS_PROMPT", "none")
@@ -128,7 +137,10 @@ def test_helper_without_a_page_declines(
 
 
 def test_helper_with_a_wrong_token_declines(
-    person: Person, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    person: Person,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _env(monkeypatch, "helper-site", tmp_path)
     monkeypatch.setenv(askpass.ENV_TOKEN, "not-a-token")
@@ -183,9 +195,7 @@ def _prompt_ask(service: RelayService, site: str) -> Ask | None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer", ["typed-on-the-page", None])
-async def test_a_stray_prompt_becomes_a_page(
-    relay_paths: RelayPaths, answer: str | None
-) -> None:
+async def test_a_stray_prompt_becomes_a_page(relay_paths: RelayPaths, answer: str | None) -> None:
     add_site(relay_paths)
     service = RelayService(relay_paths)
     provider = provider_of(service)

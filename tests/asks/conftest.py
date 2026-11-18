@@ -36,7 +36,7 @@ collect_ignore = [] if FIXTURES_ENV.is_file() else ["test_askpass_otp.py"]
 
 
 @pytest.fixture(autouse=True)
-def _private_keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def private_keyring(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("CLIO_RELAY_KEYRING", "memory")
     for key in list(os.environ):
         if key.startswith(("CLIO_RELAY_GRANT_FILE_", "CLIO_RELAY_GLOBUS_", "CLIO_RELAY_GITHUB_")):

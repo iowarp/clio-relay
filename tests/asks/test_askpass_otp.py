@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from pathlib import Path
 
 import httpx
 import pytest
@@ -60,7 +61,7 @@ def _ssh(fx: dict[str, str], env: dict[str, str]) -> subprocess.CompletedProcess
 @pytest.mark.parametrize("answer", ["code", "decline"])
 async def test_otp_code_typed_on_the_page(relay_paths: RelayPaths, answer: str) -> None:
     fx = _fixtures()
-    secret = open(fx["FX_OTP_SECRET_FILE"], encoding="ascii").read().strip()  # noqa: PTH123, SIM115
+    secret = Path(fx["FX_OTP_SECRET_FILE"]).read_text(encoding="ascii").strip()
     add_site(relay_paths, "fx-otp")
     service = RelayService(relay_paths)
     provider = provider_of(service)
@@ -72,7 +73,11 @@ async def test_otp_code_typed_on_the_page(relay_paths: RelayPaths, answer: str) 
 
     def pending() -> Ask | None:
         for ask in service.asks.all():
-            if ask.site == "fx-otp" and ask.state == "pending" and ask.binding.get("mode") == "prompt":
+            if (
+                ask.site == "fx-otp"
+                and ask.state == "pending"
+                and ask.binding.get("mode") == "prompt"
+            ):
                 return ask
         return None
 

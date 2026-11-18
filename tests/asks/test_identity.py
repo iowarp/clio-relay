@@ -12,7 +12,6 @@ import json
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -42,7 +41,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
-from .conftest import add_site, eventually, hidden_fields, provider_of, submit
+from .conftest import add_site, eventually, provider_of, submit
 
 pytestmark = [pytest.mark.release_platform("posix")]
 
@@ -275,7 +274,9 @@ class GlobusStub:
         )
 
 
-def _stubbed(provider: RelayAskProvider, handler: Callable[[httpx.Request], httpx.Response]) -> None:
+def _stubbed(
+    provider: RelayAskProvider, handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
     async def make() -> None:
         provider._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))  # pyright: ignore[reportPrivateUsage]
 
@@ -318,7 +319,9 @@ async def test_globus_redirect_sign_in(
         state = stub.remember(link)
         callback = parse_qs(urlsplit(link).query)["redirect_uri"][0]
         assert callback == f"{provider.base_url()}/relay/asks/callback"
-        assert client.get(callback, params={"code": "the-code", "state": "other"}).status_code == 404
+        assert (
+            client.get(callback, params={"code": "the-code", "state": "other"}).status_code == 404
+        )
         done = client.get(callback, params={"code": "the-code", "state": state})
         assert done.status_code == 200, done.text
         assert "Signed in" in done.text
@@ -388,9 +391,7 @@ async def test_globus_without_a_client_says_so(relay_paths: RelayPaths) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_grant_finishes_an_identity_ask(
-    relay_paths: RelayPaths, tmp_path: Path
-) -> None:
+async def test_a_grant_finishes_an_identity_ask(relay_paths: RelayPaths, tmp_path: Path) -> None:
     grant = tmp_path / "host" / "globus.json"
     add_site(relay_paths, identity="globus")
     paths = RelayPaths(relay_paths.config_dir, relay_paths.state_dir, {"globus": grant})
@@ -546,7 +547,10 @@ async def test_probe_classifies_sites(
 @pytest.mark.parametrize(
     ("refusal", "state"),
     [
-        (Refusal(RefusalReason.UNREACHABLE, "no allocation", allocation=False), "missing_allocation"),
+        (
+            Refusal(RefusalReason.UNREACHABLE, "no allocation", allocation=False),
+            "missing_allocation",
+        ),
         (Refusal(RefusalReason.NEEDS_SIGN_IN, "x"), "needs_sign_in"),
         (Refusal(RefusalReason.INVALID_CONFIG, "x"), "not_configured"),
         (Refusal(RefusalReason.UNREACHABLE, "x"), "unreachable"),

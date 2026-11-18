@@ -81,4 +81,3 @@ async def test_no_public_address_keeps_the_page_on_loopback(relay_paths: RelayPa
     url = provider.page_address(ask)
     assert url is not None and url.startswith("http://127.0.0.1:")
     await service.close()
-
