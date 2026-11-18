@@ -28,6 +28,12 @@ For CI parity, also verify the built artifacts:
 uvx twine check dist/*
 ```
 
+The rework's relay tests are split by area. `tests/relay_next` covers the core
+service, server, routing and the conformance kit. `tests/asks` covers asks and
+identities, `tests/relay_ssh` the ssh adapter and `tests/relay_tapis` the Tapis
+adapter. The ssh and asks tests reach the W2 fixture sites named in the file
+that `CLIO_RELAY_FIXTURES_ENV` points to.
+
 ## build-once release CI
 
 The trusted release candidate is produced only by the primary Ubuntu/Python

@@ -253,6 +253,7 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
 - [connection model](docs/connection-model.md) — normative
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
+- [guarded sites](docs/guarded-sites.md): what a guarded site runs, and how packages are reviewed
 - [release](docs/release.md)
 - [brand prompt](docs/brand.md)
 - [ai context](docs/ai/README.md)
@@ -260,6 +261,8 @@ Use `session teardown --stop-worker` only when the user chooses to clean up the 
   - [globus](docs/adapters/globus.md): jobs through Globus Compute, files through Globus Transfer
   - [iri](docs/adapters/iri.md): the IRI Facility API that NERSC, ALCF, OLCF and ESnet serve
   - [sky](docs/adapters/sky.md): SkyPilot managed jobs on clouds, Kubernetes and Slurm
+  - [ssh](docs/adapters/ssh.md): any site you can reach with ssh, with or without a batch scheduler
+  - [tapis](docs/adapters/tapis.md): TACC and other Tapis tenants, with no ssh from your machine
 
 ## Development
 

@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from pydantic import ValidationError
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
@@ -30,13 +32,13 @@ pytestmark = pytest.mark.release_platform("posix")
 
 
 class KeyringSky(SkyAdapter):
-    """The adapter with an in-memory keyring."""
+    """The adapter with an in-memory secret store."""
 
     name: ClassVar[str] = "sky-keyring"
-    secrets: ClassVar[dict[tuple[str, str], str]] = {}
+    secrets: ClassVar[dict[str, str]] = {}
 
-    def _secret(self, service: str, entry: str) -> str | None:
-        return self.secrets.get((service, entry))
+    def _secret(self, name: str) -> str | None:
+        return self.secrets.get(name)
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +104,20 @@ async def test_price_comes_from_skypilot_in_dollars(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_price_without_a_duration_has_no_amount(tmp_path: Path) -> None:
+    class NoCall(SkyAdapter):
+        async def call(self, op: str, request: dict[str, Any]) -> dict[str, Any]:
+            raise AssertionError(f"price called SkyPilot ({op}) with no walltime")
+
+    adapter = _build(tmp_path, cls=NoCall)
+    charge = await adapter.price(JobSpec(executable="true", resources=JobResources(node_count=2)))
+    assert charge.amount is None
+    assert charge.walltime_s is None
+    assert charge.node_hours is None
+    assert (charge.nodes, charge.unit, charge.site) == (2, "USD", "aws")
+
+
+@pytest.mark.asyncio
 async def test_price_follows_spot_and_job_overrides(tmp_path: Path) -> None:
     spot = await _build(tmp_path, use_spot=True).price(_hour())
     assert spot.amount == pytest.approx(0.192 * 0.125)
@@ -145,11 +161,14 @@ async def test_keys_from_the_keyring_reach_skypilot(tmp_path: Path) -> None:
     credentials = {"provider": "aws", "env": {"AWS_ACCESS_KEY_ID": "aws-access-key-id"}}
     adapter = _build(tmp_path, KeyringSky, credentials=credentials)
     need = await adapter.sign_in_needed()
-    assert need is not None and need.provider == "aws"
+    assert need is not None and need.provider == "keyring:aws-access-key-id"
+    assert "aws" in need.message
     with pytest.raises(Refusal) as refused:
         await adapter.run(JobSpec(executable="true"), operation_id="op0")
     assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
-    KeyringSky.secrets[("clio-relay", "aws-access-key-id")] = "AKIAEXAMPLE"
+    assert refused.value.data["provider"] == "keyring:aws-access-key-id"
+    assert refused.value.data["cloud"] == "aws"
+    KeyringSky.secrets["aws-access-key-id"] = "AKIAEXAMPLE"
     assert await adapter.sign_in_needed() is None
     spec = JobSpec(executable="sh", arguments=["-c", "echo key=$AWS_ACCESS_KEY_ID"])
     handle = await adapter.run(spec, operation_id="op1")
@@ -157,6 +176,34 @@ async def test_keys_from_the_keyring_reach_skypilot(tmp_path: Path) -> None:
     assert status.state == JobState.COMPLETED
     log = next(Path(item.path) for item in status.outputs if item.name == "run.log")
     assert "key=AKIAEXAMPLE" in log.read_text()
+
+
+def test_secrets_come_from_relays_token_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[str] = []
+
+    class Store:
+        def secret(self, name: str) -> str | None:
+            asked.append(name)
+            return "from-store" if name == "aws-access-key-id" else None
+
+    fake = types.ModuleType("clio_relay.identity.store")
+    fake.__dict__["TokenStore"] = Store
+    monkeypatch.setitem(sys.modules, "clio_relay.identity.store", fake)
+    credentials: dict[str, object] = {
+        "provider": "aws",
+        "env": {"AWS_ACCESS_KEY_ID": "aws-access-key-id"},
+    }
+    adapter = _build(tmp_path, credentials=credentials)
+    assert adapter._credential_env() == {"AWS_ACCESS_KEY_ID": "from-store"}  # pyright: ignore[reportPrivateUsage]  # pyright: ignore[reportPrivateUsage]
+    assert asked == ["aws-access-key-id"]
+
+
+def test_the_old_keyring_service_setting_is_refused(tmp_path: Path) -> None:
+    credentials: dict[str, object] = {"provider": "aws", "service": "clio-relay", "env": {}}
+    with pytest.raises(ValidationError):
+        SkyConfig.model_validate({**local_config(tmp_path), "credentials": credentials})
 
 
 @pytest.mark.asyncio

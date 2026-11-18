@@ -379,8 +379,17 @@ def test_client_without_elicitation_gets_a_typed_refusal_and_a_page(
             (ask,) = refusal["data"]["asks"]
             assert ask["page"].startswith("http://127.0.0.1:")
             assert await asyncio.to_thread(answer_page, ask["page"]) == 200
+            operation_id = refusal["data"]["operation_id"]
+            changed = {**ECHO, "arguments": ["something-else"]}
+            mismatch = await client.call_tool(
+                "run",
+                {"resume": operation_id, "site": "fx", "spec": changed, "wait_s": 0},
+                raise_on_error=False,
+            )
+            assert mismatch.is_error
+            assert _structured(mismatch)["refusal"]["reason"] == "approval_mismatch"
             resumed = await client.call_tool(
-                "run", {"resume": refusal["data"]["operation_id"], "wait_s": 30}
+                "run", {"resume": operation_id, "site": "fx", "spec": ECHO, "wait_s": 30}
             )
             assert _structured(resumed)["state"] == "completed"
 

@@ -11,6 +11,7 @@ legacy one, and otherwise as a typed refusal that names the ask and its page.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 from collections.abc import AsyncGenerator, Sequence
@@ -50,9 +51,11 @@ from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.changes import ServerChanges
+from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, files_call
-from clio_relay.surface.service import RelayService, endpoint_summary, service_ready
+from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.surface.skills import SkillResources
 
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
@@ -68,7 +71,8 @@ INSTRUCTIONS = (
     "Relay runs work on the sites in its sites file. Call describe first. "
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
     "exec runs one short command; files lists, reads, writes and stages files; "
-    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal."
+    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal. "
+    "A site's skill, when it has one, is the resource relay://sites/<site>/skill."
 )
 
 
@@ -258,6 +262,9 @@ class RelayTasksExtension(ServerExtension):
             return "waiting for a sign-in to finish"
         if service_ready(record):
             return f"the service is running: {endpoint_summary(record)}"
+        latest = service_message(record)
+        if latest is not None:
+            return f"the service is {record.state.value}: {latest}"
         return f"relay operation is {record.state.value}"
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
@@ -378,6 +385,7 @@ class RelayServer:
         self.service = service
         self.tasks = RelayTasksExtension(service)
         self.changes = ServerChanges()
+        self.skills = SkillResources(service.paths.config_dir, service.sites)
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
         modes = _elicitation_modes(ctx)
@@ -458,6 +466,7 @@ class RelayServer:
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
+                self.service.same_request(self.service.operation(resume), site, spec)
                 record = await self.service.advance(resume)
                 return await self._deliver(ctx, record, wait_s)
             if site is None or spec is None:
@@ -524,19 +533,7 @@ class RelayServer:
     ) -> ToolResult | InputRequiredToolResult:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
-        if site is not None and spec is not None:
-            entry = self.service.site(site)
-            current = (
-                self.service.prepare_service(entry, spec)
-                if isinstance(spec, ServiceSpec)
-                else self.service.apply_defaults(entry, spec)
-            )
-            if site != record.site or current.digest() != record.spec_digest:
-                raise Refusal(
-                    RefusalReason.APPROVAL_MISMATCH,
-                    "the retry's arguments differ from what was asked about; call run again",
-                    operation_id=operation_id,
-                )
+        self.service.same_request(record, site, spec)
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
                 action, content = _response_parts(response)
@@ -736,15 +733,22 @@ class RelayServer:
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
         server.add_extension(self.tasks)
+        server.add_provider(self.skills)
         self.changes.install(server)
         self.service.serve_hook.attach(server, self.changes)
         return server
 
     @asynccontextmanager
     async def _lifespan(self, _server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
+        # A service that ended while relay was down is finished without anyone asking.
+        observing = asyncio.create_task(self.service.observe_open_services())
+        watching = asyncio.create_task(self.skills.watch(self.changes))
         try:
             yield {}
         finally:
+            observing.cancel()
+            watching.cancel()
+            await asyncio.gather(observing, watching, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 

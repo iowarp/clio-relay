@@ -42,9 +42,17 @@ def add_site(
     return SiteStore(paths.sites_file).add(entry)
 
 
-def answer_page(url: str, action: str = "accept", value: str | None = None) -> int:
-    """Open a loopback ask page and submit it the way a person would."""
-    with httpx.Client(timeout=10) as client:
+def answer_page(
+    url: str,
+    action: str = "accept",
+    value: str | None = None,
+    auth: tuple[str, str] | None = None,
+) -> int:
+    """Open a loopback ask page and submit it the way a person would.
+
+    Over HTTP the page sits behind the operator credential, passed as ``auth``.
+    """
+    with httpx.Client(timeout=10, auth=auth) as client:
         page = client.get(url)
         page.raise_for_status()
         token = re.search(r"name='t' value='([^']+)'", page.text)

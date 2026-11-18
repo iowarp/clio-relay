@@ -1,0 +1,23 @@
+id: stampede3
+name: TACC Stampede3
+description: >-
+  TACC's Stampede3, through Tapis. Needs a TACC allocation on Stampede3. Jobs run
+  reviewed clio-jarvis packages only, and every job asks before it spends.
+source: https://docs.tacc.utexas.edu/hpc/stampede3/
+address: stampede3.tacc.utexas.edu
+adapter: tapis
+identity: tacc
+config:
+  base_url: https://tacc.tapis.io
+  tenant_id: tacc
+  authn: tms
+  launcher: guarded
+alternatives:
+  worker:
+    ssh_profile: stampede3
+policy: guarded
+spend:
+  ask: always
+defaults:
+  account: null
+skill: stampede3

@@ -154,8 +154,8 @@ class Charge(BaseModel):
     queue: str | None = None
     account: str | None = None
     nodes: int
-    walltime_s: float
-    node_hours: float
+    walltime_s: float | None = Field(default=None, description="None when no walltime is set")
+    node_hours: float | None = Field(default=None, description="None when unknown")
     amount: float | None = None
     unit: str = "node-hours"
 
@@ -192,6 +192,17 @@ class GuardHook(Protocol):
 
     async def price(self, site: SiteEntry, spec: JobSpec) -> Charge:
         """Return the most ``spec`` may cost on ``site``."""
+        ...
+
+    async def prepare(
+        self, site: SiteEntry, spec: JobSpec, *, adapter: BaseAdapter[Any]
+    ) -> JobSpec:
+        """Return the spec ``adapter`` submits, for example with a reviewed package staged.
+
+        Relay calls it just before it submits a job or starts a service's job.
+        It never changes the operation record, so the approved digest stays the
+        one the person saw. A refusal fails the operation.
+        """
         ...
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -42,6 +43,7 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
+log = logging.getLogger(__name__)
 UUID_PATTERN = r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 LAUNCHERS = ("mpiexec", "mpirun", "srun", "aprun")
 _STATES = {
@@ -80,7 +82,11 @@ class StartConfig(BaseModel):
         min_length=1,
         description="Command that starts the endpoint",
     )
-    timeout_s: float = Field(default=900, gt=0, description="Longest the start command may take")
+    timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Optional limit on the start command. By default it runs until it ends",
+    )
 
 
 class GlobusConfig(BaseModel):
@@ -230,7 +236,7 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
             values[keys.account] = attributes.account
         if keys.queue and attributes.queue_name:
             values[keys.queue] = attributes.queue_name
-        if keys.walltime:
+        if keys.walltime and attributes.duration is not None:
             values[keys.walltime] = format_walltime(
                 attributes.duration, self.config.walltime_format
             )
@@ -294,9 +300,27 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
                 content=self.context.content,
             ),
         )
+
+        async def quiet(silent_s: float, next_check_s: float) -> None:
+            log.info(
+                "the endpoint start on %s has printed nothing for %.0f s; checking again in %.0f s",
+                self.context.site_id,
+                silent_s,
+                next_check_s,
+            )
+
         result = await helper.exec(
-            list(start.command), timeout_s=start.timeout_s, max_output_bytes=65536
+            list(start.command),
+            timeout_s=start.timeout_s,
+            max_output_bytes=65536,
+            on_stall=quiet,
         )
+        if result.timed_out:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"the endpoint is {info.status} and starting it through {start.adapter} "
+                f"did not finish within the site's timeout_s ({start.timeout_s} s)",
+            )
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.UNREACHABLE,

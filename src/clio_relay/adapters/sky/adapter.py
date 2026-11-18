@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
 import json
 import os
 import re
@@ -66,14 +67,14 @@ _EXIT_CODE = re.compile(r"exit code[:= ]+(-?\d+)", re.IGNORECASE)
 
 
 class SkyCredentials(BaseModel):
-    """Cloud keys relay keeps in the keyring and hands to SkyPilot as variables."""
+    """Cloud keys the person typed on relay's page, handed to SkyPilot as variables."""
 
     model_config = ConfigDict(extra="forbid")
 
-    provider: str = Field(description="Identity name shown when a key is missing, such as aws")
-    service: str = Field(default="clio-relay", description="Keyring service the keys are under")
+    provider: str = Field(description="Cloud named when a key is missing, such as aws")
     env: dict[str, str] = Field(
-        description="Variable to keyring entry, such as AWS_ACCESS_KEY_ID: aws-access-key-id"
+        description="Variable to secret name in relay's store, "
+        "such as AWS_ACCESS_KEY_ID: aws-access-key-id"
     )
 
 
@@ -185,24 +186,29 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
         self.python = python
         self.records = context.state_dir / "sky-jobs"
 
-    def _secret(self, service: str, entry: str) -> str | None:
-        import keyring
-
-        return keyring.get_password(service, entry)
+    def _secret(self, name: str) -> str | None:
+        """Return a secret the person typed on relay's page, from relay's token store."""
+        try:
+            store_module = importlib.import_module("clio_relay.identity.store")
+        except ImportError:
+            return None
+        value: object = store_module.TokenStore().secret(name)
+        return value if isinstance(value, str) else None
 
     def _credential_env(self) -> dict[str, str]:
         credentials = self.config.credentials
         if credentials is None:
             return {}
         found: dict[str, str] = {}
-        for variable, entry in credentials.env.items():
-            value = self._secret(credentials.service, entry)
+        for variable, name in credentials.env.items():
+            value = self._secret(name)
             if not value:
                 raise Refusal(
                     RefusalReason.NEEDS_SIGN_IN,
-                    f"relay has no {credentials.provider} key {entry}; add it on relay's page",
-                    provider=credentials.provider,
-                    entry=entry,
+                    f"relay has no {credentials.provider} key {name}; add it on relay's page",
+                    provider=f"keyring:{name}",
+                    cloud=credentials.provider,
+                    secret=name,
                 )
             found[variable] = value
         return found
@@ -309,7 +315,10 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
     async def price(self, spec: JobSpec) -> Charge:
         """Return what ``spec`` may cost, in US dollars, from SkyPilot's catalog."""
         nodes = spec.resources.nodes()
-        walltime_s = spec.attributes.duration.total_seconds()
+        duration = spec.attributes.duration
+        if duration is None:
+            return Charge(site=self.context.site_id, nodes=nodes, unit="USD")
+        walltime_s = duration.total_seconds()
         found = await self.call(
             "price", {**self.resources(spec), "seconds": walltime_s, "nodes": nodes}
         )
@@ -334,7 +343,7 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
         try:
             self._credential_env()
         except Refusal as refusal:
-            provider = str(refusal.data.get("provider", "cloud"))
+            provider = str(refusal.data.get("provider", "keyring"))
             return SignInNeed(provider=provider, message=refusal.message)
         return None
 

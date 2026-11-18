@@ -42,12 +42,14 @@ Kept by W1 as the ledger's header owner. The coordinator assigns owners.
 | clio-agent: `test_sync_tool_executor_setup_waits_while_its_server_starts` (a 1 s no-progress timing test) failed once under load on Ares and passed on rerun | W3 | TBD (coordinator) | Not written off as flaky. If it fails again under load, remove it or replace it with a deterministic check before the final merge |
 | clio-relay: the old process-containment tests depend on a systemd user manager | W1 | W8 | On Ares compute nodes uid 1008 has no user manager unless a session happens to exist, so `systemd-run --user` fails with "Failed to connect to bus" and the failing set changes between runs (`test_process_containment`, `test_storage_process_guard`). The code is unchanged from develop. On the login node (linger, stable bus) both modules pass 43 of 43, 3 runs out of 3. Not written off as flaky: run them where a user manager exists, or make the capability probe and the spawn agree, before the final merge |
 | clio-relay: develop's full suite has 139 pre-existing failures and 3 errors on Ares | W1 | TBD (coordinator) | origin/develop 034117b, same node type. Mostly the old surface (bootstrap receipts, JARVIS receipt binding, `/run/user` absent on compute nodes). Triage before the final merge |
+| clio-relay: `tests/relay_ssh/test_ssh_fixtures.py:223` skips `test_lq9_a_code_site_refuses_and_names_worker[True]` when W6's askpass is installed | W1 | W7 | It skips on the integration branch, where askpass is always installed. A skip counts as a failure. Make the case hold with askpass installed, or remove the parameter |
 
 ## Decisions across workstreams
 
 Kept by W1 as the ledger's header owner. Each is the coordinator's.
 
 - **LQ14 reads as one server instance.** Raised by W2. Protocol `2026-07-28` has no MCP session: `ctx.session_id` changes on every call, over Streamable HTTP and over stdio. "One session" in LQ14 therefore means continuity of one server instance (and one client connection). W2's counter reports `server_instance` for this. W9 and W16 test against it.
+- **Tab action tools are listed only to A2UI clients, as app-only (amends LQ1 and review round 2 #2).** Raised by W14: clio-agent's dispatcher (`server_actions.resolve_server_tool`) and its executor permission gate call only tools that appear in `tools/list`, so tab actions kept out of every listing would leave each Compute tab button broken. Relay lists its tab action tools, marked `_meta.ui.visibility: ["app"]`, only in a `tools/list` request whose `_meta` declares `org.a2ui/a2ui`. That is the standard MCP Apps app-only pattern and needs no host change. A client without A2UI sees exactly the five verbs plus mounted tools. Every action call still needs its single-use action token, so a host that ignores visibility still cannot act. W14 builds it in `surface/a2ui/`, and asks W1 if it needs a hook in the `tools/list` path.
 - **clio-kit relay rework work targets main, per the execution plan's base and drift row.** Raised by W15. clio-kit's develop (8375600b) is the old layout, without mcp-servers/ and with ParaView 2.2.3, and has diverged from main (38 ahead, 175 behind, 80 conflicts). W15 stays on main; its branch line is updated when it sends its final commit with the paraview-mcp 3.2.0 bump.
 
 ## W1. Relay core
@@ -93,25 +95,50 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
 - **Ask pages mount on the HTTP server (W6).** `MountsPages` is an optional Protocol (`mount(server)`). `create_server` calls it after `build()` for HTTP when the ask provider implements it. W9's `attach` follows the same pattern. `HookContext.settings["public_base_url"]` holds the server's public origin.
 - **`serve` over HTTP.** The command line takes `--grant-file PROVIDER=PATH` (repeatable). It did not exist at M1, though the published interfaces listed it. It also takes `--tls-cert` and `--tls-key`, given together, which make the origin https for RL25a. Uvicorn's access log is off, because page addresses carry single-use tokens.
 - **The job name is recorded before submit.** A run's SUBMITTING move stores `result["job_name"]` with the note "job name X" (RL25a).
-- **The asks command group comes from W6 when installed.** `clio-relay-next asks` mounts `clio_relay.cli_asks.app`. Without it, the built-in `list` and `answer` remain.
+- **The asks command group is W6's.** `clio-relay-next asks` mounts `clio_relay.cli_asks.app`. The built-in `list` and `answer` were removed when W6 merged.
 - **Bounded commands leave nothing behind.** `run_bounded` reads both pipes to their end after a timeout kill. When its caller is cancelled, it kills the process group before it re-raises. This fixed a leaked subprocess transport ("Event loop is closed") from the local conformance tests, which was already present at M1. The relay_next suite now runs with `PytestUnraisableExceptionWarning` as an error.
 - **W11 merged.** `jaimecernuda-relay-rework-w11` at b41c756 is merged as aa9b7b1. Its adapter pages are in the docs index in `README.md`.
 - **Routing skips an adapter whose settings do not build (RL5, coordinator decision).** An alternative that fails at build time with `invalid_config`, such as Aurora with no endpoint or iri with no `resource_id`, is skipped, and routing moves on to the next one. The skip is part of the route, as `skipped: [{site, adapter, reason, message}]`. It shows in `describe`'s routes, in an operation's `result["skipped"]` and in an `exec` result, so the person sees why it was not used. When every candidate fails, the call refuses with `invalid_config`, and the refusal lists each adapter's reason. Any other refusal at build time is still returned as it is. Routing builds each candidate through the service's adapter cache (`RelayService.route` and `site_routes`).
 - **`exec` has no hard time limit (coordinator decision, the person's rule).** `timeout_s` is optional and has no default or ceiling. Without it the command runs until it ends. After 30 s with no output on either stream, relay reports it as quiet, then reports again after waits that double (30, 60, 120 s and so on, capped at 600 s) while it stays quiet. Each report is a progress notification on the call (not a log message, since logging is deprecated at `2026-07-28`): "no output for N s; the command is still running; relay checks again in M s; cancel the call to stop it". Cancelling the call kills the command's process group. A caller may still pass `timeout_s`, and then the command is killed at that limit as before. Every adapter's `exec` must accept `timeout_s=None` and an optional `on_stall`.
 - **The conformance kit no longer skips.** For a verb the adapter does not implement, each kit test asserts the typed `verb_not_implemented` refusal and passes, instead of skipping. A new kit test runs `exec` with no time limit.
+- **Wave 1 merges.** Each was merged into `jaimecernuda-relay-rework-w1`, gated on Ares and then pushed to the integration branch:
+  - W11 at 785dcba, then at b8c9cf4 (merge f8a02d2), which moves globus and sky onto W6's identity API. Then at 745308c (merge 3f2d571), which adds regression tests for my duration compat edits in globus, iri and sky. The `credentials.service` setting is gone, and a config that still sets it is refused with `invalid_config`.
+  - W7 at c30e348 (merge 82a2302), then its follow-up at cbf2e39 (merge 9490a62). Its exec replaces my compat stopgap c5ea18b.
+  - W6 at 4bad7cb, then at 03c2819 (merge a27a8b2), with the device-flow fix. Then at 0945b1a, which adds the crash rerun's evidence and Package, Version and Source rows on the approval page for package reviews.
+  - W10 at c5b6c3c, then at 09d1cf8 (merge 303524b), then at 0388291, with `on_site_added` for Tapis and W6's types. W10 replaced my compat `_max_minutes`. When Tapis gets no `maxMinutes`, it falls back to the app's limit, then the system's, then 10 minutes, and kills the job. So the mapping always sends one: the duration, else the queue's `maxMinutes` for BATCH jobs, else 525600. At the cutover, the W10 run sheets that name `clio-relay-next` get renamed.
+  - Fixes at merge: `conftest.answer_page(..., auth=)`, and `test_transports` passes the operator token to the ask page over HTTP.
+- **Relay never imposes a walltime or a duration (coordinator decision, the person's rule).** `JobAttributes.duration` is `timedelta | None` with no default, for run and serve specs alike. When it is unset, the site's `defaults.duration` applies if the site sets one. Otherwise no walltime is sent, and the scheduler's own default applies. `to_psij` passes `duration=None` explicitly, because psij's own default is 10 minutes. `JobSpec.node_hours()` returns `None` when the duration is unknown, and `Charge.walltime_s` and `Charge.node_hours` may be `None`, meaning unknown. The globus, iri, tapis and sky adapters send no walltime when the spec has none. These are compat edits in W10's and W11's files, for their owners to review. Sky prices such a job with no amount.
+- **An unknown cost always asks (coordinator decision).** `SpendPolicy.needs_approval(None)` is true unless the site's `ask` is `never`. The approval message says plainly: "sets no walltime, so its duration and cost are unknown: the scheduler's default limit applies".
+- **No new job state for a job the scheduler forgot (coordinator decision).** A job the scheduler no longer lists, with no exit record of its own, stays open as running with `native_state: "unknown"` and a message that says cancel ends it. It is never recorded as failed. W7's ssh adapter and relay's `local` adapter both follow this.
+- **Local batch jobs are named and leave a record (W6's crash finding).** psij 0.9.11's templates read `job.name`, which psij's `Job` lacks, so they never name a job. Slurm then names it `submit.sh`, and `find()` cannot reconcile a job submitted just before a crash. `LocalAdapter.name_submit` puts the name on the submit line: Slurm `--job-name=`, PBS `-N`, LSF `-J`. `mark_script` has the job script write its scheduler id to `scheduler_id` in the job directory, and `find()` reads that when the scheduler has forgotten the job. The job's exit code comes from psij's `<native_id>.ec` file. Ares has `sacct` off and `MinJobAge` 300 s, so the scheduler forgets a finished job after 5 minutes.
+- **psij 0.9.11 bugs that relay works around.** `Job` has no `name`, as above. The pbspro template writes `-N="x"`, which qsub refuses. Paths are made absolute against the local machine, not the site. W7's ssh adapter renders its own scripts for the last two.
+- **A resumed run must match its approval.** `run(resume=op, site=, spec=)` with a changed site or spec refuses with `approval_mismatch`, as a task's resume round does. `RelayService.same_request(record, site, spec)` holds the check.
+- **A sign-in finished elsewhere closes its ask.** `advance()` resolves a pending URL ask as accepted when the adapter's `sign_in_needed()` returns `None`. This covers a device-flow sign-in finished at the provider when no one answered relay's page.
+- **`describe` with no site gives each site's status (LQ2).** Each listed site has `status`: `{"state": "ready"}`, `{"state": "needs_sign_in", "provider", "detail"}` or `{"state": "unavailable", "reason", "detail"}`. It asks the adapter that serves `describe` whether a sign-in is needed. That reads local state and runs nothing remote. `src/clio_relay/surface/describing.py` holds both reports.
+- **Adapters may set a site up when it is added (W10's request).** The optional protocol is `clio_relay.adapters.base.SiteAdded`, with `async on_site_added(site: SiteEntry) -> dict | None`. `RelayService.site_added(site_id)` calls it on the adapter in use and on every alternative that implements it. The command line calls it after `site add`, `add-from-catalog`, `edit` and `switch`, and prints the results under `set_up`. A typed refusal, such as no sign-in yet, is reported, and the site stays saved, so the method must be safe to run again. An adapter whose settings do not build is left out here; `describe` shows why.
+- **Hooks see the config directory.** `HookContext.settings["config_dir"]` (W6's request).
+- **Relay keeps watching a service (W9's requests).** While a service is not ready, its task status message is "the service is <state>: <the hook's latest message>". A TLS refusal or a hung start is therefore visible on `tasks/get`. When the server starts, it observes each open service once, in the background, so a service that ended while relay was down is finished and its forwards close. Any error from `ServeHook.status` is a failed look, not the service's end: the service stays open, and its message says "relay could not observe the service: <error>". The hook must keep secrets out of its exception text, as it does out of `JobStatus.message`.
+- **Site skills are resources (RL34).** `relay://skills/{name}` serves each skill: the catalog's `catalog/skills/<name>.md`, or the person's own `<config_dir>/skills/<name>.md`, which replaces a shipped one of the same name. `relay://sites/{site}/skill` serves the skill a site links with its `skill` field, which is a skill name or the path of a Markdown file (a relative path is read from the config directory). Both are `text/markdown` for the assistant, listed by a FastMCP provider (`surface/skills.py`, `SkillResources`) that reads the disk on each request, so a skill linked from the command line shows without a restart. A site with no skill, or with a link relay cannot read, has no site skill resource. `describe` gives each site `skill`: `None`, `{"linked", "uri"}`, or `{"linked", "uri": None, "detail"}` when the link is broken. The server looks at the sites file and skills every 5 s and announces a changed list or an edited skill on the change bus. The server instructions name the URI, and `site add --skill` links one.
+- **Package reviews are approvals, and the guard prepares what runs (W13's requests R1 to R3, RL24 and RL45).**
+  - `check_run`'s decision may carry `data["asks"]`, a list of reviews. Each has a `message` and a `binding` (`kind: "package_review"`, `package`, `version`, `package_hash`, `source`). Relay turns each into an approve ask bound to the site and the spec digest, placed after the sign-in ask and before the spend ask. `advance` checks it like any approval (`surface/guarding.py`, `review_asks`).
+  - `GuardHook.prepare(site, spec, *, adapter) -> JobSpec` returns the spec the adapter submits. Relay calls it in `submit` just before `adapter.run`, and on a service's job just before `ServeHook.start`. It never changes `record.spec`, so the approved digest stays the one the person saw. A refusal from it fails the operation. `DefaultGuard.prepare` returns the spec unchanged.
+  - `BaseAdapter.runs_packages` (default `False`) says the adapter runs a reviewed package rather than the agent's command. Tapis sets it.
+  - The entry point `guard = "clio_relay.guard:create_guard"` is registered. It falls back to `DefaultGuard` while `clio_relay.guard` is not installed.
+  - The docs index links `docs/guarded-sites.md`, which W13 writes.
 
 ### Published interfaces (M1)
 
 Owned by W1, not frozen. A change goes through W1, which reruns every consumer's contract tests first.
 
-- Adapters (`clio_relay.adapters.base`): the `Adapter` Protocol (`name`, `Config`, `describe`, `run(spec, operation_id)`, `status`, `cancel`, `find(operation_id)`, `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)`, `files`, `serve`), `BaseAdapter[ConfigT]`, `SiteInfo`, `SignInNeed`, `AdapterContext`.
+- Adapters (`clio_relay.adapters.base`): the `Adapter` Protocol (`name`, `Config`, `describe`, `run(spec, operation_id)`, `status`, `cancel`, `find(operation_id)`, `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)`, `files`, `serve`), `BaseAdapter[ConfigT]`, `SiteInfo`, `SignInNeed`, `AdapterContext`, and the optional `SiteAdded` (`on_site_added(site)`).
 - Jobs (`clio_relay.jobs`): `JobSpec` (PSI/J names, `JobResources.to_psij()` builds `ResourceSpecV1`), `JobResources`, `JobAttributes`, `InputRef`, `PackageRef`, `ServiceSpec`, `ServicePort`, `ServiceLifetime`, `canonical_digest`, `JobHandle`, `JobStatus`, `JobState`, `ExecResult`, `StallReport` and `STALL_S`, `Endpoint`, `EndpointPort`, `FileEntry`, `FileAccess`, `OutputRef`.
 - Records: `OperationRecord`, `OperationState`, `RecordStore`. Layout: `<state>/operations/`, `<state>/asks/`, `<state>/sites/<site>/<adapter>/`, and `sites.yaml` in the config directory.
 - Content store: `ContentStore` at `<state>/content/cas/sha256/<first two hex>/<digest>`.
 - `RefusalReason`, 24 typed reasons: `verb_not_implemented`, `site_not_found`, `site_exists`, `unknown_adapter`, `adapter_unavailable`, `invalid_config`, `invalid_spec`, `invalid_arguments`, `guard_unavailable`, `policy_refused`, `needs_approval`, `needs_sign_in`, `declined`, `interactive_auth_required`, `operation_not_found`, `ask_not_found`, `approval_mismatch`, `input_missing`, `path_not_found`, `path_exists`, `not_cancellable`, `submit_failed`, `unreachable`, `timeout`.
-- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` (`start`, `status`, `stop`, `attach`, `ui_data`) for W9; the optional `MountsPages` (`mount`) for an ask provider's pages.
+- Hooks (`clio_relay.adapters.hooks`): `Ask`, `AskProvider` (`choose`, `approve`, `url`) for W6; `GuardHook` (`check_run`, `check_exec`, `price`), `Charge` and `GuardDecision` for W13; `ServeHook` (`start`, `status`, `stop`, `attach`, `ui_data`) for W9; the optional `MountsPages` (`mount`) for an ask provider's pages. `HookContext.settings` holds `grant_files`, `config_dir` and, over HTTP, `public_base_url`.
 - Serve runtime, provided by W9 and imported lazily: `clio_relay.serve.factory`, `start_for(adapter, spec, *, operation_id)`, `connect(handle, *, paths)` and `settings(paths, changes)`, where `changes` is None to show. `SiteEntry.serve` holds a site's serve settings.
 - Change events: `ServerChanges` (above).
+- Skills (`clio_relay.surface.skills`): `skill_uri(name)`, `site_skill_uri(site)`, `skills(config_dir)`, `site_skill`, `skill_link`, and the `SkillResources` provider.
 - Routing (`clio_relay.sites.routing`): `route(entry, verb, check) -> Routed(adapter, config, skipped)`, `routes(entry, check) -> list[Route]`, and `Skipped(site, adapter, reason, message)` in `Route.skipped`.
 - Command line `clio-relay-next`: `serve` (stdio, or HTTP with a bearer token, `--grant-file`, `--tls-cert` and `--tls-key`), `adapters`, `site`, `asks`, `connect <handle>`, `rendezvous set|show`.
 
@@ -362,6 +389,117 @@ Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `j
 
 ## W6. Asks and identities
 
+Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2 merged in). Files: `src/clio_relay/asks/`, `src/clio_relay/identity/` (not `tacc.py`), `src/clio_relay/cli_asks.py`, `tests/asks/`.
+
+### Published interfaces
+
+- **The `asks` hook.** `clio_relay.asks:create_provider(context) -> RelayAskProvider`, registered as `asks` in `clio_relay.hooks` (a60bc01). It implements W1's `AskProvider`:
+  - `choose(...)` and `approve(...)` store a form ask. An approval is bound to the operation id, the spec digest and the charge, and the page shows queue, account, nodes, walltime and the most it may use.
+  - `url(site=, operation_id=, need=)` stores a URL ask.
+  - It also implements `MountsPages.mount(server)`, `page_address(ask)` and `close()`.
+  - The sign-in mode comes from the need: an `https` URL is an external page; `keyring:<name>` asks for a secret; a name in the identity table is a sign-in through that provider; a site with a registered askpass starter runs ssh; anything else is a confirm.
+- **The page.** Each page is single-use: the token in its URL is good for one POST, and a second POST gets 404. The link expires after `CLIO_RELAY_PAGE_TTL_S` (default 24 hours); the ask itself does not, and `asks page <ask>` mints a fresh link. GET only shows. A POST needs a CSRF token that is an HMAC of the ask and page token. Nothing is logged: the askpass answers stay in memory, the records hold no secret, and `serve` runs uvicorn with its access log off.
+  - Over stdio the page is on a loopback listener, and `<state>/pages/base.json` holds its address.
+  - Over Streamable HTTP it is under relay's own origin at `/relay/asks/<ask_id>` and `/relay/asks/callback`. It needs the operator credential: HTTP Basic, any user name, with the operator token as the password. The token is `CLIO_RELAY_OPERATOR_TOKEN` or `<state>/operator-token` (0600, written when the routes mount). This is separate from the MCP bearer token, so a client holding only the bearer cannot approve anything.
+- **Askpass (RL28), as given to W7.** An adapter calls `clio_relay.asks.askpass.environment(site=, operation_id=None, title=None, state_dir=None)`. That returns `SSH_ASKPASS` (`clio-relay-askpass`, the `[project.scripts]` entry; `askpass.program()` finds it), `SSH_ASKPASS_REQUIRE=force`, `DISPLAY`, `CLIO_RELAY_ASKPASS_ADDR`, `CLIO_RELAY_ASKPASS_TOKEN`, `CLIO_RELAY_ASKPASS_SITE` and, when given, `CLIO_RELAY_ASKPASS_OPERATION`.
+  - The adapter sets `BatchMode=no` and closes stdin.
+  - ssh runs the helper once per prompt, with the prompt as `argv[1]`. The helper prints the answer, or exits 1 on a decline.
+  - `SSH_ASKPASS_PROMPT=confirm` prints `yes` on agreement. `none` shows a notice until ssh ends the helper.
+  - `askpass.register_sign_in(site_id, async starter(env))` lets a site's sign-in run from the page.
+  - W7 found that `-M` together with `-o ControlMaster=yes` puts OpenSSH in ask mode, which raises "Allow shared connection?" through askpass every session. Use `ControlMaster=yes` alone.
+- **The identity table (RL30), as given to W10.** `clio_relay.identity`:
+  - `register(name, factory | None)`, `get(name)` (returns the factory), `names()`, and the entry point group `clio_relay.identities`.
+  - Relay ships `globus` and `github`. `tacc` points at `clio_relay.identity.tacc:TaccIdentity` and is skipped while that module is absent.
+  - A factory takes `IdentityContext(store, grants, settings)`.
+  - A provider meets the `IdentityProvider` Protocol in `identity/base.py`: `name` and `title`, plus async `status()`, `token(resource_server=None)`, `begin(ctx)`, `poll(ctx, step)`, `callback(ctx, params)` and `sign_out()`.
+  - A redirect provider keeps its OAuth state in `step.data["state"]`. `step.data` is never shown or written down.
+  - **A device flow** sets `poll_interval_s` on its step. Relay polls at that interval whether `relay_page` is true or false, and adds 5 s when the provider answers `slow_down`. When the code expires (`poll` returns `expired`, or the step's optional `expires_at` passes), relay calls `begin` again and shows the new link and code on the same ask's page. The ask stays pending, and nothing limits how long the person takes. `clio_relay.identity.device.follow` is the shared loop, used by both the page and `asks sign-in`.
+- **Shared identities for adapters.** `clio_relay.identity.shared()` returns the `Identities` the serving relay uses, so it sees `--grant-file`. Outside a serving relay it builds one from `CLIO_RELAY_GRANT_FILE_<PROVIDER>` and the keyring. `shared().get("globus")` returns a built provider.
+- **Grant files.** `GrantFiles` reads `CLIO_RELAY_GRANT_FILE_<PROVIDER>`, overridden by `--grant-file PROVIDER=PATH`. It re-reads a file when its mtime, size or inode changes. A grant token comes before a keyring token. On a change, `GrantWatcher` probes the sites that name that identity (`identity/probe.py`; results in `<state>/identity/probes.json`).
+- **The keyring.** `TokenStore` uses keyring service `clio-relay` with JSON entries. Secrets typed on the page are kept as `secret:<name>`, read with `TokenStore().secret(name)`, and written with `set_secret` and `delete_secret`. `CLIO_RELAY_KEYRING=memory` keeps entries in the process, for tests.
+- **`clio-relay-next asks`** (mounted by `cli_next`):
+  - `list [--all]`, `show`, `page`;
+  - `answer <ask> [--decline] [--value]`, `decline`;
+  - `identities`, `sign-in <provider>`, `sign-out <provider>`, `probe <provider>`.
+  - `answer` refuses with exit 2 (`approval_mismatch`) when the operation's spec digest no longer matches the approval.
+
+### Answers for W11
+
+- `Token` is a pydantic model: `resource_server: str | None`, `access_token: SecretStr` (read it with `.get_secret_value()`), `token_type = "Bearer"`, `expires_at: datetime | None`, `scopes: list[str]`, `source: "grant" | "keyring"`, and `live()`. It is not a tuple.
+- `status()` and `token()` are async, as are `begin`, `poll`, `callback` and `sign_out`.
+- Use `clio_relay.identity.shared().get("globus")`, not `identity.get("globus")`: `get` returns the factory, not a provider.
+- Cloud keys: the service `clio-relay` is W6's, so use `TokenStore().secret("aws-access-key-id")` rather than raw keyring entries. The names under `secret:` are W11's to choose. To have the person type one on relay's page, raise `SignInNeed(provider="keyring:aws-access-key-id")`.
+
+### Decisions
+
+- **The page needs the operator credential over HTTP, and loopback stays credential-free.** Over stdio the page is on 127.0.0.1 with a single-use token, as the plan says. Over HTTP the origin is reachable from other machines, so it takes HTTP Basic on top.
+- **The origin rule.** A POST whose `Origin` or `Referer` is foreign is refused. A POST with neither passes, because some browsers drop both on a form POST to the same origin; the HMAC CSRF token is the defence.
+- **`accept` is taken as `done`** on a URL ask's page, so an MCP client that answers `accept` works.
+- **No hard limit on the person.** No ask, askpass prompt or sign-in has a time limit. A prompt whose ssh has gone away is dropped, and a device sign-in polls at the provider's interval until the person finishes or declines.
+- **A standalone askpass prompt** (one not tied to an operation) is seen only through `clio-relay-next asks list` and `page`. No MCP request carries it.
+- **Globus sign-in** is a native-app PKCE flow: the person pastes the code on relay's page. GitHub uses the device flow, with its code shown on relay's page and not in the transcript. The client ids come from `CLIO_RELAY_GLOBUS_CLIENT_ID` and `CLIO_RELAY_GITHUB_CLIENT_ID`, or from `settings`.
+- **Production keeps the OS keyring.** `keyrings.alt` is only in the `testing` extra, for headless Ares.
+
+### Facts
+
+- **`SSH_ASKPASS_REQUIRE` is honoured from OpenSSH 8.4** ([release notes](https://www.openssh.com/txt/release-8.4): "a new $SSH_ASKPASS_REQUIRE environment variable, including forcibly enabling and disabling its use", bz#69).
+  - Ares and every W2 fixture run 8.9p1, so `force` works there; the fx-otp tests prove it.
+  - On Windows, Win32-OpenSSH 8.1 (the Windows 10 and Server 2019 built-in) ignores it ([PowerShell/Win32-OpenSSH#1726](https://github.com/PowerShell/Win32-OpenSSH/issues/1726)). 8.6p1 (the Windows 11 built-in) honours it ([PowerShell/Win32-OpenSSH#2115](https://github.com/PowerShell/Win32-OpenSSH/issues/2115)).
+  - This machine has `OpenSSH_for_Windows_9.5p2`; it was not exercised with askpass, since tests run on Ares only.
+  - Before 8.4, askpass runs only with `DISPLAY` set and no terminal. Relay closes stdin and sets `DISPLAY`, which is enough for a detached relay, but `force` is the dependable route.
+- **Ares has Slurm accounting off** (`AccountingStorageType = accounting_storage/none`), so `sacct` returns nothing. `squeue -t all` keeps a finished job for `MinJobAge = 300 s`. Reconciling by name on Ares therefore works only within 5 minutes of the job ending.
+- **mcp 2.3.0 and fastmcp 4.2.1** in the W6 venv. `mcp.Client.call_tool` has no `raise_on_error`.
+
+### Evidence
+
+`tests/asks` on Ares at 8b13e42 (`CLIO_RELAY_KEYRING=memory`): **68 passed, 0 skipped**. After the device-flow fix: **71 passed, 0 skipped, 0 failed**. That includes `test_askpass_otp`: real ssh to fx-otp (127.0.0.1:47103), with the key and then a TOTP typed on relay's page, answered and declined. ruff, `ruff format --check` and strict pyright are clean on the W6 files.
+
+`tests/relay_next` with W6 installed: at 4b72bf2, `test_transports.py::test_plain_mcp_client_over_http[legacy]` and `[auto]` failed because W1's helper opened the HTTP page without the operator credential. W1 fixed this with `answer_page(auth=)` at 87da62d. At 87da62d, `tests/asks` plus those two tests give **73 passed, 0 skipped, 0 failed** on Ares.
+
+**LQ42, live on Ares, 2026-11-18.** The client is `tests/asks/lq42_live.py`. It uses the official `mcp` SDK `Client` with no elicitation callback and no tasks, and opens a new connection for each step. The site is `slurm` (adapter `local`, `{"scheduler": "slurm"}`, `--policy open --spend always`), the job `/bin/sh -c "hostname; echo lq42-<tag>"` on partition `debug`, PT5M.
+
+- **Over stdio, mode `legacy`** (`python tests/asks/lq42_live.py --site slurm <step>`):
+  - The gate: `run` refused with `needs_approval`, operation `op_8bd623bec5c50aace0da1f47`, ask `ask_63381fe64a9f82c3cb6138df`, and a page on `http://127.0.0.1:10165`. The ask's message was "Run /bin/sh on slurm? It may use up to 0.0833 node-hours (1 node(s) for 5 min)."
+  - Two GETs of the page returned 200, after which `describe` still showed `awaiting_input`, the ask `pending` and no native id.
+  - Approving on the page: POST 200; the same POST again, 404.
+  - Retry 1 and retry 2 (`run resume`) both returned Slurm job **27724**.
+  - The same run with a changed spec got a new operation (`op_1e477f453cdd09a4b161496d`) and a new approval. The first approval did not carry over.
+  - Resuming the approved operation with a changed spec continued it at 4b72bf2. At 87da62d, rerun on 2026-11-18 at 07:38, it is refused with `approval_mismatch` (`op_222ad58111a41d0967834392`, Slurm job 27744).
+  - Reconnecting: `describe` showed `completed`, job 27724. `files read jobs/<op>/stdout` gave `ares-comp-03` and `lq42-gate`.
+  - Decline: `op_13632a885db31975f126bff2` went to `cancelled` (`declined`), with no handle and no job directory.
+  - No answer: `op_b474063849e345932b3a93dd` stayed `awaiting_input`, with no handle and no job directory; a retry was again `needs_approval`.
+  - Cancel through `run`: `op_7ec137cc87b2d3de98a12a17` was approved and ran as job 27725, then `run cancel` gave `cancelled` and Slurm showed 27725 `CANCELLED`.
+- **Over Streamable HTTP with TLS, from compute nodes.**
+  - Relay ran on the login node: `clio-relay-next serve --http --host ares.ares.local --port 47160 --tls-cert … --tls-key …`, with a self-signed certificate.
+  - The client ran under `srun -p debug -N1` on ares-comp-03 (gate, decline, no answer) and ares-comp-04 (reconnect).
+  - MCP without the bearer: 401.
+  - The gate: `op_53a0f721139608c923a83519`, ask `ask_690532b42e5aa0e5da6fdff4`, page `https://ares.ares.local:47160/relay/asks/…`.
+    - The page without the operator credential: **401**.
+    - With it: GET 200 twice, still `pending`, no job.
+    - Approve: POST 200, then 404.
+    - Two retries: one job, **27731**.
+  - Decline (mode `legacy`) and no answer (mode `auto`) submitted nothing.
+  - Reconnect: `completed`, with output read through `files`.
+  - The serve log has no request lines and no page URLs.
+- **Exactly once across a crash.** A fake `sbatch` first on `PATH` runs the real one and then `kill -9`s relay, after Slurm has accepted the job and before relay writes its id. Relay is then restarted with the normal `PATH`.
+  - **At 4b72bf2, it failed to reconcile.** `op_841635bf1ab636c3eb03c79a` was accepted by Slurm as job 27726, which ran to completion. After the restart relay could not find it and, after `SUBMIT_GRACE`, recorded `failed` ("no job was found"). The cause: psij's Slurm template takes `--job-name` from `job.name`, which is empty, so Slurm named the job `submit.sh`, not `relay-<op>`. Nothing was submitted twice, but relay lost the job.
+  - **At 87da62d, with W1's job naming and `scheduler_id` record, it passes.**
+    - Restart while Slurm still lists the job: `op_7752f84c897ba04b72395965` was killed after Slurm accepted job **27745** (`relay-op_7752…`, PENDING, no native id in the record). The restart reconciled by name. History: `submitting` ("job name relay-op_…"), `queued` ("reconciled after an interrupted submit"), `running`, `completed`. Slurm had exactly one job for it, and stdout was `ares-comp-03` and `lq42-crash`.
+    - Restart after Slurm forgot the job: `op_07e8c69c4cc2c58895a47f45` was killed after acceptance of job **27751**. Relay was restarted only once squeue no longer listed the job (MinJobAge passed, 07:39 to 07:44). The restart found it through `<job_dir>/scheduler_id` and recorded `queued` ("reconciled after an interrupted submit") and then `completed`, with output read back. One job.
+- **Not covered here.** `files` transfer, `serve` service and stop, A2UI, and the tab token belong to W1, W9 and W14, and are left to their owners' LQ42 runs.
+
+### Halves of other rows
+
+- **LQ10 and LQ11 (W8).** Ready. A worker's sign-in raises a `url` ask with a loopback page; the code is typed on the page (askpass, or a `keyring:` secret) and is never in an ask record, the transcript or a log. W8 registers its starter with `askpass.register_sign_in`.
+- **LQ19 and LQ20 (W13).** Ready, proven above through W1's stub guard: the page shows queue, account, nodes, walltime and the most it may use; a no submits nothing; nobody answering leaves the operation waiting with no job. W13 runs them with its own guard.
+- **LQ39 (W10).** Ready on W6's side. TACC registers in the identity table; a device-code sign-in shows its code on relay's page (`SignInStep(relay_page=True, display=…)`), never in `ask.url`.
+- **Globus (O10).** Tested against a stub only. **The live Globus sign-in is pending O10** (no native-app client is registered yet). It is not a pass.
+
+### Open
+
+- **The four W1 requests landed at 87da62d:** job naming (with `scheduler_id`), refusing a changed resume, `answer_page(auth=)`, and `settings["config_dir"]`, which the ask provider now reads. Closed.
+- **Live Globus** waits for O10.
+
 ## W7. The ssh adapter and scheduler jobs
 
 Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, tests in `tests/relay_ssh/`, user doc in `docs/adapters/ssh.md`, Ares entry in `catalog/sites/ares.yaml` and `catalog/skills/ares.md`.
@@ -375,6 +513,9 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
 - Every `ssh` and `scp` uses `BatchMode=yes`. A site that asks for a code refuses with `interactive_auth_required`, naming `worker` as the adapter to use, unless `interactive_sign_in` is set. Then `sign_in_needed()` returns `SignInNeed(provider="ssh")` and registers a starter with W6's `askpass.register_sign_in`; the starter brings up a ControlMaster through askpass, and every later call reuses it with `BatchMode=yes`. Until W6 merges, the adapter falls back to an `askpass:` program from the config.
 - serve: the adapter declares it and calls `clio_relay.serve.start_for` lazily, and exposes `ssh_argv()` for W9's `ssh -L`.
 - No time limits on jobs or transfers. Only the connection setup has one (`connect_timeout_s`, default 30 s), which refuses as `unreachable`.
+- No walltime of relay's own (coordinator decision after the gate). When the spec gives no `duration`, the adapter passes `None` to PSI/J, which then writes no `--time` or `walltime` line, and the scheduler's partition or queue default applies. A site default walltime is the existing `defaults.duration` in the site entry (and so in the catalog schema, since `CatalogEntry` extends `SiteEntry`); the service fills it in before pricing and before the record, so the charge and the script agree. The adapter takes a duration as given only when it is in the spec's `model_fields_set`, because `JobAttributes.duration` still defaults to 10 minutes.
+- exec follows W1's interface (integration `14e8edd`): `timeout_s` is optional, `on_stall` gets quiet-time reports on W1's schedule (30, 60, 120, 240 s, then at most every 600 s). The command runs on the site in its own session under a small watchdog that holds the ssh session's standard input. When relay's `ssh` ends, times out, is cancelled or drops, standard input closes and the watchdog stops the command's process group, so exec needs no remote guard time.
+- A job the scheduler has forgotten (Slurm drops finished jobs after `MinJobAge`, 300 s on fx-slurm and on Ares) is read from its own record: PSI/J's `<native id>.ec` in the job directory. With no exit code, Slurm accounting (`sacct -X -n -P -j <id> -o State,ExitCode`) is asked, only in that case. With neither, `status` reports the job open (`running`, or `queued` if that was the last record) with `native_state: unknown` and a message, never `failed`. `JobState` has no unknown value; if W1 adds one, the adapter will use it. PBS keeps finished jobs through `qstat -x` for `job_history_duration` (24 h on fx-pbs); after that it falls to the same record. `find` never consults the queue, so a purged job is never submitted again.
 
 ### Facts
 
@@ -382,7 +523,7 @@ Branch `jaimecernuda-relay-rework-w7`. Code in `src/clio_relay/adapters/ssh/`, t
   - `Job` has no `name`, which its templates read; the adapter sets it from the operation.
   - The pbspro template writes `#PBS -N="name"`, which `qsub` refuses; the adapter rewrites the line to `#PBS -N name`.
   - `JobSpec` paths and the launch command are made absolute against the local machine; the adapter sets the site's paths after building the spec.
-  - With no `duration`, `JobAttributes` asks the scheduler for 10 minutes. The charge then reports `walltime_s: 600` and `node_hours: 0.1667` for a 30 s job. Any spec without a duration gets that limit, so W1 may want a site default.
+  - With no `duration`, W1's `JobAttributes` fills in 10 minutes (`jobs/spec.py`), and the record round trip (`model_dump`, then `JobSpec.model_validate` at submit) marks it as given. So through the service every job without a duration is still sent with 10 minutes and charged `walltime_s: 600`, until W1 makes the default `None` (requested). Directly through the adapter, and once W1's change lands, no walltime is sent.
 - OpenSSH: `-M` together with `-o ControlMaster=yes` is "ask" mode, which confirms every shared session through askpass ("Master refused session request" under BatchMode). Use `ControlMaster=yes` alone. This matters to W6's sign-in page.
 - Ares, from the [GRC Ares user guide](https://grc.iit.edu/docs/ares/ares-user-guide/) and live `sinfo`: partitions `compute` (default, 22 nodes, 2 days), `debug` (6 nodes, 4 days) and `datacrumbs`; 40 threads and about 47 GB per node; Ubuntu 22.04.5; `module` (Lmod 8.7.25) works only in a login shell, so the skill says to wrap commands in `bash -lc`.
 
@@ -403,6 +544,13 @@ All runs on Ares from `~/clio-relay-rework/clio-relay-w7` with its own venv, aga
   - Handle path, `run` with `wait_s: 0`: `op_762577707ebfa2cb494c0e8c`, Slurm job 27722 on `debug`, `ares-comp-03`. The first poll, 3.00 s after submit, read `running`; `completed` with exit 0 at 31.43 s. stdout carries the staged input's sha256; outputs are exactly `result.txt`, `stderr` and `stdout`; `files read` and `files list` on the job directory work.
   - Tasks path (`io.modelcontextprotocol/tasks`): `op_af3050dd70a6b3d5db8a5b81`, Slurm job 27723, task created in 1.53 s, completed with exit 0.
   - The service half is W9's.
+- No walltime of relay's own (code at `f768fc9`, retested at `14b83ae`):
+  - `test_no_duration_renders_no_walltime[slurm|pbs]`: the rendered script has no `--time` or `walltime` line.
+  - `test_a_job_without_a_duration_gets_the_schedulers_limit[fx-slurm|fx-pbs]`: `scontrol show job` gives `TimeLimit=UNLIMITED` and `qstat -f -F json` gives no `Resource_List.walltime` for a job with no duration; with 15 minutes, both show `00:15:00` and the script has the directive.
+  - Live, through the adapter: `sh -c "sleep 660; echo slept 660"` with no duration, on fx-slurm (`op_fd5e6c4933b6e32c552ececa`, Slurm job 53) and fx-pbs (`op_d38a82aafd767420b31f9417`, `32.fx-pbs`) together. No time directives; both `completed` with exit 0 after 674.7 s, stdout `slept 660`.
+- exec (W1's interface): `test_exec_without_time_limit` passes on all three targets; `test_a_quiet_process_gets_stall_reports`; `test_the_exec_watchdog_stops_the_command_when_stdin_closes`; `test_cancelling_exec_stops_the_remote_command` on fx-ssh cancels an exec of `sleep 3600` and the remote pid goes away.
+- Forgotten jobs: `test_a_job_the_scheduler_forgot_is_read_from_its_own_record` on fx-slurm submits a job that prints and one `sleep 3600`, checks both scripts carry `#SBATCH --job-name="relay-..."`, drops the adapter, `scancel`s the second outside relay, and waits until `squeue -t all` lists neither (MinJobAge 300 s). A new adapter then finds both: the first is `completed`, exit 0, `native_state: gone`, from its `.ec`; the second is `cancelled` from `sacct`. Units cover `sacct` parsing and the unknown branch.
+- After merging integration `14e8edd`, at `14b83ae`: `pytest tests/relay_ssh`, `78 passed in 491.72s`. `ruff check`, `ruff format` and `pyright` clean.
 
 ## W8. The worker adapter and the old surface's removal
 
@@ -813,6 +961,137 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 
 ## W10. Tapis
 
+Branch `jaimecernuda-relay-rework-w10`; the commit sent to W1 is named in the report to the coordinator. Rows: RL46 to RL49 (RL50's plugin row is W14's), LQ35 to LQ40, and the live rows LQ-L14, LQ-L15 and LQ-L17. Page: [docs/adapters/tapis.md](../adapters/tapis.md).
+
+Files: `src/clio_relay/adapters/tapis/` (adapter, client, files, launcher, mapping, register, the `python -m clio_relay.adapters.tapis` driver and `tapisjob_app.sh`), `src/clio_relay/identity/tacc.py`, `catalog/sites/{chameleon-tapis,ares-tapis,vista,stampede3}.yaml` and their skills, `tests/fixtures/tapis_stub/` and `tests/relay_tapis/`.
+
+### Decisions
+
+- **Every Tapis call goes through tapipy 25.4.0, in a worker thread.** `client.TapisClient.tapis_call(service, operation, **kwargs)` builds one `Tapis` object per call from the keyring token, with no spec download (`resource_set="local"`). An HTTP 401 becomes `needs_sign_in`; other errors become typed refusals carrying Tapis's own message. Reason: tapipy is synchronous, and a stored client would hold a token past its refresh.
+- **The launcher is one shell script in a gzip tar, run by Tapis's `ZIP` runtime (RL47).** The tar is byte-stable (mtime 0, USTAR, fixed mode). The app id is the system id for a relay-made system, otherwise `clio-relay.<username>.<system id>`, and the version is `1.0-<first 10 hex of the script's SHA-256>`, so a changed launcher is a new app version and an old job keeps its own. The archive goes to `<work dir>/launcher/` through Tapis Files.
+- **The job spec travels as one base64 argument** of NUL-terminated fields. Reason: nothing is quoted through a shell, and Tapis's argument handling cannot split it.
+- **Inputs are staged by content into `<work dir>/content/<sha256>` and passed as `tapislocal` file inputs.** Tapis does not copy them; the launcher links them into the job's directory. The launcher writes `relay.exitcode`, which `status` reads once the job ends.
+- **`find` searches Tapis jobs for the description `clio-relay op <operation id>`** (`getJobSearchList` with `description.eq`), so a retried `run` after a restart finds the job it already submitted.
+- **Job type:** `BATCH` on a Slurm system, `FORK` on a system with no scheduler and `canExec`. Any other scheduler is refused with `verb_not_implemented`.
+- **`exec` and `serve` are not implemented** and route to the site's `ssh` or `worker` alternative. The catalog's `ares-tapis` and `chameleon-tapis` name `ssh`; `vista` and `stampede3` name `worker`, because those hosts ask for a second factor.
+- **Guarded sites refuse a free-form `run` in the adapter, before any Tapis call,** with `policy_refused` and `next_step: package_review`. The service's own guard (W13) refuses first when it is installed.
+- **Package mode runs the `jarvis` on PATH with a `JARVIS_ROOT` of the job's own (W13's sequence, jarvis-cd 1.8.1).** The package is `<repo>.<package>`; the archive holds `<repo>/<repo>/<package>/...` at its root, plus whatever the repo reads beside it (clio-jarvis reads `schemas/` there, `_contract/spec.py:42`). The launcher refuses a name not of that form (exit 64) and an archive with no `<repo>/<repo>` (exit 66) before calling jarvis. Then, with `JARVIS_ROOT=<job dir>/.relay-jarvis`: `jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared"`, `jarvis repo add <unpacked>/<repo>` (jarvis names a repo after its directory, so not the digest directory), `jarvis ppl create relay_<job uuid>`, `jarvis ppl append <name> pkg key=value...` (the alias `pkg` is explicit, or jarvis takes the first `key=value` as the alias), `jarvis ppl run`. Reason: the site's own `~/.ppi-jarvis` is never read or changed, and jobs share nothing. `TapisAdapter.runs_packages` is `True` (W1's `BaseAdapter` flag, integration 1a8c20b).
+- **Own host (`authn: pki`).** Relay reads the login, home and Slurm partitions through the site's `ssh` alternative, creates `clio-relay.<username>.<site id>` (job working directory `~/.clio-relay/tapis`, one logical queue per partition, carrying the partition's time limit from `sinfo` as `maxMinutes`), makes a new RSA 4096 pair in a private temp file, appends the public key to `authorized_keys` with the comment `clio-relay-tapis:<system id>`, gives the pair to Tapis with `createUserCredential`, and deletes the private file. If Tapis's credential check fails, the key line is taken back out. `unregister-host` removes the credential, the system only when relay made it, and the key line.
+- **TACC host (`authn: tms`).** Relay calls `createUserCredential` with `createTmsKeys=true` and makes no key. It never creates or deletes a TACC system.
+- **The TACC identity is the device code grant, kept in the keyring (RL48).** `TaccIdentity` implements W6's `IdentityProvider` with `relay_page=False`: the ask carries TACC's own `https` page and the short user code. The device code, the access token and the refresh token stay in the keyring (service `clio-relay`) and are never logged, written to relay's files or returned. Refresh uses the `refresh_token` grant and needs the client key; a refused refresh signs out and the next call asks again. The types are W6's, imported from `clio_relay.identity.base`, and `tacc` is in W6's provider table.
+- **Registration runs when a site is saved.** The adapter implements W1's `SiteAdded`: after `site add`, `add-from-catalog`, `edit` and `switch`, `on_site_added` calls `checkUserCredential` and, only if that fails, `register_host` through the site's `ssh` alternative (none for TMS). So running it again changes nothing. Signed out, it refuses `needs_sign_in` and the site stays saved. `register-host` in the driver stays, for the run sheets and for a site whose hook was refused.
+- **`maxMinutes` is always sent (reviewing W1's compat edit at 87da62d).** W1's `_max_minutes` sent none for a job with no duration. That is wrong for Tapis: an unset `maxMinutes` falls back to the app's, then the system's, then 10 minutes, and Tapis fails a job past it with `JOB_EXECUTION_MONITORING_TIMEOUT` (Tapis jobs docs, "maxMinutes"). Relay's apps and systems set none, so every job with no duration would be killed at 10 minutes, a hard limit the person's rule forbids. `mapping.max_minutes` replaces it: a duration is sent rounded up to whole minutes; with no duration, a `BATCH` job gets its logical queue's `maxMinutes` (so Slurm's `--time` fits the partition), and otherwise relay sends 525600 (a year), since Tapis has no "no limit" value.
+- **No hard limits.** Jobs, sign-ins and transfers have none. The device code's own 600 s expiry is Tapis's. The step carries it as `expires_at` with `poll_interval_s` 5, and `poll` answers `expired` for a dead code, whether the time passed or Tapis says so. Relay's device loop (W6's `device.follow`) then calls `begin` for a new code on the same ask.
+- **A driver for live runs:** `python -m clio_relay.adapters.tapis {status,sign-in,sign-out,lifetimes,refresh,describe,register-host,unregister-host} --site <id>`. It prints the page, the code and token expiry times, never a token. It is the run sheets' tool and the TACC demo's.
+
+### Facts
+
+- **tapipy 25.4.0 operations behind each call** (read from the 25.4.0 wheel's bundled specs):
+
+  | Call | Operations |
+  | --- | --- |
+  | sign-in | `authenticator.generate_device_code`, `authenticator.create_token` (`grant_type=device_code`) |
+  | refresh | `authenticator.create_token` (`grant_type=refresh_token`, client id and key) |
+  | sign-out | `authenticator.revoke_token` (access and refresh) |
+  | describe | `systems.getSystem`, `systems.checkUserCredential` |
+  | run | `apps.getApp`, `apps.createAppVersion`, `files.insert`, `files.mkdir`, `files.getStatInfo`, `jobs.submitJob` |
+  | status, cancel | `jobs.getJob`, `jobs.getJobStatus`, `jobs.cancelJob` |
+  | find | `jobs.getJobSearchList` |
+  | files | `files.listFiles`, `files.getContents`, `files.insert`, `files.mkdir`, `files.moveCopy`, `files.delete`, `files.getStatInfo` |
+  | register-host | `systems.createSystem` (`skipCredentialCheck`), `systems.createUserCredential` (PKI pair or `createTmsKeys`) |
+  | unregister-host | `systems.removeUserCredential`, `systems.deleteSystem` |
+
+- **Token lifetimes.** The Tapis authenticator issues device-code access tokens for 30 days, against the plan's assumed 4 h. A device code lives 600 s, and the authenticator sends no `interval` and no `slow_down`, so relay polls every 5 s (RFC 8628's default). The device code response's `expires_in` is a date string, not seconds. **The refresh-token lifetime is not yet known**; it is recorded at LQ-L14.
+- **TACC pages behind the catalog entries** (each fetched with HTTP 200):
+  - `vista`: https://docs.tacc.utexas.edu/hpc/vista/
+  - `stampede3`: https://docs.tacc.utexas.edu/hpc/stampede3/
+  - TACC's second factor: https://docs.tacc.utexas.edu/basics/mfa/
+  - `ares-tapis`: https://tapis.readthedocs.io/en/latest/technical/systems.html
+  - the sign-in: https://tapis.readthedocs.io/en/latest/technical/authentication.html
+  - `chameleon-tapis`: https://chameleoncloud.readthedocs.io/en/latest/getting-started/index.html
+- **Registration results for Ares and Chameleon: pending.** They need O5, O6 and the person's sign-in. Recorded at LQ-L14 and LQ-L17.
+- **Tapis job time limit:** `maxMinutes` defaults to 10 and inherits request, then app, then system; a job past it fails with `JOB_EXECUTION_MONITORING_TIMEOUT`. Source: https://tapis.readthedocs.io/en/latest/technical/jobs.html. For Slurm, Tapis turns it into `--time`.
+- **Not yet confirmed against the real Tapis** (the stub follows the specs; each is checked in the live rows):
+  - `description.eq` in a job search;
+  - `getContents`'s `range` semantics, and `listFiles`'s size unit;
+  - whether `containerImage` for a `ZIP` app may be a path on the system;
+  - that `tapislocal` inputs are not copied;
+  - whether `batchLogicalQueues` must be set on a Slurm system;
+  - `${apiUserId}` in `effectiveUserId` together with a `loginUser` credential;
+  - that Tapis accepts the RSA PEM relay writes.
+
+### Evidence
+
+All on Ares, in `~/clio-relay-rework/clio-relay-w10` with its own venv (`uv sync --extra tapis`, plus `keyrings.alt`), against the stub in `tests/fixtures/tapis_stub` and W2's `fx-ssh` and `fx-slurm`. Ruff, format and pyright are clean on the W10 paths. Tests ran at 350e132 (integration 87da62d, with W6 and W7, merged): conformance 11, identity 11, register 4 and service 17, all 43 passing; the file size and class-in-function ratchets pass (16 and 10).
+
+| Row | State | Command | What was read |
+| --- | --- | --- | --- |
+| LQ35 | Passed | `pytest tests/relay_tapis/test_tapis_conformance.py` | 11 of 11 with W1's kit at 14e8edd, including `test_exec_bounded`, `test_exec_without_time_limit` and `test_unimplemented_verbs_refuse` asserting `verb_not_implemented` for `exec` and `serve` |
+| LQ36 | Passed | `test_tapis_service.py::test_run_survives_a_restart`, `::test_find_reconciles_through_tapis_search` | The service is closed and reopened mid-job; the task completes. Operation states `awaiting_input, submitting, queued, running, completed`. Stub job history `PENDING` to `FINISHED` through Tapis's states. The task result carries the Tapis UUID. The request named `appId clio-relay.alice.tp`, `jobType FORK`, and a `tapislocal://exec.tapis/.../content/<sha256>` input with target `input.txt`, and `maxMinutes` 525600 for a job with no duration. `find` returns the same job |
+| LQ37 | Passed | `test_tapis_service.py::test_describe_routes_exec_and_serve_to_ssh` | With W7 merged into integration: `exec` and `serve` route `{adapter: ssh, via: alternative}`; `describe`, `run` and `files` stay on `tapis` |
+| LQ38 | Passed | `test_tapis_service.py::test_guarded_site_refuses_a_free_form_run` | The service refuses with `guard_unavailable` until W13's guard is installed; the adapter's own `run` refuses with `policy_refused`, `next_step: package_review`. The stub log has no `/v3/jobs` request |
+| LQ39 | Passed | `pytest tests/relay_tapis/test_tapis_identity.py` | 11 of 11. One URL elicitation: `https://tapis-stub.invalid/v3/oauth2/device?client_id=clio-relay-test`, "Sign in to TACC. Open the TACC page, enter the code XXXX and sign in with your TACC account." No password asked. The access token, refresh token, device code and client key are absent from the ask records, relay's log, relay's state files and the MCP transcript. A client without elicitation gets `needs_sign_in` with the same `https` page and resumes once the ask is answered. Throttled polling, an expired code (reported as `expired`, by time or by Tapis, with a new code from the next `begin`), refresh, no client key, a refused refresh, sign-out, and the driver's `lifetimes` and `refresh` (no token in their output) each pass. W6's `device.follow`, given a code Tapis calls expired, asks again with a new code and signs in |
+| LQ40 | Passed | `pytest tests/relay_tapis/test_tapis_register.py` | 4 of 4. `Registration(system_id='clio-relay.alice.lq40', created_system=True, authn='pki', login_user='relay', key_installed=True, private_key_deleted=True)`. The stub's credential check logs in to `fx-ssh` with the registered key, and the public key is in `authorized_keys`. An audit hook on `open` during registration saw 5 files, none under `~/.ssh` or the fixture's ssh directory. Removal `{credential: True, system: True, key_line: True}`. A refused credential gives `submit_failed` "Credential check failed: no login" and the key line is gone. On `fx-slurm` the queues are `[compute, debug]`, with `maxMinutes` from `sinfo` (`compute` none, `debug` 30), and the job type is `BATCH`. Through `RelayService.site_added` (the CLI's hook), site `lq40hook` registers once: `{registered: True, system_id: 'clio-relay.alice.lq40hook', authn: 'pki', key_installed: True, private_key_deleted: True, tapis_message: 'credential registered'}`; the second call returns `{system_id, registered: False, credential: 'ok'}` and leaves the key alone |
+
+Also on Ares:
+- **The TMS path** (`test_a_tacc_host_gets_a_tms_credential_and_no_key`): `Registration(system_id='stampede3-tapis-stub', created_system=False, authn='tms', key_installed=False)`. Unregistering removes the credential only. The site hook on a TACC host (`vista-tapis-stub`) registers a TMS credential once and changes nothing the second time. Signed out, the hook refuses `needs_sign_in` with TACC's page and makes no Systems call.
+- **`maxMinutes`** (`test_max_minutes_never_falls_to_the_tapis_default`, `test_slurm_time_limits_become_minutes`): FORK with no duration 525600; BATCH on a 2880-minute default queue 2880; a queue with no limit 525600; 90.5 s gives 2. Slurm limits `2-00:00:00`, `1:00:00`, `30:00`, `30:01`, `45` read as 2880, 60, 30, 31, 45; `infinite`, `UNLIMITED`, empty and zero as no limit.
+- **The CLI hook, signed out** (`clio-relay-next site add-from-catalog ares-tapis` in a scratch config, no OAuth client): the site is saved and `set_up.tapis.refusal` is `invalid_config`, "relay has no OAuth client for the TACC tenant yet; set CLIO_RELAY_TACC_CLIENT_ID (and CLIO_RELAY_TACC_CLIENT_KEY for refresh)". `site switch ares-tapis tapis` runs the hook again with the same answer.
+- **The live driver against the standalone stub** (`python -m tests.fixtures.tapis_stub --port 47180`, file keyring in scratch, `fx-ssh` as the host): `status` signed_out; `sign-in` prints the page and the code, then "Signed in." with source keyring, account alice, expiry 30 days out; `register-host` and `describe` report credential ok, job type `FORK` and app `clio-relay.alice.fx-tapis` version `1.0-540fce7250`; `unregister-host` returns all true; `sign-out` returns to signed_out. No token appears in the output.
+- **Package mode with the real jarvis-cd 1.8.1** (W13's request; Slurm job 27774 on `ares-comp-03`, debug partition, 1 node, 4 ranks; `sbatch` running `python -m tests.relay_tapis.live_package --root ~/clio-relay-rework/clio-jarvis --include clio_jarvis --include schemas --package clio_jarvis.gray_scott --set nprocs=4 --set ppn=4 --set L=64 --set steps=500 --set plotgap=50`, with the shared venv's `jarvis` and W5's Gray-Scott and MPI on PATH and no `PYTHONPATH`). The adapter's `run` on a guarded site staged the archive (40764 bytes, sha256 `de90efea...a2d555e`, clio-jarvis 2d12dbb) through Tapis Files, and the stub ran `tapisjob_app.sh`. Tapis history `PENDING` to `FINISHED`; status `completed`, exit 0, `relay.exitcode` 0, `stderr` empty. jarvis's `stdout`: "Jarvis initialized at <job dir>/.relay-jarvis", "Added repository: <work dir>/packages/<sha256>/clio_jarvis", "Created pipeline: relay_ca55ce15_..._007", "Added package clio_jarvis.gray_scott as pkg to pipeline", process layout 2x2x1, "Simulation at step 500 writing output step 10". `bpls` on `<job dir>/.relay-jarvis/shared/<pipeline>/executions/<id>/shared/pkg/run/gs.bp` (41 MB): `U` and `V` `10*{64, 64, 64}`, `step` and `time` `10*scalar`. `find ~/.ppi-jarvis -newer <mark made before the job>` printed nothing. The run before it (job 27773), with an archive of `clio_jarvis/` alone, resolved the package but failed in clio-jarvis's contract loader, which reads `schemas/` beside the repo directory; hence the layout note in Decisions.
+- **Package mode against a recording `jarvis`** (`pytest tests/relay_tapis/test_tapis_package.py`, 3 of 3): the exact calls, each with `JARVIS_ROOT=<job dir>/.relay-jarvis`, are `init <root>/config <root>/private <root>/shared`, `repo add <work dir>/packages/<sha256>/w10demo`, `ppl create relay_<uuid>`, `ppl append w10demo.hello pkg "greeting=hi there" count=3` and `ppl run`, with no `~/.ppi-jarvis` made in the job's home. A name with no dot fails with exit 64, and an archive with no `w10demo/w10demo` with exit 66, each with its reason in `relay.launcher.log` and no jarvis call.
+
+### Run sheets for the live rows
+
+All three are **pending**, never passed. They wait on the owner blockers below. The person signs in and supplies credentials; W10 runs the rows. Before each run: `ssh ares`, `cd ~/clio-relay-rework/clio-relay-w10`, `git pull`, `~/.local/bin/uv sync --extra tapis`. The person sets the OAuth client in the shell themselves (`export CLIO_RELAY_TACC_CLIENT_ID=...` and `CLIO_RELAY_TACC_CLIENT_KEY=...`); neither is pasted into a chat. `T=python -m clio_relay.adapters.tapis`; `R=clio-relay-next` (the new CLI, until W1 renames it `clio-relay`).
+
+**Sign-in (shared by all three).** `S` is the row's site: `chameleon-tapis` or `ares-tapis`.
+1. `uv run $R site add-from-catalog $S`. For `chameleon-tapis`, then set the person's SSH profile for the node: `uv run $R site edit $S '{alternatives: {ssh: {ssh_profile: <profile>}}}'` (`ares-tapis` already names `ares`). Check `ssh <profile> hostname` first. Signed out, each prints `set_up` with a `needs_sign_in` refusal, and the site is saved; with no OAuth client in the shell, the refusal is `invalid_config` naming the two variables instead.
+2. `uv run $T sign-in --site $S`. It prints TACC's page and a code.
+3. The person opens the page, enters the code, and signs in with their TACC account and second factor. The driver prints "Signed in."
+4. `uv run $T status --site $S`. Record `account` and `expires_at`, never a token.
+5. `uv run $T lifetimes --site $S`. It prints, from the tokens' claims, when each token expires and the seconds left, and no token text. Record the access lifetime (expected 30 days) and **the refresh-token lifetime**, the ledger fact still open.
+6. `uv run $T refresh --site $S`. Expect "A new access token was issued." This confirms the refresh grant with relay's client key.
+
+**LQ-L14, `chameleon-tapis`.** Needs O3, O4, O5.
+1. Sign in as above with `S=chameleon-tapis`.
+2. `uv run $R site switch chameleon-tapis tapis` (tapis is already in use, so this only runs the hook again). Its `set_up.tapis` is the registration. Record it whole (system id, login user, key installed, private key deleted, Tapis's message). Run it a second time and record `registered: false, credential: ok`. If it shows a refusal, `uv run $T register-host --site chameleon-tapis` gives the same record with the full error.
+3. `uv run $T describe --site chameleon-tapis`. Expect credential ok and job type `FORK`.
+4. Start relay's MCP server on that site list and, from an MCP client, call `run` with `/bin/sh -c "hostname; date; echo relay-l14 > out.txt"`. Poll the task to completion.
+5. Record the Tapis job UUID from the task result, and the time from `submitting` to `running` from the operation's history.
+6. Read `out.txt` back with the `files` tool and check it says `relay-l14`.
+7. Keep the system for LQ-L15. After LQ-L15: `uv run $T unregister-host --site chameleon-tapis`, then check `grep clio-relay-tapis ~/.ssh/authorized_keys` on the node is empty.
+
+**LQ-L15, the TACC demo on `chameleon-tapis`.** Needs LQ-L14, and on the node: `jarvis` on PATH (jarvis-cd 1.8.1; the launcher makes a `JARVIS_ROOT` of the job's own, so nothing needs adding to the node's `~/.ppi-jarvis`), ADIOS2 and MPI for the solvers. The package archive is W13's, holding `clio_jarvis/` and `schemas/` (W5, O1). Needs W14's ParaView tab (and W15's follow) on the desktop side.
+1. From the agent, ask: "Run Gray-Scott on Chameleon through Tapis and show me the field."
+2. Expect a package `run` (`clio_jarvis.gray_scott`, version and SHA-256), a Tapis job UUID, the outputs read back through Tapis Files, and the BP5 output opening in the ParaView tab.
+3. Repeat with Xcompact3d (`clio_jarvis.xcompact3d`, TGV).
+4. Record both UUIDs, both submit-to-running times, and a screenshot of each field, in the science log.
+
+**LQ-L17, `ares-tapis`.** Needs O3, O4, O6.
+1. Sign in as above with `S=ares-tapis`.
+2. `uv run $R site switch ares-tapis tapis` (tapis is already in use, so this only runs the hook again). Record `set_up.tapis`, the registration, including the queues (Ares's Slurm partitions) and each queue's `maxMinutes`. If it shows a refusal, run `uv run $T register-host --site ares-tapis` for the full record.
+3. **The contract exception.** If Tapis's credential check cannot log in to Ares from TACC, the registration refuses `submit_failed` with Tapis's own message, and the key line is removed. Record that message verbatim as the row's result; LQ-L14 then carries the adapter. Stop here.
+4. Otherwise `describe` (job type `BATCH`), then `run` from an MCP client with `/bin/sh -c "hostname; echo relay-l17 > out.txt"` on queue `debug`.
+5. Record the Tapis job UUID, the Slurm job id Tapis reports (`remoteJobId` in `getJob`), and the submit-to-running time.
+6. Read `out.txt` back with `files`. Then `unregister-host` and check the key line is gone from `~/.ssh/authorized_keys` on Ares.
+
+### Owner blockers
+
+| Blocker | What the person supplies | Rows |
+| --- | --- | --- |
+| O3 | A TACC account, signed in once through the driver | LQ-L14, LQ-L15, LQ-L17 |
+| O4 | An OAuth client in the `tacc` tenant: its id and key, set as `CLIO_RELAY_TACC_CLIENT_ID` and `CLIO_RELAY_TACC_CLIENT_KEY` | All three. Without the key, sign-in works but refresh does not |
+| O5 | A leased Chameleon node with a floating IP, and an SSH profile for it | LQ-L14, LQ-L15 |
+| O6 | Confirmation that Ares accepts SSH from outside IIT with a key and no second factor, and that a key held by Tapis is acceptable | LQ-L17 |
+| O7 | TACC's answers on Vista and Stampede3: whether relay's TMS credential and a `ZIP` app are allowed there, and the allocation to use | Catalog entries `vista` and `stampede3`; no live row yet |
+
+### Open
+
+- **W13:** the package archive must hold the repo's `schemas/` beside `clio_jarvis/`, or clio-jarvis's contract loader fails at `ppl append` (job 27773).
+- **W1:** link `docs/adapters/tapis.md` from the docs index; note `tests/relay_tapis/` as a test directory.
+- **Shared fixture:** LQ40 edits `fx-ssh`'s `authorized_keys` only on lines with the comment `clio-relay-tapis:<system id>`, and removes them in `finally`.
+
 ## W11. globus, iri and sky
 
 Branch `jaimecernuda-relay-rework-w11`, from `6b32300`. Code: `src/clio_relay/adapters/{globus,iri,sky}/`. Catalog: `catalog/sites/{polaris,aurora,deltaai}.yaml` and the skills `alcf-polaris`, `alcf-aurora` and `ncsa-deltaai`. Pages: `docs/adapters/{globus,iri,sky}.md`. hpc-bridge was read as a reference only; nothing is imported from it.
@@ -827,7 +1106,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - The spend price goes through the same subprocess.
   - The install step is in `docs/adapters/sky.md`.
 - **globus-compute-sdk is pinned to 4.21.0 (W1, `6b32300`).** 4.22 is an alpha. Stable 4.21.0 is what the adapter and its tests were written against.
-- **Credentials come from W6's identity layer.** `tokens.provider("globus")` calls `clio_relay.identity.get("globus")` when that module exists. Until W6 merges, it uses `GrantFileProvider`, a stub with the same shape (`async token(resource_server=...)`, `status()`). The stub reads the grant file named by `CLIO_RELAY_GRANT_FILE_GLOBUS`. The adapters never start a sign-in. With no token, or an expired one, they refuse `needs_sign_in`, and `sign_in_needed()` names the provider.
+- **Credentials come from W6's identity layer.** `tokens.provider("globus")` calls `clio_relay.identity.shared().get("globus")`, the provider relay is serving with, so it sees `--grant-file`. `identity.get` is not used: it returns the factory. W6's `Token.access_token` is a `SecretStr` and is revealed only to build the `Authorization` header; `status()` is async and returns an `IdentityStatus` whose `state` the adapters report. Where `clio_relay.identity` is absent, `GrantFileProvider` stands in, reading the grant file named by `CLIO_RELAY_GRANT_FILE_GLOBUS`. The adapters never start a sign-in. With no token, or an expired one, they refuse `needs_sign_in`, and `sign_in_needed()` names the provider.
 - **globus: one Compute task per job, cancelled with a marker.** The task is `relay_task`, a self-contained function that uses only the standard library, because Compute ships functions by source.
   - The task writes the inputs and `relay-state.json` into `<job_root>/<operation id>/`. It runs the command in its own process group and polls for a `relay-cancel` marker.
   - `cancel` sends a second task that writes the marker, because the Compute service cannot cancel a submitted task.
@@ -835,7 +1114,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - Submission uses `create_batch` and `batch_run`, and polling uses `get_task`. The SDK `Executor` is never opened, since it holds a long-lived connection.
 - **globus: `user_config_keys` maps the job onto the endpoint's template.** The defaults, `account`, `queue`, `walltime` and `nodes_per_block`, are ALCF's keys. Each facility names them differently.
 - **globus `files` is Globus Transfer between two collections.** One is the site's; the other is on relay's own machine, for example Globus Connect Personal. A transfer that keeps faulting is cancelled and refused. A transfer that is making progress has no time limit.
-- **globus: the person's own endpoint starts through another adapter.** `start` names `worker` or `ssh` and the start command, for Aurora. It goes through W1's `exec`, which requires `timeout_s` (default 900 s here). The start command daemonizes and returns. See Open.
+- **globus: the person's own endpoint starts through another adapter.** `start` names `worker` or `ssh` and the start command, for Aurora. It goes through W1's `exec` with no time limit (since `14e8edd`); quiet stretches are logged, and `start.timeout_s` sets a limit only if the site asks for one. A failed start refuses `unreachable` before anything is submitted. The IRI `token_command` runs the same way, with no limit.
 - **iri: v2 is the default, and v1 is supported.**
   - In v2, `run` sends an `Idempotency-Key`, uuid5 of `clio-relay:<site>:<operation id>`, so a retried submit returns the same job.
   - v1 has no key. Relay's own record under `state_dir/iri-jobs/` covers `find`.
@@ -848,7 +1127,7 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - When the job ends, its log is downloaded as the output.
   - SkyPilot reports no exit code for a managed job. A failure is recorded with exit code 1, unless the failure reason names a code, and the message says so.
   - There is no hard limit on a SkyPilot call. Relay stops waiting only when SkyPilot prints nothing for `stall_s` (1800 s).
-- **sky cloud keys come from the keyring.** `credentials.env` maps variables to keyring entries under the service `clio-relay`, such as `AWS_ACCESS_KEY_ID: aws-access-key-id`. A missing entry refuses `needs_sign_in` with the provider. Without `credentials`, SkyPilot uses the cloud profiles already on the machine.
+- **sky cloud keys are secrets in W6's token store.** `credentials.env` maps variables to secret names, such as `AWS_ACCESS_KEY_ID: aws-access-key-id`, read with `TokenStore().secret(name)` (stored by W6 as `secret:<name>` under its keyring service; W11 writes nothing there). A missing secret refuses `needs_sign_in`, and `sign_in_needed()` returns `SignInNeed(provider="keyring:<name>")`, so relay's page asks the person to type it. Without `credentials`, SkyPilot uses the cloud profiles already on the machine.
 - **The spend price is `SkyAdapter.price(spec) -> Charge`, in US dollars.**
   - `amount` is SkyPilot's `Resources.get_cost(walltime)` times the node count.
   - `unit` is `"USD"`, and `nodes`, `walltime_s` and `node_hours` are filled in. `Charge.unit` is free text, so W13 needs no new field.
@@ -887,8 +1166,11 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 
 All of this is unit and mock evidence.
 
-- **Gate on Ares** at `3015e81`, in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
-  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: 82 passed, 5 skipped. The skips are the conformance kit's own: `exec` is not implemented on the four targets (globus, iri v2, iri v1, sky), and `files` is not implemented on sky.
+- **Gate on Ares** at `702356e` (integration `87da62d` merged, with W6 and optional duration), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`): the four W11 modules gave exit 0, 102 passed and none skipped; ruff is clean and pyright reports 0 errors. The three new tests cover a job with no duration: globus sends no walltime, iri sends no `duration`, and sky prices it with no amount, walltime or node-hours, without calling SkyPilot.
+- **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted):
+  - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 99 passed, none skipped. The kit asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The globus endpoint-start tests cover no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit. The four W6 tests cover the `SecretStr` token and async `IdentityStatus`, `shared().get` over `identity.get`, cloud keys read from `TokenStore`, and the old `credentials.service` setting refused.
+  - The same modules, ruff and pyright on a scratch merge with `-w6` at `4bad7cb` (local, not pushed): exit 0, 99 passed, clean, 0 errors. A smoke script on that merge with `CLIO_RELAY_KEYRING=memory` showed `tokens.provider("globus")` returning W6's `GlobusIdentity`, status `signed_out`, the bearer refusing `needs_sign_in`, the sky adapter asking `keyring:aws-access-key-id`, and after `TokenStore().set_secret` the key handed to SkyPilot's environment.
+  - Earlier gates: `83f81dc` gave 95 passed; `3015e81` gave 82 passed and 5 skipped, before the kit asserted refusals.
   - `uv run ruff check` and `ruff format --check` on the W11 paths: clean.
   - `pyright` 1.1.411 on the W11 paths: 0 errors.
 - **What the mocks cover.**
@@ -969,9 +1251,9 @@ Needs an AWS account the person agrees to spend on (O11), and an IAM key pair wi
    uv venv ~/.clio-relay/sky
    uv pip install --python ~/.clio-relay/sky 'skypilot[aws]==0.14.3'
    ```
-2. Add a site with `adapter: sky`, `infra: aws`, `cpus: 2+` and the keyring entries `AWS_ACCESS_KEY_ID: aws-access-key-id` and `AWS_SECRET_ACCESS_KEY: aws-secret-access-key`.
+2. Add a site with `adapter: sky`, `infra: aws`, `cpus: 2+` and `credentials: {provider: aws, env: {AWS_ACCESS_KEY_ID: aws-access-key-id, AWS_SECRET_ACCESS_KEY: aws-secret-access-key}}`.
 3. Without the keys, `describe` reports `skypilot_version` and the site shows as needing sign-in. Type the two keys on relay's page.
-4. Check that they are in the OS keyring under the service `clio-relay`, and not in any file.
+4. Check that they are in the OS keyring, under W6's service `clio-relay` as `secret:aws-access-key-id` and `secret:aws-secret-access-key`, and not in any file.
 5. `run` `echo hello` with 1 node and 15 minutes. The spend gate must show SkyPilot's price in USD, about 0.024 for `m6i.large` on demand. Screenshot it, then approve.
 6. Check that the job completes with exit code 0, and that `run.log` is listed and contains `hello`.
 7. In the AWS console or `sky status`, check that the job's instance is terminated once the managed job ends. With W9, check that a `serve` cluster autostops when idle.
@@ -1001,7 +1283,6 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
 
 - **Compute cancel is a marker.** The Compute service cannot cancel a submitted task. On a busy endpoint, the cancel task may wait behind the job it cancels. LQ-L2 step 7 measures this.
 - **A crash between submit and the record write loses the globus task id.** `find` returns nothing, and a retried `run` submits again. Compute has no idempotency key. The window is one local write.
-- **Endpoint start uses `exec`, whose Protocol requires `timeout_s`.** `StartConfig.timeout_s` defaults to 900 s and is settable. `globus-compute-endpoint start` daemonizes and returns, so the bound does not limit jobs. If the coordinator reads it as a hard limit on something the person waits on, W1's `exec` needs a stall-only form.
 - **Globus Compute status strings** beyond those in SDK 4.21.0's documentation are not verified live. Unknown strings map to queued. LQ-L2 records the strings it sees.
 - **ALCF's IRI Globus scope was not found** in ALCF's pages. Until it is, ALCF IRI uses `token_command`.
 - **The IRI download format varies by facility.** Binary round trips are checked in LQ-L5 step 4.
@@ -1009,11 +1290,10 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
 - **Aurora's endpoint setup is a one-time person step.** Relay starts the endpoint afterwards; it does not create it.
 - **Requests to W1:**
   - Add `docs/adapters/{globus,iri,sky}.md` to the docs index.
-  - RL5 routing cannot fall back to an alternative on a config-level refusal: Aurora with no `endpoint`, or `iri` with no `resource_id`, refuses `invalid_config` at build. Decide whether routing skips such an alternative or reports it.
   - O11's text says "paid cloud account for LQ-L8". The cloud row is LQ-L6, and LQ-L8 is DeltaAI.
-- **Requests to W6:**
-  - Confirm the `Token` shape (`access_token`, `expires_at`) and whether `status()` is sync or async. `tokens.py` accepts either.
-  - Confirm the keyring naming for cloud keys: service `clio-relay`, entries such as `aws-access-key-id`. Relay's page should write those entries.
+- **Settled by W1 at `14e8edd`:** routing now skips an alternative whose build refuses `invalid_config` (Aurora with no `endpoint`, `iri` with no `resource_id`) and records the skip; and `exec` takes no time limit, so the globus endpoint start and the IRI `token_command` have none.
+- **Answered by W6 (4bad7cb on `-w6`), and adopted:** the `Token` and `IdentityStatus` shapes, `shared().get`, and cloud keys as `TokenStore` secrets raised as `keyring:<name>`. W6 is merged at integration `87da62d`, and the gate there ran against its code.
+- **Settled by W1 at `87da62d`:** a job's duration is optional. W11 reviewed and kept W1's edits: globus sends no walltime (the endpoint's default applies), iri omits `duration`, and sky returns a `Charge` with no amount, so the spend gate asks.
 - **Request to W13:** call `SkyAdapter.price(spec)` from `GuardHook.price` for sky sites. It returns a `Charge` with `unit: "USD"`, and `node_hours` is still filled in for the node-hour threshold.
 - **For W9:** SkyPilot autostop is the idle release for `serve`. The `sky` adapter does not implement `serve`.
 

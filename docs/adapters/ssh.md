@@ -44,6 +44,16 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 Jobs and transfers have no time limit. A long upload or a job that runs for
 days is allowed to finish.
 
+`exec` has no time limit either unless the call gives one. While a command
+prints nothing, the caller hears that it is still running. When the call ends,
+times out or is cancelled, or the connection drops, the command and everything
+it started are stopped on the site.
+
+Relay asks the scheduler for no walltime of its own. A job's walltime is its
+`duration`, or the site's `defaults.duration` when the job gives none. With
+neither, the batch script has no time line, and the scheduler's default for
+the partition or queue applies.
+
 ## How a job runs
 
 1. Relay renders the batch script on your machine with
@@ -60,6 +70,14 @@ days is allowed to finish.
 Relay keeps no connection open between calls, so it can restart at any time.
 After a restart, `find` reads the job's directory and returns the same job, so
 a retried `run` never submits a second copy.
+
+Schedulers forget finished jobs; Slurm drops them from `squeue` after
+`MinJobAge`, often five minutes. When the scheduler no longer lists a job,
+`status` reads the exit code the job wrote into its directory. With no exit
+code, it asks Slurm accounting (`sacct`) if the site keeps it. With neither,
+the job stays open with `native_state` `unknown` and a message saying so,
+rather than being called failed. A later poll can still find an exit code, and
+`cancel` ends it.
 
 ### Hosts with no scheduler
 

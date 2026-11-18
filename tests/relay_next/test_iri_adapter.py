@@ -172,6 +172,12 @@ def test_job_spec_uses_only_published_fields(tmp_path: Path) -> None:
     assert body["launcher"] == "srun"
 
 
+def test_job_spec_sends_no_duration_when_the_job_has_none() -> None:
+    spec = JobSpec(executable="/bin/hostname", attributes=JobAttributes(account="m1234"))
+    body = iri_job_spec(spec, job_dir=None)
+    assert body["attributes"] == {"account": "m1234"}
+
+
 def test_package_jobs_refuse() -> None:
     spec = JobSpec(package=PackageRef(name="demo", version="1", sha256="0" * 64))
     with pytest.raises(Refusal) as refused:

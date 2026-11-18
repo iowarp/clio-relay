@@ -72,9 +72,12 @@ class JobResources(_Spec):
 class JobAttributes(_Spec):
     """PSI/J ``JobAttributes`` fields."""
 
-    duration: timedelta = Field(
-        default=timedelta(minutes=10),
-        description="Walltime, as seconds or an ISO 8601 duration",
+    duration: timedelta | None = Field(
+        default=None,
+        description=(
+            "Walltime, as seconds or an ISO 8601 duration. Leave it out to use the "
+            "site's default walltime or, with none, the scheduler's own limit"
+        ),
     )
     queue_name: str | None = None
     account: str | None = None
@@ -87,14 +90,17 @@ class JobAttributes(_Spec):
         from psij import JobAttributes as PsijJobAttributes
 
         custom: dict[str, object] | None = dict(self.custom_attributes) or None
-        return PsijJobAttributes(
-            duration=self.duration,
+        attributes = PsijJobAttributes(
             queue_name=self.queue_name,
             account=self.account,
             reservation_id=self.reservation_id,
             project_name=self.project_name,
             custom_attributes=custom,
         )
+        # psij's constructor defaults to 10 minutes and refuses None; the setter takes
+        # None, which sends no walltime at all.
+        attributes.duration = self.duration
+        return attributes
 
 
 class InputRef(_Spec):
@@ -159,9 +165,12 @@ class JobSpec(_Spec):
         """Return the SHA-256 of the canonical JSON form. Approvals bind to it."""
         return canonical_digest(self.model_dump(mode="json"))
 
-    def node_hours(self) -> float:
-        """Return the most node-hours this job may consume."""
-        return self.resources.nodes() * self.attributes.duration.total_seconds() / 3600.0
+    def node_hours(self) -> float | None:
+        """Return the most node-hours this job may consume, or None when no walltime is set."""
+        duration = self.attributes.duration
+        if duration is None:
+            return None
+        return self.resources.nodes() * duration.total_seconds() / 3600.0
 
     def to_psij(
         self,

@@ -263,17 +263,30 @@ def status_script(
     mode: str,
     status_command: str | None,
     native_id: str | None,
+    accounting_command: str | None = None,
 ) -> str:
-    """One poll: the record, then the scheduler or the supervisor (RL17)."""
+    """One poll: the record, then the scheduler or the supervisor (RL17).
+
+    ``accounting_command`` runs only when the queue no longer lists the job and
+    the job wrote no exit code, as the last evidence of how it ended.
+    """
     body = f"J={q(job_dir)}\n" + 'cd "$J" 2>/dev/null || { echo "@@nodir"; exit 0; }\n'
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
     body += 'echo "@@last"; tail -n 1 states 2>/dev/null\n'
     if mode == "scheduler" and status_command is not None and native_id is not None:
+        ec = q(native_id + ".ec")
         body += (
             f"out=$({status_command} 2>&1 </dev/null); rc=$?\n"
             'echo "@@schedrc $rc"; echo "@@sched"; printf "%s\\n" "$out"\n'
-            f'echo "@@ec"; cat {q(native_id + ".ec")} 2>/dev/null; echo\n'
+            f'echo "@@ec"; cat {ec} 2>/dev/null; echo\n'
         )
+        if accounting_command is not None:
+            body += (
+                f"if [ ! -s {ec} ] && ! printf '%s\\n' \"$out\" | "
+                f"awk '{{print $1}}' | grep -qxF {q(native_id)}; then\n"
+                f'  echo "@@acct"; {accounting_command} 2>/dev/null </dev/null; echo\n'
+                "fi\n"
+            )
     else:
         body += (
             'echo "@@exit"; cat exit_code 2>/dev/null; echo\n'
@@ -345,18 +358,31 @@ def describe_script(scheduler: str) -> str:
     )
 
 
-def exec_script(command: Sequence[str], guard_s: int | None) -> str:
-    """Run one command from the home directory, with a cleanup guard on the site
-    when it has a time limit."""
+def exec_script(command: Sequence[str]) -> str:
+    """Run one command from the home directory, stopped when relay lets go.
+
+    Relay holds the session's standard input open. When it closes, because the
+    call ended, timed out or was cancelled, or the connection dropped, the
+    watchdog stops the command's process group.
+    """
     joined = shlex.join(list(command))
-    if guard_s is None:
-        return f'cd "$HOME" 2>/dev/null\nexec {joined} </dev/null\n'
     return (
         'cd "$HOME" 2>/dev/null\n'
-        "if command -v timeout >/dev/null 2>&1; then\n"
-        f"  exec timeout -k 2 {guard_s} {joined} </dev/null\n"
+        "exec 3<&0\n"
+        "if command -v setsid >/dev/null 2>&1; then\n"
+        f"  setsid {joined} </dev/null 3<&- &\n"
+        "else\n"
+        f"  {joined} </dev/null 3<&- &\n"
         "fi\n"
-        f"exec {joined} </dev/null\n"
+        "c=$!\n"
+        '( cat <&3 >/dev/null 2>&1; kill -TERM -"$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null\n'
+        '  sleep 2; kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null ) '
+        ">/dev/null 2>&1 &\n"
+        "w=$!\n"
+        "exec 3<&-\n"
+        'wait "$c"; rc=$?\n'
+        'kill "$w" 2>/dev/null\n'
+        'exit "$rc"\n'
     )
 
 

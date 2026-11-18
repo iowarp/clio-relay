@@ -12,11 +12,13 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from pydantic import BaseModel, SecretStr
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
@@ -25,8 +27,9 @@ from clio_relay.adapters.globus.compute import ComputeService, function_digest
 from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
 from clio_relay.adapters.globus.task import relay_task
 from clio_relay.adapters.globus.transfer import TransferService
+from clio_relay.adapters.local import LocalAdapter
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import JobState
+from clio_relay.jobs.handles import ExecResult, JobState, StallReport
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobAttributes, JobResources, JobSpec
@@ -159,6 +162,12 @@ def test_user_config_keys_follow_the_site(tmp_path: Path) -> None:
     }
 
 
+def test_user_config_sends_no_walltime_without_a_duration(tmp_path: Path) -> None:
+    adapter = _build(tmp_path)
+    spec = JobSpec(executable="hostname", attributes=JobAttributes(queue_name="debug"))
+    assert adapter.user_config(spec) == {"queue": "debug", "nodes_per_block": 1}
+
+
 @pytest.mark.asyncio
 async def test_job_reaches_the_endpoint_with_its_user_config(tmp_path: Path) -> None:
     adapter = _build(tmp_path)
@@ -240,6 +249,100 @@ async def test_signed_out_refuses_needs_sign_in(tmp_path: Path) -> None:
     assert "endpoint_status" not in info.facts
 
 
+class RecordingLocal(LocalAdapter):
+    """The ``local`` adapter, keeping the arguments of each ``exec`` call."""
+
+    name: ClassVar[str] = "start-recorder"
+    calls: ClassVar[list[dict[str, Any]]] = []
+
+    async def exec(
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
+    ) -> ExecResult:
+        RecordingLocal.calls.append(
+            {"command": command, "timeout_s": timeout_s, "on_stall": on_stall}
+        )
+        return await super().exec(
+            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+        )
+
+
+class OfflineGlobusAdapter(LocalGlobusAdapter):
+    """The local adapter with an endpoint that reports offline."""
+
+    async def _compute_service(self) -> ComputeService:
+        await tokens.bearer(self.identity, tokens.COMPUTE_RESOURCE_SERVER, what="compute")
+        return LocalComputeService(self.context.state_dir / "endpoint", status="offline")
+
+
+@pytest.fixture
+def start_recorder() -> Any:
+    RecordingLocal.calls.clear()
+    registry.register(RecordingLocal, "start-recorder")
+    yield RecordingLocal.calls
+    registry.unregister("start-recorder")
+
+
+def _offline(tmp_path: Path, command: list[str], **start: Any) -> OfflineGlobusAdapter:
+    config = GlobusConfig.model_validate(
+        {
+            **local_config(tmp_path),
+            "start": {"adapter": "start-recorder", "command": command, **start},
+        }
+    )
+    return OfflineGlobusAdapter(config, _context(tmp_path))
+
+
+def test_endpoint_start_has_no_default_limit() -> None:
+    config = GlobusConfig.model_validate({"endpoint": ENDPOINT, "start": {"adapter": "worker"}})
+    assert config.start is not None
+    assert config.start.timeout_s is None
+
+
+@pytest.mark.asyncio
+async def test_offline_endpoint_is_started_with_no_limit(
+    tmp_path: Path, start_recorder: list[dict[str, Any]]
+) -> None:
+    marker = tmp_path / "started"
+    command = [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]
+    adapter = _offline(tmp_path, command)
+    handle = await adapter.run(JobSpec(executable="true"), operation_id=new_id("op"))
+    assert marker.exists()
+    assert len(start_recorder) == 1
+    assert start_recorder[0]["command"] == command
+    assert start_recorder[0]["timeout_s"] is None
+    assert start_recorder[0]["on_stall"] is not None
+    await start_recorder[0]["on_stall"](30.0, 30.0)
+    status, _ = await wait_final(adapter, handle, 60, 0.2)
+    assert status.state == JobState.COMPLETED, status
+
+
+@pytest.mark.asyncio
+async def test_endpoint_start_passes_a_set_limit(
+    tmp_path: Path, start_recorder: list[dict[str, Any]]
+) -> None:
+    adapter = _offline(tmp_path, [sys.executable, "-c", "pass"], timeout_s=120)
+    await adapter.run(JobSpec(executable="true"), operation_id=new_id("op"))
+    assert start_recorder[0]["timeout_s"] == 120
+
+
+@pytest.mark.asyncio
+async def test_failed_endpoint_start_refuses_unreachable(
+    tmp_path: Path, start_recorder: list[dict[str, Any]]
+) -> None:
+    command = [sys.executable, "-c", "import sys; print('no config'); sys.exit(2)"]
+    adapter = _offline(tmp_path, command)
+    with pytest.raises(Refusal) as refused:
+        await adapter.run(JobSpec(executable="true"), operation_id=new_id("op"))
+    assert refused.value.reason == RefusalReason.UNREACHABLE
+    assert "no config" in str(refused.value)
+    assert LocalComputeService(tmp_path / "adapter" / "endpoint").submitted() == []
+
+
 def _grant(path: Path, tokens_: list[dict[str, Any]]) -> Path:
     path.write_text(
         json.dumps({"version": 1, "provider": "globus", "written_at": 0, "tokens": tokens_}),
@@ -289,6 +392,67 @@ async def test_status_of_accepts_enums_and_coroutines() -> None:
             return Status.SIGNED_IN
 
     assert await tokens.status_of(Async()) == "signed_in"
+
+
+class W6Token(BaseModel):
+    """The shape of W6's ``Token``: the access token is a ``SecretStr``."""
+
+    resource_server: str | None = None
+    access_token: SecretStr
+    token_type: str = "Bearer"
+
+
+class W6Status(BaseModel):
+    """The shape of W6's ``IdentityStatus``."""
+
+    provider: str
+    state: str
+
+
+class W6Provider:
+    """A provider with W6's signatures: both calls async, ``resource_server`` optional."""
+
+    async def token(self, resource_server: str | None = None) -> W6Token | None:
+        if resource_server == tokens.COMPUTE_RESOURCE_SERVER:
+            return W6Token(resource_server=resource_server, access_token=SecretStr("secret-1"))
+        return None
+
+    async def status(self) -> W6Status:
+        return W6Status(provider="globus", state="expired")
+
+
+@pytest.mark.asyncio
+async def test_w6_token_and_status_shapes() -> None:
+    source = W6Provider()
+    assert await tokens.bearer(source, tokens.COMPUTE_RESOURCE_SERVER, what="x") == "secret-1"
+    with pytest.raises(Refusal) as refused:
+        await tokens.bearer(source, tokens.TRANSFER_RESOURCE_SERVER, what="files")
+    assert refused.value.reason == RefusalReason.NEEDS_SIGN_IN
+    assert await tokens.status_of(source) == "expired"
+    assert "secret-1" not in repr(await source.token(tokens.COMPUTE_RESOURCE_SERVER))
+
+
+def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    built = W6Provider()
+    asked: list[str] = []
+
+    class Identities:
+        def get(self, name: str) -> W6Provider | None:
+            asked.append(name)
+            return built if name == "globus" else None
+
+    shared = Identities()
+    fake = types.ModuleType("clio_relay.identity")
+    fake.__dict__["shared"] = lambda: shared
+
+    def factory_get(name: str) -> object:
+        pytest.fail(f"get({name!r}) returns the factory, not a provider")
+
+    fake.__dict__["get"] = factory_get
+    monkeypatch.setitem(sys.modules, "clio_relay.identity", fake)
+    assert tokens.provider("globus") is built
+    assert isinstance(tokens.provider("nobody"), tokens.GrantFileProvider)
+    assert asked == ["globus", "nobody"]
 
 
 def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:
