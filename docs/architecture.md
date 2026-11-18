@@ -73,7 +73,6 @@ the single admission credential.
 |---|---|---|
 | `jarvis` | required | The job directly represents application work whose JARVIS execution may carry scheduler `native_id` provenance. |
 | `remote_agent` | required | The parent agent and any scheduler work it initiates need one durable owning session generation. |
-| `mcp_call` | optional, recorded when present | A generic call runs in endpoint containment without an outer scheduler allocation. If the called tool creates JARVIS work, its returned native handle and record remain the scheduler authority. |
 
 Supplying only one header is always a typed refusal. An owner-session-scoped
 API additionally verifies that the pair matches its exact live generation.
@@ -119,53 +118,6 @@ identities remain visible only as compatibility evidence; none can establish a
 1.0 claim, ownership, polling, or cancellation eligibility.
 
 Interactive services should be launched through scheduler-backed package or pipeline behavior as well. The relay records the gateway session and transport metadata, while the package owns how the service starts on the allocated node, how stdout and stderr are interpreted, and which structured progress or runtime events are reported.
-
-## Remote MCP catalogs
-
-Remote MCP servers are registered per cluster with direct-execution commands,
-tool allowlists, local profile permissions, and optional child-to-worker
-environment references. References contain names only; the packaged runner
-constructs a minimal child environment and resolves explicitly allowed values
-at execution time. Relay-owned credentials are never eligible references.
-Schema discovery is a durable
-`mcp_call` job using the `tools/list` operation. Its validated result and
-provenance are cached on the operator desktop; local MCP `tools/list` never
-starts a cluster process.
-
-The cluster-side MCP client and registered server run directly under endpoint
-process containment. They retain normal relay leases, cooperative cancellation,
-timeouts, bounded logs, immutable result artifacts, and restart reconciliation,
-but do not use a JARVIS adapter merely to perform protocol transport. Specialized
-JARVIS semantics require the exact immutable registered contract; a generic MCP
-tool cannot claim them by name.
-
-Fresh equivalent schemas across clusters become one deterministic local alias
-with a `cluster` routing property. The property is added to a copy of the
-remote input schema and removed before submission, so it never changes the
-remote contract. Stale, command-mismatched, unsafe, or non-allowlisted schemas
-are excluded. Alias collisions receive stable content-derived suffixes.
-Paginated discovery is bounded by page, unique-tool, and response-byte limits;
-cursor cycles and conflicting duplicate definitions fail the durable job.
-
-For exact JARVIS contract v3.6 routes, package descriptions may declare a closed
-`jarvis.configuration-input-binding.v1` setting. Only that schema declaration
-authorizes relay to snapshot a bounded regular file under the configured local
-workspace, ingest it through the authenticated owner-generation API, replace
-the argument with its cluster-local content-addressed path, and attach its
-content pin to the job. Successful add-step lineage is durable across MCP client
-restart and is keyed by the complete route, server artifact, pipeline, and
-owner-session identity. Unannotated path-like strings and other contracts are
-never interpreted as upload requests.
-
-Run inputs move only this way. The declared value is a path on the client
-machine, relative to the configured workspace root; the bytes travel through the
-owned session over the connection's one link. Relay never copies a run input
-with `scp` or `rsync`, and a cluster-absolute path supplied for a
-binding-declared setting is not staging — it disables it, leaving the job with
-an empty `used_artifact_refs`. A non-empty `used_artifact_refs` whose digest
-matches the client's bytes is the proof that staging engaged; an empty one on a
-declared file-typed setting means the input arrived out of band and the run is
-not reproducible.
 
 ## provenance records
 
@@ -214,9 +166,8 @@ connections concurrently, behind one client-facing MCP endpoint.
 
 Every transport carries local HTTP between endpoints. No job submission, cursor, artifact, cancellation, progress, or provenance record depends on a particular tunnel.
 
-`docs/connection-model.md` is the normative statement of this model, including
-the 2FA operating constraint, reconnect semantics, the input-staging contract,
-and the tracked deviations. Read it before implementing against relay.
+`docs/adapters/worker.md` describes how the worker places itself, signs in and
+reconnects over this one link.
 
 ## Detach and Teardown
 

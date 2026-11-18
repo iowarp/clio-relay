@@ -158,13 +158,3 @@ def as_http_problem(fault: RelayFaultLike) -> JSON:
     if fault.reason == "owner_session_identity_refused":
         document["message"] = fault.message
     return _bounded_document(document)
-
-
-def as_browser_gateway_error(fault: RelayFaultLike) -> tuple[int, JSON]:
-    """Render a fault onto the browser gateway's two-argument response shape.
-
-    The legacy gateway surface carried only ``{"error": message}``. This
-    adapter reuses the same RFC 7807 document as the HTTP surface and pairs it
-    with ``fault.http_status`` for the document-aware gateway responder.
-    """
-    return fault.http_status, as_http_problem(fault)

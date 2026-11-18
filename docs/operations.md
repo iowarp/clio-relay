@@ -6,9 +6,8 @@ For a complete first-connection walkthrough from a local desktop through a
 homelab relay to a cluster worker and remote agent, see
 `docs/connect-desktop-homelab-cluster.md`.
 
-`docs/connection-model.md` is normative for everything transport-related on this
-page: one held link per connection, the ssh budget, the 2FA operating
-assumption, reconnect, and relay-owned input staging. The operator paths below
+`docs/adapters/worker.md` describes the one held link this page relies on:
+placement in one ssh pass, sign-in, reconnect, and the worker's settings. The operator paths below
 are ways to build and drive that one connection, not independent ways to reach
 the cluster.
 
@@ -666,11 +665,11 @@ worker slots inside that service. `--concurrency` is the total process capacity.
 total; managed policies retain at least one control slot and one workload slot.
 This allows status, progress, artifact, and runtime-binding queries to execute
 while a long-lived workload is still running. Repeat `--kind-concurrency
-KIND=LIMIT` to add a ceiling for `jarvis`, `remote_agent`, or `mcp_call`;
+KIND=LIMIT` to add a ceiling for `jarvis` or `remote_agent`;
 omitted kinds remain governed only by their lane and total capacity. Kind limits
-are caps, not reserved slots. An `mcp_call` kind limit applies to workload-class
-MCP calls; reserved control queries use the separately configured control-query
-cap, so a long-running workload MCP call cannot consume its query lane. The
+are caps, not reserved slots. Reserved control queries use the separately
+configured control-query cap, so a long-running workload cannot consume its
+query lane. The
 queue checks these limits atomically with
 durable lease creation across slots and processes. A saturated kind is skipped
 so it cannot block an eligible job of another kind. Explicit install overrides
@@ -680,174 +679,6 @@ flags cannot silently reset the worker to one slot. Use
 `clio-relay worker status`, HTTP
 `/workers`, and the equivalent MCP operation report the configured policy,
 whether fresh worker registrations agree, and active leases by kind.
-
-## Expose Tools to an Agent
-
-```powershell
-clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
-clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
-```
-
-The `--prompt` and `--mcp-config` values are cluster-side paths for operator
-material placed once at bootstrap, before the connection carries work. They are
-not a transfer channel and must not be used as a precedent for getting other
-files onto the cluster. A file that a job reads is staged by relay from the
-desktop workspace through the connection's one link; see `stage declared local
-package inputs` in `docs/remote-mcp-federation.md`.
-
-Agents should submit child cluster work asynchronously and return the child `job_id`. A single cluster worker cannot execute a child job while it is blocked inside a parent agent job waiting for that child to finish.
-
-Agents can also record structured task timeline events:
-
-```powershell
-clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
-clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
-```
-
-Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
-
-## serve MCP background tasks
-
-The relay MCP server uses native FastMCP. Stdio remains the default:
-
-```powershell
-clio-relay mcp-server --profile user
-```
-
-To expose authenticated Streamable HTTP on loopback:
-
-```powershell
-$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
-clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
-```
-
-HTTP refuses to start without the relay API token. Modern FastMCP clients can
-use ordinary `call_tool` for transparent polling or `call_tool_task` for an
-immediate standard task handle. Closing the client does not cancel the relay
-job; reconnect with the retained task ID. Cancellation remains a separate
-explicit operation.
-
-The server implements SEP-2663 over existing relay jobs and does not start
-FastMCP's Docket execution backend. See [MCP background
-tasks](mcp-tasks.md) for status mapping, input rounds, limits, client examples,
-and protocol-version behavior.
-
-## Use Remote JARVIS MCP
-
-Install the cluster-side server once, then launch its persistent executable:
-
-```bash
-uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
-clio-kit mcp-server jarvis
-```
-
-Release bootstrap is stricter: it downloads and hashes the exact released
-wheel first, installs that wheel with `uv tool install`, and records the uv
-binary/version, tool and environment directories, provider interpreter,
-`pyvenv.cfg` uv marker, installed RECORD closure, and retained wheel digest.
-Repeated worker calls execute that receipt-bound tool directly; they do not
-create a new `uvx` environment per call.
-
-The default agent MCP profile exposes compact relay tools and the compact JARVIS tools:
-
-- `relay_remote_mcp_context`
-- `relay_submit_agent`
-- `relay_status`
-- `relay_cancel`
-- `relay_observe`
-- `relay_wait`
-- `relay_queue_list`
-- `relay_queue_diagnose`
-- `relay_queue_stale`
-- `relay_storage_status`
-- `relay_bind_jarvis_runtime`
-- `relay_artifact_lineage`
-- `jarvis_create_pipeline`
-- `jarvis_describe`
-- `jarvis_add_step`
-- `jarvis_edit_step`
-- `jarvis_get_execution`
-- `jarvis_run`
-
-Operator-registered remote MCP aliases are added to this user surface from the
-profile-filtered durable schema cache. Administrative mutation, worker, raw
-dispatch, and direct gateway tools remain hidden and are rejected at dispatch.
-
-The pre-1.0 user contract merges removal into
-`jarvis_edit_step(operation="remove")`; `operation="edit"` requires `config`.
-Removal unlinks pipeline membership and intentionally does not clean package
-files. There is no `jarvis_remove_step` alias, including in admin/all profiles;
-admin retains the lower-level `unlink_pkg` compatibility tool.
-`jarvis_run(spack_specs=[...])` applies the runtime Spack
-environment inside JARVIS rather than relying on a process-local load command.
-
-The expected workflow is to create or load a pipeline through those JARVIS
-tools, use `jarvis_describe` for package and pipeline inspection, and call
-`jarvis_run` to submit the configured pipeline through the cluster-local JARVIS
-environment. Discover an application with
-`jarvis_describe(target="package_search", query="visualization", page_size=10)`.
-The query is required and limited to 256 characters; `page_size` defaults to 10
-and is bounded from 1 through 25. Results contain lightweight package summaries
-rather than package settings and never exceed 64 KiB. When `next_cursor` is
-present, repeat the same query with that opaque cursor to read the next page.
-The cursor is limited to 1,024 characters and is bound to both the query and the
-current package inventory, so a different query or a changed inventory fails
-closed. After selecting a result, use `target="package"` with its canonical
-`name` as `package_name` to retrieve the package-owned settings. The exhaustive
-`target="packages"` inventory remains available for explicit legacy use, but it
-is not the normal discovery path. `relay_observe` and `relay_wait` are the
-agent-facing monitor loop for progress and terminal output. `relay_wait` omits
-stdout and stderr unless `include_logs=true`; its inline MCP result prioritizes
-the authoritative `structured_result`, while the complete protocol response
-remains available in the SHA-verified immutable result artifact.
-After submission, `jarvis_get_execution` is the single durable query. It always
-returns the execution handle, lifecycle record, and runtime metadata; progress
-is included by default and can be disabled with `include_progress=false`.
-Artifacts remain opt-in: pass `artifacts={}` or bounded filters for one page,
-then pass the returned opaque cursor with the same filters for the next page.
-The call requires the local `cluster` selector plus the returned `pipeline_id`
-and `execution_id`. The relay forwards the query as a durable remote MCP job and
-validates the returned identities, lifecycle, progress, artifact filters,
-counts, and cursor bounds before marking its result valid.
-
-Virtual `jarvis_run` returns a durable execution handle without waiting for the
-workload. The short relay MCP job may be waited only long enough to obtain that
-handle; its completion is not workload completion and its progress
-notifications are not live-workload evidence. `jarvis-mcp-validate` repeatedly
-calls `jarvis_get_execution`, requiring an identity-coherent running package
-progress snapshot followed by a coherent terminal snapshot. Package progress
-adapters, stdout scraping, and `clio-kit.jarvis-package-progress.v1`
-notifications remain legacy compatibility paths and are invalid as 1.0
-acceptance evidence.
-
-`--wait-timeout-seconds` bounds one validation observation window; it is not a
-workload deadline. If the exact execution is still queued or running, or its
-terminal artifact page is not observable yet, the command writes a `pending`
-report containing a query-only resume checkpoint. Resume it with
-`jarvis-mcp-validate --cluster <cluster> --resume-report <report.json>` after any
-delay. Resume never calls `jarvis_run`, cancels the scheduler job, or creates a
-replacement execution. A pending report is useful operational evidence but
-cannot satisfy the release gate until the same execution reaches a validated
-terminal result with its requested artifacts.
-
-Cluster bootstrap stores the exact clio-kit wheel path, digest, persistent-tool
-environment, and JARVIS MCP command in the installation receipt. The worker
-service reads that receipt and invokes the installed executable directly; it
-does not resolve a package version or create another cache environment at call
-time. Desktop CLI and MCP submissions defer JARVIS command selection to the
-target, so a desktop package default cannot replace the cluster receipt. For
-prerelease diagnostics, `CLIO_RELAY_JARVIS_MCP_COMMAND` can still
-override the command with a JSON string array. The override is interpreted on
-the cluster, but it cannot satisfy released evidence unless it exactly matches
-the receipt-bound command and wheel. A Git
-branch is diagnostic only and cannot satisfy the 1.0 released-artifact gate.
-
-Operational queue, gateway-session, raw MCP-call, and low-level log tools are available through:
-
-```bash
-clio-relay mcp-server --profile admin
-```
 
 ## Bound Worker Output Storage
 
@@ -867,63 +698,6 @@ one `<stream>.truncated` event, and indexes `log-capture.json`. Execution
 provenance records the configured limits and exact observed, persisted, and
 dropped byte counts. Changing these limits while retrying an existing job is
 rejected because it would make the durable accounting ambiguous.
-
-See `docs/remote-mcp-federation.md` for the full agent-facing model.
-
-## Federate a registered remote MCP server
-
-Register only the tools an agent should see, then refresh their schemas through
-a durable cluster-side `tools/list` job:
-
-```powershell
-uv tool install --python 3.12 --no-config C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl
-clio-relay remote-mcp register --cluster my-cluster --name science --command science-mcp --env-from SCIENCE_API_TOKEN=SITE_SCIENCE_API_TOKEN --allow-tool inspect_dataset --profile user --call-timeout-seconds 300
-clio-relay remote-mcp refresh --cluster my-cluster --name science
-clio-relay remote-mcp reload --profile user
-clio-relay remote-mcp validate --cluster my-cluster --name science --tool inspect_dataset --arguments-json-file .\inspect-arguments.json --output-json .\validation\remote-mcp.json
-```
-
-Release validation can additionally require contract-specific
-`structuredContent` semantics with `--result-expectation-json` or
-`--result-expectation-json-file`. The expectation is validated against the
-registered semantic contract and selected tool before relay dispatch. For the
-Spack user contract, it can bind an exact package name and DAG hash, the unique
-locate prefix and canonical `/hash` load spec, or installed status with the
-requested reuse setting. The resulting `remote-mcp.structured-result` check and
-`structured_result_assertion` job metadata are suitable for release-policy
-constraints; successful text content cannot substitute for structured data.
-
-For clio-kit's scientific catalog, register the current
-`clio-kit-scientific-catalog-user-v1.1` contract. Its describe result exposes an
-exact top-level `dataset_descriptor` for direct handoff to
-`jarvis_add_step(config.dataset_descriptor=...)`; do not pass the surrounding
-catalog `dataset` record to JARVIS. Historical
-`clio-kit-scientific-catalog-user-v1` registrations remain valid against their
-own preserved digest, but do not claim this explicit handoff shape.
-
-The wheel path is an operator-supplied immutable artifact. A PyPI requirement
-string is insufficient for user-profile evidence. A direct console script is
-accepted only when it belongs to one non-editable installed distribution and
-every file in that distribution's `RECORD` closure verifies.
-
-The generated alias is normally `remote_science_inspect_dataset`. Its local
-schema contains a `cluster` selector; the remote call receives only the
-discovered server arguments. Stale schemas and command-changed cache entries
-are hidden until the operator refreshes them. `reload` is local and performs no
-remote execution.
-
-The alias returns a durable relay job handle, so its local `outputSchema`
-describes that handle rather than copying the remote tool's synchronous result
-schema. The worker enforces the registration's call timeout and bounded MCP
-stdout, stderr, and response sizes. Read the completed `mcp_result` artifact for
-the upstream tool result.
-
-`--env-from` stores variable-name references only. The worker gives the MCP
-child a minimal runtime environment plus those references; it does not inherit
-the worker's remaining environment. Relay API, frp, progress, runtime-metadata,
-and STCP credentials cannot be referenced. Schema discovery follows bounded
-MCP pagination and records its page, tool, and response-byte limits in the
-durable result.
 
 ## Manage Streaming Service Runtimes
 
@@ -1109,7 +883,7 @@ writes a revocation marker before
 stopping the owned proxy; same-id retries return an idempotent revoked result, while
 a different attachment id is refused.
 
-Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. By design the application stream rides the connection's one link like all other traffic — compute node to the cluster relay over cluster-internal connectivity, then the cluster relay to the local relay over whatever link the connection is configured with (relay-point TCP, or the held ssh forward; the stream's semantics are identical in every mode). The current `transport_mode` implementation deviates: it opens a compute-node-side frp transport that bypasses the cluster relay and has no ssh-pathway equivalent — tracked on the connection-model restoration, issue #179.
+Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. By design the application stream rides the connection's one link like all other traffic — compute node to the cluster relay over cluster-internal connectivity, then the cluster relay to the local relay over whatever link the connection is configured with (relay-point TCP, or the held ssh forward; the stream's semantics are identical in every mode). The current `transport_mode` implementation deviates: it opens a compute-node-side frp transport that bypasses the cluster relay and has no ssh-pathway equivalent — tracked on issue #179.
 
 The default service contract is push-based. A desktop client subscribes once to `stream_url`, and the remote application pushes data, images, frames, or domain records as they are emitted. The relay does not assume any application-specific endpoint shape. Pull-style endpoints are represented only as named `compatibility_paths`, such as `snapshot`, `render_once`, or `state_dump`.
 
@@ -1405,34 +1179,3 @@ It owns one bounded validation job, observes pending before release, proves allo
 from assigned nodes, observes a fresh running state, and waits for completion. A failed
 run cancels only the exact job id it submitted and records cleanup in the JSON report.
 
-## Live Acceptance
-
-```powershell
-clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --report .clio-relay\validation-reports\validation-my-cluster-live-test.json
-```
-
-A complete live acceptance should verify the cluster bootstrap, worker service, transport, JARVIS package execution, logs, artifacts, provenance, progress, and agent tool submission path.
-
-`--timeout-seconds` bounds one observation, not the lifetime of an HPC job. If
-the primary relay job remains queued or running, live JARVIS metadata is not yet
-available, or a secure-runtime query/bind remains nonterminal, `live-test`
-writes a `pending` report. Its strict checkpoint records the exact cluster,
-run id, relay job, idempotency key, phase, and any known pipeline, execution,
-source-artifact, service, or gateway identities. It has no TTL and requests no
-scheduler or relay cancellation.
-
-Resume that exact observation after any delay while passing the same semantic
-inputs:
-
-```powershell
-clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --resume-report .clio-relay\validation-reports\pending-live-test.json --timeout-seconds 900
-```
-
-The resume writes a new sibling report and preserves the source checkpoint. It
-queries the recorded phase/job in place; it does not submit another primary
-JARVIS run. Changed cluster configuration, pipeline content, validation intent,
-or checkpoint evidence is rejected before any remote command. A deterministic
-failed/canceled workload or malformed/integrity-invalid runtime result remains
-a failed validation. The release gate continues to reject `pending` reports.
-
-When a package adapter or runtime metadata artifact is present, the text and machine-readable reports also record `application_boundary`, `application_profile`, `package_adapter`, `package_owner`, `runtime_metadata_source`, `runtime_scheduler_provider`, `runtime_scheduler_job_id`, its field-level source, and the runtime artifact id. `structured_runtime_metadata=legacy_fallback` is evidence of a compatibility path, not proof that structured runtime ingestion passed the 1.0 gate.

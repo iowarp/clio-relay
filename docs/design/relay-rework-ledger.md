@@ -900,12 +900,17 @@ LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `
 
 Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` were held, because W9's runtime still imported them. W9 dropped those imports at 5a01766. W8 merged W9's branch at that commit (91bcc3c), so the deletion could go ahead, and deleted the three groups with their tests (ba5ad4b). Nothing in `src`, `tests`, `jarvis-packages` or `scripts` imports them now. The worker's scheduler module is imported as `worker_scheduler`.
 
-Still to clear for LQ32, in a follow-up on this branch:
-- the `browser_gateway_overloaded` code and its adapter in `door_errors`;
-- the `mcp_call` job kind (`models_enums`, `models_job_specs`, and W9's `jarvis_service_runtime_validation`);
-- the `virtual_*_mcp_call` release-gate roles;
-- comments in W1's scripts;
-- the user docs (`architecture`, `mcp-tasks`, `operations`, `release-acceptance-1.0`). README is W1's.
+Done in the follow-up (353ef89):
+- The seven `browser_*` door reasons and `as_browser_gateway_error` are removed. Nothing produced them once the gateway was gone. REASONS goes from 75 to 68, and the HTTP statuses from 61 to 54.
+- In the user docs, the sections for the deleted commands are removed: `operations.md` (agent, `mcp-server`, remote JARVIS MCP, remote MCP federation, `live-test`) and `architecture.md` (remote MCP catalogs, the `mcp_call` row).
+- Links to the deleted `connection-model.md` and `remote-mcp-federation.md` now point at `docs/adapters/worker.md`, or are dropped.
+
+Left, with the reason:
+- The `mcp_call` job kind (`JobKind.MCP_CALL`, `McpCallSpec`) has no producer and no runner on the worker. W9's `jarvis_service_runtime_validation.py:55` still reads it, so W8 removes it after W9 drops that use. Its test hits go with it.
+- The `virtual_*_mcp_call` roles are vocabulary of the old 1.0 release gate: `release_gate_resources`, `validation_report` and `docs/release-gate-1.0.yaml`. That code is reached through `validation_report`, which the bootstrap and session code still use. Renaming a role changes recorded reports for no gain. Whether the 1.0 release-gate machinery goes is a decision for the coordinator.
+- Some history comments in W1's scripts name deleted modules. W8 leaves W1's files alone beyond the approved edits.
+- `README.md` (lines 42, 62, 130, 253) and `docs/mcp-tasks.md:127` belong to W1.
+- `operations.md` still documents the old operator command paths (`clio-relay cluster ...` and gateway sessions). It needs a rewrite owner once the cutover settles the command names.
 
 ### clio-schemas
 
@@ -1013,7 +1018,16 @@ On Ares, at ba5ad4b unless noted. The merge of integration at dae2774 (8b34a44) 
 - **The process-containment modules** (the six that need a user manager) passed 170 of 170 on the login node at af85a62.
 - **Targeted modules** (17 files: the edited tests plus the cli, scheduler, http api, service runtime and patch-seam modules) ran in Slurm (job 27799). 13 tests failed, all of them in develop's 142, so none are new: 12 in the two scheduler-cancel files ("relay-managed JARVIS installation receipt does not match this worker"), and `test_isolated_named_wrapper_loads_plain_module_roots_without_python_hooks`, which fails because the compute node has no user manager.
 - **pyright.** 5076 errors, under the 5583 baseline, measured with `uv run` at 8b34a44. The baseline is lowered to match. Run without the venv active, the count is 8987, because imports do not resolve then. That is a measuring mistake, not a regression.
-- **The full suite** runs once in Slurm at the request commit. Its result and the develop failures it retires go here when it ends.
+- **The full suite** ran once, in Slurm job 27809 at a4dc2cf, without the six user-manager modules (which run on the login node). The run counted 3913 dots (passing tests) and 8 skips, plus 126 failed node ids:
+  - **46 are in develop's list.** All are in kept or moved files: `test_endpoint` (18), the two scheduler-cancel files (12, "relay-managed JARVIS installation receipt does not match this worker"), `test_bootstrap_cluster_paths` (5), `test_jarvis_recovery_scheduling` (3), `test_endpoint_bounded_reads` (2), and one each in `test_endpoint_worker_lanes`, `test_frpc_proxy_scripts`, `test_owner_session_lease`, `test_scheduler_status`, `test_worker_concurrency` and `test_worker_lifetime_lock`. Their causes are the ones listed under "Develop's pre-existing failures".
+  - **78 failed because of where they ran.** W2's fixtures listen on the login node's loopback (`127.0.0.1:47100-47107`), which a compute node cannot reach (`relay_ssh`, `test_fixtures_smoke`, `asks/test_askpass_otp`). `relay_tapis` failed because W8's venv lacked the `tapis` extra.
+  - **2 more were not in develop's list.** `test_remote_cli` expected the remote command without the `worker` group; the test is fixed (24c6d6d). `test_remote_agent_runner` runs `python` from PATH, which Ares does not have outside the venv.
+  - **Rerun on the login node at 24c6d6d**, with the fixtures env, the `tapis` extra and the venv on PATH: `relay_ssh`, `relay_tapis`, `test_fixtures_smoke`, `asks/test_askpass_otp`, `test_remote_cli` and `test_remote_agent_runner` passed 178 of 178, none skipped. The six user-manager modules passed 170 of 170 there.
+- **Develop's failures retired.** W8's base list has 173 node ids. 127 no longer fail:
+  - 59 were in deleted files;
+  - 52 are in the user-manager modules, which pass on the login node;
+  - 16 in kept files now pass.
+  The 46 above remain. None of them is skipped or rerun to pass.
 
 ### Workflows
 

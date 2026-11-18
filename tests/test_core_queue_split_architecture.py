@@ -867,7 +867,7 @@ def test_guard_detects_a_dead_fstring_loop_seam_fixture() -> None:
 # lines later. The same review pass found this shape live-broken a second time
 # in ``tests/test_jarvis_handle_first_admission.py`` (no ``raising=False`` --
 # that one simply errored, but nothing had run it end-to-end since the facade
-# collapse) and unnecessarily flagged in ``tests/test_browser_gateway.py``
+# collapse) and unnecessarily flagged in the old gateway's tests
 # (``raising=False`` on an attribute that has always resolved).
 
 

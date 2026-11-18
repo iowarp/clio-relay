@@ -19,8 +19,8 @@ The `ssh` and `scp` invocations below belong to the gate harness. They place
 build scripts, provider fixtures, and site material on an evidence cluster
 before any connection carries work. They are not how a client, an agent, or an
 application uses relay, and they must never be copied into product code, agent
-instructions, or a benchmark harness. `docs/connection-model.md` is normative
-for what relay actually does.
+instructions, or a benchmark harness. `docs/adapters/worker.md` describes
+what relay actually does.
 
 Two steps below currently go further than fixture placement and stage a **run
 input** out of band: the LAMMPS input deck and the secure-runtime dataset
@@ -678,7 +678,7 @@ $HomelabBootstrap = Invoke-RelayReport -Id "homelab-bootstrap-preparation" -Diag
 foreach ($Cluster in @($AresCluster, $HomelabCluster)) {
   & $Relay cluster install-endpoint-service --cluster $Cluster --concurrency 3 `
     --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 `
-    --kind-concurrency mcp_call=1 --start --enable --require-persistent
+    --start --enable --require-persistent
   if ($LASTEXITCODE -ne 0) { throw "worker service installation failed: $Cluster" }
 }
 
