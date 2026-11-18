@@ -302,6 +302,23 @@ def create_app(state: StubState) -> FastAPI:
 
     # systems
 
+    @app.get("/v3/systems")
+    async def get_systems(request: Request) -> Response:
+        # Only the ``(field.eq=value)~(...)`` search relay sends; every system is visible.
+        if user(request) is None:
+            return _error(401, "Invalid token")
+        terms = [
+            term.partition(".eq=")
+            for term in request.query_params.get("search", "").strip("()").split(")~(")
+            if ".eq=" in term
+        ]
+        found = [
+            {"id": system["id"], "host": system.get("host")}
+            for system in list(state.systems.values())
+            if all(str(system.get(field)) == value for field, _, value in terms)
+        ]
+        return _envelope(found)
+
     @app.get("/v3/systems/{system_id}")
     async def get_system(system_id: str, request: Request) -> Response:
         if user(request) is None:

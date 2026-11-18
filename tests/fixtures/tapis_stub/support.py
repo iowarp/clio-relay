@@ -92,3 +92,14 @@ def package_archive(root: Path, names: Iterable[str]) -> bytes:
                 filter=lambda item: None if "__pycache__" in item.name.split("/") else item,
             )
     return buffer.getvalue()
+
+
+def demo_checkout(root: Path) -> Path:
+    """A checkout holding ``w10demo``, a jarvis repo with the package ``w10demo.hello``."""
+    checkout = root / "src"
+    package = checkout / "w10demo" / "w10demo" / "hello"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "pkg.py").write_text("# the fake jarvis never imports this\n", encoding="utf-8")
+    return checkout

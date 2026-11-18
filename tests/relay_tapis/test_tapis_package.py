@@ -7,7 +7,6 @@ The real jarvis-cd run is ``python -m tests.relay_tapis.live_package`` on Ares
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import Any
 
@@ -17,51 +16,16 @@ from clio_relay.adapters.tapis import TapisAdapter, launcher, mapping
 from clio_relay.jobs.handles import JobHandle, JobState
 from clio_relay.jobs.spec import JobSpec, PackageRef
 from tests.fixtures.tapis_stub import TapisStub
-from tests.fixtures.tapis_stub.support import package_archive, sign_in, use_memory_keyring
+from tests.fixtures.tapis_stub.support import (
+    demo_checkout,
+    package_archive,
+    sign_in,
+    use_memory_keyring,
+)
 
 from .live_package import guarded_adapter, run_package, slurm_system
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
-
-FAKE_JARVIS = """#!/bin/bash
-{ printf '%s' "$JARVIS_ROOT"; printf '\\x1f%s' "$@"; printf '\\n'; } >> "$FAKE_JARVIS_LOG"
-case "$1 ${2:-}" in
-"init "*) mkdir -p "$2" "$3" "$4" ;;
-"repo add") [ -d "$3/$(basename "$3")" ] || { echo "no package named for $3" >&2; exit 1; } ;;
-"ppl run") echo ran > "$JARVIS_ROOT/shared/ran" ;;
-"ppl start")
-    [ "${FAKE_JARVIS_START_RC:-0}" = 0 ] || exit "$FAKE_JARVIS_START_RC"
-    echo started > "$JARVIS_ROOT/shared/started" ;;
-"ppl stop") echo stopped > "$JARVIS_ROOT/shared/stopped" ;;
-esac
-echo "fake jarvis $1 ${2:-}"
-"""
-
-
-@pytest.fixture
-def jarvis_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Put a recording ``jarvis`` first on PATH, and give the job a home of its own."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    script = bin_dir / "jarvis"
-    script.write_text(FAKE_JARVIS, encoding="utf-8")
-    script.chmod(0o755)
-    log = tmp_path / "jarvis.log"
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("FAKE_JARVIS_LOG", str(log))
-    monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    return log
-
-
-def demo_checkout(root: Path) -> Path:
-    """A checkout holding ``w10demo``, a jarvis repo with the package ``w10demo.hello``."""
-    checkout = root / "src"
-    package = checkout / "w10demo" / "w10demo" / "hello"
-    package.mkdir(parents=True)
-    (package.parent / "__init__.py").write_text("", encoding="utf-8")
-    (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "pkg.py").write_text("# the fake jarvis never imports this\n", encoding="utf-8")
-    return checkout
 
 
 async def test_a_package_runs_through_a_jarvis_of_its_own(

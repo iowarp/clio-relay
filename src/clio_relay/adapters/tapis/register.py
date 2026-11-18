@@ -294,8 +294,14 @@ async def register_host(
     *,
     home: str | None = None,
     queues: list[str] | None = None,
+    address: str | None = None,
 ) -> Registration:
-    """Register the site's system and the person's credential on it."""
+    """Register the site's system and the person's credential on it.
+
+    ``address`` is the site's host. A TACC host with no ``system_id`` set is
+    refused with the Tapis systems on that host the person can see, so the
+    person can pick one.
+    """
     username = await adapter.username()
     system_id = await adapter.system_id()
     authn = adapter.config.authn
@@ -309,11 +315,7 @@ async def register_host(
     existing = await _get_system(adapter, system_id)
     if existing is None:
         if target is None:
-            raise Refusal(
-                RefusalReason.INVALID_CONFIG,
-                f"Tapis has no system {system_id}, and the site has no ssh alternative "
-                "to register one from",
-            )
+            raise await _no_system(adapter, system_id, address)
         assert ssh is not None
         home = home or await asyncio.to_thread(ssh.home)
         limits: dict[str, int | None] = {}
@@ -376,6 +378,44 @@ async def _get_system(adapter: TapisAdapter, system_id: str) -> dict[str, Any] |
         if exc.not_found:
             return None
         raise exc.refusal(system=system_id) from None
+
+
+async def systems_on_host(adapter: TapisAdapter, host: str) -> list[str]:
+    """The ids of the Tapis systems on ``host`` that the person can see."""
+    try:
+        found = await adapter.tapis_call(
+            "systems",
+            "getSystems",
+            search=f"(host.eq={host})",
+            listType="ALL",
+            select="id,host",
+            limit=100,
+        )
+    except TapisCallError as exc:
+        raise exc.refusal(host=host) from None
+    items = cast(list[dict[str, Any]], found or [])
+    return sorted(str(item["id"]) for item in items if item.get("id"))
+
+
+async def _no_system(adapter: TapisAdapter, system_id: str, address: str | None) -> Refusal:
+    """The refusal for a site whose system is missing and cannot be made from here."""
+    if adapter.config.authn != "tms" or not address:
+        return Refusal(
+            RefusalReason.INVALID_CONFIG,
+            f"Tapis has no system {system_id}, and the site has no ssh alternative "
+            "to register one from",
+            system=system_id,
+        )
+    candidates = await systems_on_host(adapter, address)
+    shown = f": {', '.join(candidates)}" if candidates else "; Tapis shows this person none"
+    return Refusal(
+        RefusalReason.INVALID_CONFIG,
+        f"Tapis has no system {system_id}. For {address}, set system_id in the site's "
+        f"config to a Tapis system on that host{shown}",
+        system=system_id,
+        host=address,
+        candidates=candidates,
+    )
 
 
 async def _credential(
