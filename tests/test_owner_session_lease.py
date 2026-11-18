@@ -1097,7 +1097,12 @@ def test_run_once_sweeps_owner_session_leases_every_cycle(
     before accepting work" ask, for the owned-session-lease dimension)."""
     import clio_relay.adapters.worker.endpoint_serve_loop as endpoint_serve_loop
 
-    settings = RelaySettings(core_dir=tmp_path / "core", spool_dir=tmp_path / "spool")
+    # A tmp jarvis_bin keeps the host's own relay-managed JARVIS install out of the test.
+    settings = RelaySettings(
+        core_dir=tmp_path / "core",
+        spool_dir=tmp_path / "spool",
+        jarvis_bin=str(tmp_path / "bin/jarvis"),
+    )
     queue = ClioCoreQueue(settings.core_dir)
     worker = EndpointWorker(
         role=EndpointRole.WORKER,
