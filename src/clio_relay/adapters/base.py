@@ -167,6 +167,8 @@ class BaseAdapter[ConfigT: BaseModel]:
     name: ClassVar[str] = "base"
     Config: ClassVar[type[BaseModel]] = EmptyConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe"})
+    # True when the site runs a reviewed package from the package store, not the agent's command.
+    runs_packages: ClassVar[bool] = False
 
     def __init__(self, config: ConfigT, context: AdapterContext) -> None:
         self.config = config

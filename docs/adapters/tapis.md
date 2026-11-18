@@ -101,7 +101,11 @@ A site entry names the Tapis tenant and, for a host you reach yourself, the
 ## Registering a host
 
 Tapis runs jobs on a *system*: a host it can log in to. Relay registers one
-system for you per site, once.
+system for you per site, once. It does this when you add the site, add it from
+the catalog, edit it or switch to it, and reports what it did. If the
+credential already works, it leaves everything alone, so doing it again is
+safe. If you are not signed in yet, the add reports `needs_sign_in` and keeps
+the site; sign in, then add or switch to the site again, or register by hand:
 
 ```
 python -m clio_relay.adapters.tapis register-host --site ares-tapis
@@ -120,8 +124,8 @@ For a host you already reach over SSH, such as a Chameleon node or Ares:
    partitions, through the site's `ssh` alternative.
 2. It creates the Tapis system `clio-relay.<username>.<site id>`, with its job
    working directory at `~/.clio-relay/tapis`. Each Slurm partition becomes a
-   Tapis logical queue, and jobs run as `BATCH` jobs. A host with no scheduler
-   runs `FORK` jobs.
+   Tapis logical queue, with the partition's time limit, and jobs run as
+   `BATCH` jobs. A host with no scheduler runs `FORK` jobs.
 3. It makes a new RSA key pair, adds the public key to your
    `~/.ssh/authorized_keys` with the comment `clio-relay-tapis:<system id>`,
    and gives the pair to Tapis as your credential for the system.
@@ -162,6 +166,29 @@ allocation on the host.
 5. `status` reads the Tapis job status, and the exit code once the job ends.
    `cancel` calls `cancelJob`.
 
+A package runs through the `jarvis` on the system's PATH. Its name is
+`<repo>.<package>`, for example `clio_jarvis.gray_scott`, and its archive
+holds `<repo>/<repo>/<package>/...` at its root, with anything the repo reads
+beside it (clio-jarvis's `schemas/`). The launcher checks the archive's
+SHA-256, unpacks it once into `<work dir>/packages/<sha256>/`, and runs jarvis
+with a `JARVIS_ROOT` of the job's own, in `<job dir>/.relay-jarvis`:
+
+```bash
+jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared"
+jarvis repo add "<unpacked>/<repo>"
+jarvis ppl create "relay_<job uuid>"
+jarvis ppl append "<repo>.<package>" pkg key=value ...
+jarvis ppl run
+```
+
+So a job never reads or changes your own `~/.ppi-jarvis`, and two jobs never
+share a pipeline. jarvis's output is the job's `stdout` and `stderr`.
+
+Tapis stops any job that runs past its time limit, and gives a job 10 minutes
+when none is asked for. So relay always asks for one. A job with a duration
+gets that, rounded up to whole minutes. A job with none gets its queue's own
+limit, or, where the queue has no limit or there is no queue, a year.
+
 Relay keeps no connection to Tapis between calls, so it can restart at any
 time. After a restart, `find` searches Tapis for a job whose description holds
 the operation id, so a retried `run` never submits a second copy.
@@ -178,7 +205,7 @@ Tapis. Every job on these sites asks you before it spends allocation hours.
 | Refusal | What it means |
 | --- | --- |
 | `needs_sign_in` | Sign in to TACC on the page it names, then try again |
-| `invalid_config` | The site has no Tapis system yet. Run `register-host` |
+| `invalid_config` | The site has no Tapis system yet. Add or switch to the site again, or run `register-host` |
 | `policy_refused` | A free-form executable on a guarded site |
 | `submit_failed` | Tapis refused the job or the credential. The message carries Tapis's own words |
 | `verb_not_implemented` | The system uses a scheduler other than Slurm, which relay does not run jobs on yet |
