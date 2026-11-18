@@ -78,7 +78,8 @@ itself.
 Every endpoint template names its settings differently. `user_config_keys` maps
 the job's account, queue, walltime, node count and reservation onto them. The
 defaults, `account`, `queue`, `walltime` and `nodes_per_block`, match ALCF's
-endpoints. Set a key to `null` when the template has no such setting.
+endpoints. Set a key to `null` when the template has no such setting. A job with
+no walltime sends none, and the endpoint's own default applies.
 
 ## How a job runs
 

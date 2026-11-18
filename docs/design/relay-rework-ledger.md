@@ -748,7 +748,8 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 
 All of this is unit and mock evidence.
 
-- **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`):
+- **Gate on Ares** at `702356e` (integration `87da62d` merged, with W6 and optional duration), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`): the four W11 modules gave exit 0, 102 passed and none skipped; ruff is clean and pyright reports 0 errors. The three new tests cover a job with no duration: globus sends no walltime, iri sends no `duration`, and sky prices it with no amount, walltime or node-hours, without calling SkyPilot.
+- **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted):
   - `uv run pytest -q -rs tests/relay_next/test_globus_adapter.py tests/relay_next/test_iri_adapter.py tests/relay_next/test_sky_adapter.py tests/relay_next/test_w11_catalog.py`: exit 0, 99 passed, none skipped. The kit asserts the `verb_not_implemented` refusal for `exec` on all four targets and `files` on sky, and runs `exec` with no limit. The globus endpoint-start tests cover no default limit, a set limit passed through, stall reporting wired, and a failed start refusing `unreachable` before submit. The four W6 tests cover the `SecretStr` token and async `IdentityStatus`, `shared().get` over `identity.get`, cloud keys read from `TokenStore`, and the old `credentials.service` setting refused.
   - The same modules, ruff and pyright on a scratch merge with `-w6` at `4bad7cb` (local, not pushed): exit 0, 99 passed, clean, 0 errors. A smoke script on that merge with `CLIO_RELAY_KEYRING=memory` showed `tokens.provider("globus")` returning W6's `GlobusIdentity`, status `signed_out`, the bearer refusing `needs_sign_in`, the sky adapter asking `keyring:aws-access-key-id`, and after `TokenStore().set_secret` the key handed to SkyPilot's environment.
   - Earlier gates: `83f81dc` gave 95 passed; `3015e81` gave 82 passed and 5 skipped, before the kit asserted refusals.
@@ -873,7 +874,8 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
   - Add `docs/adapters/{globus,iri,sky}.md` to the docs index.
   - O11's text says "paid cloud account for LQ-L8". The cloud row is LQ-L6, and LQ-L8 is DeltaAI.
 - **Settled by W1 at `14e8edd`:** routing now skips an alternative whose build refuses `invalid_config` (Aurora with no `endpoint`, `iri` with no `resource_id`) and records the skip; and `exec` takes no time limit, so the globus endpoint start and the IRI `token_command` have none.
-- **Answered by W6 (4bad7cb on `-w6`), and adopted:** the `Token` and `IdentityStatus` shapes, `shared().get`, and cloud keys as `TokenStore` secrets raised as `keyring:<name>`. Until W6 merges, the W11 tests check those shapes against stand-ins.
+- **Answered by W6 (4bad7cb on `-w6`), and adopted:** the `Token` and `IdentityStatus` shapes, `shared().get`, and cloud keys as `TokenStore` secrets raised as `keyring:<name>`. W6 is merged at integration `87da62d`, and the gate there ran against its code.
+- **Settled by W1 at `87da62d`:** a job's duration is optional. W11 reviewed and kept W1's edits: globus sends no walltime (the endpoint's default applies), iri omits `duration`, and sky returns a `Charge` with no amount, so the spend gate asks.
 - **Request to W13:** call `SkyAdapter.price(spec)` from `GuardHook.price` for sky sites. It returns a `Charge` with `unit: "USD"`, and `node_hours` is still filled in for the node-hour threshold.
 - **For W9:** SkyPilot autostop is the idle release for `serve`. The `sky` adapter does not implement `serve`.
 
