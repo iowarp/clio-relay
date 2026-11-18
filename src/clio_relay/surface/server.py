@@ -458,6 +458,7 @@ class RelayServer:
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
+                self.service.same_request(self.service.operation(resume), site, spec)
                 record = await self.service.advance(resume)
                 return await self._deliver(ctx, record, wait_s)
             if site is None or spec is None:
@@ -524,19 +525,7 @@ class RelayServer:
     ) -> ToolResult | InputRequiredToolResult:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
-        if site is not None and spec is not None:
-            entry = self.service.site(site)
-            current = (
-                self.service.prepare_service(entry, spec)
-                if isinstance(spec, ServiceSpec)
-                else self.service.apply_defaults(entry, spec)
-            )
-            if site != record.site or current.digest() != record.spec_digest:
-                raise Refusal(
-                    RefusalReason.APPROVAL_MISMATCH,
-                    "the retry's arguments differ from what was asked about; call run again",
-                    operation_id=operation_id,
-                )
+        self.service.same_request(record, site, spec)
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
                 action, content = _response_parts(response)

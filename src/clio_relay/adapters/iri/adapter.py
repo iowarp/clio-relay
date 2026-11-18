@@ -105,7 +105,9 @@ def iri_job_spec(spec: JobSpec, *, job_dir: str | None) -> dict[str, Any]:
     if spec.resources.exclusive_node_use:
         resources["exclusive_node_use"] = True
     attributes: dict[str, Any] = {
-        "duration": max(1, int(spec.attributes.duration.total_seconds())),
+        "duration": None
+        if spec.attributes.duration is None
+        else max(1, int(spec.attributes.duration.total_seconds())),
         "queue_name": spec.attributes.queue_name,
         "account": spec.attributes.account,
         "reservation_id": spec.attributes.reservation_id,

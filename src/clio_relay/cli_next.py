@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -196,6 +197,25 @@ def site_list() -> None:
     _print([entry.model_dump(mode="json") for entry in SiteStore(_paths().sites_file).list()])
 
 
+def _saved(entry: SiteEntry) -> None:
+    """Print a saved site and what its adapters set up for it."""
+
+    async def set_up() -> dict[str, Any]:
+        from clio_relay.surface.service import RelayService
+
+        service = RelayService(_paths())
+        try:
+            return await service.site_added(entry.id)
+        finally:
+            await service.close()
+
+    shown = entry.model_dump(mode="json")
+    set_up_by = asyncio.run(set_up())
+    if set_up_by:
+        shown["set_up"] = set_up_by
+    _print(shown)
+
+
 @site_app.command("show")
 def site_show(site_id: str) -> None:
     """Show one site and which adapter serves each verb."""
@@ -240,9 +260,11 @@ def site_add(
                 "spend": {"ask": ask},
             }
         )
-        _print(SiteStore(_paths().sites_file).add(entry).model_dump(mode="json"))
+        added = SiteStore(_paths().sites_file).add(entry)
     except Refusal as refusal:
         _fail(refusal)
+        return
+    _saved(added)
 
 
 @site_app.command("catalog")
@@ -259,7 +281,7 @@ def site_add_from_catalog(catalog_id: str, site_id: str | None = None) -> None:
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(added.model_dump(mode="json"))
+    _saved(added)
 
 
 @site_app.command("edit")
@@ -277,7 +299,7 @@ def site_edit(
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(edited.model_dump(mode="json"))
+    _saved(edited)
 
 
 @site_app.command("remove")
@@ -299,7 +321,7 @@ def site_switch(site_id: str, adapter: str) -> None:
     except Refusal as refusal:
         _fail(refusal)
         return
-    _print(switched.model_dump(mode="json"))
+    _saved(switched)
 
 
 def main() -> None:

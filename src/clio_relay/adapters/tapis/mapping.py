@@ -102,7 +102,6 @@ def job_request(
         "archiveSystemId": system_id,
         "archiveSystemDir": job_dir,
         "archiveOnAppError": True,
-        "maxMinutes": max(1, math.ceil(spec.attributes.duration.total_seconds() / 60)),
         "fileInputs": [
             {
                 "name": f"relay-input-{index}",
@@ -113,6 +112,7 @@ def job_request(
         ],
         "tags": ["clio-relay"],
         "parameterSet": params,
+        **_max_minutes(spec),
     }
     if resources.node_count is not None:
         request["nodeCount"] = resources.node_count
@@ -126,6 +126,14 @@ def job_request(
             request["execSystemLogicalQueue"] = spec.attributes.queue_name
         params["schedulerOptions"] = scheduler_options(spec)
     return request
+
+
+def _max_minutes(spec: JobSpec) -> dict[str, int]:
+    """Send ``maxMinutes`` only when the spec sets a walltime; otherwise Tapis applies its own."""
+    duration = spec.attributes.duration
+    if duration is None:
+        return {}
+    return {"maxMinutes": max(1, math.ceil(duration.total_seconds() / 60))}
 
 
 def description(operation_id: str) -> str:

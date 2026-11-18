@@ -14,10 +14,11 @@ from datetime import timedelta
 from typing import Any, cast
 
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import VERBS, AdapterContext, BaseAdapter, Verb
+from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
     Ask,
     AskProvider,
+    Charge,
     GuardHook,
     HookContext,
     ServeHook,
@@ -39,6 +40,7 @@ from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
+from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 
@@ -62,6 +64,19 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
         return None
     name = namer(operation_id)
     return name if isinstance(name, str) else None
+
+
+def _approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
+    if charge.walltime_s is None or charge.node_hours is None:
+        return (
+            f"{action} on {site.title}? It asks for {charge.nodes} node(s) and sets no "
+            "walltime, so its duration and cost are unknown: the scheduler's default "
+            "limit applies."
+        )
+    return (
+        f"{action} on {site.title}? It may use up to {charge.node_hours:g} {charge.unit} "
+        f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
+    )
 
 
 def _public_endpoint(endpoint: Endpoint) -> dict[str, Any]:
@@ -109,7 +124,8 @@ class RelayService:
         )
         self.asks: RecordStore[Ask] = RecordStore(paths.asks_dir, Ask)
         settings: dict[str, Any] = {
-            "grant_files": {key: str(value) for key, value in paths.grant_files.items()}
+            "grant_files": {key: str(value) for key, value in paths.grant_files.items()},
+            "config_dir": str(paths.config_dir),
         }
         if public_base_url is not None:
             settings["public_base_url"] = public_base_url
@@ -171,6 +187,26 @@ class RelayService:
             adapter=name,
         )
 
+    async def site_added(self, site_id: str) -> dict[str, Any]:
+        """Let each adapter that implements ``SiteAdded`` set up a saved site.
+
+        An adapter whose settings do not build is left out here; ``describe`` names it.
+        """
+        site = self.site(site_id)
+        results: dict[str, Any] = {}
+        for name, config in [(site.adapter, site.config), *site.alternatives.items()]:
+            try:
+                adapter = self._build(site, name, config)
+            except Refusal:
+                continue
+            if not isinstance(adapter, SiteAdded):
+                continue
+            try:
+                results[name] = await adapter.on_site_added(site)
+            except Refusal as refusal:
+                results[name] = {"refusal": refusal.to_dict()}
+        return results
+
     # describe
 
     async def describe(self, site_id: str | None = None, job: str | None = None) -> dict[str, Any]:
@@ -178,34 +214,8 @@ class RelayService:
         if job is not None:
             return self.view(await self.refresh(job))
         if site_id is None:
-            return {
-                "sites": [
-                    {
-                        "id": entry.id,
-                        "name": entry.title,
-                        "adapter": entry.adapter,
-                        "alternatives": sorted(entry.alternatives),
-                        "policy": entry.policy,
-                    }
-                    for entry in self.sites.list()
-                ],
-                "adapters": registry.names(),
-                "verbs": list(VERBS),
-            }
-        site = self.site(site_id)
-        described: dict[str, Any] = {
-            "site": site.model_dump(mode="json"),
-            "routes": [item.model_dump(mode="json") for item in self.site_routes(site)],
-        }
-        try:
-            adapter = self.adapter_for(site, "describe")
-            described["info"] = (await adapter.describe()).model_dump(mode="json")
-            need = await adapter.sign_in_needed()
-            described["sign_in"] = None if need is None else need.model_dump(mode="json")
-        except Refusal as refusal:
-            described["info"] = None
-            described["refusal"] = refusal.to_dict()
-        return described
+            return await relay_report(self)
+        return await site_report(self, self.site(site_id))
 
     # run
 
@@ -217,7 +227,7 @@ class RelayService:
             changes["queue_name"] = site.defaults.queue
         if attributes.account is None and site.defaults.account is not None:
             changes["account"] = site.defaults.account
-        if "duration" not in attributes.model_fields_set and site.defaults.duration is not None:
+        if attributes.duration is None and site.defaults.duration is not None:
             changes["duration"] = site.defaults.duration
         if not changes:
             return spec
@@ -319,11 +329,7 @@ class RelayService:
                 await self.ask_provider.approve(
                     site=site,
                     operation_id=operation_id,
-                    message=(
-                        f"{action} on {site.title}? It may use up to "
-                        f"{charge.node_hours:g} {charge.unit} "
-                        f"({charge.nodes} node(s) for {charge.walltime_s / 60:g} min)."
-                    ),
+                    message=_approval_message(action, site, charge),
                     binding=binding,
                 )
             )
@@ -385,6 +391,28 @@ class RelayService:
                 ask.resolve("cancelled", {"action": "cancel"}, by)
             self.asks.put(ask_id, ask)
         return ask
+
+    def same_request(
+        self, record: OperationRecord, site: str | None, spec: JobSpec | ServiceSpec | None
+    ) -> None:
+        """Refuse a retry or resume whose site or spec differs from what was approved."""
+        if site is None and spec is None:
+            return
+        changed = site is not None and site != record.site
+        if spec is not None and not changed:
+            entry = self.site(record.site)
+            current = (
+                self.prepare_service(entry, spec)
+                if isinstance(spec, ServiceSpec)
+                else self.apply_defaults(entry, spec)
+            )
+            changed = current.digest() != record.spec_digest
+        if changed:
+            raise Refusal(
+                RefusalReason.APPROVAL_MISMATCH,
+                "the arguments differ from what was asked about; call run again",
+                operation_id=record.operation_id,
+            )
 
     async def _signed_in(self, ask: Ask, record: OperationRecord) -> bool:
         site = self.site(record.site)

@@ -139,14 +139,15 @@ class DefaultGuard:
         return await self.check_run(site, JobSpec(executable=command[0] if command else "true"))
 
     async def price(self, site: SiteEntry, spec: JobSpec) -> Charge:
-        walltime = spec.attributes.duration.total_seconds()
+        duration = spec.attributes.duration
+        node_hours = spec.node_hours()
         return Charge(
             site=site.id,
             queue=spec.attributes.queue_name,
             account=spec.attributes.account,
             nodes=spec.resources.nodes(),
-            walltime_s=walltime,
-            node_hours=round(spec.node_hours(), 4),
+            walltime_s=None if duration is None else duration.total_seconds(),
+            node_hours=None if node_hours is None else round(node_hours, 4),
         )
 
 

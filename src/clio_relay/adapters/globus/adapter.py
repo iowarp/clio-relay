@@ -236,7 +236,7 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
             values[keys.account] = attributes.account
         if keys.queue and attributes.queue_name:
             values[keys.queue] = attributes.queue_name
-        if keys.walltime:
+        if keys.walltime and attributes.duration is not None:
             values[keys.walltime] = format_walltime(
                 attributes.duration, self.config.walltime_format
             )

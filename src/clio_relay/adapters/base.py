@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -25,6 +25,9 @@ from clio_relay.jobs.handles import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+
+if TYPE_CHECKING:
+    from clio_relay.sites.models import SiteEntry
 
 Verb = Literal["describe", "run", "exec", "files", "serve"]
 VERBS: tuple[Verb, ...] = get_args(Verb)
@@ -123,6 +126,22 @@ class Adapter(Protocol):
 
     async def sign_in_done(self, answer: dict[str, Any]) -> None:
         """Take the result of a completed sign-in ask."""
+        ...
+
+
+@runtime_checkable
+class SiteAdded(Protocol):
+    """An adapter that sets a site up when relay adds or enables it. Optional.
+
+    Relay calls ``on_site_added`` on the adapter in use and on every alternative that
+    implements it, after the site is saved: on add, add from the catalog, edit and
+    switch. Tapis registers the person's host here. A typed refusal (for example, no
+    sign-in yet) is reported to the person and the site stays saved; running it
+    again must be safe.
+    """
+
+    async def on_site_added(self, site: SiteEntry) -> dict[str, Any] | None:
+        """Set the site up and return a short summary for the person, or ``None``."""
         ...
 
 

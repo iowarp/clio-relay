@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -10,7 +11,7 @@ import pytest
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec
+from clio_relay.jobs.spec import JobAttributes, JobSpec
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
@@ -33,11 +34,13 @@ async def test_open_site_runs_without_asking(relay_paths: RelayPaths) -> None:
     view = service.view(done)
     assert view["exit_code"] == 0
     assert "hello-relay" in view["result"]["stdout_tail"]
-    assert view["result"]["charge"]["node_hours"] >= 0
+    assert view["result"]["charge"]["node_hours"] is None
     await service.close()
 
 
 async def test_guarded_site_refuses_without_a_guard(relay_paths: RelayPaths) -> None:
+    hooks_see = getattr(RelayService(relay_paths).guard, "context").settings
+    assert hooks_see["config_dir"] == str(relay_paths.config_dir)
     add_site(relay_paths, policy="guarded")
     service = RelayService(relay_paths)
     with pytest.raises(Refusal) as refused:
@@ -62,7 +65,7 @@ async def test_spend_approval_then_submit(relay_paths: RelayPaths) -> None:
     assert ask.kind == "approve"
     assert ask.binding["spec_digest"] == record.spec_digest
     assert ask.binding["site"] == "fx"
-    assert "node-hours" in ask.message
+    assert "unknown" in ask.message
     service.answer(ask.ask_id, "accept", {"approve": True}, by="test")
     advanced = await service.advance(record.operation_id)
     assert advanced.state == OperationState.QUEUED
@@ -74,7 +77,9 @@ async def test_spend_approval_then_submit(relay_paths: RelayPaths) -> None:
 async def test_threshold_only_asks_above_it(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, spend=10.0)
     service = RelayService(relay_paths)
-    small = await service.start_run("fx", ECHO)
+    small = await service.start_run(
+        "fx", ECHO.model_copy(update={"attributes": JobAttributes(duration=timedelta(minutes=10))})
+    )
     assert small.state == OperationState.QUEUED
     big = JobSpec.model_validate(
         {
@@ -247,11 +252,38 @@ async def test_a_sign_in_finished_elsewhere_closes_the_url_ask(relay_paths: Rela
 
 async def test_exec_and_describe(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
+    add_site(relay_paths, "fx-sign", config={"queue_s": 0.1, "run_s": 0.2, "sign_in": True})
+    add_site(relay_paths, "fx-gone", adapter="no-such-adapter")
     service = RelayService(relay_paths)
     listed = await service.describe()
-    assert [site["id"] for site in listed["sites"]] == ["fx"]
+    status = {site["id"]: site["status"] for site in listed["sites"]}
+    assert status["fx"] == {"state": "ready"}
+    assert status["fx-sign"]["state"] == "needs_sign_in"
+    assert status["fx-gone"]["state"] == "unavailable"
+    assert status["fx-gone"]["reason"]
     described = await service.describe("fx")
     assert described["site"]["id"] == "fx"
     result = await service.exec("fx", ["echo", "hi"], timeout_s=5, max_output_bytes=100)
     assert result["exit_code"] == 0
     assert "hi" in result["stdout"]
+
+async def test_adapters_set_up_a_saved_site(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[str] = []
+
+    async def on_site_added(self: FixtureAdapter, site: Any) -> dict[str, Any]:
+        seen.append(site.id)
+        if site.id == "fx-early":
+            raise Refusal(RefusalReason.NEEDS_SIGN_IN, "sign in first")
+        return {"registered": site.id}
+
+    monkeypatch.setattr(FixtureAdapter, "on_site_added", on_site_added, raising=False)
+    add_site(relay_paths)
+    add_site(relay_paths, "fx-early")
+    service = RelayService(relay_paths)
+    assert await service.site_added("fx") == {"fixture": {"registered": "fx"}}
+    early = await service.site_added("fx-early")
+    assert early["fixture"]["refusal"]["reason"] == "needs_sign_in"
+    assert seen == ["fx", "fx-early"]
+    await service.close()

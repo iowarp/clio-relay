@@ -315,7 +315,10 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
     async def price(self, spec: JobSpec) -> Charge:
         """Return what ``spec`` may cost, in US dollars, from SkyPilot's catalog."""
         nodes = spec.resources.nodes()
-        walltime_s = spec.attributes.duration.total_seconds()
+        duration = spec.attributes.duration
+        if duration is None:
+            return Charge(site=self.context.site_id, nodes=nodes, unit="USD")
+        walltime_s = duration.total_seconds()
         found = await self.call(
             "price", {**self.resources(spec), "seconds": walltime_s, "nodes": nodes}
         )
