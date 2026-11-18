@@ -51,7 +51,8 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     assert server["args"][-2:] == ["clio-relay-next", "serve"]
     assert "clio-relay-next" in scripts
     source = server["args"][server["args"].index("--from") + 1]
-    assert re.fullmatch(r"clio-relay @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}", source)
+    pinned = r"clio-relay @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}"
+    assert re.fullmatch(pinned, source)
     assert server["env"] == {"CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}"}
     launched = {"CLIO_RELAY_GRANT_FILE_GLOBUS": "/plugin-data/accounts/globus.json"}
     assert RelayPaths.from_env(launched).grant_files == {
