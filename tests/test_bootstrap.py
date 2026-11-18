@@ -271,7 +271,7 @@ def test_fresh_bootstrap_loads_packaged_graph_before_explicit_build_fallback() -
     assert '"provider": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_PROVIDER_PYTHON"]' in script
     assert '"clio-kit": os.environ["CLIO_RELAY_BOOTSTRAP_JARVIS_MCP_EXECUTABLE"]' in script
     assert "clio-kit.git@main#subdirectory=clio-kit-mcp-servers/jarvis" not in script
-    assert script.count("status --porcelain=v1 --untracked-files=all") == 1
+    assert "status --porcelain=v1 --untracked-files=all" not in script
     assert 'ln -sf "$JARVIS_VENV/bin/jarvis-mcp" "$HOME/.local/bin/jarvis-mcp"' not in script
     assert 'RELAY_INSTALL_SPEC="$DEST"' in script
     assert "uv tool install --force --python 3.12 --no-config" in script
