@@ -1,6 +1,7 @@
 #!/bin/bash
 # SSH host whose sign-in asks for a key and then a one-time code (TOTP), the way
 # multi-factor HPC sites do. The TOTP secret comes from /fixture-secrets.
+# shellcheck source=../common/site-lib.sh
 source /opt/clio-fixtures/site-lib.sh
 
 if [ "$#" -gt 0 ]; then

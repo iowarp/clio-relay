@@ -263,6 +263,8 @@ cmd_up() {
     fi
     has_site frps && start_container frps frps -p "$b:$FX_FRPS_PORT:7000" \
         -p "$b:$FX_FRPS_WSS_PORT:7443" "$(image_for frps)"
+    # The secret is read inside the container, so the single quotes are intended.
+    # shellcheck disable=SC2016
     has_site secret && start_container secret secret -p "$b:$FX_SECRET_PORT:8080" \
         "$(image_for secret)" sh -c 'FIXTURE_SECRET=$(cat /fixture-secrets/secret_service_secret) \
             exec clio-fixture-secret-service --host 0.0.0.0 --port 8080 \
