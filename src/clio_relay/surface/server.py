@@ -50,6 +50,7 @@ from clio_relay.adapters.hooks import Ask, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
@@ -355,6 +356,7 @@ class RelayServer:
     def __init__(self, service: RelayService) -> None:
         self.service = service
         self.tasks = RelayTasksExtension(service)
+        self.changes = ServerChanges()
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
         modes = _elicitation_modes(ctx)
@@ -697,6 +699,7 @@ class RelayServer:
             return await relay.serve(site, spec)
 
         server.add_extension(self.tasks)
+        self.changes.install(server)
         return server
 
     @asynccontextmanager
@@ -704,6 +707,7 @@ class RelayServer:
         try:
             yield {}
         finally:
+            self.changes.close()
             await self.service.close()
 
 

@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
 from clio_relay.adapters.hooks import Ask
@@ -36,7 +37,7 @@ class LoopbackPages:
         self.host = host
         self._tokens: dict[str, _PageTokens] = {}
         self._lock = threading.Lock()
-        self._server: ThreadingHTTPServer | None = None
+        self._server: _PagesServer | None = None
         self._thread: threading.Thread | None = None
 
     @property
@@ -44,16 +45,11 @@ class LoopbackPages:
         """Return the bound port, starting the server if needed."""
         return self.start().server_address[1]
 
-    def start(self) -> ThreadingHTTPServer:
+    def start(self) -> _PagesServer:
         """Start serving, once."""
         with self._lock:
             if self._server is None:
-                pages = self
-
-                class Handler(_Handler):
-                    owner = pages
-
-                self._server = ThreadingHTTPServer((self.host, 0), Handler)
+                self._server = _PagesServer((self.host, 0), _Handler, owner=self)
                 self._server.daemon_threads = True
                 self._thread = threading.Thread(
                     target=self._server.serve_forever, name="relay-pages", daemon=True
@@ -114,9 +110,24 @@ class LoopbackPages:
             server.server_close()
 
 
+class _PagesServer(ThreadingHTTPServer):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        handler: type[BaseHTTPRequestHandler],
+        *,
+        owner: LoopbackPages,
+    ) -> None:
+        self.owner = owner
+        super().__init__(address, handler)
+
+
 class _Handler(BaseHTTPRequestHandler):
-    owner: LoopbackPages
     server_version = "clio-relay-pages"
+
+    @property
+    def owner(self) -> LoopbackPages:
+        return cast("_PagesServer", self.server).owner
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         return
