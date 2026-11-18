@@ -701,9 +701,11 @@ The routes that only the old tools used go with them. These are gateway sessions
 
 LQ32 searches clio-relay for `relay_submit`, `mcp_call`, `browser_gateway` and `scheduler_providers`. Today they appear in about 112 files outside the deletion list, mostly tests and the `mcp_call` job kind in the endpoint, queue and models. W8 removes them all from `src`, `tests`, `jarvis-packages`, `scripts`, `.github` and the user docs. The design docs under `docs/design/` and the dated validation notes under `docs/ai/` keep the names, because they record the history. Assumption: LQ32 reads the shipped tree and the user docs, not the design record.
 
+Exception found during the move: `browser_gateway`, `scheduler_providers` and `remote_mcp*` are held, not deleted, because W9's runtime still imports them (see the requests below). W8's own code no longer imports them. LQ32 passes once W9 drops those imports and deletes the held modules.
+
 ### clio-schemas
 
-Dropped. Nothing in `src/` imports it, and the worker link does not use it. It is used only by the schema-equality fixtures, their generator, `test_clio_schemas_convergence.py` and `test_schema_equality.py`. Those tests check relay's records against CLIO's schema package, which is CLIO-only coupling (user rule 1). They are deleted, and W1 removes `clio-schemas==0.2.1` from `pyproject.toml`.
+Kept. This corrects the inventory, which said dropped. `jarvis-packages/clio_relay/clio_relay/remote_agent/runner.py:16` imports `ArtifactKind`, `ArtifactVersion`, `Custody`, `IdentityEvidence` and `Mechanism` from it, and `remote_agent` stays on the worker. Nothing in `src/` imports it. The schema-equality fixtures and their tests (`test_clio_schemas_convergence.py`, `test_schema_equality.py`) are deleted, because they compared relay's records with CLIO's schema package. So `clio-schemas==0.2.1` stays in `pyproject.toml`, and the earlier request to W1 to remove it is withdrawn. Dropping it needs `remote_agent` to stop using those five types.
 
 ### The process-containment tests
 
@@ -730,28 +732,62 @@ develop 034117b on a compute node gives 139 failed and 3 errors, which is 142 no
 
 ### The worker adapter
 
-- **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]`, with this config:
-  - `host`, the ssh destination used only for placement and sign-in;
-  - `scheduler`, a psij executor name or `none`;
-  - `rendezvous`, the frps address;
-  - `state_dir`;
-  - `install`, the wheel or version to place.
-- **Verbs.**
-  - `describe` and `status` read the owned session and worker info.
-  - `run`, `cancel` and `find` go through the job routes; `find` uses the job name `relay-<operation_id>`.
-  - `exec` runs a `bounded_command` job.
-  - `files` uses artifacts and input ingest.
-  - `serve` is `return await clio_relay.serve.start_for(self, spec, operation_id=operation_id)`, with a lazy import, as W9 asked.
+- **Shape.** `clio_relay.adapters.worker.WorkerAdapter` is registered under the `worker` entry point. It is a `BaseAdapter[WorkerConfig]` (`adapters/worker/adapter.py`). The config keys are:
+  - `ssh_profile`, the Host in `~/.ssh/config` used for sign-in and placement (the key W11's catalog entries use), and `ssh_config_file`;
+  - `scheduler`, `auto` or a psij executor name;
+  - `work_dir` and `remote_dir`;
+  - `rendezvous`: `address`, `port`, `protocol` (`tcp`, `websocket` or `wss`), `site_address`, `site_port`, `token_env` and `token_file`;
+  - `relay_wheel` or `relay_requirement`, `site_frpc`, `python` and `submit_timeout_s`.
+- **Placement.** In the one ssh pass relay installs itself in a private directory on the site, writes the worker's identity and starts `clio-relay worker site-serve` detached. That process serves the owned-session API on loopback and holds an frpc `stcp` proxy to the rendezvous. Relay reaches it over the one held link (`brokered_tcp`), and nothing uses SSH after that. `worker-link.json` (0600) in the adapter's state directory lets a restarted relay reconnect over frp without SSH.
+- **Verbs.** Each verb is one POST to the worker's `/adapter` routes. On the site the verbs run through the `local` adapter, so scheduler coverage is psij's (RL18), and a refusal on the site comes back as the same typed refusal.
+  - `describe`, `run`, `status`, `cancel`, `find` and `files` (`WorkerFileAccess`, `adapters/worker/files.py`).
+  - `exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)` follows W1's exec contract: with no `timeout_s` it runs until the command ends, and stall progress comes from the site's polls.
+  - `serve` is `return await clio_relay.serve.start_for(self, spec, operation_id=operation_id)`, with a lazy import. Without the serve runtime it refuses `verb_not_implemented`.
 - **Sign-in (LQ10, LQ11).**
-  - `sign_in_needed()` returns `SignInNeed(provider="ssh", url=None, ...)` while the worker link is down.
-  - The adapter calls `askpass.register_sign_in(site_id, starter)`. The starter runs bootstrap and the one-link connect over ssh. Its environment is `clio_relay.asks.askpass.environment(site=, operation_id=, title=)`, with `BatchMode=no` and stdin closed.
-  - After the worker dials the rendezvous, the ssh process exits and nothing uses SSH again.
-  - Until W6 merges, a local stub with the same signatures stands in.
-- **The hop for W9.** `WorkerAdapter.hop_exec(site: str, argv: list[str], *, env: Mapping[str, str] | None = None, stdin: bytes = b"") -> ExecResult` (async).
-  - It runs one bounded command on the login side through the held worker link, as a `bounded_command` job on the worker HTTP API. There is no ssh.
-  - It replaces the `remote_cli.remote_env` and ssh calls in `frp_remote_scripts.py`, `service_runtime_connector_step_scripts.py`, `service_runtime_submission_scripts.py` and `jarvis_service_runtime.py`.
-  - Long-running service processes go through `run(spec)`. Service bytes stay on W9's frp connector and visitor.
-- **Operator commands (RL3).** `clio_relay.adapters.worker.cli:worker_app`, a Typer app that W1 mounts as `clio-relay worker`. Its groups are `cluster`, `endpoint`, `api`, `session`, `relay-host`, `queue`, `scheduler` and `runtime` (the old `worker` group). Its commands are `init`, `install-frp`, `installation-*` and `bootstrap-inspect`. The old `agent`, `job`, `monitor`, `gateway`, `jarvis`, `remote-mcp`, `storage`, `release` and `diagnostics` groups go. Their verbs are the new surface's `run`, `exec`, `files` and `describe`.
+  - `sign_in_needed()` returns `SignInNeed(provider="ssh", url=None, ...)` while the link is down.
+  - The adapter calls `askpass.register_sign_in(site_id, starter)`. The starter runs placement and the connect over ssh with `clio_relay.asks.askpass.environment(site=, operation_id=, title=)` and `BatchMode=no`.
+  - Deviation from W6's "close stdin": the connect pipes the placement script to the remote shell over ssh's stdin. Under `SSH_ASKPASS_REQUIRE=force` ssh never reads a prompt answer from stdin, so the prompt still goes to askpass. LQ10 and LQ11 passed this way.
+  - When W6 is not installed, a local stub with the same signatures stands in.
+- **The hop for W9.** `WorkerAdapter.hop_exec(command, *, timeout_s=None, max_output_bytes, on_stall=None) -> ExecResult` runs one command on the worker's host (the login side) over the held link, with the exec contract above. There is no ssh. Long-running service processes go through `run(spec)`. Service bytes stay on W9's frp connector and visitor.
+- **Operator commands (RL3).** `clio_relay.adapters.worker.cli:worker_app`, a Typer app mounted as `clio-relay worker`. Its groups are `endpoint`, `relay-host`, `cluster`, `api`, `session`, `queue` and `scheduler`. Its commands are `status`, `init`, `install-frp` and `installation-*`, and the hidden `bootstrap-inspect`, `jarvis-runtime-authority` and `site-serve`. The old `agent`, `job`, `monitor`, `gateway`, `jarvis`, `remote-mcp`, `storage`, `release`, `live-test` and `diagnostics` groups go. Their verbs are the new surface's `run`, `exec`, `files` and `describe`.
+- **Not covered by LQ4: wss.** The frpc config writer has no custom-CA option, so the fixture's self-signed wss endpoint cannot be trusted. LQ4 ran over tcp. A wss rendezvous with a public certificate needs no change.
+
+### Changes made during the move
+
+Fixes and edits beyond the mechanical move, in commit order:
+
+- **safe_archive.** The deletion list included `safe_archive.py`, but the bootstrap remote script imports it from a string. It is restored byte for byte as `adapters/worker/safe_archive.py`, with `tests/test_safe_archive.py` (1d1a900). A sweep for string references to deleted modules found no other real caller.
+- **The bootstrap candidate overlay.** It was flat and keyed by file name. Its keys are now paths under the candidate `clio_relay` package (`adapters/worker/X.py`), with `extend_path` inits for `adapters/` and `adapters/worker/`. The writer refuses absolute paths, `..` and symlinked parents. The overlay was never self-contained, even at base: it relies on `extend_path` falling back to the installed package (1d1a900).
+- **`package_source_root`** in `bootstrap.py` used `parents[2]`, the repo root before the move. It is `parents[4]` now (9a88f8c).
+- **The worker command prefix.** The bootstrap preamble and the readiness probe call `clio-relay worker endpoint worker-info`, and fall back to the unprefixed command for a relay placed before the move (2e223de). `test_bootstrap_fast_path` counts both.
+- **`jarvis_mcp.py`** no longer imports `remote_mcp`. It keeps the contract, the artifact checks and its own `server_artifact_digest`. The virtual JARVIS tools and the MCP server builders went with the old surface (8dd5260).
+- **Scheduler seams.** `http_api_routes_scheduler`, `test_cli`, `test_cli_endpoint`, `test_cli_scheduler` and the two scheduler-cancel tests use `clio_relay.adapters.worker.scheduler`, not the held `scheduler_providers` (80ebdaa).
+- **GC purge** kept one open descriptor per directory level, so trash deeper than `ulimit -n` could never be purged (EMFILE at 1024, the soft limit on Ares login and compute nodes). It keeps only the current parent open now. Each level is still opened with `O_NOFOLLOW` relative to its parent. This defect predates the move; `test_gc_purge_is_iterative_and_detects_directory_swap_races` fails the same way on base ee1a845 (140b02f).
+- **Tests.**
+  - The patch-seam guard (`test_cli_patch_seam.py`) knows both packages. 23 audited pairs went with their callers or owners, so its counts go from 61/32 to 38/18 (531053b).
+  - 15 test files import `worker_app as app`.
+  - Tests of removed commands are deleted: `job`, `gateway`, `storage`, `live-test` and `scheduler validate-lifecycle`.
+  - `test_ci_clio_kit_wheel.py` drops its three checks of the old ci and release steps. Its pin checks stay.
+  - `test_core_queue_split_architecture` accepts `clio_relay.adapters.worker` as an owner package. `queue_validation` leaves its non-owner lists. The `queue_startup` import budget goes from 550 to 552, for the two import lines the move wraps.
+  - `test_door_errors` expects 61 HTTP statuses, not 64. `jarvis_dispatch_refused`, `execution_not_found`, `mcp_submission_conflict` and `mcp_admission_refused` went with their routes.
+  - `test_bootstrap` disables commit signing for its scratch commits (46751cd). Ares sets `commit.gpgsign=true`, and gpg fails in Slurm.
+- **Edits to W1's files (approved).** `scripts/check_file_size.py`: removal comments for deleted files, and lower baselines for `bootstrap.py` (924), `session_recovery_inspection.py` (837) and the dropped `jarvis_mcp.py` entry. `scripts/check_no_class_in_function.py`: the `wheel_snapshot_identity` entry at its worker path. `scripts/check_pyright_ratchet.py`: see the gate.
+- **W9's tests (import-only edits, and prunes that let them collect).** `test_service_runtime`, `test_jarvis_service_runtime` and `test_frp_transport_dials` import the moved modules from `adapters.worker`. 15 tests in `test_jarvis_service_runtime` are deleted, with the helper `_owner_token_values`. The first drove `cli_jarvis_mcp` and the rest drove `mcp_server`:
+    - `test_hidden_relay_authority_command_emits_one_private_json_document`
+    - `test_model_facing_mcp_projection_redacts_runtime_bearer_token`
+    - `test_verified_jarvis_wait_preserves_public_bearer_fingerprint`
+    - `test_jarvis_authorization_restore_rejects_non_public_descriptors`
+    - `test_arbitrary_mcp_cannot_expose_jarvis_shaped_authorization`
+    - `test_waited_execution_exposes_compact_verified_binding_before_large_result`
+    - `test_generic_mcp_wait_serializes_verified_result_before_bulk_evidence`
+    - `test_async_relay_wait_exposes_same_compact_verified_service_binding`
+    - `test_ssh_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_owned_remote_async_relay_wait_exposes_verified_service_binding`
+    - `test_multiple_ready_services_have_exact_unchanged_bindings`
+    - `test_bind_rejects_mixed_or_invalid_handoff_forms`
+    - `test_agent_bind_persists_urls_and_rejects_runtime_commands`
+    - `test_agent_bind_pending_replays_same_gateway_and_connector_intents`
+    - `test_owned_agent_bind_uses_shared_cluster_scoped_gateway_admission`
 
 ### Workflows
 
@@ -760,17 +796,17 @@ There are 8 files in `.github/workflows/`, not 6: `ci`, `finalize-release`, `liv
 ### Requests to other owners
 
 - **W9.**
-  - In `jarvis_service_runtime.py:35` and `service_runtime_core.py:45`, change the import `clio_relay.core_queue` to `clio_relay.adapters.worker.core_queue`.
-  - Drop the `browser_gateway` imports in `service_runtime_browser`, `service_runtime_local_start` and `service_runtime_readiness`.
-  - Drop the `scheduler_providers` imports in `service_runtime_observation`, `service_runtime_remote_connector` and `service_runtime_start`. Use psij or `hop_exec` instead.
-  - Drop the `remote_mcp` import in `jarvis_service_runtime_validation`.
-  - Change the remote command strings `clio-relay scheduler connector-step-*` in `frp_remote_scripts.py:156,197` to `clio-relay worker scheduler connector-step-*`.
-  - Migrate `test_service_runtime.py` and `test_jarvis_service_runtime.py` off the old `cli`, `browser_gateway` and `scheduler_providers`.
+  - The held modules `browser_gateway`, `scheduler_providers` and `remote_mcp*` stay only because W9's runtime imports them: `service_runtime_browser`, `service_runtime_local_start` and `service_runtime_readiness` (`browser_gateway`), `service_runtime_observation`, `service_runtime_remote_connector` and `service_runtime_start` (`scheduler_providers`), and `jarvis_service_runtime_validation` (`remote_mcp`). W9 drops those imports and then deletes the held modules, which finishes LQ32. The tests that only test the held modules go with them: `test_scheduler_status.py` (the provider and connector-step parts), `test_clio_kit_mcp_contracts.py`, `test_contract_gate.py`, and the `remote_mcp` parts of `test_cluster_config.py`, `test_validation_report.py` and `test_door_errors.py`.
+  - `BrowserAttachmentRecord` has two definitions: `browser_gateway` and `adapters/worker/browser_attachment_record.py`. The queue uses the worker one, which W9 keeps for revoke-on-teardown. W9's `service_runtime_readiness` and `service_runtime_browser` still use the `browser_gateway` one.
+  - The allocation connector is retired (W9's decision). The worker has no `connector-step-*` commands. `frp_remote_scripts.py:156,197` still calls `clio-relay scheduler connector-step-reconcile` and `connector-step-start`, and `service_runtime_connector_step_scripts.py` builds `connector-step-status`, `-cancel` and `-reconcile`. Nothing outside W9's files and the held `scheduler_providers` calls them.
+  - `frp_link.py:174` tells the person to run `clio-relay cluster add`. The command is now `clio-relay worker cluster add`.
+  - Test failures in W9's files on this branch, none of them rerun:
+    - 12 gateway tests in `test_service_runtime.py` and 2 in `test_jarvis_service_runtime.py` call the deleted `gateway` commands or `scheduler connector-step-start`.
+    - `test_local_connector_does_not_retain_captured_cli_pipes` fails with "captured relay CLI waited for its long-lived connector grandchild". It is not in develop's failure list.
 - **W1.**
-  - Remove `clio-schemas` and the `mcp_call` force-include (`pyproject.toml` lines 9 and 48 to 53).
-  - Add the `worker` entry point in `clio_relay.adapters`.
-  - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker`.
-  - At the cutover, replace the old `cli.py` root.
+  - Keep `clio-schemas` (see above). The `mcp_call` force-include in `pyproject.toml` is removed on this branch (approved edit).
+  - Mount `clio_relay.adapters.worker.cli:worker_app` as `clio-relay worker` in `cli_next.py`, and at the cutover point `clio-relay` and `python -m clio_relay` at the new surface.
+- **W7.** Four ssh masters to fx-otp (`/tmp/clio-relay-ssh-1008/*.sock` and `/tmp/w7dbg.*/cm.sock`) were left running from an earlier W7 run. W8 does not touch them.
 - **W3 and W4 (clio-agent).** None. The old command-line calls in `drivers.py` went with RL38 (6801be185).
 
 ## W9. serve
