@@ -580,9 +580,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "serve needs the service runtime, and it is not installed",
                 verb="serve",
             ) from exc
-        return cast(
-            Endpoint, await serve_module.start_for(self, spec, operation_id=operation_id)
-        )
+        return cast(Endpoint, await serve_module.start_for(self, spec, operation_id=operation_id))
 
     # sign-in
 
