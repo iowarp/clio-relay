@@ -107,6 +107,32 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
     asyncio.run(scenario())
 
 
+def test_rows_stay_within_the_tables_bounds(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths)
+    SiteStore(relay_paths.sites_file).edit("fx", {"name": "N" * 300, "address": "a" * 300})
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            row = host.row("fx")
+            assert len(row["title"]) == 120 and row["title"].endswith("\u2026")
+            assert len(row["subtitle"]) == 120
+            table = host.table()
+            declared = {column["id"] for column in table["columns"]}
+            assert set(row["values"]) <= declared
+            assert set(table["defaults"]["values"]) <= declared
+            icons = [
+                option["icon"]
+                for column in table["columns"]
+                for option in column["options"]
+                if "icon" in option
+            ]
+            assert icons and all(icon.isalnum() and icon[0].islower() for icon in icons)
+
+    asyncio.run(scenario())
+
+
 def test_a_pick_without_its_rows_token_is_refused(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
     store = SiteStore(relay_paths.sites_file)

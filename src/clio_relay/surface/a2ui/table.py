@@ -48,6 +48,9 @@ from clio_relay.surface.a2ui.surfaces import (
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
 
+# clio-workspace/v1 caps labels at 120 characters and descriptions at 500.
+_LABEL = 120
+_TEXT = 500
 _SECURITY_LOOK = {"guarded": ("lock", "positive"), "open": ("lockOpen", "warning")}
 _STATUS = {
     "ready": ("Ready", "Answers and needs nothing from you", "check", "positive"),
@@ -178,6 +181,11 @@ def _detail(
     return tree.card(f"{base}-detail", tree.column(f"{base}-detail-body", [heading, *children]))
 
 
+def _clip(text: str, limit: int) -> str:
+    """Keep a row's text within the table's bounds, so one long name can't void the table."""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "\u2026"
+
+
 def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any]:
     site = view.site
     values = {"protocol": site.adapter, "security": site.policy}
@@ -186,19 +194,19 @@ def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any
         values["status"] = status
     row: dict[str, Any] = {
         "id": site.id,
-        "title": site.title,
+        "title": _clip(site.title, _LABEL),
         "values": values,
         "context": {"token": tokens.mint(SET_VALUE, site.id)},
         "menu": _menu(view, state, tokens),
     }
     if site.address:
-        row["subtitle"] = site.address
+        row["subtitle"] = _clip(site.address, _LABEL)
     caption = _caption(view)
     if caption:
-        row["caption"] = caption
+        row["caption"] = _clip(caption, _LABEL)
     error = state.errors.get(site.id, {}).get(FORM_ERROR)
     if error and site.id not in state.editing:
-        row["error"] = error
+        row["error"] = _clip(error, _TEXT)
     return row
 
 
