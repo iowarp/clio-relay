@@ -557,11 +557,33 @@ try:
         except (UnicodeDecodeError, csv.Error) as error:
             raise SystemExit("installed candidate RECORD is malformed") from error
         installed_names = {row[0] for row in installed_rows if len(row) == 3}
-        launcher_name = os.path.relpath(
-            environment_prefix / "bin/clio-relay", site_packages
-        ).replace(os.sep, "/")
+        entry_point_names = [
+            name for name in names if name == str(dist_info / "entry_points.txt")
+        ]
+        console_scripts = {"clio-relay"}
+        if entry_point_names:
+            try:
+                entry_point_lines = archive.read(entry_point_names[0]).decode("utf-8").splitlines()
+            except UnicodeDecodeError as error:
+                raise SystemExit("candidate wheel entry points are malformed") from error
+            section = None
+            for line in entry_point_lines:
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1].strip()
+                elif section == "console_scripts" and "=" in line:
+                    script = line.split("=", 1)[0].strip()
+                    if not script or "/" in script or script in {".", ".."}:
+                        raise SystemExit("candidate wheel declares an unsafe console script")
+                    console_scripts.add(script)
         required_generated = {
-            launcher_name,
+            os.path.relpath(environment_prefix / "bin" / script, site_packages).replace(
+                os.sep, "/"
+            )
+            for script in console_scripts
+        } | {
             str(dist_info / "INSTALLER"),
             str(dist_info / "REQUESTED"),
             str(dist_info / "direct_url.json"),

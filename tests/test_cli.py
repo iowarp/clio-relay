@@ -2689,6 +2689,8 @@ def test_owned_session_recovery_waits_for_late_start_metadata(
     session_dir.mkdir(parents=True)
     transition_path = session_dir / "transition.lock"
     transition_path.write_text("", encoding="utf-8")
+    # filelock 4 sets the explicit mode only on a lock file it creates, so make it private here.
+    transition_path.chmod(0o600)
     metadata_path = session_dir / "metadata.json"
     observed: list[OwnedSessionRecoveryStatus] = []
     failures: list[BaseException] = []

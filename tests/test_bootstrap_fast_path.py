@@ -399,6 +399,7 @@ def test_candidate_verifier_accepts_pinned_uv_metadata_subset_only() -> None:
     """Pinned uv metadata and long-path launchers verify while unknown members fail closed."""
     driver = r"""
 import base64
+import configparser
 import csv
 import hashlib
 import os
@@ -467,15 +468,24 @@ with tempfile.TemporaryDirectory() as value:
     site_packages = next((tool_directory / "clio-relay").glob("lib/python*/site-packages"))
     record = next(site_packages.glob("clio_relay-*.dist-info/RECORD"))
     rows = list(csv.reader(record.read_text(encoding="utf-8").splitlines(), strict=True))
+    dist_info = record.parent.relative_to(site_packages).as_posix()
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = {item.filename for item in archive.infolist() if not item.is_dir()}
+        entry_points = configparser.ConfigParser(delimiters=("=",))
+        entry_points.optionxform = str
+        entry_points.read_string(archive.read(f"{dist_info}/entry_points.txt").decode())
     launcher = os.path.relpath(
         tool_directory / "clio-relay/bin/clio-relay", site_packages
     ).replace(os.sep, "/")
+    launchers = {
+        os.path.relpath(tool_directory / "clio-relay/bin" / script, site_packages).replace(
+            os.sep, "/"
+        )
+        for script in entry_points["console_scripts"]
+    }
     installed_names = {row[0] for row in rows if len(row) == 3}
-    dist_info = record.parent.relative_to(site_packages).as_posix()
     generated = {
-        launcher,
+        *launchers,
         *(f"{dist_info}/{name}" for name in (
             "INSTALLER",
             "REQUESTED",
@@ -2207,6 +2217,8 @@ def test_payload_free_inspector_fails_closed_after_repair_does_not_converge(
         "CLIO_RELAY_BOOTSTRAP_DESIRED_STATE_BASE64",
         base64.b64encode(desired.model_dump_json().encode()).decode(),
     )
+    # The CLI reads the stable generation pointer under HOME; a real install must not leak in.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     state = JarvisStateEvidence(
         initialized=True,
         root=str(tmp_path / ".ppi-jarvis"),

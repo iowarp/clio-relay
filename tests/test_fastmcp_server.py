@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+import httpx2
 import mcp_types
 import pytest
 from fastmcp import Client, FastMCP
@@ -462,7 +463,8 @@ def test_fastmcp_tools_list_forwards_remote_tool_titles(
         by_name = {tool.name: tool for tool in tools}
         assert by_name["remote_demo_explicit_title"].title == "Explicit Title"
         assert by_name["remote_demo_annotations_title"].title == "Annotated Title"
-        assert by_name["remote_demo_no_title"].title is None
+        # FastMCP 4.2 always emits a title, deriving one from the name when none is declared.
+        assert by_name["remote_demo_no_title"].title == "Remote Demo No Title"
 
     asyncio.run(scenario())
 
@@ -1263,22 +1265,31 @@ def test_http_task_management_rejects_mcp_name_header_mismatch(
     )
     queue = ClioCoreQueue(settings.core_dir)
 
+    async def forge_task_name(request: httpx2.Request) -> None:
+        # The SDK stamps the correct Mcp-Name on every request, so forge it on the wire.
+        if request.headers.get("mcp-method", "").startswith("tasks/"):
+            request.headers["mcp-name"] = "not-the-relay-job-id"
+
     async def scenario() -> None:
-        async with (
-            asgi_server(_task_server(settings, queue)) as running,
-            Client(
-                running.transport(headers={"Mcp-Name": "not-the-relay-job-id"}),
+        async with asgi_server(_task_server(settings, queue)) as running:
+
+            def forging_client(*args: Any, **kwargs: Any) -> httpx2.AsyncClient:
+                client = running.http_client(*args, **kwargs)
+                client.event_hooks = {"request": [forge_task_name]}
+                return client
+
+            async with Client(
+                running.transport(httpx_client_factory=forging_client),
                 mode="auto",
-            ) as client,
-        ):
-            task = await call_tool_task(
-                client,
-                "relay_submit_agent",
-                _submit_arguments(tmp_path, "header"),
-            )
-            with pytest.raises(MCPError) as failure:
-                await task.status()
-            assert failure.value.code == mcp_types.HEADER_MISMATCH
+            ) as client:
+                task = await call_tool_task(
+                    client,
+                    "relay_submit_agent",
+                    _submit_arguments(tmp_path, "header"),
+                )
+                with pytest.raises(MCPError) as failure:
+                    await task.status()
+                assert failure.value.code == mcp_types.HEADER_MISMATCH
 
     asyncio.run(scenario())
 
