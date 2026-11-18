@@ -24,6 +24,16 @@ Kept by W1 as the ledger's header owner. The coordinator assigns owners.
 | Item | Raised by | Owner | Notes |
 | --- | --- | --- | --- |
 | Linux fence egress bypass | W4 | TBD (coordinator) | The Linux Codex profile grants network "enabled" (host netns), so egress that does not go through the CONNECT proxy is neither recorded nor gated. Tracked outside W4 |
+| frpc over wss does not verify the frps certificate | W2 | W9 (owns `frp_*`) | frpc 0.69.1 logs in over wss without the CA, so it does not verify by default. Relay must set TLS verification explicitly. The fixture CA is `FX_WSS_CA_FILE` in the fixture env file |
+| W12's 8 client-side contract assumptions | W12 | W3 | With W3 for confirmation |
+| gact-tui relay references remain | W12 | W8, W14 | `managed-service-identity.tsx:28`, `infrastructure-service-labels.ts:14`, `test-fixtures/managed-services.ts`, `relay-settings.tsx`, the e2e fixtures, `domain.ts` `relay_job`, and `scripts/check_brand_literals` |
+| Marketplace plugins/ssh still declares native_tool("ssh_execute") | W4 | W4 | In progress |
+
+## Decisions across workstreams
+
+Kept by W1 as the ledger's header owner. Each is the coordinator's.
+
+- **LQ14 reads as one server instance.** Raised by W2. Protocol `2026-07-28` has no MCP session: `ctx.session_id` changes on every call, over Streamable HTTP and over stdio. "One session" in LQ14 therefore means continuity of one server instance (and one client connection). W2's counter reports `server_instance` for this. W9 and W16 test against it.
 
 ## W1. Relay core
 
@@ -174,6 +184,12 @@ Everything else is refused with the existing reasons: `elicitation_url_insecure_
 
 RL37 done in clio-agent (W4, `jaimecernuda-relay-rework-w4`). Fenced-shell ssh, scp, sftp and Git over SSH run through `runtime/net_connect.py`, a CONNECT helper used as ProxyCommand. The shims come from `runtime/fence_ssh.py` and are on PATH only inside an enforced fence. LQ29 passed on Ares inside codex-linux-sandbox 0.167.0: `ssh <host> hostname` succeeded and net.egress showed host and port 22. scp, sftp, `git ls-remote` and `git clone` over SSH passed. A host the policy denies is refused with an explicit message. Open: the Linux Codex profile grants network "enabled" (host netns), so egress that does not go through the proxy is neither recorded nor gated.
 
+RL36: "ssh_execute removed from clio-agent. Deleted: gact/ssh_tools.py, gact/ssh_recorded_presentation.py, gact/infrastructure/ssh_execution.py, gact/infrastructure/ssh_result.py, their tests and docs/verification/ssh-agent-execution-2026-10-19.md. The native_tool_registry entry and the legacy presentation calls in tool_result_presentation.py and session_export_projection.py are gone. Recorded ssh_execute rows render through the generic recorded-presentation path; new test test_retired_tool_presentation.py. Agents reach SSH hosts from the fenced shell (RL37); docs/PERMISSIONS.md says so. Kept: the Infrastructure SSH transport (paramiko SshRoute), storage SFTP and NDP SSH routes."
+
+RL38: "Relay leftovers removed from clio-agent. The managed relay service is gone (RELAY_VERSION, the relay ManagedServiceDefinition, _relay_plan, _relay_reused, _ssh_destination) from gact/infrastructure/drivers.py. Its only readers were drivers.py and test_infrastructure_reuse.py; the service_definitions consumers only iterate. A persisted relay service record is no longer listed, and acting on it returns 'Unknown managed service'. Also removed: the relay pytest marker (pyproject.toml), the CLIO_RELAY_* env strip in tests/conftest.py, relay in the network guard's EXEMPT_MARKERS, CLIO_RELAY_API_TOKEN, FRP_TOKEN and STCP_SECRET in conf.py and clio-paths.yaml (no code reads them), the relay row in the infrastructure docs and site page, and stale relay comments in agent.py, tools/gateway.py, gact/provenance_wiring.py, tools/mcp_connection_era.py, tools/mcp_discovery.py, errors.py, tools/fs_write.py and gact/infrastructure/reuse.py. Kept on purpose: gact/task_migration.py reading placement 'relay' from historical task records (a legacy-data reader); historical text in docs/design, docs/knob_audit, benchmark/ and scripts/check_file_size.py and check_task_replacement_removal.py comments; generic test fixtures that use 'relay' as an arbitrary namespace name."
+
+Branch: clio-agent `jaimecernuda-relay-rework-w4` at 6801be185.
+
 ## W5. clio-jarvis
 
 ## W6. Asks and identities
@@ -189,6 +205,21 @@ RL37 done in clio-agent (W4, `jaimecernuda-relay-rework-w4`). Fenced-shell ssh, 
 ## W11. globus, iri and sky
 
 ## W12. gact-tui host semantics and removals
+
+W12, gact-tui host semantics and removals: done (draft PR iowarp/gact-tui#1320).
+- HS1/HS2: `A2UISurface.owner` decoded. Server-owned surfaces send actions to their server through `/a2ui/actions`.
+  - The outcome (applied, no_update, task_pending, tool_error) is worded under the surface.
+  - Attribution reads "From {server} in the {plugin} plugin".
+  - The surface is read-only when its server is gone.
+  - `a2ui.server_surface.refused` raises a worded toast.
+- HS3: a generic `plugin` WorkbenchTab kind.
+  - Launchers come from `GET plugin-tabs`; open, close and actions use their routes.
+  - `plugin_tab.*` SSE keeps open tabs current; a revision gap reopens the tab.
+  - States: loading, empty, unavailable and error with Retry, plus Reload.
+  - The pocket width never changes when tabs open.
+- HS5: URL questions show Origin and "Trusted because" for configured, plugin_origin and plugin_loopback.
+- Removed: the relay engine icon, `ssh_execute`, and the `clio-relay==1.6.8` managed-service entries.
+- Proof: live against a stub, at 1440x900 and 390x844, in en and el.
 
 ## W13. Guardrails
 
