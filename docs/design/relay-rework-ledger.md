@@ -454,7 +454,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
 
 `tests/asks` on Ares at 8b13e42 (`CLIO_RELAY_KEYRING=memory`): **68 passed, 0 skipped**. After the device-flow fix: **71 passed, 0 skipped, 0 failed**. That includes `test_askpass_otp`: real ssh to fx-otp (127.0.0.1:47103), with the key and then a TOTP typed on relay's page, answered and declined. ruff, `ruff format --check` and strict pyright are clean on the W6 files.
 
-`tests/relay_next` with W6 installed: everything passes except `test_transports.py::test_plain_mcp_client_over_http[legacy]` and `[auto]`. W1's helper opens the HTTP page without the operator credential, and the stub it was written against had none. This is a request to W1 (see Open).
+`tests/relay_next` with W6 installed: at 4b72bf2, `test_transports.py::test_plain_mcp_client_over_http[legacy]` and `[auto]` failed because W1's helper opened the HTTP page without the operator credential. W1 fixed this with `answer_page(auth=)` at 87da62d. At 87da62d, `tests/asks` plus those two tests give **73 passed, 0 skipped, 0 failed** on Ares.
 
 **LQ42, live on Ares, 2026-11-18.** The client is `tests/asks/lq42_live.py`. It uses the official `mcp` SDK `Client` with no elicitation callback and no tasks, and opens a new connection for each step. The site is `slurm` (adapter `local`, `{"scheduler": "slurm"}`, `--policy open --spend always`), the job `/bin/sh -c "hostname; echo lq42-<tag>"` on partition `debug`, PT5M.
 
@@ -464,6 +464,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
   - Approving on the page: POST 200; the same POST again, 404.
   - Retry 1 and retry 2 (`run resume`) both returned Slurm job **27724**.
   - The same run with a changed spec got a new operation (`op_1e477f453cdd09a4b161496d`) and a new approval. The first approval did not carry over.
+  - Resuming the approved operation with a changed spec continued it at 4b72bf2. At 87da62d, rerun on 2026-11-18 at 07:38, it is refused with `approval_mismatch` (`op_222ad58111a41d0967834392`, Slurm job 27744).
   - Reconnecting: `describe` showed `completed`, job 27724. `files read jobs/<op>/stdout` gave `ares-comp-03` and `lq42-gate`.
   - Decline: `op_13632a885db31975f126bff2` went to `cancelled` (`declined`), with no handle and no job directory.
   - No answer: `op_b474063849e345932b3a93dd` stayed `awaiting_input`, with no handle and no job directory; a retry was again `needs_approval`.
@@ -481,8 +482,10 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
   - Reconnect: `completed`, with output read through `files`.
   - The serve log has no request lines and no page URLs.
 - **Exactly once across a crash.** A fake `sbatch` first on `PATH` runs the real one and then `kill -9`s relay, after Slurm has accepted the job and before relay writes its id. Relay is then restarted with the normal `PATH`.
-  - **As merged, it fails to reconcile.** `op_841635bf1ab636c3eb03c79a` was accepted by Slurm as job 27726, which ran to completion. After the restart relay could not find it and, after `SUBMIT_GRACE`, recorded `failed` ("no job was found"). The cause: psij's Slurm template takes `--job-name` from `job.name`, which is empty, so Slurm names the job `submit.sh`, not `relay-<op>`. Nothing was submitted twice, but relay lost the job.
-  - **With a two-line fix in the local adapter** (tried in the W6 clone on Ares only, then reverted): add `--job-name=relay-<op>` to the sbatch argv. Then `op_301e8834aacd8e397afe52a8` was killed after acceptance, and the restart reconciled it by name to job **27727**: history `submitting` ("job name relay-op_…"), then `queued` ("reconciled after an interrupted submit"), `running`, `completed`. squeue held exactly one job for it.
+  - **At 4b72bf2, it failed to reconcile.** `op_841635bf1ab636c3eb03c79a` was accepted by Slurm as job 27726, which ran to completion. After the restart relay could not find it and, after `SUBMIT_GRACE`, recorded `failed` ("no job was found"). The cause: psij's Slurm template takes `--job-name` from `job.name`, which is empty, so Slurm named the job `submit.sh`, not `relay-<op>`. Nothing was submitted twice, but relay lost the job.
+  - **At 87da62d, with W1's job naming and `scheduler_id` record, it passes.**
+    - Restart while Slurm still lists the job: `op_7752f84c897ba04b72395965` was killed after Slurm accepted job **27745** (`relay-op_7752…`, PENDING, no native id in the record). The restart reconciled by name. History: `submitting` ("job name relay-op_…"), `queued` ("reconciled after an interrupted submit"), `running`, `completed`. Slurm had exactly one job for it, and stdout was `ares-comp-03` and `lq42-crash`.
+    - Restart after Slurm forgot the job: `op_07e8c69c4cc2c58895a47f45` was killed after acceptance of job **27751**. Relay was restarted only once squeue no longer listed the job (MinJobAge passed, 07:39 to 07:44). The restart found it through `<job_dir>/scheduler_id` and recorded `queued` ("reconciled after an interrupted submit") and then `completed`, with output read back. One job.
 - **Not covered here.** `files` transfer, `serve` service and stop, A2UI, and the tab token belong to W1, W9 and W14, and are left to their owners' LQ42 runs.
 
 ### Halves of other rows
@@ -494,10 +497,7 @@ Branch `jaimecernuda-relay-rework-w6` (from the integration branch, with 4b72bf2
 
 ### Open
 
-- **To W1: name Slurm jobs.** In `LocalAdapter._submit_batch`, add `--job-name=relay-<op>` to the sbatch argv, or the PBS equivalent `-N`. Without it, reconciling by name never finds a job, as the crash run above shows. Also note that on Ares, `find()` can only see a job within 5 minutes of it ending.
-- **To W1: refuse a changed resume.** `run(resume=op, site=, spec=)` ignores a changed spec and goes on with the approved one. It should refuse `approval_mismatch` when the site or the spec digest differs, as `_resume_round` already does.
-- **To W1: the HTTP page needs the operator credential.** Give `tests/relay_next/conftest.py::answer_page` an optional `auth`. `test_transports.py` should pass `("operator", (state_dir / "operator-token").read_text())` for the HTTP server.
-- **To W1: a `config_dir` setting.** The ask provider falls back to `RelayPaths.from_env().config_dir` because `HookContext.settings` has no `config_dir`.
+- **The four W1 requests landed at 87da62d:** job naming (with `scheduler_id`), refusing a changed resume, `answer_page(auth=)`, and `settings["config_dir"]`, which the ask provider now reads. Closed.
 - **Live Globus** waits for O10.
 
 ## W7. The ssh adapter and scheduler jobs
