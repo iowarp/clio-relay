@@ -2073,14 +2073,20 @@ All live on Ares, on my own stack:
     - An open, close, open race between the page's UI and the host refused the first action with 404. W12 fixed it in gact-tui 712c3a40c and W3 in clio-agent dc032521b.
     - The edit card repeated three form fields as facts above its own heading. Fixed at a141639f.
   - On Ares at a141639f, `tests/relay_next tests/asks` gave 339 passed, 0 skipped, with ruff, the size ratchet and pyright clean (4535, at the baseline). The option-B tests assert that a plain client sees 5 tools and an A2UI client sees 5 plus the 12 app-only tools in `ACTIONS`, and that a call without a token, or with a made-up one, is refused.
+- **The TACC demo fixes (W10's findings), live on Windows, without Ares and without tests.** The stack was clio-agent b89ffcb1 with gact-tui 10030493 on the `jaimecernuda-relay-rework` lines, on my own ports (agent :18914, UI :15914) and my own `CLIO_AGENT_HOME`. The plugin was pinned to `clio-relay[tapis]` at integration b8d48591.
+  - **One ask per page.** The host already sends one surface consent covering all 12 relay app tools. The page missed it because it listened for `interaction.*`, while the host emits `permission.*`, so the ask showed only under the bell. "Allow once" was also the default. Now the ask shows on the page, "This page" (a session grant) leads, and the bell's quick Allow gives the same grant. One answer granted all 12, and no later action asked again.
+  - **Results without a reload.** After the answer, the add form appeared in about 1 s. Add from catalog, Connect, Probe and Remove each showed their result in under 1 s. Plugin opens and actions also get a 30-minute bridge budget, instead of CLIO Desktop's 30 s default, so an approval wait or a slow Tapis call no longer times out.
+  - **"Compute is unavailable" on the first open.** Page reads started relay inside the fence without the provisioning a turn does, so on Windows the uvx git source could not build. Reads now provision first. A cold open, including a fresh build, returned the page in 18 s, and the unavailable state now offers Retry.
+  - **The demo flow.** Added "Ares (through Tapis)", then pressed Connect. Connect answers inline that relay has no OAuth client for the TACC tenant, naming `CLIO_RELAY_TACC_CLIENT_ID` and `CLIO_RELAY_TACC_CLIENT_KEY`. That needs the demo's OAuth client, not a page change.
+  - Passed at 1440×900 and 390×844, in en and el. Screenshots `{en,el}-{1440,390}-0{1..8}-*.png` are in the session artifacts.
 
 ### Open items
 
 - **Tab actions before the first turn.** After an agent restart, every tab action is refused 403 `a2ui_server_tool_not_app_visible` until the session has run one turn. The host checks the executor's tool definitions, and those are empty until then. This is for W3.
 - **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
-- **The pin.** `plugin/mcp.json` and the marketplace run `clio-relay serve` from integration 3d0ff6b, which has W14 ec6541e merged (4e81b94). A later relay change moves both pins together.
+- **The pin.** `plugin/mcp.json` and the marketplace run `clio-relay[tapis] serve` from integration b8d48591. A later relay change moves both pins together.
 - **Two `mcp_resource_updated` per tab action.** On the live stack, each tab action POST is followed by two adjacent `mcp_resource_updated namespace=relay uri=a2ui://clio-relay/compute` lines in the agent log, even for an action that only sets an error. Only one relay process is up. W1's tests show one notification per change inside relay, so the second is probably counted on the host side. This is for W3.
-- **A consent prompt per action tool on the page.** The first use of each relay app tool (open add, add, probe, set value, edit, save, cancel, remove, confirm) raises its own external-MCP consent. The prompt shows the raw call, such as "relay_compute_open_add: token …". It can take more than 10 s to show, sometimes only in the bell. This is for W3.
+- **A consent prompt per action tool on the page.** Resolved for the page: the host sends one surface consent for all of relay's app tools, and the page now shows it with "This page" first (gact-tui 10030493). The card still shows the raw call, such as "relay_compute_open_add: token …". That is the generic consent card, for W3 and W12.
 
 ### Run sheets for the person rows
 
