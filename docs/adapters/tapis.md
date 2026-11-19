@@ -57,8 +57,18 @@ python -m clio_relay.adapters.tapis sign-out --site ares-tapis
 
 ### The OAuth client
 
-The device code sign-in needs an OAuth client in the `tacc` tenant. Until relay
-ships one, set it in the environment relay runs in:
+The device code sign-in needs an OAuth client in the `tacc` tenant. Relay ships
+none yet, so make your own, once. Any TACC account can. Run this on your own
+machine; curl asks for your TACC password, which goes only to TACC:
+
+```
+curl -u <your TACC username> -H 'Content-type: application/json' \
+  -d '{"description": "clio-relay"}' https://tacc.tapis.io/v3/oauth2/clients
+```
+
+TACC answers with a `client_id` and a `client_key`. Put both in the environment
+relay runs in. Under CLIO, that is the environment CLIO starts in, because
+relay's server inherits it. Never paste them into a chat.
 
 | Variable | What it is |
 | --- | --- |
@@ -66,7 +76,9 @@ ships one, set it in the environment relay runs in:
 | `CLIO_RELAY_TACC_CLIENT_KEY` | The client's key. Needed only for refresh |
 | `CLIO_RELAY_TACC_BASE_URL`, `CLIO_RELAY_TACC_TENANT_ID` | Another Tapis tenant |
 
-A site's `client_id` setting takes precedence over the environment.
+A site's `client_id` setting takes precedence over the environment. Without a
+client, a Tapis site shows "relay has no OAuth client"; with an id TACC does
+not know, it shows "TACC has no OAuth client".
 
 ## Adding a site
 
@@ -108,7 +120,9 @@ system for you per site, once. It does this when you add the site, add it from
 the catalog, edit it or switch to it, and reports what it did. If the
 credential already works, it leaves everything alone, so doing it again is
 safe. If you are not signed in yet, the add reports `needs_sign_in` and keeps
-the site; sign in, then add or switch to the site again, or register by hand:
+the site. After you sign in, the first call that needs the system registers
+it, using the way in the add saved, so there is nothing to add again. You can
+also register by hand:
 
 ```
 python -m clio_relay.adapters.tapis register-host --site ares-tapis
@@ -263,7 +277,7 @@ Tapis. Every job on these sites asks you before it spends allocation hours.
 | Refusal | What it means |
 | --- | --- |
 | `needs_sign_in` | Sign in to TACC on the page it names, then try again |
-| `invalid_config` | The site has no Tapis system yet. Add or switch to the site again, or run `register-host`. On a TACC host, set `system_id` to one of the `candidates` it lists |
+| `invalid_config` | The site has no Tapis system yet, and registering it on first use failed or the site names a `system_id`. Add or switch to the site again, or run `register-host`. On a TACC host, set `system_id` to one of the `candidates` it lists |
 | `policy_refused` | A free-form executable on a guarded site |
 | `submit_failed` | Tapis refused the job or the credential. The message carries Tapis's own words |
 | `verb_not_implemented` | The system uses a scheduler other than Slurm, which relay does not run jobs on yet |
