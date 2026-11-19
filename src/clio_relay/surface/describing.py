@@ -60,7 +60,9 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
         "routes": [item.model_dump(mode="json") for item in service.site_routes(site)],
-        "skill": await asyncio.to_thread(skill_link, site, service.paths.config_dir),
+        "skill": await asyncio.to_thread(
+            skill_link, site, service.paths.config_dir, with_text=True
+        ),
     }
     try:
         adapter = service.adapter_for(site, "describe")

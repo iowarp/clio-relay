@@ -1,4 +1,4 @@
-"""Single-use action tokens for the Compute tab (RL32, LQ1).
+"""Single-use action tokens for the Compute page (RL32, LQ1).
 
 Every button relay renders carries a token bound to one action and one subject
 (a site id, or the adapter an add form is for). The action tools take the

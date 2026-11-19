@@ -34,7 +34,6 @@ def ssh_target(
         config=config,
         state_dir=tmp_path,
         site_id=profile,
-        files_dir=f"{RUN_DIR}/{profile}-files",
         **extra,  # pyright: ignore[reportArgumentType]
     )
 

@@ -46,17 +46,10 @@ path = "hatch_build.py"
 [tool.hatch.build.targets.wheel]
 packages = ["src/clio_relay"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"jarvis-packages" = "clio_relay/assets/jarvis-packages"
-"jarvis-packages/clio_relay/clio_relay/_jarvis_api.py" = "clio_relay/_jarvis_api.py"
-"jarvis-packages/clio_relay/clio_relay/bounded_command" = "clio_relay/bounded_command"
-"jarvis-packages/clio_relay/clio_relay/remote_agent" = "clio_relay/remote_agent"
-
 [tool.hatch.build.targets.sdist]
 include = [
     "hatch_build.py",
     "src",
-    "jarvis-packages",
     "tests",
     "README.md",
     "LICENSE",
@@ -133,7 +126,7 @@ ignore = ["ANN401"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-include = ["src", "jarvis-packages", "tests", "scripts"]
+include = ["src", "tests", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

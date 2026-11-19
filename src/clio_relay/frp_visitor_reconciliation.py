@@ -4,8 +4,9 @@ iowarp/clio-relay#285: a ``brokered_tcp``/``udp_rendezvous`` connection's held
 frpc visitor (:class:`~clio_relay.frp_link.HeldFrpVisitor`) has no
 self-tearing-down tether the way ``ssh_forward``'s held stdin pipe does
 (``control_channel.py``'s own module docstring) -- nothing closes it when the
-owning CLI process exits. The atexit hook
-(:mod:`clio_relay.adapters.worker.remote_connection_registry`) covers the ordinary-exit case;
+owning CLI process exits. The worker adapter's atexit hook
+(``_close_all_connections`` in :mod:`clio_relay.adapters.worker.adapter`) covers
+the ordinary-exit case;
 this module covers what an atexit hook structurally cannot -- a ``kill -9``'d
 or crashed CLI leaves its visitor process (and its rendered-config temp dir,
 secret included) with no owner, and no atexit hook ever runs for a process
@@ -56,9 +57,8 @@ and:
 
 **Known limitation (D7, documented rather than fixed):** on Windows, a
 ``parent_pid`` this module observes as "alive" is only ever cross-checked
-against the CURRENT snapshot's own pid column -- never against a start-time
-identity the way ``process_containment_recorded.process_start_identity``
-does for OWNED processes elsewhere in this codebase. If the ORIGINAL parent
+against the CURRENT snapshot's own pid column -- never against a recorded
+process start time. If the ORIGINAL parent
 CLI process exits and the OS reuses its exact pid for an unrelated process
 before this module's next reconciliation pass runs, a genuinely orphaned
 visitor is misclassified as "parent still alive" and is never reaped by

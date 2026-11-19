@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib
 import json
 import os
 import re
@@ -187,13 +186,7 @@ class SkyAdapter(BaseAdapter[SkyConfig]):
         self.records = context.state_dir / "sky-jobs"
 
     def _secret(self, name: str) -> str | None:
-        """Return a secret the person typed on relay's page, from relay's token store."""
-        try:
-            store_module = importlib.import_module("clio_relay.identity.store")
-        except ImportError:
-            return None
-        value: object = store_module.TokenStore().secret(name)
-        return value if isinstance(value, str) else None
+        return self.context.secret(name)
 
     def _credential_env(self) -> dict[str, str]:
         credentials = self.config.credentials

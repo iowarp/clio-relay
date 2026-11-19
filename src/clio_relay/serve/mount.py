@@ -131,6 +131,9 @@ class Mounter:
         existing = self.provider.mounts.get(operation_id)
         if existing is not None:
             return existing
+        taken = next((m for m in self.provider.mounts.values() if m.prefix == prefix), None)
+        if taken is not None:
+            raise ValueError(f"{prefix}* is already mounted for {taken.operation_id}")
         client: Client[Any] = Client(url, auth=secret) if secret else Client(url)
         await client.__aenter__()
         try:

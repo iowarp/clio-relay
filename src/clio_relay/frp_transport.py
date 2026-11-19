@@ -1,6 +1,6 @@
 """``RelayTransport`` implementations for modes (a) ``brokered_tcp`` and (b)
 ``udp_rendezvous`` (iowarp/clio-relay#231 R5, tracked by iowarp/clio-relay#188
-items 1-3+5; the design is ``docs/design/relay-architecture-2026-08.md`` §8).
+items 1-3+5).
 
 ``control_channel.py``'s ``SshForwardTransport`` is the reference lifecycle for
 mode (c): dial once, hold the process for the connection's lifetime, prove the
@@ -229,8 +229,8 @@ class _FrpChannelTransport:
         iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
         reconciliation pass runs for this exact ``frpc_bin`` -- re-verified,
         pid-reuse-safe reaping (D1) of any prior visitor whose owning CLI
-        process is gone (a ``kill -9`` or crash the atexit hook in
-        ``remote_connection_registry.py`` could never have caught), each
+        process is gone (a ``kill -9`` or crash the worker adapter's atexit
+        hook could never have caught), each
         reap also removing its own secret-bearing config dir (D3), plus a
         once-per-process sweep (D8) of aged crash-orphaned config dirs
         regardless of emptiness. This never blocks a legitimate concurrent
@@ -452,8 +452,7 @@ def _verify_pinned_identity(
     pinned cluster/session/generation/nonce could still pass this specific
     check -- only the later re-proof
     (``remote_connection.verify_session_identity``, against THIS document)
-    closes that gap. See ``docs/design/relay-architecture-2026-08.md`` §8.6's
-    R1 entry: the preshared anchor does not cover the local bind end.
+    closes that gap: the preshared anchor does not cover the local bind end.
     """
     if identity.get("schema_version") != SESSION_IDENTITY_SCHEMA or any(
         identity.get(field) != expected

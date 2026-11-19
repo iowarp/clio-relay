@@ -4,15 +4,17 @@ This folder is relay's plugin for CLIO. Installing it gives CLIO:
 
 - relay's MCP server, launched from `mcp.json`, with the five tools `describe`,
   `run`, `exec`, `files` and `serve`;
-- the Compute tab, where a person adds, probes, edits and removes sites;
+- the Compute page in CLIO's left bar, where a person adds, probes, edits and
+  removes compute endpoints (relay's sites) and picks each one's protocol and
+  security;
 - a Globus account, whose grant file CLIO hands relay as
   `CLIO_RELAY_GRANT_FILE_GLOBUS`;
 - sign-in pages on the loopback address and on `https://tacc.tapis.io`;
 - the `use-relay` skill, which sends the agent to relay's skill resources.
 
-`ai.iowarp.clio/a2ui/clio-relay-compute/` is the A2UI catalog the tab draws
-with. It is ten Basic components, unchanged, so CLIO renders everything the
-tab sends.
+`ai.iowarp.clio/a2ui/clio-relay-compute/` is the A2UI catalog the page draws
+with: ten Basic components, unchanged, and CLIO's choice table. A client
+that renders only the Basic catalog gets the page as cards.
 
 CLIO's fence lets a plugin server write only to its own data folder, so
 `mcp.json` puts relay's configuration (`sites.yaml`, skills) and state in

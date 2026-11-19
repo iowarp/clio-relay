@@ -102,7 +102,9 @@ def test_a_task_shows_why_a_service_is_not_ready(
                 if "certificate" in message:
                     break
                 await asyncio.sleep(0.1)
-            assert message == "the service is running: frpc: the rendezvous refused the certificate"
+            assert (
+                message == "the service is starting: frpc: the rendezvous refused the certificate"
+            )
             await client.call_tool("serve", {"stop": task.task_id})
 
     asyncio.run(scenario())

@@ -39,7 +39,9 @@ One call carries at most 4 MiB. Larger files move in chunks.
 Upload: write the first chunk at `offset` 0 with `final=false`, each next
 chunk at the offset where the last one ended, and the last chunk with
 `final=true`. The chunks collect in `<path>.relay-part`; the last one moves it
-to `path`. `overwrite` is checked on the first chunk and again when the file
+to `path`. An adapter whose site cannot append keeps the part in relay's own
+state and sends it up once, with the last chunk; `stat` on `<path>.relay-part`
+still answers from it. `overwrite` is checked on the first chunk and again when the file
 moves into place. A chunk with `final=false` answers with `resume_at`, the
 offset of the next chunk.
 
@@ -58,9 +60,10 @@ asked for.
 | Adapter | list, stat, read, whole write | delete | chunked write | Notes |
 | --- | --- | --- | --- | --- |
 | local, fixture | yes | yes | yes | The reference implementation. |
+| any adapter built on `SiteFiles` | yes | yes | yes | `SiteFiles` applies these rules over six primitives; see [adding an adapter](adding-an-adapter.md#files). |
 | worker | yes | yes | yes | The site side runs the local implementation. |
 | tapis | yes | yes | not yet | Tapis Files has no append. |
-| ssh | yes | not yet | not yet | Relative paths still resolve under the home directory. |
+| ssh | yes | yes | yes | One remote script per op, so each op costs one ssh round trip. |
 | globus | yes | not yet | not yet | |
 | iri | yes, up to the API's size limit | not yet | not yet | |
 

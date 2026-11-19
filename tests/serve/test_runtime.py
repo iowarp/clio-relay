@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from clio_relay.jobs.handles import JobHandle, JobState, JobStatus, OutputRef
+from clio_relay.adapters.worker.adapter import WorkerAdapter
+from clio_relay.jobs.handles import ExecResult, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.serve import config as serve_settings
+from clio_relay.serve import runtime as runtime_module
 from clio_relay.serve.desktop import decode, settings, visitor_plan
-from clio_relay.serve.mount import tool_prefix
+from clio_relay.serve.mount import Mount, Mounter, tool_prefix
 from clio_relay.serve.plan import ServePlan
-from clio_relay.serve.runtime import ServeRuntime, connect_handle, is_artifact
+from clio_relay.serve.runtime import ServeRuntime, connect_handle, handle_job_dir, is_artifact
 from clio_relay.surface.settings import RelayPaths
 
-from .helpers import frp_plan, rendezvous
+from .helpers import frp_plan, rendezvous, service
 
 pytestmark = pytest.mark.release_platform("posix")
 
@@ -212,6 +215,167 @@ def test_the_jobs_native_id_reaches_the_record_and_provenance(tmp_path: Path) ->
     assert block["native_id"] == "27810"
     stored = runtime.records.get(plan.operation_id)
     assert stored is not None and stored.handle is not None
+
+
+def test_the_job_dir_is_found_inside_a_handle_the_worker_wraps() -> None:
+    inner = JobHandle(adapter="local", native_id="801", data={"job_dir": "/w/jobs/op_1"})
+    wrapped = JobHandle(
+        adapter="worker", native_id="801", data={"remote": inner.model_dump(mode="json")}
+    )
+    assert handle_job_dir(inner) == "/w/jobs/op_1"
+    assert handle_job_dir(wrapped) == "/w/jobs/op_1"
+    assert handle_job_dir(JobHandle(adapter="x", native_id="1", data={})) is None
+
+
+def test_a_running_service_is_brought_up_without_a_client_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client may stop polling at "running" and wait for tools/list_changed."""
+    monkeypatch.setattr(runtime_module, "FOLLOW_FIRST_S", 0.0)
+    monkeypatch.setattr(runtime_module, "FOLLOW_MAX_S", 0.0)
+    handle = JobHandle(adapter="fixture", native_id="1", data={"job_dir": "/j"})
+    plan = frp_plan(tmp_path).model_copy(update={"job_dir": "/j", "handle": handle})
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    runtime.plans[plan.operation_id] = plan
+    running = JobStatus(state=JobState.RUNNING)
+    calls: list[int] = []
+
+    served = plan.endpoint(note="serving", connect_command=None)
+
+    async def bring_up(_plan: ServePlan, _adapter: Any, status: JobStatus) -> Any:
+        calls.append(1)
+        return status, (served if len(calls) >= 3 else None)
+
+    class Adapter:
+        async def status(self, _handle: JobHandle) -> JobStatus:
+            return running
+
+    runtime._running = bring_up  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+
+    async def scenario() -> None:
+        runtime._follow(plan, Adapter(), handle, running)  # pyright: ignore[reportPrivateUsage]
+        runtime._follow(plan, Adapter(), handle, running)  # pyright: ignore[reportPrivateUsage]
+        follower = runtime._followers[plan.operation_id]  # pyright: ignore[reportPrivateUsage]
+        await follower
+
+    asyncio.run(scenario())
+    assert len(calls) == 3
+    assert not runtime._followers  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_status_call_during_a_stop_does_not_mount_again(tmp_path: Path) -> None:
+    """A task poll in flight when a stop arrives must not leave the tools mounted."""
+    handle = JobHandle(adapter="fixture", native_id="1", data={"job_dir": "/j"})
+    plan = frp_plan(tmp_path).model_copy(update={"job_dir": "/j", "handle": handle})
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    runtime.plans[plan.operation_id] = plan
+    record = OperationRecord(
+        operation_id=plan.operation_id,
+        kind="serve",
+        site="fx",
+        adapter="fixture",
+        spec={},
+        spec_digest="d" * 64,
+        state=OperationState.RUNNING,
+    )
+    runtime.records.put(plan.operation_id, record)
+    mounted: list[bool] = []
+    state = {"job": JobState.RUNNING}
+
+    async def bring_up(_plan: ServePlan, _adapter: Any, status: JobStatus) -> Any:
+        mounted.append(True)
+        return status, plan.endpoint(note="serving", connect_command=None)
+
+    async def close_desktop(_plan: ServePlan) -> None:
+        mounted.append(False)
+
+    async def request_stop(_plan: ServePlan, _adapter: Any, _handle: JobHandle) -> None:
+        state["job"] = JobState.CANCELLED
+
+    async def finish(_plan: ServePlan, _adapter: Any, status: JobStatus) -> JobStatus:
+        return status
+
+    gate = asyncio.Event()
+
+    class Adapter:
+        async def status(self, _handle: JobHandle) -> JobStatus:
+            if not gate.is_set():
+                await gate.wait()
+            return JobStatus(state=state["job"])
+
+    runtime._running = bring_up  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    runtime._close_desktop = close_desktop  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    runtime._request_stop = request_stop  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    runtime._finish = finish  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
+    adapter = Adapter()
+
+    async def scenario() -> JobStatus:
+        polling = asyncio.create_task(runtime.status(None, adapter, record))
+        await asyncio.sleep(0)
+        stopping = asyncio.create_task(runtime.stop(None, adapter, record))
+        await asyncio.sleep(0)
+        gate.set()
+        await polling
+        final = await stopping
+        state["job"] = JobState.RUNNING
+        again, endpoint = await runtime.status(None, adapter, record)
+        assert endpoint is None
+        assert again.message is not None and again.message.startswith("stopping")
+        return final
+
+    final = asyncio.run(scenario())
+    assert final.state == JobState.CANCELLED
+    assert mounted == [True, False]
+
+
+def test_a_second_mcp_server_with_the_same_tool_names_is_refused(tmp_path: Path) -> None:
+    """Two live servers under one ``<site>_<name>_`` prefix would hide each other's tools."""
+    spec = service(
+        ports=[{"name": "mcp", "protocol": "mcp", "protection": "secret_env:SVC_SECRET"}]
+    )
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    live = frp_plan(tmp_path, spec).model_copy(update={"operation_id": "op_live"})
+    runtime._save(live)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(Refusal, match="op_live already serves an MCP server"):
+        runtime._refuse_a_second_mount("fx", "web_app", "op_new")  # pyright: ignore[reportPrivateUsage]
+    runtime._refuse_a_second_mount("fx", "other", "op_new")  # pyright: ignore[reportPrivateUsage]
+    runtime._refuse_a_second_mount("fx", "web_app", "op_live")  # pyright: ignore[reportPrivateUsage]
+    runtime._save(live.model_copy(update={"stop_requested_at": live.created_at}))  # pyright: ignore[reportPrivateUsage]
+    runtime._refuse_a_second_mount("fx", "web_app", "op_new")  # pyright: ignore[reportPrivateUsage]
+
+    mounter = Mounter()
+    mounter.provider.mounts["op_live"] = Mount("op_live", "fx_web_app_", "u", cast(Any, None))
+    with pytest.raises(ValueError, match="already mounted for op_live"):
+        asyncio.run(mounter.mount("op_new", "fx_web_app_", "http://127.0.0.1:1/mcp"))
+
+
+def test_the_login_hop_runs_through_the_workers_hop_exec(tmp_path: Path) -> None:
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    class Worker:
+        async def hop_exec(
+            self,
+            command: list[str],
+            *,
+            timeout_s: float | None = None,
+            max_output_bytes: int,
+            on_stall: Any = None,
+        ) -> ExecResult:
+            del on_stall
+            calls.append((command, {"timeout_s": timeout_s, "max": max_output_bytes}))
+            return ExecResult(argv=command, exit_code=0, stdout="ok\n", stderr="", duration_s=0)
+
+        async def exec(self, *_args: Any, **_kwargs: Any) -> ExecResult:
+            raise AssertionError("the worker's hop_exec comes first")
+
+    real = inspect.signature(WorkerAdapter.hop_exec).parameters
+    fake = inspect.signature(Worker.hop_exec).parameters
+    assert [(p.name, p.kind) for p in real.values()] == [(p.name, p.kind) for p in fake.values()]
+    plan = frp_plan(tmp_path)
+    runtime = ServeRuntime(tmp_path / "state", transport="http")
+    result = asyncio.run(runtime._exec(Worker(), plan, ["true"]))  # pyright: ignore[reportPrivateUsage]
+    assert result.stdout == "ok\n"
+    assert calls and calls[0][0] == ["true"] and calls[0][1]["max"] > 0
 
 
 def test_settings_cli_sets_shows_and_clears(tmp_path: Path) -> None:

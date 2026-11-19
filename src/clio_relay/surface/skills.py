@@ -101,18 +101,34 @@ def site_skill(
 
 
 def skill_link(
-    site: SiteEntry, config_dir: Path, known: dict[str, Skill] | None = None
+    site: SiteEntry,
+    config_dir: Path,
+    known: dict[str, Skill] | None = None,
+    *,
+    with_text: bool = False,
 ) -> dict[str, Any] | None:
-    """Say what ``describe`` reports about a site's skill: its URI, or why there is none."""
+    """Say what ``describe`` reports about a site's skill: where to read it, or why there
+    is none. ``with_text`` adds the guide itself, so a client that never reads MCP
+    resources still gets it from the ``describe`` tool."""
     if not site.skill:
         return None
-    if site_skill(site, config_dir, known) is None:
+    skill = site_skill(site, config_dir, known)
+    if skill is None:
         return {
             "linked": site.skill,
             "uri": None,
             "detail": "relay cannot find or read this skill; fix the site's skill field",
         }
-    return {"linked": site.skill, "uri": site_skill_uri(site.id)}
+    link: dict[str, Any] = {
+        "linked": site.skill,
+        "uri": site_skill_uri(site.id),
+        "title": skill.title,
+    }
+    if with_text:
+        link["text"] = skill.text
+    else:
+        link["read_with"] = f"describe(site={site.id!r})"
+    return link
 
 
 def _resource(uri: str, skill: Skill, description: str) -> TextResource:

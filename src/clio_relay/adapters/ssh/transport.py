@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from clio_relay.adapters.ssh import errors
 from clio_relay.adapters.ssh.config import SshConfig
 from clio_relay.asks import askpass
 from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
@@ -33,26 +34,7 @@ logger = logging.getLogger(__name__)
 
 POSIX = os.name == "posix"
 MAX_STALL_STEP_S = 600.0
-
-# ssh reports its own failures with exit code 255 and one of these on stderr.
-_INTERACTIVE_MARKERS = ("keyboard-interactive", "password", "verification code")
-_NETWORK_MARKERS = (
-    "connection timed out",
-    "connection refused",
-    "could not resolve hostname",
-    "no route to host",
-    "network is unreachable",
-    "connection closed",
-    "connection reset",
-    "kex_exchange_identification",
-    "timeout, server",
-    "broken pipe",
-    "client_loop",
-    "operation timed out",
-    "lost connection",
-    "control socket connect",
-    "mux_client",
-)
+MAX_RETRY_WAIT_S = 30.0
 
 # ``ssh -N -f`` leaves the master in its own session, so it would outlive relay.
 # This watcher, detached too, stops it once the relay process that started it ends.
@@ -230,31 +212,6 @@ async def run_process(
     )
 
 
-def is_ssh_failure(result: Completed) -> bool:
-    """Return whether ``ssh`` itself failed, as opposed to the remote command."""
-    if result.exit_code != 255:
-        return False
-    text = result.error_text().lower()
-    return (
-        "permission denied" in text
-        or "host key verification failed" in text
-        or text.startswith("ssh:")
-        or any(marker in text for marker in _NETWORK_MARKERS)
-    )
-
-
-def is_interactive_refusal(result: Completed) -> bool:
-    """Return whether the site wanted a code or password that BatchMode could not give."""
-    text = result.error_text().lower()
-    return "permission denied" in text and any(m in text for m in _INTERACTIVE_MARKERS)
-
-
-def is_network_failure(result: Completed) -> bool:
-    """Return whether the connection failed or dropped, so a retry may work."""
-    text = result.error_text().lower()
-    return result.exit_code == 255 and any(marker in text for marker in _NETWORK_MARKERS)
-
-
 def _short_dir(preferred: Path) -> Path:
     """Return a directory whose socket paths fit the 104-byte Unix limit."""
     if len(str(preferred)) + 42 < 100:
@@ -346,35 +303,81 @@ class SshTransport:
         check_timeout: bool = True,
         hold_stdin: bool = False,
         on_stall: StallReport | None = None,
+        retry: bool = True,
     ) -> Completed:
         """Run ``script`` with ``sh`` on the site and refuse on an ssh failure.
 
         The script goes on standard input. With ``data`` or ``hold_stdin``, the
         script goes on the command line and ``data`` on standard input, which
-        ``hold_stdin`` keeps open until the command ends.
+        ``hold_stdin`` keeps open until the command ends. A call whose connection
+        failed or dropped runs again, up to ``retries`` times. Without ``retry``
+        the script must not run twice, so it runs again only when the connection
+        never opened.
         """
         if data is None and not hold_stdin:
             argv = [*self.ssh_argv(), "sh -s"]
-            stdin = script.encode()
+            # sh reads a group whole before it runs any of it, so a stream cut
+            # short by a dropped connection runs nothing rather than a part.
+            stdin = ("{\n" + script.rstrip("\n") + "\n}\n").encode()
         else:
             argv = [*self.ssh_argv(), f"sh -c {shlex.quote(script)}"]
             stdin = data or b""
-        result = await run_process(
-            argv,
-            timeout_s=timeout_s,
-            max_output_bytes=max_output_bytes,
-            stdin=stdin,
-            env=self.environment(),
-            hold_stdin=hold_stdin,
-            on_stall=on_stall,
-        )
+
+        async def once() -> Completed:
+            return await run_process(
+                argv,
+                timeout_s=timeout_s,
+                max_output_bytes=max_output_bytes,
+                stdin=stdin,
+                env=self.environment(),
+                hold_stdin=hold_stdin,
+                on_stall=on_stall,
+            )
+
+        result = await self.retrying(once, what, once=not retry)
         if result.timed_out and not check_timeout:
             return result
         self.raise_for_failure(result, what)
         return result
 
+    async def retrying(
+        self,
+        call: Callable[[], Awaitable[Completed]],
+        what: str,
+        *,
+        scp: bool = False,
+        once: bool = False,
+    ) -> Completed:
+        """Run ``call`` again while its connection fails or drops, up to ``retries`` times.
+
+        With ``once``, only a connection that never opened is tried again.
+        """
+        attempt = 0
+        while True:
+            result = await call()
+            code = result.exit_code
+            if scp and code:
+                code = 255  # scp exits 1 and passes on ssh's own message
+            if attempt >= self.config.retries or not errors.retryable(
+                result.error_text(), code, once=once
+            ):
+                return result
+            attempt += 1
+            wait = min(MAX_RETRY_WAIT_S, 2.0**attempt)
+            detail = result.error_text().strip().splitlines()
+            logger.warning(
+                "%s on %s: the connection failed (%s); retry %d of %d in %.0f s",
+                what,
+                self.config.ssh_profile,
+                detail[-1] if detail else "no detail",
+                attempt,
+                self.config.retries,
+                wait,
+            )
+            await asyncio.sleep(wait)
+
     def raise_for_failure(self, result: Completed, what: str) -> None:
-        """Turn an ssh failure into a typed refusal."""
+        """Turn an ssh failure into a typed refusal (see ``errors``)."""
         if result.timed_out:
             raise Refusal(
                 RefusalReason.TIMEOUT,
@@ -382,45 +385,30 @@ class SshTransport:
                 site=self.site_id,
             )
         local_programs = (self.config.ssh_command, self.config.scp_command)
+        # Only the spawn failure in ``run_process`` writes exactly this; a remote
+        # shell's "bash: <program>: command not found" is the job's own failure.
         if (
             result.exit_code == 127
             and not result.stdout
-            and b"command not found" in result.stderr
             and result.argv
             and result.argv[0] in local_programs
+            and result.stderr == f"{result.argv[0]}: command not found".encode()
         ):
             raise Refusal(
                 RefusalReason.ADAPTER_UNAVAILABLE,
                 f"{result.argv[0]} is not installed on this machine",
                 site=self.site_id,
             )
-        if not is_ssh_failure(result):
-            return
-        detail = result.error_text().strip().splitlines()
-        last = detail[-1] if detail else "ssh failed"
-        if is_interactive_refusal(result):
-            if self._use_askpass():
-                raise Refusal(
-                    RefusalReason.NEEDS_SIGN_IN,
-                    f"{self.config.ssh_profile} needs you to sign in again: {last}",
-                    site=self.site_id,
-                )
-            raise Refusal(
-                RefusalReason.INTERACTIVE_AUTH_REQUIRED,
-                (
-                    f"{self.config.ssh_profile} asks for a code or password on every "
-                    "connection, so the ssh adapter cannot use it unattended. Use the worker "
-                    "adapter for this site: you sign in once and relay places a worker there. "
-                    f"ssh said: {last}"
-                ),
-                site=self.site_id,
-                adapter="worker",
-            )
-        raise Refusal(
-            RefusalReason.UNREACHABLE,
-            f"ssh could not reach {self.config.ssh_profile}: {last}",
+        refusal = errors.refusal(
+            result.error_text(),
+            result.exit_code,
+            profile=self.config.ssh_profile,
             site=self.site_id,
+            what=what,
+            sign_in=self._use_askpass(),
         )
+        if refusal is not None:
+            raise refusal
 
     # scp
 
@@ -436,32 +424,22 @@ class SshTransport:
             *[str(path) for path in sources],
             f"{self.config.ssh_profile}:{destination.rstrip('/')}/",
         ]
-        attempt = 0
-        while True:
-            result = await run_process(
+
+        async def once() -> Completed:
+            return await run_process(
                 argv, timeout_s=None, max_output_bytes=65536, env=self.environment()
             )
-            if result.exit_code == 0:
-                return
-            if is_network_failure(result) and attempt < self.config.transfer_retries:
-                attempt += 1
-                logger.warning(
-                    "copy to %s dropped (%s); retry %d of %d",
-                    self.config.ssh_profile,
-                    result.error_text().strip(),
-                    attempt,
-                    self.config.transfer_retries,
-                )
-                await asyncio.sleep(min(30, 2**attempt))
-                continue
-            if result.exit_code == 255 or is_ssh_failure(result):
-                result.exit_code = 255
-                self.raise_for_failure(result, "copying")
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                f"scp to {self.config.ssh_profile} failed: {result.error_text().strip()}",
-                site=self.site_id,
-            )
+
+        result = await self.retrying(once, "copying", scp=True)
+        if result.exit_code == 0:
+            return
+        result.exit_code = 255
+        self.raise_for_failure(result, "copying")
+        raise Refusal(
+            RefusalReason.UNREACHABLE,
+            f"scp to {self.config.ssh_profile} failed: {result.error_text().strip()}",
+            site=self.site_id,
+        )
 
     # interactive sign-in
 

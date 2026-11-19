@@ -17,7 +17,7 @@ import json
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import mcp_types
 from fastmcp import Context, FastMCP
@@ -46,14 +46,24 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
-from clio_relay.adapters.hooks import Ask, MountsPages, Transport
+from clio_relay.adapters.hooks import MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
+from clio_relay.surface.elicit import (
+    ask_mode,
+    elicit_document,
+    elicit_request,
+    elicitation_modes,
+    modern,
+    refusal_result,
+    response_parts,
+    tasks_opted_in,
+)
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
-from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_call
+from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.progress import progress_message
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -74,19 +84,9 @@ INSTRUCTIONS = (
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
     "exec runs one short command; files lists, reads, writes and stages files; "
     "serve starts a service. Refusals carry a typed reason in structuredContent.refusal. "
-    "A site's skill, when it has one, is the resource relay://sites/<site>/skill."
+    "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
+    "it is also the resource relay://sites/<site>/skill, which files cannot read."
 )
-
-
-def refusal_result(refusal: Refusal) -> ToolResult:
-    """Render a refusal as an error tool result with a typed reason."""
-    return ToolResult(
-        content=[
-            mcp_types.TextContent(type="text", text=f"{refusal.reason.value}: {refusal.message}")
-        ],
-        structured_content={"refusal": refusal.to_dict()},
-        is_error=True,
-    )
 
 
 def _text(value: dict[str, Any]) -> str:
@@ -129,67 +129,6 @@ def record_result(service: RelayService, record: OperationRecord) -> ToolResult:
         if ui is not None:
             result.meta = {**(result.meta or {}), SERVICE_META: ui}
     return result
-
-
-def _modern(ctx: Context) -> bool:
-    rc = ctx.request_context
-    return rc is not None and rc.protocol_version in MODERN_PROTOCOL_VERSIONS
-
-
-def _tasks_opted_in(ctx: Context) -> bool:
-    return _modern(ctx) and ctx.client_extension_settings(TASKS_EXTENSION_ID) is not None
-
-
-def _elicitation_modes(ctx: Context) -> set[str]:
-    try:
-        capabilities = ctx.session.client_capabilities
-    except (AttributeError, RuntimeError):
-        return set()
-    elicitation = getattr(capabilities, "elicitation", None) if capabilities else None
-    if elicitation is None:
-        return set()
-    form = getattr(elicitation, "form", None)
-    url = getattr(elicitation, "url", None)
-    modes: set[str] = set()
-    if form is not None or url is None:
-        modes.add("form")
-    if url is not None:
-        modes.add("url")
-    return modes
-
-
-def _mode(ask: Ask) -> str:
-    return "url" if ask.kind == "url" else "form"
-
-
-def elicit_request(ask: Ask) -> mcp_types.ElicitRequest:
-    """Return the elicitation for one ask."""
-    if ask.kind == "url":
-        return mcp_types.ElicitRequest(
-            params=mcp_types.ElicitRequestURLParams(
-                message=ask.message, url=ask.url or "", elicitation_id=ask.ask_id
-            )
-        )
-    return mcp_types.ElicitRequest(
-        params=mcp_types.ElicitRequestFormParams(
-            message=ask.message,
-            requested_schema=ask.requested_schema or {"type": "object", "properties": {}},
-        )
-    )
-
-
-def _elicit_document(ask: Ask) -> dict[str, Any]:
-    return elicit_request(ask).model_dump(by_alias=True, mode="json", exclude_none=True)
-
-
-def _response_parts(response: Any) -> tuple[str, dict[str, Any] | None]:
-    if isinstance(response, mcp_types.ElicitResult):
-        return response.action, dict(response.content) if response.content else None
-    if isinstance(response, dict):
-        action = str(response.get("action", "cancel"))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-        content = response.get("content")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        return action, dict(content) if isinstance(content, dict) else None  # pyright: ignore[reportUnknownArgumentType]
-    return "cancel", None
 
 
 class RelayTasksExtension(ServerExtension):
@@ -266,7 +205,8 @@ class RelayTasksExtension(ServerExtension):
             return f"the service is running: {endpoint_summary(record)}"
         latest = service_message(record)
         if latest is not None:
-            return f"the service is {record.state.value}: {latest}"
+            shown = record.state.value if record.state.final else "starting"
+            return f"the service is {shown}: {latest}"
         note = progress_message(record)
         return f"relay operation is {record.state.value}" + (f": {note}" if note else "")
 
@@ -292,7 +232,7 @@ class RelayTasksExtension(ServerExtension):
             return GetTaskResult(
                 **fields,
                 input_requests={
-                    ask.ask_id: _elicit_document(ask) for ask in self.service.outstanding(record)
+                    ask.ask_id: elicit_document(ask) for ask in self.service.outstanding(record)
                 },
             )
         if record.state.final:
@@ -331,7 +271,7 @@ class RelayTasksExtension(ServerExtension):
         for ask_id, response in params.input_responses.items():
             if ask_id not in record.asks:
                 continue
-            action, content = _response_parts(response)
+            action, content = response_parts(response)
             self.service.answer(ask_id, action, content, by="tasks/update")
         await self.service.advance(params.task_id)
         return UpdateTaskResult()
@@ -352,7 +292,7 @@ class RelayTasksExtension(ServerExtension):
     ) -> Any:
         """Turn a task ``run`` or ``serve`` that starts an operation into a task."""
         outcome = await call_next()
-        if params.name not in TASK_TOOLS or not _tasks_opted_in(context):
+        if params.name not in TASK_TOOLS or not tasks_opted_in(context):
             return outcome
         arguments = params.arguments or {}
         if any(arguments.get(name) is not None for name in _NOT_A_START):
@@ -391,9 +331,9 @@ class RelayServer:
         self.skills = SkillResources(service.paths.config_dir, service.sites)
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
-        modes = _elicitation_modes(ctx)
+        modes = elicitation_modes(ctx)
         for ask in self.service.outstanding(record):
-            if _mode(ask) not in modes:
+            if ask_mode(ask) not in modes:
                 return record
             if ask.kind == "url":
                 response = await ctx.session.elicit_url(
@@ -404,7 +344,7 @@ class RelayServer:
                     message=ask.message,
                     requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
                 )
-            action, content = _response_parts(response)
+            action, content = response_parts(response)
             self.service.answer(ask.ask_id, action, content, by="elicitation")
         return await self.service.advance(record.operation_id)
 
@@ -436,9 +376,9 @@ class RelayServer:
     ) -> ToolResult | InputRequiredToolResult:
         if record.state == OperationState.AWAITING_INPUT:
             outstanding = self.service.outstanding(record)
-            if outstanding and _modern(ctx):
-                modes = _elicitation_modes(ctx)
-                if all(_mode(ask) in modes for ask in outstanding):
+            if outstanding and modern(ctx):
+                modes = elicitation_modes(ctx)
+                if all(ask_mode(ask) in modes for ask in outstanding):
                     return InputRequiredToolResult(
                         mcp_types.InputRequiredResult(
                             input_requests={ask.ask_id: elicit_request(ask) for ask in outstanding},
@@ -477,7 +417,7 @@ class RelayServer:
                     RefusalReason.INVALID_ARGUMENTS,
                     "run needs site and spec, or cancel, or resume",
                 )
-            task = _tasks_opted_in(ctx)
+            task = tasks_opted_in(ctx)
             record = await self.service.start_run(site, spec, task=task)
             if task:
                 return operation_result(self.service.view(record))
@@ -509,7 +449,7 @@ class RelayServer:
                     RefusalReason.INVALID_ARGUMENTS,
                     "serve needs site and spec, or service, or stop",
                 )
-            task = _tasks_opted_in(ctx)
+            task = tasks_opted_in(ctx)
             record = await self.service.start_serve(site, spec, task=task)
             if task:
                 return record_result(self.service, record)
@@ -539,7 +479,7 @@ class RelayServer:
         self.service.same_request(record, site, spec)
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
-                action, content = _response_parts(response)
+                action, content = response_parts(response)
                 self.service.answer(ask_id, action, content, by="input_required")
         record = await self.service.advance(operation_id)
         return await self._deliver(ctx, record, wait_s)
@@ -582,16 +522,11 @@ class RelayServer:
             is_error=result["exit_code"] != 0,
         )
 
-    async def files(self, site: str, args: FilesArgs) -> ToolResult:
+    async def files(
+        self, ctx: Context, site: str, args: FilesArgs
+    ) -> ToolResult | InputRequiredToolResult:
         """The ``files`` verb."""
-        try:
-            structured, text = await files_call(self.service, site, args)
-        except Refusal as refusal:
-            return refusal_result(refusal)
-        return ToolResult(
-            content=[mcp_types.TextContent(type="text", text=text)],
-            structured_content=structured,
-        )
+        return await files_tool(self.service, ctx, site, args)
 
     def build(self, *, auth: AuthProvider | None = None) -> FastMCP[Any]:
         """Return the FastMCP server."""
@@ -614,18 +549,25 @@ class RelayServer:
             site: Annotated[str | None, Field(description="A site id")] = None,
             job: Annotated[str | None, Field(description="An operation id")] = None,
         ) -> ToolResult:
-            """Without arguments, list the sites. With site, describe it and its routes.
-            With job, observe one operation."""
+            """Without arguments, list the sites. With site, describe it and its routes,
+            and return its guide (skill.text) when it has one: read it before the first
+            run there. With job, observe one operation."""
             try:
                 described = await relay.service.describe(site, job)
             except Refusal as refusal:
                 return refusal_result(refusal)
             if job is not None:
                 return operation_result(described)
-            return ToolResult(
-                content=[mcp_types.TextContent(type="text", text=_text(described))],
-                structured_content=described,
-            )
+            content = [mcp_types.TextContent(type="text", text=_text(described))]
+            skill = cast("dict[str, Any] | None", described.get("skill")) if site else None
+            guide = skill.get("text") if skill else None
+            if skill and isinstance(guide, str) and guide:
+                listed = {**described, "skill": {**skill, "text": "(below)"}}
+                content = [
+                    mcp_types.TextContent(type="text", text=_text(listed)),
+                    mcp_types.TextContent(type="text", text=guide),
+                ]
+            return ToolResult(content=content, structured_content=described)
 
         async def run(
             ctx: Context,
@@ -673,6 +615,7 @@ class RelayServer:
             annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
         )
         async def files(  # pyright: ignore[reportUnusedFunction]
+            ctx: Context,
             site: Annotated[str, Field(description="The site id")],
             op: Literal["list", "stat", "read", "write", "delete", "stage", "has"],
             path: Annotated[
@@ -691,13 +634,15 @@ class RelayServer:
             final: Annotated[bool, Field(description="False while more chunks follow")] = True,
             recursive: Annotated[bool, Field(description="Delete a non-empty directory")] = False,
             digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
-        ) -> ToolResult:
+        ) -> ToolResult | InputRequiredToolResult:
             """Files up to 4 MiB move inline. A larger upload is chunks of up to 4 MiB:
             write each at its offset with final=false and the last with final=true; after
             a dropped link, stat "<path>.relay-part" gives the offset to resume at. A
             larger download is reads at increasing offsets. stage puts bytes in the
-            site's content store and returns the SHA-256 a JobSpec input names."""
+            site's content store and returns the SHA-256 a JobSpec input names. On a
+            guarded site, delete and a write that replaces a file wait for the person's yes."""
             return await relay.files(
+                ctx,
                 site,
                 FilesArgs(
                     op=op,

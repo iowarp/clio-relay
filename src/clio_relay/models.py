@@ -28,7 +28,7 @@ behavior change. See each owner module's own docstring for what it owns:
 - :mod:`clio_relay.models_scheduling` -- endpoint registration and
   cluster-scheduler durable observation records.
 - :mod:`clio_relay.models_gateway` -- artifact index entries and
-  scheduler-backed gateway/service runtime records.
+  gateway session records.
 """
 
 from __future__ import annotations
@@ -66,7 +66,6 @@ from clio_relay.models_enums import (
 from clio_relay.models_gateway import (
     ArtifactRef,  # noqa: F401
     GatewaySession,  # noqa: F401
-    ServiceRuntimeSpec,  # noqa: F401
 )
 from clio_relay.models_jarvis_package import (
     JarvisPackageInputContractRecord,  # noqa: F401

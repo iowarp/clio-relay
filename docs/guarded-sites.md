@@ -22,6 +22,25 @@ clio-relay site add polaris --adapter ssh --config '{ssh_profile: polaris}' --po
 | `exec` of a read-only command (`squeue`, `ls`, `cat`, `module avail`, ...) | Runs. |
 | `exec` of anything else (`rm`, `sh -c`, `scancel`, `jarvis ppl run`, ...) | Refused with `policy_refused` and the list of commands that are allowed. |
 | A warm allocation | Held after the spend question; `exec` reaches it with `srun --jobid=<job> --overlap <read-only command>`. |
+| `files` list, stat, read, stage, or a write of a new file | Runs. |
+| `files` delete, or a write that replaces a file (`overwrite` on a path that exists) | You get a question first. Nothing is deleted or replaced until you say yes. |
+
+## Deleting and replacing files
+
+`files delete` and a `files write` that would replace an existing file wait for
+your yes, on every adapter. Writing a new file, inside the work directory or
+anywhere else the site lets relay write, does not ask.
+
+- Your yes covers one site, one path, and whether the delete is recursive. It is
+  used once: by the delete, or by the last chunk of the upload it approved. The
+  next delete or replace asks again.
+- A chunked upload asks at its first chunk and goes through on the same yes to its
+  last chunk; the chunks in between never ask.
+- A client that can show a form asks you inside the call. Any other client gets
+  `needs_approval` with the ask and its page; answer it there or with
+  `clio-relay asks answer`, and the agent calls `files` again with the same
+  arguments.
+- If you say no, the call is refused with `policy_refused` and the file stays.
 
 ## Running a package
 

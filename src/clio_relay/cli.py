@@ -195,6 +195,26 @@ def adapters() -> None:
     _print(found)
 
 
+@app.command()
+def describe(
+    site_id: Annotated[str | None, typer.Argument(help="A site; all sites when left out")] = None,
+) -> None:
+    """Describe a site the way the describe tool does, which checks relay reaches it."""
+    from clio_relay.surface.service import RelayService
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return await service.describe(site_id)
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
+
+
 @site_app.command("list")
 def site_list() -> None:
     """List your sites."""
@@ -276,8 +296,13 @@ def site_add(
 
 
 @site_app.command("catalog")
-def site_catalog() -> None:
+def site_catalog(
+    schema: Annotated[bool, typer.Option(help="Print the schema of a catalog site file")] = False,
+) -> None:
     """List the sites relay ships."""
+    if schema:
+        _print(catalog.schema())
+        return
     _print([entry.model_dump(mode="json") for entry in catalog.sites()])
 
 

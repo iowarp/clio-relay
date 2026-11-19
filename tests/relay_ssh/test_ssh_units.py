@@ -6,6 +6,7 @@ These run without a site. The live checks are in the fixture modules.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
@@ -88,6 +89,12 @@ def test_network_failures_refuse_as_unreachable(tmp_path: Path) -> None:
 
 def test_a_remote_command_exit_255_is_not_an_ssh_failure(tmp_path: Path) -> None:
     _adapter(tmp_path).transport.raise_for_failure(_failed("my tool failed"), "exec")
+
+
+def test_a_missing_remote_program_is_not_a_missing_ssh(tmp_path: Path) -> None:
+    _adapter(tmp_path).transport.raise_for_failure(
+        _failed("bash: relay-no-such-program: command not found", code=127), "exec"
+    )
 
 
 @pytest.mark.asyncio
@@ -241,6 +248,21 @@ async def test_the_exec_script_returns_the_exit_code_with_stdin_held(tmp_path: P
     result = await run_process(["sh", "-c", script], timeout_s=None, stdin=b"", hold_stdin=True)
     assert result.exit_code == 7
     assert result.text() == "out\n"
+
+
+@pytest.mark.asyncio
+async def test_the_exec_script_runs_a_login_shell_function_without_reparsing(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".bash_profile").write_text('relayfn() { printf "%s|" "$@"; }\n')
+    script = scripts.exec_script(["relayfn", "a b; touch hit", "$HOME"])
+    env = {**os.environ, "HOME": str(tmp_path)}
+    result = await run_process(
+        ["sh", "-c", script], timeout_s=None, stdin=b"", hold_stdin=True, env=env
+    )
+    assert result.exit_code == 0, result.text()
+    assert result.text().endswith("a b; touch hit|$HOME|")
+    assert not (tmp_path / "hit").exists()
 
 
 def _alive(pid: int) -> bool:
