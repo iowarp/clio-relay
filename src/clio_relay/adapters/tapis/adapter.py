@@ -13,6 +13,7 @@ Every Tapis call is made with the person's own token.
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import re
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -175,7 +176,12 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
 
     async def _files(self) -> TapisFiles:
         system = await self.system()
-        return TapisFiles(self.client, str(system["id"]), self.work_dir(system))
+        return TapisFiles(
+            self.client,
+            str(system["id"]),
+            self.work_dir(system),
+            staging=self.context.state_dir / "parts",
+        )
 
     async def files(self) -> FileAccess:
         return await self._files()
@@ -285,8 +291,8 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     async def _create_app(self, app_id: str, app_version: str) -> None:
         system = await self.system()
         files = await self._files()
-        path = f"{files.work_dir}/launcher/{launcher.archive_name()}"
-        if not await files.exists(path):
+        path = f"{files.root}/launcher/{launcher.archive_name()}"
+        if await files.kind(path) != "file":
             await files.write(path, launcher.archive(), overwrite=True)
         body = mapping.app_definition(
             app_id=app_id,
@@ -333,12 +339,12 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             digests.append(spec.package.sha256)
         await self._stage_inputs(files, digests)
         app_id, app_version = await self.ensure_app()
-        job_dir = f"{files.work_dir}/jobs/{operation_id}"
-        content_host = self.host_path(system, f"{files.work_dir}/content")
+        job_dir = f"{files.root}/jobs/{operation_id}"
+        content_host = self.host_path(system, posixpath.dirname(files.content_path("x")))
         fields = launcher.record(
             spec,
             content_dir=content_host,
-            package_root=self.host_path(system, f"{files.work_dir}/packages"),
+            package_root=self.host_path(system, f"{files.root}/packages"),
             guarded=guarded,
         )
         request = mapping.job_request(

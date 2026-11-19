@@ -8,8 +8,6 @@ These follow tapis-files (commit 6943d3f) and the `tapipy` 25.4.0 spec:
   ``dd ibs=1 skip=start count=count``, and the header parser refuses
   ``start > count``.
 - ``insert`` makes the parent directories and overwrites.
-- ``moveCopy`` runs ``mkdir -p parent; mv src dst``: it overwrites a file and
-  moves into a directory that stands at the target.
 - ``delete`` removes a directory with everything in it, and a symlink as itself.
 - ``getStatInfo`` follows links only when ``followLinks`` is true.
 - Paths are taken from the system's ``rootDir`` and may not climb out of it.
@@ -122,31 +120,6 @@ def add_file_routes(app: FastAPI, state: StubState, user: Callable[[Request], st
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(await upload.read())
         return envelope(None, "File uploaded")
-
-    @app.put("/v3/files/ops/{system_id}/{path:path}")
-    async def move_copy(request: Request, system_id: str, path: str) -> Response:
-        found = place(request, system_id, path)
-        if isinstance(found, Response):
-            return found
-        source, _ = found
-        data = await request.json()
-        landing = place(request, system_id, str(data["newPath"]))
-        if isinstance(landing, Response):
-            return landing
-        target, _ = landing
-        if not os.path.lexists(source):
-            return error(404, f"Path not found: {path}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_dir():
-            target = target / source.name
-        if str(data.get("operation", "MOVE")).upper() == "COPY":
-            if source.is_dir():
-                shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
-            else:
-                shutil.copy2(source, target, follow_symlinks=False)
-        else:
-            os.replace(source, target)
-        return envelope(None, "ok")
 
     @app.delete("/v3/files/ops/{system_id}/{path:path}")
     async def delete(request: Request, system_id: str, path: str) -> Response:
