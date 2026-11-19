@@ -82,7 +82,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: two decimals at measurement time. May only RISE, except when deleting
 #: small files lowers the share without any file growing; record why here.
 #: 92.15 (141/153) after the old queue, storage and models layers were deleted.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 92.15
+SRC_DISTRIBUTION_BASELINE_PERCENT = 92.20
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
