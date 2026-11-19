@@ -55,7 +55,9 @@ clio-relay site list
 ```
 
 `clio-relay adapters` lists the adapters installed. Each adapter page below
-lists its settings.
+lists its settings. Leave out `--adapter` or `--policy` and `site add` uses the
+defaults for new sites, which `clio-relay site defaults` shows and changes; the
+Compute page in CLIO shares them.
 
 ## Use it from an agent
 

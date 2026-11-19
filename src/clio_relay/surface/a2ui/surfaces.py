@@ -177,6 +177,7 @@ class TabState:
     links: dict[str, str] = field(default_factory=dict[str, str])
     adding: bool = False
     defaults: dict[str, str] = field(default_factory=dict[str, str])
+    """The site store's defaults for new endpoints, read on each load and never saved here."""
     pending: dict[str, str] = field(default_factory=dict[str, str])
     """A protocol picked for an endpoint that has no settings for it yet, by endpoint."""
 
@@ -193,7 +194,6 @@ class TabState:
             "errors": self.errors,
             "links": self.links,
             "adding": self.adding,
-            "defaults": self.defaults,
             "pending": self.pending,
         }
 
@@ -222,7 +222,6 @@ class TabState:
             },
             links={str(k): str(v) for k, v in mapping(raw.get("links")).items()},
             adding=raw.get("adding") is True,
-            defaults={str(k): str(v) for k, v in mapping(raw.get("defaults")).items()},
             pending={str(k): str(v) for k, v in mapping(raw.get("pending")).items()},
         )
 

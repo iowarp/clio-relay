@@ -256,20 +256,51 @@ def site_show(site_id: str) -> None:
     )
 
 
+@site_app.command("defaults")
+def site_defaults(
+    adapter: Annotated[
+        str | None, typer.Option(help="The adapter a new site uses when --adapter is left out")
+    ] = None,
+    policy: Annotated[
+        str | None, typer.Option(help="open or guarded, for a new site without --policy")
+    ] = None,
+) -> None:
+    """Show the defaults for new sites, or change them."""
+    store = SiteStore(_paths().sites_file)
+    try:
+        if adapter is None and policy is None:
+            shown = store.defaults()
+        else:
+            if adapter is not None:
+                registry.load(adapter)
+            shown = store.set_defaults(adapter=adapter, policy=policy)
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _print(shown.model_dump(mode="json"))
+
+
 @site_app.command("add")
 def site_add(
     site_id: str,
-    adapter: Annotated[str, typer.Option(help="The adapter in use")],
+    adapter: Annotated[
+        str | None, typer.Option(help="The adapter in use; `site defaults` when left out")
+    ] = None,
     config: Annotated[str, typer.Option(help="Adapter settings, as JSON or YAML")] = "{}",
     name: str | None = None,
-    policy: Annotated[str, typer.Option(help="open or guarded")] = "guarded",
+    policy: Annotated[
+        str | None, typer.Option(help="open or guarded; `site defaults` when left out")
+    ] = None,
     spend: Annotated[str, typer.Option(help="always, never, or a node-hour threshold")] = "always",
     skill: Annotated[
         str | None, typer.Option(help="A skill name, or the path of your own Markdown skill")
     ] = None,
 ) -> None:
     """Add a site."""
+    store = SiteStore(_paths().sites_file)
     try:
+        defaults = store.defaults()
+        adapter = adapter or defaults.adapter
         loaded: Any = yaml.safe_load(config) or {}
         if not isinstance(loaded, dict):
             typer.echo("config must be a mapping", err=True)
@@ -283,12 +314,12 @@ def site_add(
                 "name": name,
                 "adapter": adapter,
                 "config": settings,
-                "policy": policy,
+                "policy": policy or defaults.policy,
                 "spend": {"ask": ask},
                 "skill": skill,
             }
         )
-        added = SiteStore(_paths().sites_file).add(entry)
+        added = store.add(entry)
     except Refusal as refusal:
         _fail(refusal)
         return
