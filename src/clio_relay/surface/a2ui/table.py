@@ -182,11 +182,10 @@ def _detail(
         )
         children += [question, tree.row(f"{base}-confirm", [yes, no], justify="start")]
     if site.id in state.editing:
-        children += identity_rows(tree, base, view)
-        children += settings_rows(tree, base, view, security=False)
+        facts = identity_rows(tree, base, view) + settings_rows(tree, base, view, fields=False)
         errors = state.errors.get(site.id, {})
         pending = state.pending.get(site.id, "")
-        children.append(edit_form(tree, site, forms, tokens, errors, pending))
+        children.append(edit_form(tree, site, forms, tokens, errors, pending, facts))
     if not children:
         return None
     if site.id not in state.editing:

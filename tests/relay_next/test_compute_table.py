@@ -309,6 +309,9 @@ def test_the_row_menu_probes_edits_and_removes(relay_paths: RelayPaths) -> None:
 
             await host.menu("lab", "edit")
             assert "e-lab-save" in host.visible("relay-sites")
+            edit = host.surfaces["relay-sites"]["components"]["e-lab"]["children"]
+            assert edit[0] == "e-lab-title", "the edit form's heading opens the card"
+            assert "s-lab-spend" not in host.visible("relay-sites"), "it is a field in the form"
             host.set("relay-sites", "/drafts/lab/site/name", "Lab cluster")
             result = await host.press("relay-sites", "e-lab-save")
             assert result.structured_content["ok"] is True, host.text("relay-sites")
