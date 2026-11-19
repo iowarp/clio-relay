@@ -19,7 +19,14 @@ from clio_relay.serve import runtime as runtime_module
 from clio_relay.serve.desktop import decode, settings, visitor_plan
 from clio_relay.serve.mount import Mount, Mounter, tool_prefix
 from clio_relay.serve.plan import ServePlan
-from clio_relay.serve.runtime import ServeRuntime, connect_handle, handle_job_dir, is_artifact
+from clio_relay.serve.report import (
+    connect_handle,
+    final_message,
+    frpc_problem,
+    handle_job_dir,
+    is_artifact,
+)
+from clio_relay.serve.runtime import ServeRuntime
 from clio_relay.surface.settings import RelayPaths
 
 from .helpers import frp_plan, rendezvous, service
@@ -27,20 +34,10 @@ from .helpers import frp_plan, rendezvous, service
 pytestmark = pytest.mark.release_platform("posix")
 
 
-def runtime_with(tmp_path: Path, plan: ServePlan, frpc_log: str | None) -> ServeRuntime:
+def runtime_with(tmp_path: Path, plan: ServePlan) -> ServeRuntime:
     runtime = ServeRuntime(tmp_path / "state", transport="http")
     runtime.plans[plan.operation_id] = plan
-
-    async def read(_plan: ServePlan, _adapter: Any, name: str, *, tail: int = 0) -> bytes | None:
-        del tail
-        return frpc_log.encode() if name == "frpc.log" and frpc_log is not None else None
-
-    runtime._read = read  # type: ignore[method-assign]  # pyright: ignore[reportPrivateUsage]
     return runtime
-
-
-def frpc_problem(runtime: ServeRuntime, plan: ServePlan) -> str | None:
-    return asyncio.run(runtime._frpc_problem(plan, None))  # pyright: ignore[reportPrivateUsage]
 
 
 X509 = (
@@ -52,7 +49,7 @@ X509 = (
 def test_frpc_problem_names_the_latest_warning(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     log = "2026-11-18 12:38:58.000 [I] [client/service.go:1] start\n" + X509 + "\n"
-    problem = frpc_problem(runtime_with(tmp_path, plan, log), plan)
+    problem = frpc_problem(plan, log.encode())
     assert problem is not None
     assert problem.endswith("x509: certificate signed by unknown authority")
 
@@ -60,18 +57,18 @@ def test_frpc_problem_names_the_latest_warning(tmp_path: Path) -> None:
 def test_frpc_problem_is_gone_after_a_login(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     log = X509 + "\n2026-11-18 12:39:30.000 [I] [client/service.go:2] login to server success\n"
-    assert frpc_problem(runtime_with(tmp_path, plan, log), plan) is None
+    assert frpc_problem(plan, log.encode()) is None
 
 
 def test_frpc_problem_hides_secrets(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     log = "2026-11-18 12:38:59.277 [E] [proxy.go:9] bad key shared-key-value\n"
-    assert frpc_problem(runtime_with(tmp_path, plan, log), plan) == "bad key ***"
+    assert frpc_problem(plan, log.encode()) == "bad key ***"
 
 
 def test_ui_data_is_the_one_place_with_urls_and_secrets(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
-    runtime = runtime_with(tmp_path, plan, None)
+    runtime = runtime_with(tmp_path, plan)
     record = cast(OperationRecord, SimpleNamespace(operation_id=plan.operation_id))
     port = plan.ports[0]
     assert runtime.ui_data(record) == {
@@ -92,7 +89,7 @@ def test_connect_handle_carries_the_key_not_the_token(tmp_path: Path) -> None:
     payload = decode(handle)
     assert payload["sk"] == "shared-key-value"
     assert "frp-token-value" not in str(payload)
-    runtime = runtime_with(tmp_path, plan, None)
+    runtime = runtime_with(tmp_path, plan)
     assert runtime.connect_command(plan) == f"clio-relay connect {handle}"
     visitor = visitor_plan(handle, rendezvous(tmp_path), {"web": 45001})
     assert visitor.ports[0].local_port == 45001
@@ -104,9 +101,8 @@ def test_connect_handle_carries_the_key_not_the_token(tmp_path: Path) -> None:
 
 def test_final_message_says_how_the_service_ended(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
-    runtime = runtime_with(tmp_path, plan, None)
     status = JobStatus(state=JobState.COMPLETED)
-    final = runtime._final_message  # pyright: ignore[reportPrivateUsage]
+    final = final_message
     assert final(plan, status, {"reason": "stopped"}) == "stopped"
     taken = {"reason": "port_taken", "port": 8080, "port_name": "web", "host": "n1"}
     assert final(plan, status, taken) == "refused: port 8080 (web) was already in use on n1"

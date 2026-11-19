@@ -50,8 +50,6 @@ RATCHET_BASELINE: dict[str, int] = {
     # Files still over DEFAULT_MAX_LINES, each at its current length. Lower an entry
     # when its file shrinks and drop it once the file is under the limit.
     "src/clio_relay/spool.py": 1064,
-    # W9's serve follower landed it at 833; W9 brings it back under the cap.
-    "src/clio_relay/serve/runtime.py": 833,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
@@ -100,7 +98,8 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: Set to 91.44 (171/187) when the old system's small modules were deleted
 #: (W8 and W9, the JARVIS repository): deleting small files lowers the share
 #: without any file growing.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 91.44
+#: Raised to 91.48 (172/188) when W9 split serve/report.py out of serve/runtime.py.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 91.48
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
