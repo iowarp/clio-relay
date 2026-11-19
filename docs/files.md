@@ -32,6 +32,10 @@ A job's `OutputRef` paths are absolute, so they can be read back as they are.
 `delete` removes a symlink itself and never follows it. A relative path that
 leaves the work directory refuses with `invalid_arguments` on every op.
 
+On a guarded site, `delete` and any write that replaces an existing file ask a
+person first, on every adapter; a new file needs no approval. See
+[guarded sites](guarded-sites.md#deleting-and-replacing-files).
+
 ## Large files
 
 One call carries at most 4 MiB. Larger files move in chunks.
@@ -62,7 +66,7 @@ asked for.
 | local, fixture | yes | yes | yes | The reference implementation. |
 | any adapter built on `SiteFiles` | yes | yes | yes | `SiteFiles` applies these rules over six primitives; see [adding an adapter](adding-an-adapter.md#files). |
 | worker | yes | yes | yes | The site side runs the local implementation. |
-| tapis | yes | yes | not yet | Tapis Files has no append. |
+| tapis | yes | yes | yes | Tapis Files has no append, so each chunk re-sends the part. |
 | ssh | yes | yes | yes | One remote script per op, so each op costs one ssh round trip. |
 | globus | yes | not yet | not yet | |
 | iri | yes, up to the API's size limit | not yet | not yet | |
