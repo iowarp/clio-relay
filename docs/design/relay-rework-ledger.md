@@ -28,7 +28,7 @@ Kept by W1 as the ledger's header owner. The coordinator assigns owners.
 | W12's 8 client-side contract assumptions | W12 | W3 | Closed. W3 answered all 8 in clio-agent `jaimecernuda-relay-rework-w3` at 25da48a8b (`docs/design/host-semantics-contract.md`): 1 to 6 confirmed; 7 and 8 corrected (re-read the open tabs on an SSE reconnect or `stream.gap`; tabs are per session). W12 applies them in iowarp/gact-tui#1320 |
 | gact-tui relay references remain | W12 | W8, W14 | `managed-service-identity.tsx:28`, `infrastructure-service-labels.ts:14`, `test-fixtures/managed-services.ts`, `relay-settings.tsx`, the e2e fixtures, `domain.ts` `relay_job`, and `scripts/check_brand_literals` |
 | Marketplace plugins/ssh still declares native_tool("ssh_execute") | W4 | W4 | Done. W4 deleted `plugins/ssh` in iowarp/clio-agent-marketplace, branch `jaimecernuda-relay-rework-w4` at 1dc6415 (from develop dbc82af), with a CHANGELOG entry and one reworded graspa skill line. The clio-agent submodule pointer is bumped at the final merge |
-| Push clio-jarvis branch and tag v0.1.0 | W5 | W5 | Blocked on the user creating iowarp/clio-jarvis (O1) |
+| Push clio-jarvis branch and tag v0.1.0 | W5 | W5 | Branch closed: the user created iowarp/clio-jarvis (O1), with `main` and `develop` at `a6a3273` (xcompact3d 0.2.2). The repository carries no release tag yet |
 | Relay bootstrap still registers the jarvis-cd builtin repo | W5 | W8 (coordinator) | Decided: option A. The worker bootstrap stops adding and requiring `<JARVIS_ROOT>/builtin`, leaves an existing registration alone, and keeps `managed_builtin_repo_registered` in the receipt as evidence only (`bootstrap_reconcile_builtin_repos.py`, `bootstrap_script_commit.py`, `bootstrap_receipt_validation.py`). jarvis-cd's own `jarvis init` still registers `builtin` for its other users, and relay installs clio-jarvis through `jarvis_site` (RL42). The release-gate references are already gone with the gate. W8 sends the change to W1 |
 | O2: the Xcompact3d case | W5 | W5 | Resolved: TGV (Taylor-Green vortex) at Re 1600 |
 | clio-kit develop is stale vs main; forward main into develop (precedent #386) before the final merge | W15 | Coordinator | develop 8375600b is 38 ahead and 175 behind main |
@@ -409,7 +409,7 @@ Branch: clio-agent `jaimecernuda-relay-rework-w4` at 6801be185. The clio-agent i
 
 ## W5. clio-jarvis
 
-Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `jaimecernuda-relay-rework`, tag `v0.1.0` at `2d12dbb`; schema first published at `a6aba08`). It is not pushed yet: iowarp/clio-jarvis does not exist, and the user will create it. jarvis-cd 1.8.1 is unchanged, and nothing in the contract needed a jarvis-cd change.
+Repo: [iowarp/clio-jarvis](https://github.com/iowarp/clio-jarvis) (owner blocker O1, closed), default branch `develop`; `main` and `develop` were both at `a6a3273` (xcompact3d 0.2.2) when it was created, with no tags. The work before that was in a local repository on Ares at `~/clio-relay-rework/clio-jarvis` (branch `jaimecernuda-relay-rework`, local tag `v0.1.0` at `2d12dbb`; schema first published at `a6aba08`). jarvis-cd 1.8.1 is unchanged, and nothing in the contract needed a jarvis-cd change.
 
 ### Decisions
 
@@ -468,7 +468,7 @@ Repo: clio-jarvis (local on Ares at `~/clio-relay-rework/clio-jarvis`, branch `j
 
 ### Open
 
-- Push the branch and tag `v0.1.0` once the user creates iowarp/clio-jarvis (owner blocker O1).
+- A release tag on iowarp/clio-jarvis. O1 is closed and the branches are pushed (`a6a3273`), but the repository has no tags, so RL42's live run pinned `main` by commit.
 - The VTX patches to Gray-Scott and Xcompact3d stay provisional until upstream or the user accepts them.
 
 ## W6. Asks and identities
@@ -1894,7 +1894,7 @@ All on Ares: relay in `~/clio-relay-rework/clio-relay-w13` with its own venv, W2
 | LQ19 | Passed (page half by W6; R8 open) | op_a394bab1ae615b712863f109 on `fxk` | After the review, the spend question: "It may use up to 0.0833 node-hours (1 node(s) for 5 min)", with queue `debug`, account `fixture`, 1 node and 300 s in the charge. A no gave `cancelled`, reason `declined`, `native_id` null and an empty `squeue`. The unknown-cost question (op_bb33…, `fxg`): "sets no walltime, so its duration and cost are unknown"; a no submitted nothing |
 | LQ20 | Passed | op_5e2b56723498563f5e6087ed | With nobody answering, `run(resume=)` returned `needs_approval` with the same ask, the operation stayed `awaiting_input`, and `squeue` showed no job |
 | LQ21 | Passed | op_bcc2a45ccc21c02f34a2aeba, Slurm 305 | The warm request asked the spend question; after the yes, 305 ran. `exec srun --jobid=305 --overlap hostname` returned `fx-slurm`, and `squeue` run the same way listed step 305.1 inside it. `srun … rm …` and `srun --jobid=1 …` were refused. The last step, 305.2, ended at 15:05:45. The holder logged "idle for 617 s; released at 2026-11-18T15:16:02Z", and `sacct` showed 305 COMPLETED 0:0, elapsed 00:14:34. The first try (Slurm 284) found the gap fixed in f1ccc62 |
-| RL42 | Passed (local tag; O1 open) | `add_clio_jarvis` on `fxg`, url a bare clone of W5's local repo, tag v0.1.0 | First call `{commit: 2d12dbb…, repo: /home/relay/.clio-relay/clio-jarvis/v0.1.0/clio_jarvis, added: true}`; the second `added: false`; a wrong commit `submit_failed` exit 65 "tag v0.1.0 is 2d12dbb…, not 0000…". `jarvis repo list` showed `clio_jarvis` once. Against `iowarp/clio-jarvis` it waits on O1 |
+| RL42 | Passed against iowarp/clio-jarvis (O1 closed) | `add_clio_jarvis` through the real ssh adapter on Ares, url `https://github.com/iowarp/clio-jarvis`, ref `main` pinned to commit `a6a3273…` (the repository has no tags yet), relay integration 26485cfa. Earlier: `fxg`, url a bare clone of W5's local repo, tag v0.1.0 | Ares, 2026-11-19 (W1): first call `{tag: main, commit: a6a3273da28e…, repo: <base>/main/clio_jarvis, added: true}`; the second `added: false`; a wrong commit `submit_failed` exit 65 "tag main is a6a3273…, not 0000…". `jarvis repo list` (a scratch `JARVIS_ROOT`) showed `clio_jarvis` once; the clone's origin is the GitHub URL. `python -m clio_relay.packages stage <clone>/clio_jarvis clio_jarvis.xcompact3d` from that clone gave 0.2.2, sha256 `edbfb45b…be643f7`, source `{repository: https://github.com/iowarp/clio-jarvis, commit: a6a3273…}`. `~/.ppi-jarvis` unchanged. Earlier, on `fxg`: first call `{commit: 2d12dbb…, repo: /home/relay/.clio-relay/clio-jarvis/v0.1.0/clio_jarvis, added: true}`; the second `added: false`; a wrong commit exit 65 |
 | RL45 (guard half) | Passed on integration 36eb92c, no scratch patch | op_11b4bae3067c1f80c20a1d5c, Slurm 27830 on ares-comp-03 (earlier op_a0a368ea466173130a7d917a, Slurm 27819, with the scratch patch) | Re-proof on 36eb92c (W7's 60697f7): `submit.sh` puts ` &` after the whole multi-line runner and drains the group. Ready at port 51383 with `max_lifetime: null`, held 2 min with the port open, then an adapter cancel: `signalled` TERM, `[STOP] BEGIN/END`, `pvserver-stop.json` reason `signal` (SIGTERM), no supervisor pid file, `.ec` 143, final `cancelled`. Driver `rl45c.py ares13 <digest> v0.1.2 120 <remote>`; `jarvis` was `~/.local/bin/jarvis` (jarvis_cd 1.8.1), since a `uv sync` of the shared venv dropped its `jarvis`. First run, 27819: | clio-jarvis v0.1.2 `clio_jarvis.pvserver`, archive `7095bef8…` (16 files with `schemas/`). Unreviewed `prepare` refused `policy_refused`; reviewed, it lowered to `/bin/bash`, mode `service`. Ready with `max_lifetime: null`; the port was open from the node through each poll. (The earlier 27812 held for more than 10 minutes.) An adapter cancel gave `signalled` TERM, stdout `Stopping pipeline … [STOP] BEGIN/END`, `pvserver-stop.json` reason `signal`, the supervisor pid file gone, `.ec` 143, final `cancelled`, with W7's two fixes as a scratch patch |
 
 Suite on Ares at 02e1481: ruff, format and pyright are clean on the W13 paths. `tests/guard` passes 80 of 80. Against base 1a8c20b, the only new failures in the full suite are W1's two guard-absent tests (R9) and two `test_wheel_record_closure.py` tests that pass alone and together with `tests/guard`.
@@ -1905,7 +1905,7 @@ Record for each: the date, relay's commit, the site entry as used, the review an
 
 **LQ-L10. Xcompact3d into the tab, on Polaris (guarded).**
 
-Needs: an ALCF account with a Polaris allocation, LQ-L2's Globus sign-in, the clio-jarvis release on Polaris (RL42; the real remote waits on O1), a `jarvis` on Polaris with Xcompact3d built, and the ParaView tab (W14, W15).
+Needs: an ALCF account with a Polaris allocation, LQ-L2's Globus sign-in, the clio-jarvis release on Polaris (RL42; proven against iowarp/clio-jarvis on Ares), a `jarvis` on Polaris with Xcompact3d built, and the ParaView tab (W14, W15).
 
 1. Add the catalog site `polaris` (guarded, `spend.ask: always`). Set `defaults.account` to the project. In `guard.yaml`, set `sites.polaris.jarvis` to the jarvis on Polaris.
 2. From a clio-jarvis checkout at the release tag, run `python -m clio_relay.jarvis_site archive <checkout>/clio_jarvis clio_jarvis.xcompact3d --stage`. Record the `sha256` and the file count.
@@ -1932,7 +1932,7 @@ Needs: LQ-L10's setup, a dataset already on Polaris, the `pvserver` package (cli
 - R8 (W6): the approval page's rows when the walltime and the cost are unknown (the ask's message carries them). Open.
 - R9 (W1): `tests/relay_next/test_server.py::test_refusals_are_typed` and `test_service.py::test_guarded_site_refuses_without_a_guard` expect `guard_unavailable`, but with the guard installed it answers `policy_refused`. Force the stand-in in those tests. Closed: W1's `stub_guard` fixture, b4c215f.
 - R10 (W7): the multi-line launch in `forward_signals` and the group drain. Closed: W7's 60697f7 (merge faf00f8), proven live in Slurm 27830.
-- O1: `iowarp/clio-jarvis` on GitHub, for RL42 against the real remote.
+- O1: `iowarp/clio-jarvis` on GitHub, for RL42 against the real remote. Closed: see the RL42 row.
 - W9's `clio_relay.serve` module, for RL45 through `serve` and LQ-L13.
 - A review withdrawal command (today: delete the review file).
 - The full suite on Ares hung at exit in pytest's temp cleanup after writing its report (job 27790).

@@ -178,7 +178,7 @@ Sixteen sessions. Each owns its files outright. "Reads" means it may import or c
 
 **Owns.** The whole clio-jarvis repository: the contract layer, the validator, `schemas/view-descriptor.v1.json` (the descriptor relay reports and clio-kit's `open_view` takes; W9 and W15 vendor it), `pvserver`, `gray_scott`, `xcompact3d`, the self-tests, a tagged release. The ledger fact "which `builtin` packages relay 1.6.8 calls" (read from clio-relay develop).
 
-**Until the repository exists** (owner blocker O1): work in a local git repository in `~/clio-relay-rework/clio-jarvis` on Ares and push when it is created.
+**Repository** (owner blocker O1, closed): [iowarp/clio-jarvis](https://github.com/iowarp/clio-jarvis), default branch `develop`. Until it existed, the work lived in a local git repository in `~/clio-relay-rework/clio-jarvis` on Ares. At creation, `main` and `develop` were both at `a6a3273` (xcompact3d 0.2.2).
 
 **Proves.** LQ33, LQ34.
 
@@ -382,7 +382,7 @@ Session provisioning (the micromamba stack, builds, venvs, fixture images, jarvi
 | Id | Item | Gates |
 | --- | --- | --- |
 | O0 | Child sessions on this machine need shell, `ssh` and worktree writes approved. This planning session was refused every shell command and every file write inside its worktree under unattended autopilot, sub-agents included | Every implementation session. Without it, nothing can be built, tested on Ares or committed |
-| O1 | Create the empty `iowarp/clio-jarvis` repository, and give the session push and tag rights | W5's push and tag, W13's RL42, W10's guarded staging, LQ33 in W16. W5 can start in a local repository |
+| O1 | Create the empty `iowarp/clio-jarvis` repository, and give the session push and tag rights | Closed: iowarp/clio-jarvis exists (`main` and `develop` at `a6a3273`), and RL42 has run against it on Ares (ledger W13) |
 | O2 | Hand over the working Xcompact3d configuration: the ADIOS2 XML and the ParaView reader settings | W5's `xcompact3d`, LQ-L10, the second half of LQ-L15 |
 | O3 | A TACC account, and the TACC sign-in when relay first asks | LQ-L14, LQ-L15, LQ-L16, LQ-L17 |
 | O4 | One OAuth client for relay in the `tacc` tenant, id and key handed over | Live device-code sign-in with a refresh token (RL48). The stub rows do not need it |
