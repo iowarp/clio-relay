@@ -33,3 +33,26 @@ def progress_message(record: OperationRecord) -> str | None:
     if viewable:
         parts.append("views: " + ", ".join(viewable))
     return "; ".join(parts) or None
+
+
+def latest_note(record: OperationRecord) -> str | None:
+    """Return the latest step, else the latest thing the site or relay said of the job."""
+    found: object = (record.result or {}).get("message")
+    return progress_message(record) or (found if isinstance(found, str) and found else None)
+
+
+def observation_line(view: dict[str, Any]) -> str | None:
+    """Say when relay last looked at an open job and what it saw, for a tool's text."""
+    result = cast(dict[str, Any], view.get("result") or {})
+    observed = result.get("observed_at")
+    parts: list[str] = []
+    if observed:
+        parts.append(f"relay last looked at {observed}")
+    step = result.get("progress")
+    if isinstance(step, dict) and cast(dict[str, Any], step).get("step") is not None:
+        shown = cast(dict[str, Any], step)
+        total = shown.get("total")
+        parts.append(f"step {shown['step']}" + (f" of {total}" if total is not None else ""))
+    if result.get("message"):
+        parts.append(str(result["message"]))
+    return "; ".join(parts) or None

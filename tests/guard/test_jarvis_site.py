@@ -11,7 +11,6 @@ import pytest
 
 from clio_relay.jarvis_site import (
     SOURCE_FILE,
-    _main,  # pyright: ignore[reportPrivateUsage]
     archive_package,
     inspect_archive,
     package_files,
@@ -149,18 +148,3 @@ def test_package_job_keeps_resources_and_inputs() -> None:
     assert job.resources.node_count == 2
     assert job.attributes.queue_name == "debug"
     assert job.name == "demo-hello"
-
-
-def test_the_command_line_builds_and_stages(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    repo = make_repo(tmp_path)
-    state = tmp_path / "state"
-    monkeypatch.setenv("CLIO_RELAY_STATE_DIR", str(state))
-    output = tmp_path / "hello.tar.gz"
-    assert _main(["archive", str(repo), "demo.hello", "--output", str(output), "--stage"]) == 0
-    printed = json.loads(capsys.readouterr().out)
-    assert printed["staged"] is True
-    assert ContentStore(state / "content").has(printed["sha256"])
-    assert output.read_bytes() == archive_package(repo, "demo.hello", source=printed["source"])
-    assert _main(["archive", str(repo), "demo.nothing"]) == 2

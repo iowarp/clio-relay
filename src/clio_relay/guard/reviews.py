@@ -63,7 +63,8 @@ class ReviewStore:
 
     def get(self, site: str, package: PackageRef) -> Review | None:
         """Return the review of ``package`` on ``site``, if there is one."""
-        path = self._path(site, review_key(package.name, package.version, package.sha256))
+        version, sha256 = package.pinned()
+        path = self._path(site, review_key(package.name, version, sha256))
         try:
             review = Review.model_validate_json(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValidationError):
@@ -71,8 +72,8 @@ class ReviewStore:
         same = (review.site, review.package, review.version, review.sha256) == (
             site,
             package.name,
-            package.version,
-            package.sha256,
+            version,
+            sha256,
         )
         return review if same else None
 
@@ -132,7 +133,8 @@ def _review_of(ask: Ask) -> Review | None:
             version=str(binding["version"]),
             sha256=str(binding["package_hash"]),
         )
-    except (KeyError, ValidationError):
+        version, sha256 = package.pinned()
+    except (KeyError, ValueError):
         return None
     site = str(binding.get("site") or ask.site)
     if site != ask.site or not _SITE_ID.match(site):
@@ -141,8 +143,8 @@ def _review_of(ask: Ask) -> Review | None:
     return Review(
         site=site,
         package=package.name,
-        version=package.version,
-        sha256=package.sha256,
+        version=version,
+        sha256=sha256,
         source=cast(dict[str, Any], source) if isinstance(source, dict) else None,
         ask_id=ask.ask_id,
         answered_by=ask.answered_by,

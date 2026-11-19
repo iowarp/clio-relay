@@ -21,7 +21,6 @@ time a package is needed there. :func:`clio_jarvis_script` is the script and
 
 from __future__ import annotations
 
-import argparse
 import gzip
 import hashlib
 import io
@@ -29,9 +28,8 @@ import json
 import re
 import shlex
 import subprocess
-import sys
 import tarfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -268,8 +266,8 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
         raise Refusal(
             RefusalReason.INPUT_MISSING,
             f"the archive of {name} ({digest}) is not in relay's content store, so nobody can "
-            "review what would run. Build and stage it with `python -m clio_relay.jarvis_site "
-            "archive <repository dir> <package> --stage`, or stage the file with the files "
+            "review what would run. Stage it with `python -m clio_relay.packages stage "
+            "<repository dir> <package>`, or stage the file with the files "
             "verb on a local site, then run again",
             digest=digest,
             package=name,
@@ -360,7 +358,8 @@ def package_job(spec: JobSpec, *, jarvis: str = "jarvis", service: bool = False)
     if package is None:
         return spec
     split_name(package.name)
-    archive = InputRef(name=f"{ARCHIVE_DIR}/{package.sha256}.tar.gz", sha256=package.sha256)
+    digest = package.pinned()[1]
+    archive = InputRef(name=f"{ARCHIVE_DIR}/{digest}.tar.gz", sha256=digest)
     data = spec.model_dump(mode="json", exclude={"package", "executable", "arguments"})
     data["inputs"] = [
         *[item for item in data["inputs"] if item["name"] != archive.name],
@@ -372,7 +371,7 @@ def package_job(spec: JobSpec, *, jarvis: str = "jarvis", service: bool = False)
         "-c",
         RUNNER,
         "clio-relay-package",
-        package.sha256,
+        digest,
         package.name,
         jarvis,
         spec.directory or "",
@@ -477,53 +476,3 @@ async def add_clio_jarvis(
         "added": "added" in marks,
     }
 
-
-# Command line
-
-
-def _main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="python -m clio_relay.jarvis_site",
-        description="Build a reviewed-package archive for a guarded site.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-    build = sub.add_parser("archive", help="archive one package of a JARVIS repository")
-    build.add_argument("repo_dir", type=Path, help="the directory `jarvis repo add` takes")
-    build.add_argument("package", help="<repository>.<package>")
-    build.add_argument("--output", type=Path, help="also write the archive here")
-    build.add_argument(
-        "--stage",
-        action="store_true",
-        help="put it in relay's content store (CLIO_RELAY_STATE_DIR or the default)",
-    )
-    args = parser.parse_args(argv)
-    try:
-        data = archive_package(args.repo_dir, args.package, source=git_source(args.repo_dir))
-        info = inspect_archive(data, args.package)
-    except Refusal as refusal:
-        print(refusal.message, file=sys.stderr)
-        return 2
-    if args.output is not None:
-        args.output.write_bytes(data)
-    if args.stage:
-        from clio_relay.surface.settings import RelayPaths
-
-        ContentStore(RelayPaths.from_env().content_dir).put(data)
-    print(
-        json.dumps(
-            {
-                "name": args.package,
-                "sha256": info.sha256,
-                "size": info.size,
-                "files": len(info.files),
-                "source": info.source,
-                "staged": bool(args.stage),
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

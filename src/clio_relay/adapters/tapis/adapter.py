@@ -336,7 +336,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         files = await self._files()
         digests = [item.sha256 for item in spec.inputs]
         if spec.package is not None:
-            digests.append(spec.package.sha256)
+            digests.append(spec.package.pinned()[1])
         await self._stage_inputs(files, digests)
         app_id, app_version = await self.ensure_app()
         job_dir = f"{files.root}/jobs/{operation_id}"
