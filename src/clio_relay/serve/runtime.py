@@ -10,12 +10,10 @@ and returns the artifacts it wrote.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import inspect
 import json
 import logging
-import re
 import shlex
 import time
 from pathlib import Path
@@ -28,7 +26,6 @@ from clio_relay.jobs.handles import (
     JobHandle,
     JobState,
     JobStatus,
-    OutputRef,
     utc_now,
 )
 from clio_relay.jobs.records import OperationRecord, RecordStore
@@ -39,7 +36,6 @@ from clio_relay.serve.config import SiteServe
 from clio_relay.serve.forward import Forward
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
-    SERVE_DIR,
     HopState,
     ServePlan,
     check_wrappable,
@@ -51,6 +47,19 @@ from clio_relay.serve.plan import (
     wrapped_job,
 )
 from clio_relay.serve.provenance import with_provenance
+from clio_relay.serve.report import (
+    LOG_TAIL,
+    connect_handle,
+    final_message,
+    frpc_problem,
+    handle_job_dir,
+    is_artifact,
+    job_path,
+    last_line,
+    listed_artifacts,
+    redact,
+    times,
+)
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)
@@ -62,9 +71,6 @@ STOP_MARGIN_S = 30.0
 CANCEL_RETRY_S = 60.0
 FOLLOW_FIRST_S = 1.0
 FOLLOW_MAX_S = 10.0
-LOG_TAIL = 4096
-# frpc's log line: "2026-11-18 12:38:59.277 [W] [client/service.go:319] text".
-_FRPC_LINE = re.compile(r"^\S+ \S+ \[([A-Z])\] \[[^\]]*\] (.*)$")
 
 _runtime: ServeRuntime | None = None
 
@@ -106,26 +112,6 @@ async def _maybe(value: Any) -> Any:
 
 def _site_id(site: Any) -> str:
     return site if isinstance(site, str) else str(site.id)
-
-
-def _times(count: int) -> str:
-    return "once" if count == 1 else f"{count} times"
-
-
-def handle_job_dir(handle: JobHandle) -> str | None:
-    """Return the job directory from a handle, looking inside one an adapter wraps.
-
-    The worker adapter puts the handle its site-side adapter made under ``data["remote"]``.
-    """
-    data: dict[str, Any] | None = handle.data
-    while data is not None:
-        job_dir = data.get("job_dir")
-        if job_dir:
-            return str(job_dir)
-        remote = data.get("remote")
-        inner = cast(dict[str, Any], remote).get("data") if isinstance(remote, dict) else None
-        data = cast(dict[str, Any], inner) if isinstance(inner, dict) else None
-    return None
 
 
 class ServeRuntime:
@@ -516,20 +502,12 @@ class ServeRuntime:
             record.handle = plan.handle
             self.records.put(plan.operation_id, record)
 
-    def _path(self, plan: ServePlan, name: str) -> str:
-        if not plan.job_dir:
-            raise Refusal(
-                RefusalReason.INVALID_CONFIG,
-                f"adapter {plan.adapter} gave no job_dir in its handle; relay cannot read serve/",
-            )
-        return f"{plan.job_dir.rstrip('/')}/{SERVE_DIR}/{name}"
-
     async def _read(
         self, plan: ServePlan, adapter: Any, name: str, *, tail: int = 0
     ) -> bytes | None:
         try:
             files: FileAccess = await adapter.files()
-            path = self._path(plan, name)
+            path = job_path(plan, name)
             if tail:
                 entry = await files.stat(path)
                 offset = max(0, (entry.size or 0) - tail)
@@ -540,34 +518,10 @@ class ServeRuntime:
                 return None
             raise
 
-    def _redact(self, plan: ServePlan, text: str) -> str:
-        for secret in [*plan.secrets.values(), plan.secret_key, plan.hop.token if plan.hop else ""]:
-            if secret:
-                text = text.replace(secret, "***")
-        return text
-
-    async def _service_line(self, plan: ServePlan, adapter: Any) -> str | None:
-        data = await self._read(plan, adapter, "service.log", tail=LOG_TAIL)
-        if not data:
-            return None
-        lines = [line for line in data.decode(errors="replace").splitlines() if line.strip()]
-        return self._redact(plan, lines[-1][-300:]) if lines else None
-
     async def _frpc_problem(self, plan: ServePlan, adapter: Any) -> str | None:
-        """Return frpc's latest warning or error on the site, unless it logged in after it."""
         if plan.mode != "frp":
             return None
-        data = await self._read(plan, adapter, "frpc.log", tail=LOG_TAIL)
-        if not data:
-            return None
-        lines = [line for line in data.decode(errors="replace").splitlines() if line.strip()]
-        for line in reversed(lines):
-            if "login to server success" in line:
-                return None
-            match = _FRPC_LINE.match(line)
-            if match is not None and match.group(1) in ("W", "E"):
-                return self._redact(plan, match.group(2).strip()[-300:])
-        return None
+        return frpc_problem(plan, await self._read(plan, adapter, "frpc.log", tail=LOG_TAIL))
 
     async def _running(
         self, plan: ServePlan, adapter: Any, status: JobStatus
@@ -575,7 +529,8 @@ class ServeRuntime:
         if plan.ready_at is None:
             raw = await self._read(plan, adapter, "ready.json")
             if raw is None:
-                line = await self._service_line(plan, adapter)
+                log = await self._read(plan, adapter, "service.log", tail=LOG_TAIL)
+                line = last_line(plan, log)
                 problem = await self._frpc_problem(plan, adapter)
                 message = "starting: waiting for the service's ports to answer"
                 if plan.mode == "frp":
@@ -595,17 +550,17 @@ class ServeRuntime:
             message = "the service is up; binding the desktop port"
             error = forward.last_error()
             if error:
-                message += f". Forward: {self._redact(plan, error)}"
+                message += f". Forward: {redact(plan, error)}"
             return status.model_copy(update={"message": message}), None
         notes: list[str] = []
         mount_note = await self._mount(plan)
         if mount_note:
             notes.append(mount_note)
         if plan.rebinds:
-            notes.append(f"desktop port bound again {_times(plan.rebinds)}")
+            notes.append(f"desktop port bound again {times(plan.rebinds)}")
         direct = forward.direct_note()
         if direct:
-            notes.append(self._redact(plan, direct))
+            notes.append(redact(plan, direct))
         extra = self.notes.get(plan.operation_id)
         if extra:
             notes.append(extra)
@@ -689,7 +644,7 @@ class ServeRuntime:
                 plan.operation_id, tool_prefix(plan.site, plan.service), url, secret=secret
             )
         except Exception as exc:
-            return f"mounting its tools: {self._redact(plan, str(exc))[:200]}"
+            return f"mounting its tools: {redact(plan, str(exc))[:200]}"
         return f"{len(mount.tools)} tools mounted under {mount.prefix}"
 
     async def _follow_binding(self, plan: ServePlan, adapter: Any) -> None:
@@ -720,7 +675,7 @@ class ServeRuntime:
         if status.state == JobState.RUNNING and plan.job_dir:
             try:
                 files: FileAccess = await adapter.files()
-                await files.write(self._path(plan, "stop"), b"stop\n", overwrite=True)
+                await files.write(job_path(plan, "stop"), b"stop\n", overwrite=True)
                 return
             except Refusal as refusal:
                 logger.info("service %s: no stop file (%s); cancelling", plan.operation_id, refusal)
@@ -737,20 +692,8 @@ class ServeRuntime:
             with contextlib.suppress(ValueError):
                 stopped = json.loads(raw)
         outputs = [item for item in status.outputs if is_artifact(item)]
-        seen = {item.path for item in outputs}
         listing = await self._read(plan, adapter, "artifacts.txt")
-        if listing and plan.job_dir:
-            for line in listing.decode(errors="replace").splitlines():
-                size_text, _, name = line.partition("\t")
-                name = name.strip()
-                if not name:
-                    continue
-                path = f"{plan.job_dir.rstrip('/')}/{name}"
-                if path in seen:
-                    continue
-                seen.add(path)
-                size = int(size_text) if size_text.strip().isdigit() else None
-                outputs.append(OutputRef(name=name, path=path, size=size))
+        outputs += listed_artifacts(plan, listing, {item.path for item in outputs})
         record = self.records.get(plan.operation_id)
         if record is not None:
             if record.handle is None and plan.handle is not None:
@@ -758,40 +701,11 @@ class ServeRuntime:
                 record.handle = plan.handle
             outputs = with_provenance(record, outputs)
         await self._stop_hop(adapter, plan)
-        message = self._final_message(plan, status, stopped)
+        message = final_message(plan, status, stopped)
         final = status.model_copy(update={"outputs": outputs, "message": message})
         plan.final = final.model_dump(mode="json")
         self._save(plan)
         return final
-
-    def _final_message(self, plan: ServePlan, status: JobStatus, stopped: dict[str, Any]) -> str:
-        reason = str(stopped.get("reason") or "")
-        parts: list[str] = []
-        if reason == "stopped":
-            parts.append("stopped")
-        elif reason == "idle":
-            parts.append("released after its idle time")
-        elif reason == "port_taken":
-            node = stopped.get("host") or plan.host or "the node"
-            port = stopped.get("port")
-            named = f"port {port} ({stopped.get('port_name')})" if port else "a port it needs"
-            parts.append(f"refused: {named} was already in use on {node}")
-        elif reason == "exited":
-            parts.append(f"the service exited with {stopped.get('exit_code')}")
-        elif reason == "signal":
-            parts.append("the job was signalled")
-        elif status.message:
-            parts.append(self._redact(plan, status.message))
-        else:
-            parts.append(f"the job is {status.state.value}")
-        if plan.cancel_sent:
-            parts.append("its job was cancelled")
-        restarts = stopped.get("frpc_restarts")
-        if restarts:
-            parts.append(f"the site's frp client restarted {_times(int(restarts))}")
-        if plan.rebinds:
-            parts.append(f"the desktop port was bound again {_times(plan.rebinds)}")
-        return "; ".join(parts)
 
     # Reaching the service from another machine
 
@@ -801,33 +715,3 @@ class ServeRuntime:
             return None
         handle = connect_handle(plan)
         return shlex.join(["clio-relay", "connect", handle])
-
-
-def connect_handle(plan: ServePlan) -> str:
-    """Encode what a desktop needs to reach the service through the rendezvous host.
-
-    It carries the proxies' shared key, not the rendezvous token: the desktop
-    reads the token from its own rendezvous setting.
-    """
-    rendezvous = plan.rendezvous
-    payload = {
-        "v": 1,
-        "op": plan.operation_id,
-        "sk": plan.secret_key,
-        "direct": bool(rendezvous and rendezvous.direct),
-        "ports": [[port.name, port.protocol, port.local_port] for port in plan.ports],
-    }
-    raw = json.dumps(payload, separators=(",", ":")).encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-# The wrapper's own files. Logs stay, because a person reads them after a failure.
-_SERVE_FILES = {"service.log", "launch.log", "frpc.log"}
-
-
-def is_artifact(item: OutputRef) -> bool:
-    """Return whether an adapter-listed output is the service's, not the wrapper's."""
-    parts = item.name.replace("\\", "/").split("/")
-    if len(parts) == 2 and parts[0] == "serve":
-        return parts[1] in _SERVE_FILES
-    return True
