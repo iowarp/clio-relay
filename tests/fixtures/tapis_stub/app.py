@@ -17,7 +17,6 @@ import base64
 import hashlib
 import os
 import secrets
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -32,31 +31,17 @@ from typing import Any
 
 import jwt
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
 
-from .runner import JobRunner, StubJob
+from .files_routes import add_file_routes
+from .replies import envelope as _envelope
+from .replies import error as _error
+from .runner import FINAL_STATES, JobRunner, StubJob
 
 SECRET = "tapis-stub-signing-key-not-a-real-secret-0000"
 VERIFICATION_BASE = "https://tapis-stub.invalid"
 DEVICE_CODE_TTL_S = 600
 DEVICE_TOKEN_TTL_S = 30 * 24 * 3600
 REFRESH_TOKEN_TTL_S = 365 * 24 * 3600
-
-
-def _envelope(result: Any, message: str = "ok", status: int = 200) -> JSONResponse:
-    return JSONResponse(
-        {"result": result, "status": "success", "message": message, "version": "stub"},
-        status_code=status,
-        media_type="application/json",
-    )
-
-
-def _error(status: int, message: str) -> JSONResponse:
-    return JSONResponse(
-        {"result": None, "status": "error", "message": message, "version": "stub"},
-        status_code=status,
-        media_type="application/json",
-    )
 
 
 @dataclass
@@ -202,23 +187,6 @@ def _ssh_login_check(system: dict[str, Any], login: str, private_key: str) -> st
     return None
 
 
-def _file_info(path: Path, rel: str) -> dict[str, Any]:
-    st = path.lstat()
-    kind = "dir" if path.is_dir() else "file" if path.is_file() else "other"
-    return {
-        "mimeType": None,
-        "type": kind,
-        "owner": str(st.st_uid),
-        "group": str(st.st_gid),
-        "nativePermissions": oct(st.st_mode & 0o777)[2:],
-        "url": f"tapis://stub/{rel}",
-        "lastModified": datetime.fromtimestamp(st.st_mtime, UTC).isoformat(),
-        "name": path.name,
-        "path": rel,
-        "size": st.st_size,
-    }
-
-
 def create_app(state: StubState) -> FastAPI:
     """Build the stub's FastAPI app over ``state``."""
     app = FastAPI(title="tapis-stub", openapi_url=None, docs_url=None, redoc_url=None)
@@ -333,6 +301,23 @@ def create_app(state: StubState) -> FastAPI:
         return _envelope(None, "Token successfully revoked.")
 
     # systems
+
+    @app.get("/v3/systems")
+    async def get_systems(request: Request) -> Response:
+        # Only the ``(field.eq=value)~(...)`` search relay sends; every system is visible.
+        if user(request) is None:
+            return _error(401, "Invalid token")
+        terms = [
+            term.partition(".eq=")
+            for term in request.query_params.get("search", "").strip("()").split(")~(")
+            if ".eq=" in term
+        ]
+        found = [
+            {"id": system["id"], "host": system.get("host")}
+            for system in list(state.systems.values())
+            if all(str(system.get(field)) == value for field, _, value in terms)
+        ]
+        return _envelope(found)
 
     @app.get("/v3/systems/{system_id}")
     async def get_system(system_id: str, request: Request) -> Response:
@@ -522,119 +507,13 @@ def create_app(state: StubState) -> FastAPI:
         job = state.jobs.get(job_uuid)
         if job is None:
             return _error(404, f"Job not found: {job_uuid}")
+        if job.status in FINAL_STATES:
+            # tapis-java JobCancelResource: a job in a terminal state is a conflict.
+            return _error(409, f"Job {job_uuid} is already in a terminal state: {job.status}")
         runner.cancel(job)
         return _envelope({"message": "cancel requested"})
 
-    # files
-
-    def check_system(request: Request, system_id: str) -> Response | None:
-        if user(request) is None:
-            return _error(401, "Invalid token")
-        if system_id not in state.systems:
-            return _error(404, f"System not found: {system_id}")
-        return None
-
-    @app.get("/v3/files/ops/{system_id}/{path:path}")
-    async def list_files(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        target = state.host_path(system_id, path)
-        if not target.exists():
-            return _error(404, f"Path not found: {path}")
-        if target.is_dir():
-            items = sorted(target.iterdir(), key=lambda item: item.name)
-            base = path.rstrip("/")
-            return _envelope([_file_info(item, f"{base}/{item.name}") for item in items])
-        return _envelope([_file_info(target, path)])
-
-    @app.get("/v3/files/content/{system_id}/{path:path}")
-    async def get_contents(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        target = state.host_path(system_id, path)
-        if not target.is_file():
-            return _error(404, f"Path not found: {path}")
-        data = target.read_bytes()
-        byte_range = request.headers.get("range")
-        if byte_range:
-            first, _, last = byte_range.removeprefix("range=").partition(",")
-            data = data[int(first) : int(last) + 1]
-        return Response(content=data, media_type="application/octet-stream")
-
-    @app.post("/v3/files/ops/{system_id}/{path:path}")
-    async def insert(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        form = await request.form()
-        upload = form.get("file")
-        if upload is None or isinstance(upload, str):
-            return _error(400, "file is required")
-        target = state.host_path(system_id, path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(await upload.read())
-        return _envelope(None, "File uploaded")
-
-    @app.post("/v3/files/ops/{system_id}")
-    async def mkdir(request: Request, system_id: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        data = await request.json()
-        state.host_path(system_id, str(data["path"])).mkdir(parents=True, exist_ok=True)
-        return _envelope(None, "Directory created")
-
-    @app.put("/v3/files/ops/{system_id}/{path:path}")
-    async def move_copy(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        data = await request.json()
-        source = state.host_path(system_id, path)
-        if not source.exists():
-            return _error(404, f"Path not found: {path}")
-        target = state.host_path(system_id, str(data["newPath"]))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if str(data.get("operation", "MOVE")).upper() == "COPY":
-            if source.is_dir():
-                shutil.copytree(source, target)
-            else:
-                shutil.copy2(source, target)
-        else:
-            source.rename(target)
-        return _envelope(None, "ok")
-
-    @app.delete("/v3/files/ops/{system_id}/{path:path}")
-    async def delete(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        target = state.host_path(system_id, path)
-        if not target.exists():
-            return _error(404, f"Path not found: {path}")
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        return _envelope(None, "deleted")
-
-    @app.get("/v3/files/utils/linux/{system_id}/{path:path}")
-    async def stat_info(request: Request, system_id: str, path: str) -> Response:
-        if (refused := check_system(request, system_id)) is not None:
-            return refused
-        target = state.host_path(system_id, path)
-        if not target.exists():
-            return _error(404, f"Path not found: {path}")
-        st = target.stat()
-        return _envelope(
-            {
-                "absolutePath": "/" + path.lstrip("/"),
-                "uid": st.st_uid,
-                "gid": st.st_gid,
-                "size": st.st_size,
-                "perms": oct(st.st_mode & 0o777)[2:],
-                "accessTime": int(st.st_atime),
-                "modifyTime": int(st.st_mtime),
-                "dir": target.is_dir(),
-                "link": target.is_symlink(),
-            }
-        )
+    add_file_routes(app, state, user)
 
     # controls a test drives, standing in for the person and for TACC
 
@@ -643,27 +522,5 @@ def create_app(state: StubState) -> FastAPI:
         data = await request.json()
         ok = state.approve(str(data["user_code"]), str(data.get("username") or "testuser"))
         return _envelope({"approved": ok}, status=200 if ok else 404)
-
-    @app.post("/_stub/jobs/{job_uuid}/release")
-    async def release(job_uuid: str) -> Response:
-        job = state.jobs.get(job_uuid)
-        if job is None:
-            return _error(404, "no such job")
-        job.released.set()
-        return _envelope({"released": True})
-
-    @app.post("/_stub/jobs/{job_uuid}/status")
-    async def force_status(job_uuid: str, request: Request) -> Response:
-        data = await request.json()
-        job = state.jobs.get(job_uuid)
-        if job is None:
-            return _error(404, "no such job")
-        with state.lock:
-            job.forced = True
-            job.status = str(data["status"])
-            job.history.append(job.status)
-            job.last_message = str(data.get("lastMessage") or job.last_message)
-        job.released.set()
-        return _envelope(job_view(job))
 
     return app

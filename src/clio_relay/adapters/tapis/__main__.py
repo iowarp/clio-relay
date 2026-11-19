@@ -42,7 +42,7 @@ from clio_relay.sites.store import SiteStore
 from clio_relay.surface.settings import RelayPaths
 
 
-def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None]:
+def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None, str | None]:
     paths = RelayPaths.from_env()
     entry = SiteStore(paths.sites_file).get(site_id)
     if entry.adapter == "tapis":
@@ -57,7 +57,7 @@ def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None]:
         content=ContentStore(paths.content_dir),
     )
     adapter = TapisAdapter(TapisConfig.model_validate(config), context)
-    return adapter, ssh_for_site(entry)
+    return adapter, ssh_for_site(entry), entry.address
 
 
 def _print(value: Any) -> None:
@@ -98,7 +98,7 @@ async def _sign_in(adapter: TapisAdapter) -> int:
 
 
 async def _main(args: argparse.Namespace) -> int:
-    adapter, ssh = _adapter(args.site)
+    adapter, ssh, address = _adapter(args.site)
     if args.command == "sign-in":
         return await _sign_in(adapter)
     if args.command == "sign-out":
@@ -120,7 +120,7 @@ async def _main(args: argparse.Namespace) -> int:
         _print((await adapter.describe()).model_dump(mode="json"))
         return 0
     if args.command == "register-host":
-        _print(asdict(await register_host(adapter, ssh)))
+        _print(asdict(await register_host(adapter, ssh, address=address)))
         return 0
     if args.command == "unregister-host":
         _print(await unregister_host(adapter, ssh))

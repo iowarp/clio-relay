@@ -150,6 +150,19 @@ holds the key on TACC's side. The systems are TACC's own; relay registers only
 your credential and never creates or deletes the system. You need an
 allocation on the host.
 
+Relay does not guess which TACC system to use. The catalog's `vista` and
+`stampede3` name the host but no system, so adding one refuses with
+`invalid_config` and lists the Tapis systems on that host in `candidates`. Set
+the one you want, and the site registers:
+
+```
+clio-relay site edit vista '{config: {system_id: <a candidate>}}'
+```
+
+If the system's job working directory is not a plain path (for example it is
+worked out on the host from `$WORK`), set `work_dir` to a plain path under
+your work directory as well.
+
 ## How a job runs
 
 1. Relay registers its launcher once per system as a Tapis app named after the
@@ -167,7 +180,8 @@ allocation on the host.
    executable (or, on a guarded site, the reviewed package) and writes the
    exit code to `relay.exitcode`.
 5. `status` reads the Tapis job status, and the exit code once the job ends.
-   `cancel` calls `cancelJob`.
+   `cancel` calls `cancelJob`. Cancelling a job that already ended reports how
+   it ended.
 
 A package runs through the `jarvis` on the system's PATH. Its name is
 `<repo>.<package>`, for example `clio_jarvis.gray_scott`, and its archive
@@ -214,6 +228,23 @@ Relay keeps no connection to Tapis between calls, so it can restart at any
 time. After a restart, `find` searches Tapis for a job whose description holds
 the operation id, so a retried `run` never submits a second copy.
 
+## Files
+
+The `files` tool works through Tapis Files and follows relay's
+[files contract](../files.md). Relative paths are under the site's work
+directory; absolute paths are under the system's root directory.
+
+- `list` returns every entry, however many pages Tapis takes.
+- `read` with an offset asks Tapis for that byte range only.
+- A large upload moves in chunks of up to 4 MiB into `<path>.relay-part`, and
+  the last chunk moves it into place. Tapis Files cannot append, so each chunk
+  sends the part again; a very large upload is better staged another way. An
+  upload that stopped resumes from the part's size, even after relay restarts.
+- A write never lands inside a directory standing at the path, and never
+  replaces a file unless `overwrite` is set, checked again at the last chunk.
+- `delete` removes a link as itself, never what it points at. It refuses the
+  work directory and every directory above it.
+
 ## Guarded sites
 
 On `vista` and `stampede3` the site is guarded: `run` takes a reviewed
@@ -226,7 +257,7 @@ Tapis. Every job on these sites asks you before it spends allocation hours.
 | Refusal | What it means |
 | --- | --- |
 | `needs_sign_in` | Sign in to TACC on the page it names, then try again |
-| `invalid_config` | The site has no Tapis system yet. Add or switch to the site again, or run `register-host` |
+| `invalid_config` | The site has no Tapis system yet. Add or switch to the site again, or run `register-host`. On a TACC host, set `system_id` to one of the `candidates` it lists |
 | `policy_refused` | A free-form executable on a guarded site |
 | `submit_failed` | Tapis refused the job or the credential. The message carries Tapis's own words |
 | `verb_not_implemented` | The system uses a scheduler other than Slurm, which relay does not run jobs on yet |

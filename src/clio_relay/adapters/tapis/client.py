@@ -2,7 +2,9 @@
 
 Every Tapis call goes through :func:`call`, which names the service and the
 `tapipy` operation id, so the ledger's list of operations can be read off the
-callers. `tapipy` is synchronous; :func:`acall` runs it in a thread.
+callers. The one exception is a ranged ``files.getContents``, which
+:func:`read_range` streams on `tapipy`'s session. `tapipy` is synchronous;
+:func:`acall` runs it in a thread.
 
 `tapipy` turns a JSON result into ``TapisResult`` objects and returns ``None``
 for some results. Relay asks for its debug data and reads the plain JSON
@@ -14,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from typing import Any, cast
+from urllib.parse import quote
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -78,18 +81,22 @@ def make_client(base_url: str, tenant_id: str, access_token: str | None = None) 
         return cast(Any, Tapis)(**kwargs)
 
 
+def _body_message(response: Any) -> str | None:
+    try:
+        body: object = response.json()
+    except ValueError:
+        return None
+    if isinstance(body, dict):
+        text = cast(dict[str, Any], body).get("message")
+        if text:
+            return str(text)
+    return None
+
+
 def _message(exc: BaseException) -> str:
     response = getattr(exc, "response", None)
-    if response is not None:
-        try:
-            body: object = response.json()
-        except ValueError:
-            body = None
-        if isinstance(body, dict):
-            text = cast(dict[str, Any], body).get("message")
-            if text:
-                return str(text)
-    return str(getattr(exc, "message", None) or exc)
+    found = _body_message(response) if response is not None else None
+    return found or str(getattr(exc, "message", None) or exc)
 
 
 def call(client: Any, service: str, operation: str, /, **kwargs: Any) -> Any:
@@ -124,3 +131,39 @@ def call(client: Any, service: str, operation: str, /, **kwargs: Any) -> Any:
 async def acall(client: Any, service: str, operation: str, /, **kwargs: Any) -> Any:
     """Run :func:`call` in a thread."""
     return await asyncio.to_thread(call, client, service, operation, **kwargs)
+
+
+def read_range(client: Any, system_id: str, path: str, start: int, limit: int) -> bytes:
+    """``files.getContents`` from byte ``start``, cut off after ``limit`` bytes.
+
+    Tapis reads the ``range`` header as ``start,count`` and refuses a count
+    smaller than the start, so a read far into a file has to ask for more than
+    it wants. ``tapipy`` would download all of it; this streams the response on
+    ``tapipy``'s own session and stops once it holds ``limit`` bytes.
+    """
+    name = "files.getContents"
+    url = f"{str(client.base_url).rstrip('/')}/v3/files/content/{system_id}/{quote(path)}"
+    headers = {"X-Tapis-Token": client.get_access_jwt(), "range": f"{start},{max(limit, start)}"}
+    try:
+        with client.requests_session.get(
+            url, headers=headers, stream=True, verify=client.verify
+        ) as response:
+            if response.status_code >= 400:
+                raise TapisCallError(
+                    name,
+                    response.status_code,
+                    _body_message(response) or f"HTTP {response.status_code}",
+                )
+            held = bytearray()
+            for piece in response.iter_content(chunk_size=1 << 16):
+                held += piece
+                if len(held) >= limit:
+                    break
+            return bytes(held[:limit])
+    except OSError as exc:
+        raise TapisCallError(name, None, f"could not reach Tapis: {exc}") from None
+
+
+async def aread_range(client: Any, system_id: str, path: str, start: int, limit: int) -> bytes:
+    """Run :func:`read_range` in a thread."""
+    return await asyncio.to_thread(read_range, client, system_id, path, start, limit)

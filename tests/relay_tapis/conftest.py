@@ -62,3 +62,33 @@ def relay_paths(tmp_path: Path) -> RelayPaths:
 
 def add_site(paths: RelayPaths, data: dict[str, Any]) -> SiteEntry:
     return SiteStore(paths.sites_file).add(SiteEntry.model_validate(data))
+
+
+FAKE_JARVIS = """#!/bin/bash
+{ printf '%s' "$JARVIS_ROOT"; printf '\\x1f%s' "$@"; printf '\\n'; } >> "$FAKE_JARVIS_LOG"
+case "$1 ${2:-}" in
+"init "*) mkdir -p "$2" "$3" "$4" ;;
+"repo add") [ -d "$3/$(basename "$3")" ] || { echo "no package named for $3" >&2; exit 1; } ;;
+"ppl run") echo ran > "$JARVIS_ROOT/shared/ran" ;;
+"ppl start")
+    [ "${FAKE_JARVIS_START_RC:-0}" = 0 ] || exit "$FAKE_JARVIS_START_RC"
+    echo started > "$JARVIS_ROOT/shared/started" ;;
+"ppl stop") echo stopped > "$JARVIS_ROOT/shared/stopped" ;;
+esac
+echo "fake jarvis $1 ${2:-}"
+"""
+
+
+@pytest.fixture
+def jarvis_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Put a recording ``jarvis`` first on PATH, and give the job a home of its own."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "jarvis"
+    script.write_text(FAKE_JARVIS, encoding="utf-8")
+    script.chmod(0o755)
+    log = tmp_path / "jarvis.log"
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_JARVIS_LOG", str(log))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return log

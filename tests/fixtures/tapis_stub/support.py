@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import os
 import tarfile
 from collections.abc import Iterable
 from pathlib import Path
@@ -72,10 +71,6 @@ def tapis_config(stub: TapisStub, **extra: Any) -> dict[str, Any]:
     return {"base_url": stub.base_url, "tenant_id": "tacc", "client_id": CLIENT_ID} | extra
 
 
-def login_name() -> str:
-    return os.environ.get("USER") or os.environ.get("LOGNAME") or "relay"
-
-
 def package_archive(root: Path, names: Iterable[str]) -> bytes:
     """A package archive in W13's layout: ``<repo>/<repo>/<package>/...`` at its root.
 
@@ -92,3 +87,14 @@ def package_archive(root: Path, names: Iterable[str]) -> bytes:
                 filter=lambda item: None if "__pycache__" in item.name.split("/") else item,
             )
     return buffer.getvalue()
+
+
+def demo_checkout(root: Path) -> Path:
+    """A checkout holding ``w10demo``, a jarvis repo with the package ``w10demo.hello``."""
+    checkout = root / "src"
+    package = checkout / "w10demo" / "w10demo" / "hello"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "pkg.py").write_text("# the fake jarvis never imports this\n", encoding="utf-8")
+    return checkout

@@ -199,7 +199,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             pass
         else:
             return {"system_id": system_id, "registered": False, "credential": "ok"}
-        registration = await register_host(self, ssh_for_site(site))
+        registration = await register_host(self, ssh_for_site(site), address=site.address)
         return {"registered": True, "credential": "ok", **asdict(registration)}
 
     # describe
