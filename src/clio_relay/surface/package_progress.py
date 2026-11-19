@@ -142,7 +142,9 @@ def latest_step(lines: list[dict[str, Any]], execution: str) -> JobProgress | No
     steps = [line for line in lines if line.get("schema_version") == PROGRESS_SCHEMA]
     if not steps:
         return None
-    latest = max(steps, key=lambda line: (line.get("observed_at_epoch") or 0, line.get("sequence") or 0))
+    latest = max(
+        steps, key=lambda line: (line.get("observed_at_epoch") or 0, line.get("sequence") or 0)
+    )
     clio = _dict(_dict(latest.get("metadata")).get("clio"))
     output = _view_output(clio.get("output"), clio.get("view"))
     data: dict[str, Any] = {

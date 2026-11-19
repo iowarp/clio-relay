@@ -235,9 +235,7 @@ class PackageCatalog:
         return package.model_copy(update={"version": chosen.version, "sha256": chosen.sha256})
 
 
-def stage(
-    state_dir: Path, data: bytes, name: str, *, version: str | None = None
-) -> PackageEntry:
+def stage(state_dir: Path, data: bytes, name: str, *, version: str | None = None) -> PackageEntry:
     """Put an archive in relay's content store and record it in the catalog."""
     entry = describe_archive(data, name, version=version)
     ContentStore(state_dir / "content").put(data)
@@ -272,7 +270,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "list":
         entries = PackageCatalog(_state_dir() / "packages").all()
         fields = {"name", "version", "sha256", "kind", "staged_at"}
-        print(json.dumps([entry.model_dump(mode="json", include=fields) for entry in entries], indent=2))
+        print(
+            json.dumps(
+                [entry.model_dump(mode="json", include=fields) for entry in entries], indent=2
+            )
+        )
         return 0
     try:
         data = archive_package(args.repo_dir, args.package, source=git_source(args.repo_dir))

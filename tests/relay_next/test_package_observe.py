@@ -59,7 +59,9 @@ async def test_describe_lists_packages_and_run_pins_one_named_alone(
 ) -> None:
     add_site(relay_paths, policy="guarded")
     repo = make_repo(tmp_path / "src")
-    entry = stage(relay_paths.state_dir, archive_package(repo, "demo.hello"), "demo.hello", version="0.1.0")
+    entry = stage(
+        relay_paths.state_dir, archive_package(repo, "demo.hello"), "demo.hello", version="0.1.0"
+    )
     service = RelayService(relay_paths)
     [listed] = (await site_report(service, service.site("fx")))["packages"]
     assert (listed["name"], listed["version"], listed["sha256"]) == (
@@ -76,7 +78,9 @@ async def test_describe_lists_packages_and_run_pins_one_named_alone(
     assert record.spec["package"]["version"] == "0.1.0"
     assert record.spec["package"]["sha256"] == entry.sha256
     assert record.state == OperationState.AWAITING_INPUT
-    reviews = [ask for ask in service.outstanding(record) if ask.binding.get("kind") == "package_review"]
+    reviews = [
+        ask for ask in service.outstanding(record) if ask.binding.get("kind") == "package_review"
+    ]
     assert [ask.binding["package_hash"] for ask in reviews] == [entry.sha256]
 
     with pytest.raises(Refusal) as raised:
@@ -91,10 +95,9 @@ def _jsonl(path: Path, lines: list[dict[str, Any]], *, partial: str = "") -> Non
     path.write_text("".join(json.dumps(line) + "\n" for line in lines) + partial)
 
 
-def _execution(job_dir: Path, name: str, mtime: float) -> Path:
+def _execution(job_dir: Path, name: str) -> Path:
     execution = job_dir / JARVIS_SHARED / "relay_abc" / "executions" / name
     execution.mkdir(parents=True)
-    os.utime(execution, (mtime, mtime))
     return execution
 
 
@@ -118,9 +121,11 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
     service = RelayService(relay_paths)
     adapter = service.adapter_named(service.site("lab"), "local")
     job_dir = tmp_path / "job"
-    old = _execution(job_dir, "old", 1_000)
-    _jsonl(old / "progress" / "pkg-1.jsonl", [{"schema_version": "jarvis.progress.v1", "current": 99}])
-    execution = _execution(job_dir, "new", 2_000)
+    old = _execution(job_dir, "old")
+    _jsonl(
+        old / "progress" / "pkg-1.jsonl", [{"schema_version": "jarvis.progress.v1", "current": 99}]
+    )
+    execution = _execution(job_dir, "new")
     step = {
         "schema_version": "jarvis.progress.v1",
         "package_name": "pkg",
@@ -136,7 +141,12 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
         partial='{"schema_version": "jarvis.prog',
     )
     (execution / "progress" / "pkg-1.jsonl.lock").write_text("")
-    _jsonl(execution / "artifacts" / "pkg-1.jsonl", [_artifact("growing", 10), _artifact("complete", 20)])
+    _jsonl(
+        execution / "artifacts" / "pkg-1.jsonl",
+        [_artifact("growing", 10), _artifact("complete", 20)],
+    )
+    os.utime(old, (1_000, 1_000))
+    os.utime(execution, (2_000, 2_000))
     record = OperationRecord.model_validate(
         {
             "operation_id": "op_pkg",
@@ -173,9 +183,14 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
     assert again.progress is not None and again.progress.step == 3, "the execution is kept"
 
     plain = record.model_copy(update={"spec": {"executable": "echo"}})
-    assert (await with_package_progress(adapter, plain, JobStatus(state=JobState.RUNNING))).progress is None
+    assert (
+        await with_package_progress(adapter, plain, JobStatus(state=JobState.RUNNING))
+    ).progress is None
     missing = record.model_copy(
-        update={"result": None, "handle": JobHandle(adapter="local", data={"job_dir": str(tmp_path / "none")})}
+        update={
+            "result": None,
+            "handle": JobHandle(adapter="local", data={"job_dir": str(tmp_path / "none")}),
+        }
     )
     unread = JobStatus(state=JobState.RUNNING)
     assert await with_package_progress(adapter, missing, unread) is unread
