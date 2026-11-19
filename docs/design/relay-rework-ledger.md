@@ -1638,6 +1638,11 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
   - `adapters.globus.fakes` provides `LocalComputeService` and `LocalTransferService`.
   - `adapters.iri.fakes.FakeIriFacility` is an `httpx.MockTransport` handler. It validates job specs against the published field sets.
   - `adapters/sky/fake_sky/sky/` is a stand-in `sky` package with SkyPilot 0.14.3's call shapes. It goes on the bridge's `PYTHONPATH`.
+- **globus and iri files are built on W1's `SiteFiles`.** `GlobusFiles` and `IriFiles` implement only the six primitives; the base applies the rules in docs/files.md, including delete and chunked writes.
+  - globus keeps chunks in `<local_dir>/.relay-parts`, inside the local collection, and moves the file with one transfer on the final chunk (the coordinator's design change: no read-modify-write of a remote part). `stat` and `resume_at` answer from the local part. A recursive delete is one Transfer delete task. A link is removed, never followed: Transfer's `ls` marks it with `link_target`, or `invalid_symlink` when it is broken.
+  - iri keeps chunks in `<state_dir>/parts` and uploads once on the final chunk. `max_upload_bytes` is 5 MiB, so a larger write refuses before any byte moves, with a pointer to globus. `rm` has no recursive flag and removes a tree, so a recursive delete is one `rm`. Kind uses `stat` with `dereference: false`, so a link is not followed.
+  - The `content_dir` settings are gone from both configs: staged content lives under `<root>/.relay-content`, as the base defines. No catalog entry used them.
+  - iri gains an optional `home` setting, since the API reports no home directory. `IriFiles` overrides `resolve` and `content_path` only to refuse `invalid_config` when a `~` path has no `home`, or a relative path or staged content has no `root`, and then calls the base.
 
 ### Facts
 
@@ -1664,6 +1669,11 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 ### Evidence
 
 All of this is unit and mock evidence.
+
+- **Files gate on Ares** at `7b68650d` (integration `b048c686` merged, with `SiteFiles`): the four W11 modules gave exit 0, 144 passed and none skipped; ruff is clean and pyright reports 0 errors.
+  - The kit's files tests (`round_trip`, `delete`, `chunked_write`, `relative_paths_stay_inside`, `guarded_files_ask_first`) pass against the globus fakes and the IRI fake facility, v2 and v1.
+  - New unit tests: globus chunks never reach the collection before the final chunk and then move in one transfer; a globus delete keeps a link's target and removes a tree in one task; an iri recursive delete is one `rm` and leaves a link's target (v1 and v2); iri chunks upload once and refuse past 5 MiB before moving bytes; `~` paths use `home` and refuse without it; the Transfer stand-in and the SDK service delete, move and make directories.
+  - The first run failed the iri kit `test_files_delete` twice (v1, v2): the fake facility answered 403 for `stat /`, so `delete("/")` never reached the protected-directory refusal. A real filesystem stats `/` as a directory, so the fake now lets `stat` see the directories above its root (`7b68650d`).
 
 - **Gate on Ares** at `702356e` (integration `87da62d` merged, with W6 and optional duration), in the clone `~/clio-relay-rework/clio-relay-w11` with its own venv (`uv sync --extra globus --extra testing`): the four W11 modules gave exit 0, 102 passed and none skipped; ruff is clean and pyright reports 0 errors. The three new tests cover a job with no duration: globus sends no walltime, iri sends no `duration`, and sky prices it with no amount, walltime or node-hours, without calling SkyPilot.
 - **Gate on Ares** at `08c2880` (integration `14e8edd` merged, W6's identity API adopted):
@@ -1707,6 +1717,7 @@ Needs an ALCF account with a Polaris allocation, and a Globus identity linked to
 6. Check that `stdout`, `stderr` and the exit code are listed and readable through `files`.
 7. Run a second job of `sleep 600` and `cancel` it. Record how long the state takes to become cancelled; the cancel task may queue behind the job.
 8. Check `~/.clio-relay/jobs/<operation id>/` on Polaris (through Globus or SSH): `relay-state.json`, `relay-cancel` and the outputs.
+9. Through `files` (the local collection settings must be set, as for step 6): write a 3 MiB file in three chunks with `final: false`, then `final: true`. Before the last chunk, check that nothing is at the target on Polaris and that `stat` of `<path>.relay-part` reports the staged size. After it, check the file arrived whole in one transfer task. Then make a symlink to it on Polaris, `delete` the link, and check the target is still there. `delete` an empty directory, then a full one with `recursive: true`, and record the Transfer delete tasks each made.
 
 **LQ-L3. Polaris through `worker`.**
 
@@ -1736,7 +1747,7 @@ Needs a NERSC account with an allocation and IRI access, or the ALCF equivalent.
 1. Add a site with `adapter: iri`, `base_url: https://api.iri.nersc.gov`, `api_version: v2`, `identity: globus` and NERSC's scope from the Facts table. For ALCF, use `base_url: https://api.alcf.anl.gov` and a `token_command` that prints a token from ALCF's own tool, since relay has not found ALCF's Globus scope.
 2. Sign in, then run `describe`. It lists `/compute/resources`. Set `resource_id` to the compute resource, such as Perlmutter's, and `filesystem_resource_id` if the files resource differs.
 3. Record the API version, from `GET /api/v2/` or the OpenAPI document, and the token type: what the facility accepted, a Globus access token or the facility's own.
-4. Run `files`: write a 1 KiB file, read it back, list it and stat it. Repeat with a binary file. Record the download form the facility returned.
+4. Run `files`: write a 1 KiB file, read it back, list it and stat it. Repeat with a binary file. Record the download form the facility returned. Then write a 2 MiB file in two chunks and check it arrives whole; check a 6 MiB write refuses before anything is uploaded; `delete` a directory with files using `recursive: true` and check it is gone. Set `home` and check a `~/` path lands in your home directory.
 5. `run` `hostname` with 1 node in the debug queue and the account set. Check that it completes with exit code 0 and `stdout` and `stderr` listed.
 6. `run` `sleep 600`, then `cancel` it. Check that the state becomes cancelled.
 7. Repeat steps 4 to 6 with `api_version: v1`, if the facility still serves it.
@@ -1795,6 +1806,7 @@ Needs an ACCESS or NCSA allocation on DeltaAI, and a Globus identity mapped to t
 - **Settled by W1 at `87da62d`:** a job's duration is optional. W11 reviewed and kept W1's edits: globus sends no walltime (the endpoint's default applies), iri omits `duration`, and sky returns a `Charge` with no amount, so the spend gate asks.
 - **Request to W13:** call `SkyAdapter.price(spec)` from `GuardHook.price` for sky sites. It returns a `Charge` with `unit: "USD"`, and `node_hours` is still filled in for the node-hour threshold.
 - **For W9:** SkyPilot autostop is the idle release for `serve`. The `sky` adapter does not implement `serve`.
+- **Files, for W1:** globus and iri now implement delete and chunked writes through `SiteFiles`; update their rows in docs/files.md after the merge. That a Globus delete removes a link without following it, and that a Transfer delete needs `recursive` even for an empty directory, are assumed, not checked against Globus's documentation or seen live; LQ-L2 step 9 checks both. Suggestion for `SiteFiles.delete`: refuse root, home and `/` before calling `kind`, so a facility that answers 403 for `stat /` still gives the protected-directory refusal.
 
 ## W12. gact-tui host semantics and removals
 

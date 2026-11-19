@@ -70,8 +70,7 @@ itself.
 | `cancel_poll_s` | 5 | How often a running job checks for a cancel |
 | `inline_input_limit` | 6 MiB | Inputs up to this size travel inside the task |
 | `collection` | none | The site's Globus collection, for `files` and large inputs |
-| `collection_root` | `/~/` | Where relative paths start on that collection |
-| `content_dir` | `.clio-relay/content` | Where staged inputs go on the collection |
+| `collection_root` | `/~/` | Relay's work directory on that collection, where relative paths start |
 | `local_collection`, `local_path`, `local_dir` | none | A collection on relay's own machine, such as Globus Connect Personal, for reading and writing files |
 | `start` | none | How relay starts your own endpoint when it is offline |
 
@@ -103,8 +102,16 @@ A multi-user endpoint gives its batch job back after a few idle minutes (ALCF's
 
 ## Files
 
-`files` lists, reads and writes through Globus Transfer. Listing works with only
-the site's `collection`. Reading and writing need a collection on relay's
-machine too, since Transfer moves data between two collections. A transfer that
-keeps faulting is cancelled and refused; one that is making progress has no
-time limit.
+`files` lists, reads, writes and deletes through Globus Transfer, following the
+rules in [files](../files.md). Listing works with only the site's `collection`.
+Reading and writing need a collection on relay's machine too, since Transfer
+moves data between two collections. A transfer that keeps faulting is cancelled
+and refused; one that is making progress has no time limit.
+
+- `~` is the collection's home directory, `/~/`.
+- A chunked write collects its chunks in `<local_dir>/.relay-parts` on relay's
+  machine. Transfer cannot append, so nothing reaches the site until the final
+  chunk; then one transfer moves the whole file.
+- Delete removes a file or a symlink, never the link's target. A recursive
+  delete is one Transfer delete task.
+- Staged content goes under `<collection_root>/.relay-content`.

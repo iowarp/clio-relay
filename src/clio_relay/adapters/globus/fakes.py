@@ -109,11 +109,15 @@ class LocalTransferService:
             raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
         items: list[dict[str, Any]] = []
         for child in sorted(target.iterdir(), key=lambda item: item.name):
-            info = child.stat()
+            # Like Transfer: a symlink shows its target's type and size, with link_target set.
+            link = os.readlink(child) if child.is_symlink() else None
+            broken = link is not None and not child.exists()
+            info = child.lstat() if broken else child.stat()
             items.append(
                 {
                     "name": child.name,
-                    "type": "dir" if child.is_dir() else "file",
+                    "type": "invalid_symlink" if broken else "dir" if child.is_dir() else "file",
+                    "link_target": link,
                     "size": info.st_size,
                     "last_modified": datetime.fromtimestamp(info.st_mtime, UTC).strftime(
                         "%Y-%m-%d %H:%M:%S+00:00"
@@ -129,6 +133,33 @@ class LocalTransferService:
             raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{source_path} does not exist")
         await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.copyfile, origin, target)
+
+    async def delete(self, collection: str, path: str, *, recursive: bool) -> None:
+        # Globus Transfer deletes a directory only with recursive set.
+        target = self.resolve(collection, path)
+        if target.is_symlink() or target.is_file():
+            await asyncio.to_thread(target.unlink)
+        elif target.is_dir():
+            if not recursive:
+                raise Refusal(RefusalReason.UNREACHABLE, f"{path} is a directory")
+            await asyncio.to_thread(shutil.rmtree, target)
+        else:
+            raise Refusal(RefusalReason.UNREACHABLE, f"Globus Transfer delete: {path} not found")
+
+    async def rename(self, collection: str, old: str, new: str) -> None:
+        origin = self.resolve(collection, old)
+        target = self.resolve(collection, new)
+        if not (origin.exists() or origin.is_symlink()):
+            raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{old} does not exist", path=old)
+        if target.exists() or not target.parent.is_dir():
+            raise Refusal(RefusalReason.UNREACHABLE, f"Globus Transfer could not move to {new}")
+        await asyncio.to_thread(origin.rename, target)
+
+    async def mkdir(self, collection: str, path: str) -> None:
+        target = self.resolve(collection, path)
+        if not target.parent.is_dir():
+            raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} has no parent", path=path)
+        await asyncio.to_thread(target.mkdir, exist_ok=True)
 
 
 def main() -> None:

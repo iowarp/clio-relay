@@ -22,7 +22,7 @@ from clio_relay.adapters._process import run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.globus import tokens
 from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
-from clio_relay.adapters.iri.files import IriFileAccess
+from clio_relay.adapters.iri.files import IriFiles
 from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -67,12 +67,12 @@ class IriConfig(BaseModel):
     root: str | None = Field(
         default=None, description="Directory on the facility that relative paths start from"
     )
+    home: str | None = Field(
+        default=None, description="The user's home directory on the facility, for ~ paths"
+    )
     job_root: str | None = Field(
         default=".clio-relay/jobs",
         description="Directory for job directories, under root when relative; empty for none",
-    )
-    content_dir: str = Field(
-        default=".clio-relay/content", description="Directory for staged content"
     )
     poll_s: float = Field(default=1.0, gt=0, description="First wait between file-task polls")
     stall_s: float = Field(
@@ -204,12 +204,13 @@ class IriAdapter(BaseAdapter[IriConfig]):
         base = self._root_path(self.config.job_root)
         return f"{base.rstrip('/')}/{operation_id}" if base else None
 
-    def _files(self) -> IriFileAccess:
-        return IriFileAccess(
+    def _files(self) -> IriFiles:
+        return IriFiles(
             self.client,
             resource_id=self.config.filesystem_resource_id or self.config.resource_id,
             root=self.config.root,
-            content_dir=self.config.content_dir,
+            home=self.config.home,
+            staging=self.context.state_dir / "parts",
         )
 
     async def describe(self) -> SiteInfo:

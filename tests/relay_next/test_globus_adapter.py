@@ -26,7 +26,7 @@ from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig, tokens
 from clio_relay.adapters.globus.compute import ComputeService, function_digest
 from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
 from clio_relay.adapters.globus.task import relay_task
-from clio_relay.adapters.globus.transfer import TransferService
+from clio_relay.adapters.globus.transfer import PARTS_DIR, GlobusFiles, TransferService
 from clio_relay.adapters.local import LocalAdapter
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import ExecResult, JobState, StallReport
@@ -453,6 +453,136 @@ def test_provider_comes_from_the_shared_identities(monkeypatch: pytest.MonkeyPat
     assert tokens.provider("globus") is built
     assert isinstance(tokens.provider("nobody"), tokens.GrantFileProvider)
     assert asked == ["globus", "nobody"]
+
+
+@pytest.mark.asyncio
+async def test_transfer_stand_in_deletes_moves_and_makes_directories(tmp_path: Path) -> None:
+    site = tmp_path / "site"
+    site.mkdir()
+    service = LocalTransferService({SITE_COLLECTION: site})
+    await service.mkdir(SITE_COLLECTION, "/d")
+    await service.mkdir(SITE_COLLECTION, "/d")
+    (site / "d" / "f.txt").write_bytes(b"f")
+    await service.rename(SITE_COLLECTION, "/d/f.txt", "/d/g.txt")
+    assert (site / "d" / "g.txt").read_bytes() == b"f"
+    with pytest.raises(Refusal):
+        await service.delete(SITE_COLLECTION, "/d", recursive=False)
+    await service.delete(SITE_COLLECTION, "/d", recursive=True)
+    assert not (site / "d").exists()
+
+
+class RecordingTransferClient:
+    """Stands in for ``globus_sdk.TransferClient`` and records the calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def submit_delete(self, data: Any) -> dict[str, str]:
+        self.calls.append(("submit_delete", dict(data)))
+        return {"task_id": "t-1"}
+
+    def get_task(self, task_id: str) -> dict[str, str]:
+        return {"status": "SUCCEEDED"}
+
+    def operation_rename(self, collection: str, old: str, new: str) -> None:
+        self.calls.append(("operation_rename", (collection, old, new)))
+
+    def operation_mkdir(self, collection: str, path: str) -> None:
+        self.calls.append(("operation_mkdir", (collection, path)))
+        error = RuntimeError("exists")
+        error.__dict__["code"] = "ExternalError.MkdirFailed.Exists"
+        raise error
+
+
+@pytest.mark.asyncio
+async def test_sdk_transfer_deletes_moves_and_makes_directories() -> None:
+    from clio_relay.adapters.globus.transfer import SdkTransferService
+
+    service = SdkTransferService("token", poll_s=0.01)
+    client = RecordingTransferClient()
+    service.__dict__["_client"] = client
+    await service.delete(SITE_COLLECTION, "/d", recursive=True)
+    await service.rename(SITE_COLLECTION, "/a", "/b")
+    await service.mkdir(SITE_COLLECTION, "/d")
+    name, data = client.calls[0]
+    assert name == "submit_delete"
+    assert data["DATA_TYPE"] == "delete"
+    assert data["endpoint"] == SITE_COLLECTION
+    assert data["recursive"] is True
+    assert [item["path"] for item in data["DATA"]] == ["/d"]
+    assert client.calls[1] == ("operation_rename", (SITE_COLLECTION, "/a", "/b"))
+    assert client.calls[2] == ("operation_mkdir", (SITE_COLLECTION, "/d"))
+
+
+class CountingTransfer(LocalTransferService):
+    """The Transfer stand-in, recording each copy and delete."""
+
+    def __init__(self, collections: dict[str, Path]) -> None:
+        super().__init__(collections)
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def copy(self, source: str, source_path: str, destination: str, dest_path: str) -> None:
+        self.calls.append(("copy", source, source_path, destination, dest_path))
+        await super().copy(source, source_path, destination, dest_path)
+
+    async def delete(self, collection: str, path: str, *, recursive: bool) -> None:
+        self.calls.append(("delete", path, recursive))
+        await super().delete(collection, path, recursive=recursive)
+
+
+def _globus_files(tmp_path: Path) -> tuple[GlobusFiles, CountingTransfer, Path]:
+    site, local = tmp_path / "site", tmp_path / "local"
+    (site / "home").mkdir(parents=True)
+    transfer = CountingTransfer({SITE_COLLECTION: site, LOCAL_COLLECTION: local})
+    files = GlobusFiles(
+        transfer,
+        collection=SITE_COLLECTION,
+        root="/~/",
+        local_collection=LOCAL_COLLECTION,
+        local_path="/",
+        local_dir=local,
+        state_dir=tmp_path / "state",
+    )
+    return files, transfer, site / "home"
+
+
+@pytest.mark.asyncio
+async def test_chunks_collect_locally_and_move_in_one_transfer(tmp_path: Path) -> None:
+    files, transfer, home = _globus_files(tmp_path)
+    parts = tmp_path / "local" / PARTS_DIR
+    part = await files.write("c.bin", b"a" * 10, final=False)
+    assert part.path == "/~/c.bin.relay-part"
+    assert len(list(parts.iterdir())) == 1
+    await files.write("c.bin", b"b" * 10, offset=10, final=False)
+    assert transfer.calls == []
+    await files.write("c.bin", b"c" * 10, offset=20)
+    assert (home / "c.bin").read_bytes() == b"a" * 10 + b"b" * 10 + b"c" * 10
+    copies = [call for call in transfer.calls if call[0] == "copy"]
+    assert len(copies) == 1
+    assert copies[0][1] == LOCAL_COLLECTION
+    assert copies[0][2].startswith(f"/{PARTS_DIR}/")
+    assert copies[0][4] == "/~/c.bin"
+    assert not list(parts.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_link_targets_and_removes_a_tree_in_one_task(tmp_path: Path) -> None:
+    files, transfer, home = _globus_files(tmp_path)
+    (home / "kept" / "deep").mkdir(parents=True)
+    (home / "kept" / "deep" / "k.txt").write_bytes(b"k")
+    (home / "tree" / "a").mkdir(parents=True)
+    (home / "tree" / "a" / "c.txt").write_bytes(b"c")
+    (home / "tree" / "link").symlink_to(home / "kept")
+    assert await files.kind("/~/tree/link") == "link"
+    assert await files.kind("/~/tree/a") == "dir"
+    assert await files.kind("/~") == "dir"
+    assert files.resolve("~/x") == "/~/x"
+    await files.delete("tree/link")
+    assert (home / "kept" / "deep" / "k.txt").is_file()
+    transfer.calls.clear()
+    await files.delete("tree", recursive=True)
+    assert transfer.calls == [("delete", "/~/tree", True)]
+    assert not (home / "tree").exists()
 
 
 def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:

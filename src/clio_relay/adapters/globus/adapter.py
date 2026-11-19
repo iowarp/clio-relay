@@ -34,7 +34,7 @@ from clio_relay.adapters.globus.compute import (
     TaskInfo,
 )
 from clio_relay.adapters.globus.transfer import (
-    GlobusFileAccess,
+    GlobusFiles,
     SdkTransferService,
     TransferService,
 )
@@ -121,9 +121,6 @@ class GlobusConfig(BaseModel):
     )
     collection_root: str = Field(
         default="/~/", description="Directory on the collection that relative paths start from"
-    )
-    content_dir: str = Field(
-        default=".clio-relay/content", description="Directory on the collection for staged content"
     )
     local_collection: str | None = Field(
         default=None, pattern=UUID_PATTERN, description="A collection on relay's own machine"
@@ -459,12 +456,12 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
                 "files through Globus needs the site's collection; set collection in the "
                 "site's globus settings, or route files to another adapter",
             )
-        return GlobusFileAccess(
+        return GlobusFiles(
             await self._transfer_service(),
             collection=self.config.collection,
             root=self.config.collection_root,
-            content_dir=self.config.content_dir,
             local_collection=self.config.local_collection,
             local_path=self.config.local_path,
             local_dir=Path(self.config.local_dir).expanduser() if self.config.local_dir else None,
+            state_dir=self.context.state_dir,
         )
