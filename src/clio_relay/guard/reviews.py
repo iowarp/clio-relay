@@ -7,8 +7,9 @@ new name is never covered by an old yes. Deleting the file withdraws the review.
 
 Relay asks for a review through an approve ask whose binding has
 ``kind: package_review``. The guard turns an accepted one into a record the
-next time it looks, so a review survives a restart and needs no hook into the
-moment the person answers.
+next time it looks, while the operation that asked is still open, so a review
+survives a restart and needs no hook into the moment the person answers. The
+answered asks of finished operations are never turned into reviews again.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -106,10 +108,18 @@ class ReviewStore:
                     continue
         return found
 
-    def harvest(self, asks: RecordStore[Ask]) -> int:
-        """Record every accepted, untampered package review ask. Returns how many were new."""
+    def harvest(self, asks: RecordStore[Ask], is_open: Callable[[str], bool]) -> int:
+        """Record each accepted, untampered review ask of an open operation. Returns how many.
+
+        Only an operation still on its way to the site (``is_open`` of its id)
+        has its yes recorded here, which is the step between the answer and the
+        submit. A finished operation's old yes is never read again, so deleting
+        a review file withdraws it for good.
+        """
         added = 0
         for ask in asks.all():
+            if ask.operation_id is None or not is_open(ask.operation_id):
+                continue
             review = _review_of(ask)
             if review is None:
                 continue

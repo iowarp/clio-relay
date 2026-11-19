@@ -11,6 +11,7 @@ from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.hooks import Charge, GuardHook
 from clio_relay.guard import WARM_EXECUTABLE, Guard
 from clio_relay.jarvis_site import ARCHIVE_DIR
+from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.testing.fixture_adapter import FixtureAdapter, FixtureConfig
@@ -136,6 +137,32 @@ async def test_declined_or_tampered_review_asks_review_nothing(
     assert wrong_site.site == "other"
     assert "asks" in (await guard.check_run(hpc, package_spec(digest))).data
     assert guard.reviews.all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_review_stays_withdrawn_once_its_operation_ended(
+    guard: Guard, tmp_path: Path
+) -> None:
+    digest = stage(guard, make_repo(tmp_path), "demo.hello")
+    hpc = site()
+    review = (await guard.check_run(hpc, package_spec(digest))).data["asks"][0]
+    answer(guard, "ask-1", hpc.id, review["message"], {**review["binding"], "site": hpc.id})
+    assert "asks" not in (await guard.check_run(hpc, package_spec(digest))).data
+
+    record = guard.operations.get("op-1")
+    assert record is not None
+    record.move(OperationState.COMPLETED)
+    guard.operations.put("op-1", record)
+    for path in (guard.reviews.root / hpc.id).glob("*.json"):
+        path.unlink()
+    again = await guard.check_run(hpc, package_spec(digest))
+    assert again.data["review"] is None
+    assert again.data["asks"][0]["binding"]["package_hash"] == digest
+    assert guard.reviews.all() == []
+
+    answer(guard, "ask-2", hpc.id, review["message"], {**review["binding"], "site": hpc.id},
+           operation_id="op-2")
+    assert (await guard.check_run(hpc, package_spec(digest))).data["review"]["ask_id"] == "ask-2"
 
 
 @pytest.mark.asyncio

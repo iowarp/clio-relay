@@ -9,7 +9,7 @@ from clio_relay.adapters.hooks import Ask, HookContext
 from clio_relay.guard import Guard, create_guard
 from clio_relay.jarvis_site import archive_package
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.records import RecordStore
+from clio_relay.jobs.records import OperationRecord, OperationState, RecordStore
 from clio_relay.sites.models import SiteEntry
 
 PKG = """from jarvis_cd.core.pkg import Application
@@ -81,13 +81,31 @@ def answer(
     binding: dict[str, Any],
     *,
     state: str = "accepted",
+    operation_id: str = "op-1",
 ) -> Ask:
-    """Store an approve ask for ``binding`` the way relay's ask provider does, and answer it."""
-    ask = Ask(ask_id=ask_id, kind="approve", site=site_id, operation_id="op-1", message=message)
+    """Store an approve ask for ``binding`` the way relay's ask provider does, and answer it.
+
+    The operation that asked is recorded too, waiting on the answer, unless it already is.
+    """
+    ask = Ask(
+        ask_id=ask_id, kind="approve", site=site_id, operation_id=operation_id, message=message
+    )
     ask.bind(binding)
     if state == "accepted":
         ask.resolve("accepted", {"action": "accept", "content": {"approve": True}}, "test")
     elif state == "declined":
         ask.resolve("declined", {"action": "decline"}, "test")
     guard.context.asks.put(ask_id, ask)
+    if guard.operations.get(operation_id) is None:
+        record = OperationRecord(
+            operation_id=operation_id,
+            kind="run",
+            site=site_id,
+            adapter="fixture",
+            spec={},
+            spec_digest="0" * 64,
+            state=OperationState.AWAITING_INPUT,
+            asks=[ask_id],
+        )
+        guard.operations.put(operation_id, record)
     return ask

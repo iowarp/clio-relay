@@ -124,9 +124,13 @@ class Guard:
     def reviewed(self, site_id: str, package: PackageRef) -> Review | None:
         """Return the review of ``package`` on ``site_id``, picking up new answers first."""
         found = self.reviews.get(site_id, package)
-        if found is None and self.reviews.harvest(self.context.asks):
+        if found is None and self.reviews.harvest(self.context.asks, self._open):
             found = self.reviews.get(site_id, package)
         return found
+
+    def _open(self, operation_id: str) -> bool:
+        record = self.operations.get(operation_id)
+        return record is not None and not record.state.final
 
     # check_run
 
