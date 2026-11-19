@@ -113,9 +113,7 @@ class NoRootStat(MemoryFiles):
 
 
 @pytest.mark.parametrize("path", ["/", "/work/", "~", "/home/ada"])
-async def test_protected_paths_refuse_before_the_site_is_asked(
-    tmp_path: Path, path: str
-) -> None:
+async def test_protected_paths_refuse_before_the_site_is_asked(tmp_path: Path, path: str) -> None:
     with pytest.raises(Refusal) as refused:
         await NoRootStat(tmp_path).delete(path, recursive=True)
     assert refused.value.reason == RefusalReason.INVALID_ARGUMENTS

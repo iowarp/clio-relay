@@ -28,7 +28,9 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     kept: list[pytest.Item] = []
     for item in items:
         markers = list(item.iter_markers(name="release_platform"))
-        if len(markers) > 1 or any(m.kwargs or m.args not in (("posix",), ("windows",)) for m in markers):
+        if len(markers) > 1 or any(
+            m.kwargs or m.args not in (("posix",), ("windows",)) for m in markers
+        ):
             raise pytest.UsageError(f"{item.nodeid}: use one release_platform('posix'|'windows')")
         if not markers or markers[0].args[0] == here:
             kept.append(item)

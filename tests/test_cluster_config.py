@@ -52,9 +52,7 @@ def test_frpc_bin_prefers_the_environment(monkeypatch: pytest.MonkeyPatch) -> No
     assert RelaySettings.from_env().frpc_bin == "/opt/frp/frpc"
 
 
-def test_frpc_bin_falls_back_to_the_name(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_frpc_bin_falls_back_to_the_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))

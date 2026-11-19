@@ -98,8 +98,8 @@ class JobAttributes(_Spec):
             custom_attributes=custom,
         )
         # psij's constructor defaults to 10 minutes and refuses None; the setter takes
-        # None, which sends no walltime at all.
-        attributes.duration = self.duration
+        # None, which sends no walltime at all, though psij's types do not say so.
+        attributes.duration = self.duration  # pyright: ignore[reportAttributeAccessIssue]
         return attributes
 
 

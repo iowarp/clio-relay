@@ -81,22 +81,12 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: Recorded percentage of src-family files under SWEET_SPOT_LINES, floored to
 #: two decimals at measurement time. May only RISE, except when deleting
 #: small files lowers the share without any file growing; record why here.
-#: Set to 91.44 (171/187) when the old system's small modules were deleted.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 91.48
+#: 92.15 (141/153) after the old queue, storage and models layers were deleted.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 92.15
 
-#: Same guard for tests/ with its own (much lower) starting point
-#: (126/203 = 62.06% when first recorded; clio-relay#214 added
-#: test_application_runtime_prediction.py, then in the review-fix round
-#: test_execution_watch_prediction.py and
-#: test_queue_progress_bounded_window.py, raising it to 129/206 = 62.62%;
-#: iowarp/clio-relay#285 added two under-500 reconciliation test files).
-#: Raised to 64.01 when the relay rework's W2 added tests/test_fixtures_smoke.py
-#: and tests/conftest.py, both under 500 lines.
-#: Raised to 77.43 (175/226) when the Compute tab's change tests moved to
-#: tests/relay_next/test_compute_tab_changes.py, and to 77.53 (176/227) when its
-#: form tests moved to tests/relay_next/test_compute_tab_forms.py.
-#: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 94.73
+#: Same guard for tests/. May only RISE.
+#: 95.45 (105/110) after the old queue, storage and models tests were deleted.
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 95.45
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

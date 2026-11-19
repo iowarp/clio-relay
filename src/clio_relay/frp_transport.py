@@ -87,8 +87,11 @@ from clio_relay.frp_link import (
 )
 from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.frp_visitor_reconciliation import reconcile_stale_frp_visitors
-from clio_relay.session_api import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
-from clio_relay.session_api import SESSION_IDENTITY_SCHEMA
+from clio_relay.session_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    SESSION_IDENTITY_SCHEMA,
+)
 
 MAX_BRING_UP_FETCH_BYTES: Final = MAX_CHANNEL_BOOTSTRAP_BYTES
 

@@ -40,7 +40,10 @@ def _tool_bin(env_name: str, name: str) -> str:
     on_path = shutil.which(name)
     if on_path is not None and _works(Path(on_path)):
         return name
-    candidates = [Path.home() / ".local" / "bin" / name, Path.cwd() / ".tools" / "frp" / "bin" / name]
+    candidates = [
+        Path.home() / ".local" / "bin" / name,
+        Path.cwd() / ".tools" / "frp" / "bin" / name,
+    ]
     if os.name == "nt":
         candidates.append(Path.cwd() / ".tools" / "frp" / "bin" / f"{name}.exe")
     for candidate in candidates:

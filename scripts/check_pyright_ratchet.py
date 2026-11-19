@@ -56,9 +56,9 @@ from typing import Any, NamedTuple
 
 # Repo-wide pyright strict-mode error count, measured on Ares with
 # ``uv sync --all-extras`` and the pinned pyright. It may only go DOWN: a change
-# that fixes errors lowers it in the same change. The history of the old
-# system's burn-down is in docs/design/relay-rework-ledger.md.
-BASELINE_TOTAL = 234
+# that fixes errors lowers it in the same change. It reached 0 when the old
+# system was deleted; see docs/design/relay-rework-ledger.md.
+BASELINE_TOTAL = 0
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
