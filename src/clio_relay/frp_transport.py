@@ -229,8 +229,8 @@ class _FrpChannelTransport:
         iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
         reconciliation pass runs for this exact ``frpc_bin`` -- re-verified,
         pid-reuse-safe reaping (D1) of any prior visitor whose owning CLI
-        process is gone (a ``kill -9`` or crash the atexit hook in
-        ``remote_connection_registry.py`` could never have caught), each
+        process is gone (a ``kill -9`` or crash the worker adapter's atexit
+        hook could never have caught), each
         reap also removing its own secret-bearing config dir (D3), plus a
         once-per-process sweep (D8) of aged crash-orphaned config dirs
         regardless of emptiness. This never blocks a legitimate concurrent
