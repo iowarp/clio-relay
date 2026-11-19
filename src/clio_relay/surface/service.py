@@ -36,13 +36,15 @@ from clio_relay.jobs.records import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
+from clio_relay.packages import PackageCatalog
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.guarding import approval_message, review_asks
-from clio_relay.surface.outputs import marked_status
+from clio_relay.surface.outputs import marked_status, stdout_tail
+from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
 from clio_relay.surface.transient import drop_transient
@@ -50,7 +52,6 @@ from clio_relay.surface.transient import drop_transient
 logger = logging.getLogger(__name__)
 
 SUBMIT_GRACE = timedelta(minutes=2)
-OUTPUT_TAIL_BYTES = 8 * 1024
 
 _JOB_TO_OPERATION = {
     JobState.QUEUED: OperationState.QUEUED,
@@ -82,6 +83,7 @@ class RelayService:
         self.paths = paths
         self.sites = SiteStore(paths.sites_file)
         self.content = ContentStore(paths.content_dir)
+        self.packages = PackageCatalog(paths.packages_dir)
         self.operations: RecordStore[OperationRecord] = RecordStore(
             paths.operations_dir, OperationRecord
         )
@@ -183,7 +185,9 @@ class RelayService:
     # run
 
     def apply_defaults(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
-        """Fill the queue, account and walltime the site defaults to."""
+        """Fill the queue, account and walltime the site defaults to, and pin the package."""
+        if spec.package is not None:
+            spec = spec.model_copy(update={"package": self.packages.resolve(spec.package)})
         attributes = spec.attributes
         changes: dict[str, Any] = {}
         if attributes.queue_name is None and site.defaults.queue is not None:
@@ -580,9 +584,12 @@ class RelayService:
             return record
         try:
             status = await adapter.status(handle)
-        except Refusal as refusal:
-            logger.warning("observing %s: %s", operation_id, refusal.message)
-            return record
+        except Exception as exc:
+            # One failed look is not the job's end; it stays open and says why.
+            logger.warning("observing %s", operation_id, exc_info=True)
+            reason = exc.message if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
+            return self._observation_failed(operation_id, reason, "job")
+        status = await with_package_progress(adapter, record, status)
         return await self._apply(operation_id, adapter, status)
 
     async def _refresh_service(
@@ -608,12 +615,15 @@ class RelayService:
             return self._observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
         return await self._apply(operation_id, adapter, status, endpoint)
 
-    def _observation_failed(self, operation_id: str, error: str) -> OperationRecord:
+    def _observation_failed(
+        self, operation_id: str, error: str, what: str = "service"
+    ) -> OperationRecord:
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if not record.state.final:
                 result = dict(record.result or {})
-                result["message"] = f"relay could not observe the service: {error}"
+                result["message"] = f"relay could not observe the {what}: {error}"
+                result["observation_failed_at"] = utc_now().isoformat()
                 record.result = result
                 self.operations.put(operation_id, record)
             return record
@@ -645,7 +655,7 @@ class RelayService:
     ) -> OperationRecord:
         tail: str | None = None
         if status.state.final:
-            tail = await self._stdout_tail(adapter, status)
+            tail = await stdout_tail(adapter, status)
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if record.state.final:
@@ -655,38 +665,23 @@ class RelayService:
             status = marked_status(record, status)
             record.outputs = status.outputs
             result = dict(record.result or {})
+            result["observed_at"] = status.observed_at.isoformat()
+            result["native_state"] = status.native_state
+            result.pop("observation_failed_at", None)
             if status.progress is not None:
                 result["progress"] = status.progress.model_dump(mode="json")
-            if record.kind == "serve":
-                if endpoint is not None:
-                    result["endpoint"] = public_endpoint(endpoint)
-                if status.message is not None:
-                    result["message"] = status.message
-            if status.state.final:
-                result["native_state"] = status.native_state
-                if tail is not None:
-                    result["stdout_tail"] = tail
+            if status.message is not None:
+                result["message"] = status.message
+            elif record.kind != "serve":
+                result.pop("message", None)
+            if record.kind == "serve" and endpoint is not None:
+                result["endpoint"] = public_endpoint(endpoint)
+            if status.state.final and tail is not None:
+                result["stdout_tail"] = tail
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)
         return record
-
-    async def _stdout_tail(self, adapter: BaseAdapter[Any], status: JobStatus) -> str | None:
-        if "files" not in type(adapter).implements:
-            return None
-        output = next((item for item in status.outputs if item.name.startswith("stdout")), None)
-        if output is None:
-            output = next((item for item in status.outputs if item.name.endswith(".out")), None)
-        if output is None:
-            return None
-        try:
-            files = await adapter.files()
-            size = output.size if output.size is not None else (await files.stat(output.path)).size
-            offset = max(0, (size or 0) - OUTPUT_TAIL_BYTES)
-            data = await files.read(output.path, offset=offset, limit=OUTPUT_TAIL_BYTES)
-        except Refusal:
-            return None
-        return data.decode("utf-8", errors="replace")
 
     async def cancel(self, operation_id: str) -> OperationRecord:
         """Cancel an operation wherever it is."""

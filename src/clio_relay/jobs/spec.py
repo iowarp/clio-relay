@@ -128,11 +128,23 @@ class InputRef(_Spec):
 
 
 class PackageRef(_Spec):
-    """A reviewed JARVIS package, pinned by version and hash (RL24)."""
+    """A reviewed JARVIS package, pinned by version and hash (RL24).
 
-    name: str = Field(min_length=1)
-    version: str = Field(min_length=1)
-    sha256: str
+    A request may leave out ``version`` and ``sha256``. Relay then fills them
+    from its package catalog before the guard sees the job, so what is stored,
+    reviewed and run is always pinned.
+    """
+
+    name: str = Field(min_length=1, description="<repository>.<package>")
+    version: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Leave out to use the newest version relay has (describe(site=) lists them)",
+    )
+    sha256: str | None = Field(
+        default=None,
+        description="The archive's SHA-256. Leave out to use the catalogued archive",
+    )
     parameters: dict[str, CustomValue] = Field(default_factory=dict[str, CustomValue])
     service: bool = Field(
         default=False,
@@ -144,8 +156,14 @@ class PackageRef(_Spec):
 
     @field_validator("sha256")
     @classmethod
-    def _digest(cls, value: str) -> str:
-        return _check_digest(value)
+    def _digest(cls, value: str | None) -> str | None:
+        return None if value is None else _check_digest(value)
+
+    def pinned(self) -> tuple[str, str]:
+        """Return ``(version, sha256)``, which relay fills before a job is checked."""
+        if self.version is None or self.sha256 is None:
+            raise ValueError(f"package {self.name} is not pinned to a version and SHA-256")
+        return self.version, self.sha256
 
 
 class JobSpec(_Spec):

@@ -87,7 +87,7 @@ def record(spec: JobSpec, *, content_dir: str, package_root: str, guarded: bool)
     if spec.package is not None:
         package = spec.package
         params = [f"{key}={value}" for key, value in package.parameters.items()]
-        return head + [package.name, package.version, package.sha256, *params]
+        return head + [package.name, *package.pinned(), *params]
     if guarded:
         raise guarded_refusal()
     assert spec.executable is not None
