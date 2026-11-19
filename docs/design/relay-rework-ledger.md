@@ -1194,11 +1194,12 @@ The diff is 487 files, +1404 and -234331 lines.
 - **Cold conformance kit** (`tests/worker`, at de4d8e7, a fresh remote directory and wheel on fx-slurm): 23 passed, none failed or skipped.
 - **LQ1 and LQ32** (at 702cf19, wheel in a clean venv). `--help` lists serve, connect, adapters, site, rendezvous, asks and worker. `clio-relay` and `python -m clio_relay` list exactly the five tools on 2026-07-28 and 2025-11-25, with and without A2UI. No hits for the LQ32 names in the tree outside `docs/design`, in tracked paths, in the wheel (254 files) or in the installed package.
 - **After the files merge** (50c6bbb, Ares login node): `tests/worker` without the live kit, `tests/relay_next/test_files_tool.py` and `tests/relay_next/test_server.py`, 41 passed, none failed or skipped.
-- **Cold conformance kit after the files merge** (b7c2b4a, wheel sha256 `92ab672fb77f?`, remote directory `~/w8-live/cold-1795045324` on fx-slurm): `tests/worker`, 32 passed (18 unit, 14 conformance, including W1's files delete and chunked write), none failed or skipped.
+- **Cold conformance kit after the files merge** (b7c2b4a, wheel sha256 prefix `92ab672fb77f`, remote directory `~/w8-live/cold-1795045324` on fx-slurm): `tests/worker`, 32 passed (18 unit, 14 conformance, including W1's files delete and chunked write), none failed or skipped.
 - **The full suite**, once, in Slurm job 27849 at 50c6bbb, serially, without the live kit (a compute node cannot reach the fixtures): 1094 passed, 82 failed, no errors, none skipped. Every failure has a cause:
   - 69 need W2's fixtures on the login node's loopback: `relay_ssh` (51), `test_fixtures_smoke` (12), `relay_tapis/test_tapis_register` (4, it registers on fx-ssh) and `asks/test_askpass_otp` (2). On the login node at b7c2b4a, with the fixtures env, those modules passed 185 of 185, none skipped.
   - 10 in `test_cli_cluster.py`, which drove the removed `worker cluster` group. Deleted (b7c2b4a).
   - 3 ratchet tests read stale baseline entries in W1's scripts: `check_file_size.py` lists 8 deleted worker files, and `check_no_class_in_function.py` lists the deleted `wheel_snapshot_identity.py`. Requested from W1 below.
+- **Dead code after W9's frp_check deletion** (a907a38, on W9's b4db84e): `bounded_payload`, `pagination` and `redaction` had no caller left, and `errors.py` keeps only `PublicMessageError`, `RelayError` and `ConfigurationError`. src 1,737,587 B to 1,706,338 B, tests 960,260 B to 948,104 B. On Ares, `tests/worker` without the live kit, `test_cluster_config`, the `test_frp_*` modules, `test_dev_mode`, `test_remote_value_contract`, `tests/relay_next` and `tests/serve`: 541 passed, none failed or skipped. A full collection has no errors.
 
 ### Workflows
 
