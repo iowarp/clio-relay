@@ -123,8 +123,8 @@ async def test_final_chunk_checks_the_target_again(target: ConformanceTarget, si
     (site / "race.txt").write_text("someone else")
     await refused(RefusalReason.PATH_EXISTS, files.write("race.txt", b"end", offset=5))
     assert (site / "race.txt").read_text() == "someone else"
-    held = (await files.stat(part_path("race.txt"))).size or 0
-    await files.write("race.txt", b"end"[held - 5 :], offset=held, overwrite=True)
+    assert (await files.stat(part_path("race.txt"))).size == 5
+    await files.write("race.txt", b"end", offset=5, overwrite=True)
     assert (site / "race.txt").read_text() == "part end"
 
 
