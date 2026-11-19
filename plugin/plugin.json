@@ -37,6 +37,11 @@
         "origins": [
           "https://tacc.tapis.io"
         ]
+      },
+      "setup": {
+        "files": [
+          "config/sites.yaml"
+        ]
       }
     }
   }
