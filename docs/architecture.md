@@ -72,14 +72,13 @@ the single admission credential.
 | job lane | identity policy | attribution rationale |
 |---|---|---|
 | `jarvis` | required | The job directly represents application work whose JARVIS execution may carry scheduler `native_id` provenance. |
-| `remote_agent` | required | The parent agent and any scheduler work it initiates need one durable owning session generation. |
 
 Supplying only one header is always a typed refusal. An owner-session-scoped
 API additionally verifies that the pair matches its exact live generation.
 Older lifecycle ownership metadata remains readable for teardown compatibility,
 but the direct `RelayJob` fields are the scheduler-attribution wire contract.
 
-Application behavior belongs in JARVIS packages or operator-selected application profiles. JARVIS core owns execution identity, durable progress events, and aggregate progress snapshots; an individual package owns only the application-specific interpretation used to produce those events. Generic bootstrap and worker code do not import application modules or infer application log paths. The generic bounded-command package stays generic.
+Application behavior belongs in JARVIS packages or operator-selected application profiles. JARVIS core owns execution identity, durable progress events, and aggregate progress snapshots; an individual package owns only the application-specific interpretation used to produce those events. Generic bootstrap and worker code do not import application modules or infer application log paths.
 
 The production boundary is the native JARVIS contract. Every run returns exact
 `jarvis.execution.handle.v1`, `jarvis.execution.record.v1`, and
