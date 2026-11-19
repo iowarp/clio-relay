@@ -1,9 +1,62 @@
-"""The adapter interface (RL6) and the base class adapters extend.
+"""The adapter contract: everything an adapter implements and uses (RL6).
 
-An adapter is one way into a site. It declares a ``Config`` model, whose JSON
-Schema drives validation and the compute tab's form, and the verbs it
-implements. Every verb it does not implement refuses with
-``verb_not_implemented``, which the conformance kit checks (RL7).
+An adapter is one way into a site: SSH, a facility's REST API, a transfer
+service, a cloud. It is a subclass of :class:`BaseAdapter` with three class
+attributes and the verbs it supports. Everything it needs is importable from
+this module; docs/adding-an-adapter.md walks through it and
+``examples/adapter-template`` is a complete one to copy.
+
+What an adapter declares:
+
+- ``name``: the adapter's name in ``sites.yaml`` and the entry point.
+- ``Config``: a pydantic model of a site's settings. Its JSON Schema validates
+  ``sites.yaml`` and draws the Compute tab's form. Use ``extra="forbid"``.
+- ``implements``: the verbs it supports, from :data:`VERBS`.
+
+What it implements, by verb (each one it leaves out refuses with
+``verb_not_implemented``, which the conformance kit checks):
+
+- ``describe``: :meth:`BaseAdapter.describe`, the probe. Report the site; it
+  must work without side effects.
+- ``run``: :meth:`~BaseAdapter.run`, :meth:`~BaseAdapter.status`,
+  :meth:`~BaseAdapter.cancel` and :meth:`~BaseAdapter.find`. Handles are JSON
+  and outlive the process: a fresh instance must observe and cancel a job.
+  Inputs named by digest come from ``context.content``.
+- ``exec``: :meth:`~BaseAdapter.exec`, one bounded command.
+- ``files``: :meth:`~BaseAdapter.files` returns a
+  :class:`~clio_relay.jobs.handles.FileAccess` under docs/files.md. A remote
+  site subclasses :class:`SiteFiles` and implements six primitives.
+- ``serve``: :meth:`~BaseAdapter.serve`, used by the serve hook.
+
+Sign-in and secrets: :meth:`~BaseAdapter.sign_in_needed` returns a
+:class:`SignInNeed` when the adapter cannot act yet. ``provider`` is
+``keyring:<name>`` for a key the person types on relay's page, which the
+adapter then reads with :meth:`AdapterContext.secret`, or the provider's own
+``url`` for a browser sign-in, after which relay calls
+:meth:`~BaseAdapter.sign_in_done`.
+
+Errors: every failure the person or the agent can act on is a :class:`Refusal`
+with one :class:`RefusalReason`; clients branch on the reason. A missing token
+is ``needs_sign_in``, a facility that does not answer is ``unreachable``, a bad
+setting is ``invalid_config``, and a missing path is ``path_not_found``.
+
+Policy: a site is open or guarded. The guard sits in front of every adapter,
+so an adapter does not enforce it. On a guarded site the guard turns a reviewed
+JARVIS package into a plain command job, unless the adapter sets
+``runs_packages`` and runs :attr:`JobSpec.package` itself.
+
+Optional hooks, found by name when an adapter defines them:
+
+- ``on_site_added(site)``: :class:`SiteAdded`; set the site up when it is saved.
+- ``job_name(operation_id) -> str``: the scheduler job name relay shows.
+- ``price(spec) -> Charge``: what a job would cost, for the spend question.
+- ``system_id()``: the facility's own id for the site, shown in the tab.
+- ``ssh_argv``, ``hop_exec``, ``transport``: SSH-based adapters only, for the
+  serve hook's port forwarding.
+
+Registration: an entry point in the group ``clio_relay.adapters`` names the
+class (see :mod:`clio_relay.adapters.registry`). Relay's own code does not
+change.
 """
 
 from __future__ import annotations
@@ -14,17 +67,23 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, get_args, ru
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from clio_relay.adapters.site_files import Kind, SiteFiles
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import (
     Endpoint,
+    EndpointPort,
     ExecResult,
     FileAccess,
+    FileEntry,
     JobHandle,
+    JobProgress,
+    JobState,
     JobStatus,
+    OutputRef,
     StallReport,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.jobs.spec import InputRef, JobSpec, PackageRef, ServiceSpec
 
 if TYPE_CHECKING:
     from clio_relay.sites.models import SiteEntry
@@ -62,11 +121,24 @@ class SignInNeed(BaseModel):
 
 @dataclass(frozen=True)
 class AdapterContext:
-    """What relay gives an adapter when it builds one."""
+    """What relay gives an adapter when it builds one.
+
+    ``state_dir`` is the adapter's own directory for this site; ``content`` is
+    relay's content store, where inputs named by digest are.
+    """
 
     site_id: str
     state_dir: Path
     content: ContentStore
+
+    def secret(self, name: str) -> str | None:
+        """Return a secret the person typed on relay's page, such as an API key.
+
+        Ask for it by returning ``SignInNeed(provider=f"keyring:{name}", ...)``.
+        """
+        from clio_relay.identity.store import TokenStore
+
+        return TokenStore().secret(name)
 
 
 @runtime_checkable
@@ -212,3 +284,36 @@ class BaseAdapter[ConfigT: BaseModel]:
 
     async def sign_in_done(self, answer: dict[str, Any]) -> None:
         return None
+
+
+__all__ = [
+    "VERBS",
+    "Adapter",
+    "AdapterContext",
+    "BaseAdapter",
+    "EmptyConfig",
+    "Endpoint",
+    "EndpointPort",
+    "ExecResult",
+    "FileAccess",
+    "FileEntry",
+    "InputRef",
+    "JobHandle",
+    "JobProgress",
+    "JobSpec",
+    "JobState",
+    "JobStatus",
+    "Kind",
+    "OutputRef",
+    "PackageRef",
+    "Refusal",
+    "RefusalReason",
+    "ServiceSpec",
+    "SignInNeed",
+    "SiteAdded",
+    "SiteFiles",
+    "SiteInfo",
+    "StallReport",
+    "Verb",
+    "not_implemented",
+]

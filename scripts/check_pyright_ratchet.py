@@ -4,7 +4,7 @@
 ``local.pyright`` (:func:`clio_relay.release_validation.run_local_release_validation`)
 used to demand a bare ``uv run --no-sync pyright`` exit 0 across the whole
 strict-mode tree (``[tool.pyright]`` in ``pyproject.toml``: ``typeCheckingMode
-= "strict"``, ``include = ["src", "jarvis-packages", "tests", "scripts"]``).
+= "strict"``, ``include`` covers the source, tests and scripts).
 That was never a real gate: forensics on iowarp/clio-relay#270 traced the
 check to commit 93095eb (2026-07-13, "complete production 1.0 relay
 contracts"), which predates every 1.x release, and reproduced the same
@@ -39,13 +39,6 @@ only the most-erroring files -- no matter how large the real diagnostic
 count is. Never widen this script to print every diagnostic; that
 reintroduces the exact failure mode it exists to fix.
 
-The remaining backlog is tracked in iowarp/clio-relay#271 -- see that issue
-for the full error-class breakdown (leading-underscore names imported across
-the #231/#775 decomposition's owner-module split, and the
-``_ServiceRuntimeStartMixin`` family's sibling-mixin attribute access, which
-needs a real typing design, not mechanical renames) and the burn-down
-direction.
-
 Run as part of CI (blocking) and locally::
 
     uv run python scripts/check_pyright_ratchet.py
@@ -61,114 +54,11 @@ import sys
 from pathlib import Path
 from typing import Any, NamedTuple
 
-# Repo-wide pyright strict-mode error-count ratchet. Measured on a properly
-# LOCKED toolchain (``uv sync --locked --all-groups`` -- uv 0.11.28, pyright
-# 1.1.411, Python 3.12.0, all pinned in uv.lock) against
-# origin/develop @ fba4cdf (iowarp/clio-relay#270, landing the _register/
-# bounded_file_io/clio_kit_wheel_archive public renames and the
-# test_validation_report.py writer-lock repoint). This total may only
-# ratchet DOWN: when a change fixes errors, lower this number in the same
-# change. It must never ratchet up except for a reviewed, justified reason
-# recorded here.
-#
-# clio-relay#265/#259 merge fixup: the #265 outputs_missing verdict and the
-# #259 stderr-channel residual added 19 new strict-mode errors (7843 -> 7862
-# on CI; 7845 -> 7864 measured locally on Windows, which runs ~2 higher than
-# Linux CI for the same tree -- both offsets agree exactly). All 19 traced to
-# genuinely new `self.queue`/`self.storage_runtime` access and one
-# cross-mixin method-return-type gap in four owner modules
-# (JarvisDispatchMixin, JobExecutionMixin, ProgressIngestMixin,
-# ResultFinalizationMixin) plus one dict-literal-narrowing and one now-
-# redundant cast in files this merge touched. Fixed with real typing (per-
-# mixin ``TYPE_CHECKING``-only attribute stubs for the two composing-class
-# attributes strict pyright cannot otherwise resolve across a mixin split,
-# an explicit ``cast`` at the one cross-mixin method-return call site, an
-# explicit ``dict[str, object]`` test annotation, and one dropped
-# now-unnecessary cast) -- no ignores, no suppressions. Each stub also
-# resolved every OTHER pre-existing `self.queue`/`self.storage_runtime`
-# access already in those same four classes, not just the 19 new ones: net
-# -182 (7845 -> 7663 on Windows). Verified zero new diagnostics anywhere in
-# the repo via a full baseline-vs-fixed diff, not just the total dropping.
-#
-# clio-relay#209 one-pass cold bootstrap (adversarial-review B3 fix): the
-# new files (bootstrap_one_pass_script.py, the cli_cluster_deploy.py/
-# bootstrap_pin.py/cli_remote_worker_probe.py target-identity additions,
-# the extended test_bootstrap_preflight_transport.py/test_cli_cluster_
-# deploy.py suites) landed with explicit annotations on every previously-
-# untyped dict literal and lambda strict pyright flagged, plus the
-# established per-import private-usage pragma (the reportPrivateUsage
-# ignore paired with the SLF001 suppression, as used elsewhere in the
-# bootstrap family) for the two cross-module bootstrap-family constants
-# this slice's script composer borrows -- net -5 (7663 -> 7658 on
-# Windows), not a regression to absorb.
-#
-# clio-relay#265/#183/#162/#248 "honest verdict" slice, adversarial-review
-# fix round: the new cross-mixin `self.provider`/`_refuse_empty_jarvis_
-# pipeline` call sites (endpoint_jarvis_dispatch.py/endpoint_job_
-# execution.py) added 5 new strict-mode errors (7663 -> 7668) -- fixed with
-# the same real-typing precedent as the #265/#259 note above (TYPE_CHECKING
-# stubs + a call-site cast, no ignores). While in there, #271's own
-# direction was applied to the four private names this slice's new
-# jarvis_pipeline_precheck.py imports (`_trusted_jarvis_mcp_result`,
-# `_minimal_mcp_runner_environment`, `_endpoint_mcp_runner_command` in
-# endpoint_jarvis_recovery.py; `_write_private_json_file` in
-# endpoint_recovery_directory.py): every caller across the endpoint
-# decomposition already imports them, so the leading underscore was pure
-# reportPrivateUsage noise, not a real privacy boundary -- promoted to
-# public and every import site (including execution_watch.py, which shares
-# all four, and endpoint.py's forward re-exports) repointed. Net: 7663 ->
-# 7636, verified via a full baseline-vs-fixed diff.
-#
-# Post-rebase onto develop (which carries #209's own -5): the two deltas
-# compound independently (disjoint files); re-measured on the rebased tree
-# at 7626 and ratcheted down accordingly.
-#
-# clio-relay#278 adversarial-review fix round (D3): the six ``register_*_
-# routes(..., auth_dependency: object, ...)`` signatures across http_api_
-# routes_{artifacts,jobs,queue,session,events,gateway}.py (two of which --
-# session.py, gateway.py -- also carry a ``session_submission_dependency:
-# object`` parameter) were the root cause of every "Argument of type
-# list[object] cannot be assigned to parameter dependencies of type
-# Sequence[Depends] | None" reportArgumentType error on this surface -- 50
-# instances total, not just the one #278's own new execution-scoped route
-# added (which had been suppressed with a scoped ignore instead of fixing
-# the root; the ratchet forbids exactly that kind of one-site accounting).
-# Retyped all eight parameters to ``fastapi.params.Depends`` (the real
-# runtime type -- every call site already passes ``Depends(...)``); purely
-# mechanical, no call-site or behavior changes. Measured: 7626 -> 7574.
-#
-# clio-relay#179 dial burn-down slice: the new channel-routing modules
-# (remote_channel_dispatch.py, the three new http_api_routes_*.py surfaces,
-# cli_owned_relay_jobs_remote_listing.py) and their two new conformance
-# test files landed fully typed (explicit `fastapi.params.Depends`, typed
-# `def` fakes, one redundant cast dropped) -- its own net -5, measured
-# 7621 on its pre-#278 base. Rebased over #278's -52, the two deltas
-# compound on disjoint sites; re-measured on the merged tree and recorded
-# below.
-#
-# clio-relay#277 owned-session-lease manifest-drift fix: the #277 merge
-# (6306fb6) added QueueOwnerSessionLeaseMixin without registering it in
-# tests/test_core_queue_split_architecture.py's pinned owner tables --
-# fixed by registering its rank/budget/facade methods there (no src/
-# change). While closing the same red baseline,
-# tests/test_service_runtime.py's ``relay_cli._attach_verified_remote_
-# worker``/``relay_cli._write_remote_verified_report`` monkeypatch/call
-# seams, stale since the 1.6.7 release moved both into
-# cli_remote_worker_attach.py, were repointed at the module that actually
-# holds them now -- removing the one real ``reportAttributeAccessIssue``
-# (a static attribute access on a name that no longer exists on
-# ``clio_relay.adapters.worker.cli``) plus one adjacent count movement. Net -2, measured
-# 7569 -> 7567.
-# W8 (relay rework): the old relay_* surface, its tests and the move into
-# adapters/worker took the count from 7498 to 5583, measured on the merged
-# branch at 39f3764.
-# W8: deleting the remaining old-surface modules and their tests, with W9 at
-# 5a01766 and integration at dae2774 merged, took it to 5076 (measured with
-# `uv run` at 8b34a44). Deleting the 1.0 release gate took it to 4929, and
-# the old job kind's helpers to 4925 (W8 at ac9b06d).
-# W1: W9's McpCallSpec retirement (c4e94d4) took it to 4558, measured on
-# Ares at ee5b0d7 with `uv sync --all-extras`.
-BASELINE_TOTAL = 4535
+# Repo-wide pyright strict-mode error count, measured on Ares with
+# ``uv sync --all-extras`` and the pinned pyright. It may only go DOWN: a change
+# that fixes errors lowers it in the same change. The history of the old
+# system's burn-down is in docs/design/relay-rework-ledger.md.
+BASELINE_TOTAL = 234
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this

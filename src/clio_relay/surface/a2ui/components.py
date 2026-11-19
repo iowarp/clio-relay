@@ -1,8 +1,9 @@
 """A small builder for A2UI components, limited to relay's catalog (RL33).
 
-Relay's catalog is a subset of the Basic catalog. :data:`COMPONENTS` names that
-subset, and :class:`Tree` refuses any other component, so a surface can never
-ask CLIO for a component it does not already render.
+Relay's catalog is a subset of the Basic catalog plus CLIO's choice table
+(:data:`TABLE`). :data:`COMPONENTS` names them, and :class:`Tree` refuses any
+other component, so a surface can never ask CLIO for a component it does not
+already render. Only a client that lists relay's catalog gets the table.
 """
 
 from __future__ import annotations
@@ -22,8 +23,10 @@ COMPONENTS = frozenset(
         "TextField",
         "CheckBox",
         "ChoicePicker",
+        "clio.choice-table.v1",
     }
 )
+TABLE = "clio.choice-table.v1"
 
 Component = dict[str, Any]
 

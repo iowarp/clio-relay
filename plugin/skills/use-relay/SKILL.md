@@ -48,5 +48,5 @@ are things to tell the person, not to retry.
 
 ## Sites are the person's
 
-Do not add, edit or remove sites. The person manages them in the Compute tab
+Do not add, edit or remove sites. The person manages them on the Compute page
 or with `clio-relay site` on the command line.

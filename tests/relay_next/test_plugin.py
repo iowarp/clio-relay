@@ -21,7 +21,7 @@ def _json(path: Path) -> Any:
     return json.loads(path.read_text("utf-8"))
 
 
-def test_the_shipped_catalog_is_the_components_the_tab_draws_with() -> None:
+def test_the_shipped_catalog_is_the_components_the_page_draws_with() -> None:
     catalog = _json(CATALOG / "catalog.json")
     clio = _json(CATALOG / "catalog.clio.json")
     assert catalog["catalogId"] == clio["catalogId"] == RELAY_CATALOG_ID
@@ -29,20 +29,23 @@ def test_the_shipped_catalog_is_the_components_the_tab_draws_with() -> None:
     assert set(clio["implements"]) == set(COMPONENTS)
     assert all(row["kernel"] == name for name, row in clio["implements"].items())
     assert "openUrl" in catalog["functions"]
-    refs = set(re.findall(r"#/components/(\w+)", json.dumps(catalog)))
-    assert refs <= set(COMPONENTS)
+    refs = set(re.findall(r"#/components/([\w.-]+)", json.dumps(catalog)))
+    assert refs == set(COMPONENTS)
     assert (CATALOG / clio["instructions"]).is_file()
 
 
-def test_the_manifest_names_the_tab_the_server_serves() -> None:
+def test_the_manifest_names_the_page_the_server_serves() -> None:
     manifest = _json(PLUGIN / "plugin.json")
     assert "title" not in manifest
     clio = manifest["extensions"]["ai.iowarp.clio"]
     assert clio["title"] == "Relay"
-    assert [tab["resource"] for tab in clio["tabs"]] == [TAB_URI]
+    # Compute is a page in CLIO's left bar, not a tab; its id must not be a tab's.
+    assert "tabs" not in clio
+    page = clio["navigation"]
+    assert (page["id"], page["title"], page["resource"]) == ("compute", "Compute", TAB_URI)
     assert [row["provider"] for row in clio["accounts"]] == ["globus"]
     assert clio["elicitation"] == {"loopback": True, "origins": ["https://tacc.tapis.io"]}
-    assert "server" not in clio["tabs"][0]  # mcp.json has a single server
+    assert "server" not in page  # mcp.json has a single server
 
 
 def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:

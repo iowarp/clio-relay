@@ -34,6 +34,9 @@
     },
     "ChoicePicker": {
       "kernel": "ChoicePicker"
+    },
+    "clio.choice-table.v1": {
+      "kernel": "clio.choice-table.v1"
     }
   },
   "instructions": "instructions.md"

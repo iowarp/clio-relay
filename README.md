@@ -89,17 +89,29 @@ machine to forward the service's ports and hold them open:
 clio-relay connect <handle>
 ```
 
+## Bring your own machine or facility
+
+A machine you reach over ssh, or one behind Tapis, Globus Compute or IRI, is a
+new site: one entry in `sites.yaml`, no code. A facility with its own API needs
+an adapter: one Python class in your own package, registered by an entry
+point, with relay's conformance kit to prove it works. Relay's code does not
+change.
+
+- [Adding a machine or an adapter](docs/adding-an-adapter.md): the walkthrough
+- [The adapter template](examples/adapter-template): a complete adapter and a fake facility to copy
+- [Contributing](CONTRIBUTING.md): setting up, the checks, and the layout
+
 ## Documentation
 
 - [MCP tasks](docs/mcp-tasks.md): how `run` and `serve` behave as tasks, and without them
 - [files](docs/files.md): paths, large files and resuming, the same on every site
 - [guarded sites](docs/guarded-sites.md): what a guarded site runs, and how packages are reviewed
 - [rendezvous host](docs/rendezvous-host.md): the meeting point where a service and your machine both dial out
+- [adding a machine or an adapter](docs/adding-an-adapter.md)
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
 - [release](docs/release.md)
 - [brand prompt](docs/brand.md)
-- [ai context](docs/ai/README.md)
 - adapters
   - [globus](docs/adapters/globus.md): jobs through Globus Compute, files through Globus Transfer
   - [iri](docs/adapters/iri.md): the IRI Facility API that NERSC, ALCF, OLCF and ESnet serve
@@ -110,8 +122,10 @@ clio-relay connect <handle>
 
 ## Development
 
+See [CONTRIBUTING](CONTRIBUTING.md).
+
 ```powershell
-uv sync
+uv sync --all-extras
 uv run ruff check --fix
 uv run ruff format
 uv run pyright

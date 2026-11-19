@@ -1,15 +1,14 @@
-"""Artifact index entries and scheduler-backed gateway/service runtime records.
+"""Artifact index entries and gateway session records.
 
 Covers the durable artifact index entry (:class:`ArtifactRef`, including its
-clio-provenance-envelope lifting), the scheduler-backed gateway/visualization
-session (:class:`GatewaySession`), and the generic runtime-supervisor intent
-for a scheduler-backed remote service (:class:`ServiceRuntimeSpec`).
+provenance lifting) and the scheduler-backed gateway session
+(:class:`GatewaySession`) that the worker's queue stores.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -110,132 +109,4 @@ class GatewaySession(BaseModel):
         """Reject empty session labels."""
         if value == "":
             raise ValueError("cluster and name must not be empty")
-        return value
-
-
-class ServiceRuntimeSpec(BaseModel):
-    """Generic runtime supervisor intent for a scheduler-backed remote service."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    kind: str
-    submit_command: list[str] | None
-    status_command: list[str] | None = None
-    cancel_command: list[str] | None = None
-    deployment_driver: str = "jarvis"
-    service_port: int = Field(gt=0, le=65535)
-    protocol: Literal["http", "https"] = "http"
-    health_path: str = "/healthz"
-    health_expected_body: str | None = Field(default=None, max_length=4096)
-    stream_mode: str = "push"
-    stream_path: str | None = "/stream"
-    event_stream_path: str | None = "/events"
-    state_path: str | None = "/state"
-    command_path: str | None = None
-    compatibility_paths: dict[str, str] = Field(default_factory=dict)
-    desktop_bind_addr: str = "127.0.0.1"
-    desktop_bind_port: int = Field(gt=0, le=65535)
-    proxy_name: str | None = None
-    transport_mode: str = "frp-stcp-wss"
-    readiness_timeout_seconds: float = Field(default=300.0, gt=0)
-    poll_seconds: float = Field(default=2.0, gt=0)
-    scheduler: str = "external"
-    connect_url_template: str = "http://{bind_addr}:{bind_port}"
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("kind")
-    @classmethod
-    def service_runtime_kind_must_not_be_empty(cls, value: str) -> str:
-        """Reject empty service runtime kinds."""
-        if value == "":
-            raise ValueError("kind must not be empty")
-        return value
-
-    @field_validator("submit_command")
-    @classmethod
-    def service_runtime_command_must_not_be_empty(
-        cls,
-        value: list[str] | None,
-    ) -> list[str] | None:
-        """Reject empty scheduler submission commands."""
-        if value == []:
-            raise ValueError("submit_command must not be empty")
-        return value
-
-    @field_validator("status_command", "cancel_command")
-    @classmethod
-    def service_runtime_optional_commands_must_not_be_empty(
-        cls,
-        value: list[str] | None,
-    ) -> list[str] | None:
-        """Reject empty optional command arrays."""
-        if value == []:
-            raise ValueError("optional command arrays must not be empty")
-        return value
-
-    @field_validator("deployment_driver")
-    @classmethod
-    def service_runtime_deployment_driver_must_be_known(cls, value: str) -> str:
-        """Restrict deployment driver labels to supported supervisor contracts."""
-        if value not in {"jarvis", "jarvis-bound", "scheduler", "custom"}:
-            raise ValueError("deployment_driver must be jarvis, jarvis-bound, scheduler, or custom")
-        return value
-
-    @model_validator(mode="after")
-    def service_runtime_commands_match_driver(self) -> ServiceRuntimeSpec:
-        """Keep verified bindings command-free and submitted runtimes explicit."""
-        commands = (self.submit_command, self.status_command, self.cancel_command)
-        if self.deployment_driver == "jarvis-bound":
-            if any(command is not None for command in commands):
-                raise ValueError("jarvis-bound runtimes cannot contain lifecycle commands")
-            return self
-        if self.submit_command is None:
-            raise ValueError("submitted service runtimes require submit_command")
-        return self
-
-    @field_validator("stream_mode")
-    @classmethod
-    def service_runtime_stream_mode_must_be_known(cls, value: str) -> str:
-        """Restrict stream mode labels to supported runtime semantics."""
-        if value not in {"push", "pull", "hybrid"}:
-            raise ValueError("stream_mode must be push, pull, or hybrid")
-        return value
-
-    @field_validator(
-        "health_path",
-        "stream_path",
-        "event_stream_path",
-        "state_path",
-        "command_path",
-    )
-    @classmethod
-    def service_runtime_paths_must_be_absolute(cls, value: str | None) -> str | None:
-        """Require HTTP paths to be absolute when present."""
-        if value is not None and not value.startswith("/"):
-            raise ValueError("service runtime HTTP paths must start with /")
-        return value
-
-    @field_validator("health_expected_body")
-    @classmethod
-    def service_runtime_health_body_must_not_be_empty(
-        cls,
-        value: str | None,
-    ) -> str | None:
-        """Reject an empty exact health-response body assertion."""
-        if value == "":
-            raise ValueError("health_expected_body must not be empty")
-        return value
-
-    @field_validator("compatibility_paths")
-    @classmethod
-    def service_runtime_compatibility_paths_must_be_absolute(
-        cls,
-        value: dict[str, str],
-    ) -> dict[str, str]:
-        """Require named compatibility endpoints to be absolute HTTP paths."""
-        for name, path in value.items():
-            if not name:
-                raise ValueError("compatibility path names must not be empty")
-            if not path.startswith("/"):
-                raise ValueError("compatibility paths must start with /")
         return value

@@ -1,15 +1,14 @@
 """The frp process substrate shared by mode (c) and the modes (a)/(b) frp link.
 
-``docs/design/relay-architecture-2026-08.md`` §8.2 (iowarp/clio-relay#231 R4,
-tracked by iowarp/clio-relay#188 item 4) sizes this module from two duplicated
+iowarp/clio-relay#231 R4 (tracked by iowarp/clio-relay#188 item 4) sizes this
+module from two duplicated
 copies of "write frpc TOML, spawn ``frpc``, track it": the local-visitor half
 of ``transport_probe.py``'s ``run_frp_http_probe``/
 ``_run_frp_http_probe_with_proxy_type`` (the remote-side SSH probe scripts
 stay in that module -- only the LOCAL visitor lifecycle moves here) and the
 mode-agnostic held-process primitives ``control_channel.py``'s
 ``SshForwardTransport`` already carries. Issue #233 adds the durable service
-visitor profile here while keeping its remote shell programs in the sibling
-``frp_remote_scripts.py`` owner.
+visitor profile here.
 
 This module owns two concerns:
 
@@ -647,8 +646,7 @@ class HeldFrpVisitor:
             # keep this plaintext-secret-bearing file private.
             config_path.chmod(0o600)
             # Deliberately NOT isolated into its own process group
-            # (contrast service_runtime.py's isolate_process_group=True for
-            # its long-lived, independently-signalable connector): this
+            # (unlike a long-lived, independently-signalable connector): this
             # visitor's lifetime is scoped to its holder -- a transport_probe
             # call or a future held R5 connection -- and should die with
             # that parent rather than survive it as an orphan if cleanup

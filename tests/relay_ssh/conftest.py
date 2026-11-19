@@ -36,7 +36,12 @@ def read_fixtures_env() -> dict[str, str]:
 collect_ignore = (
     []
     if fixtures_env_path() is not None
-    else ["test_ssh_fixtures.py", "test_ssh_conformance.py", "test_ssh_store_fixtures.py"]
+    else [
+        "test_ssh_fixtures.py",
+        "test_ssh_conformance.py",
+        "test_ssh_store_fixtures.py",
+        "test_ssh_link_fixtures.py",
+    ]
 )
 
 

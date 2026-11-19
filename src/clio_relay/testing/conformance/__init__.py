@@ -10,10 +10,12 @@ module and provide a ``target`` fixture that returns a
             return ConformanceTarget(adapter="mine", config={...}, state_dir=tmp_path)
 
 The suite checks the shape of ``describe``, typed refusals for the verbs the
-adapter does not implement, bounded ``exec`` output, a file round trip, the job
-lifecycle, a failing job, cancel, staged inputs, and observing a job from a
-fresh adapter instance, which is what a relay restart looks like. Install the
-``testing`` extra for pytest and pytest-asyncio.
+adapter does not implement, bounded ``exec`` output, the files semantics of
+docs/files.md, the job lifecycle, a failing job, cancel, staged inputs,
+observing a job from a fresh adapter instance (which is what a relay restart
+looks like), typed errors, cancelling a finished job and an ``exec`` call, and
+open and guarded sites. Install the ``testing`` extra for pytest and
+pytest-asyncio.
 """
 
 from __future__ import annotations
@@ -392,6 +394,118 @@ class AdapterConformance:
         with pytest.raises(Refusal) as refused:
             await adapter.run(missing, operation_id=new_id("op"))
         assert refused.value.reason == RefusalReason.INPUT_MISSING
+
+    @pytest.mark.asyncio
+    async def test_errors_are_typed(self, target: ConformanceTarget) -> None:
+        """A missing path is path_not_found; a missing program fails, it does not hang."""
+        if not await _refuses(target, "files"):
+            files = await target.build().files()
+            with pytest.raises(Refusal) as missing:
+                await files.list(f"{target.files_dir}/no-such-dir-{new_id('d')}")
+            assert missing.value.reason == RefusalReason.PATH_NOT_FOUND
+        if not await _refuses(target, "exec"):
+            program = [f"relay-no-such-program-{new_id('p')}"]
+            try:
+                result = await target.build().exec(program, timeout_s=30, max_output_bytes=1000)
+            except Refusal as refusal:
+                assert refusal.reason in (
+                    RefusalReason.INVALID_ARGUMENTS,
+                    RefusalReason.INVALID_SPEC,
+                ), refusal
+            else:
+                assert result.exit_code not in (None, 0), result
+
+    @pytest.mark.asyncio
+    async def test_cancel_after_finish(self, target: ConformanceTarget) -> None:
+        """Cancelling a finished job changes nothing: its final state stands."""
+        if await _refuses(target, "run"):
+            return
+        adapter = target.build()
+        handle = await adapter.run(target.ok_job, operation_id=new_id("op"))
+        status, _ = await wait_final(adapter, handle, target.job_timeout_s, target.poll_s)
+        assert status.state == JobState.COMPLETED, status
+        assert (await adapter.cancel(handle)).state == JobState.COMPLETED
+        assert (await target.build().status(handle)).state == JobState.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_exec_cancelled(self, target: ConformanceTarget) -> None:
+        """Cancelling an exec call with no time limit stops it promptly."""
+        if await _refuses(target, "exec"):
+            return
+        adapter = target.build()
+        call = asyncio.create_task(adapter.exec(target.slow, max_output_bytes=1000))
+        await asyncio.sleep(1)
+        assert not call.done(), "the slow command ended on its own"
+        started = time.monotonic()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, 15)
+        assert time.monotonic() - started < 15
+
+    @pytest.mark.asyncio
+    async def test_open_and_guarded(self, target: ConformanceTarget) -> None:
+        """The guard sits in front of the adapter: an open site runs what the agent
+        asks; a guarded one refuses commands and anything but read-only exec."""
+        from clio_relay.adapters.hooks import Ask, HookContext
+        from clio_relay.guard import Guard
+        from clio_relay.jobs.records import RecordStore
+        from clio_relay.sites.models import SiteEntry
+
+        state = target.state_dir / "guard-state"
+        guard = Guard(HookContext(state_dir=state, asks=RecordStore(state / "asks", Ask)))
+        adapter = target.build()
+
+        def site(policy: str) -> SiteEntry:
+            return SiteEntry.model_validate(
+                {"id": target.site_id, "adapter": target.adapter, "policy": policy}
+            )
+
+        opened, guarded = site("open"), site("guarded")
+        assert (await guard.check_run(opened, target.ok_job)).allowed
+        assert (await guard.check_exec(opened, ["rm", "-rf", "x"])).allowed
+        assert await guard.prepare(opened, target.ok_job, adapter=adapter) == target.ok_job
+        refused = await guard.check_run(guarded, target.ok_job)
+        assert not refused.allowed
+        assert refused.reason == RefusalReason.POLICY_REFUSED
+        assert not (await guard.check_exec(guarded, ["rm", "-rf", "x"])).allowed
+        assert (await guard.check_exec(guarded, ["ls"])).allowed
+        with pytest.raises(Refusal) as kept_out:
+            await guard.prepare(guarded, target.ok_job, adapter=adapter)
+        assert kept_out.value.reason == RefusalReason.POLICY_REFUSED
+
+    @pytest.mark.asyncio
+    async def test_guarded_files_ask_first(self, target: ConformanceTarget) -> None:
+        """docs/guarded-sites.md: on a guarded site, delete and a write that replaces
+        a file need the person's yes; a new file and any open-site op do not."""
+        from clio_relay.sites.models import SiteEntry
+        from clio_relay.surface.files_approval import approval_action
+
+        if await _refuses(target, "files"):
+            return
+        files = await target.build().files()
+
+        def site(policy: str) -> SiteEntry:
+            return SiteEntry.model_validate(
+                {"id": target.site_id, "adapter": target.adapter, "policy": policy}
+            )
+
+        opened, guarded = site("open"), site("guarded")
+        path = f"{target.files_dir}/{new_id('g')}.txt"
+        assert await approval_action(guarded, files, "write", path, overwrite=True) is None
+        await files.write(path, b"first")
+        for policy in (opened, guarded):
+            assert await approval_action(policy, files, "write", f"{path}.new") is None
+        assert await approval_action(opened, files, "write", path, overwrite=True) is None
+        assert await approval_action(opened, files, "delete", path) is None
+        replace = await approval_action(guarded, files, "write", path, overwrite=True)
+        assert replace is not None and path in replace
+        middle = await approval_action(
+            guarded, files, "write", path, overwrite=True, offset=5, final=False
+        )
+        assert middle is None, "only the first and the last chunk of an upload ask"
+        assert await approval_action(guarded, files, "delete", path) is not None
+        assert await approval_action(guarded, files, "delete", f"{path}.gone") is not None
+        await _deletes(files, path)
 
 
 __all__ = [
