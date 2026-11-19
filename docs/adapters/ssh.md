@@ -57,9 +57,10 @@ unchanged. On a guarded site, `exec` runs only the read-only list; anything
 else is refused with `policy_refused`.
 
 Relay asks the scheduler for no walltime of its own. A job's walltime is its
-`duration`, or the site's `defaults.duration` when the job gives none. With
-neither, the batch script has no time line, and the scheduler's default for
-the partition or queue applies.
+`duration`, then the walltime its package's contract gives for the run's
+parameters, then the site's `defaults.duration`. With none of these, the batch
+script has no time line, and the scheduler's default for the partition or
+queue applies.
 
 The spend gate's charge is in node-hours: nodes times walltime. A job with no
 walltime has an unknown cost, so its charge has no amount and no node-hours,
