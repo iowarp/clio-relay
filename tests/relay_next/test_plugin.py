@@ -52,12 +52,14 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     servers = _json(PLUGIN / "mcp.json")["mcpServers"]
     assert list(servers) == ["relay"]
     server = servers["relay"]
-    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]["scripts"]
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]
     assert server["args"][-2:] == ["clio-relay", "serve"]
-    assert "clio-relay" in scripts
+    assert "clio-relay" in project["scripts"]
     source = server["args"][server["args"].index("--from") + 1]
-    pinned = r"clio-relay @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}"
+    # The tapis extra brings tapipy; without it every Tapis call under CLIO refuses.
+    pinned = r"clio-relay\[tapis\] @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}"
     assert re.fullmatch(pinned, source)
+    assert "tapis" in project["optional-dependencies"]
     assert server["env"] == {
         "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
         "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
