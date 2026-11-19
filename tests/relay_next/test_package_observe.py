@@ -244,7 +244,7 @@ async def test_each_look_says_when_and_what_and_a_failed_look_says_so(
         "relay could not observe the job: RuntimeError: ssh: connection reset"
     )
     assert (failed.result or {})["observation_failed_at"]
-    assert "could not observe" in (await tasks.task_result(failed)).status_message
+    assert "could not observe" in str((await tasks.task_result(failed)).status_message)
 
     answer[0] = JobStatus(state=JobState.RUNNING, native_state="RUNNING")
     quiet = await service.refresh(record.operation_id)
