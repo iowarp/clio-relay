@@ -128,7 +128,9 @@ does not count on another.
 
 Reviews are kept under relay's state directory, in `guard/reviews/<site>/`,
 one file per package name, version and hash, each naming the question it came
-from.
+from. Deleting a file withdraws that review: the next run of the package asks
+again. Relay records a yes only while the run that asked is still waiting to
+be submitted, so an old answer never brings a deleted review back.
 
 Relay checks the review again just before it submits, so a package can never
 run without one, even if something changes between the question and the
