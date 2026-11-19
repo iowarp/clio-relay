@@ -1987,6 +1987,24 @@ All live on Ares, on my own stack:
   - On Ares at b7b502d (integration 2db7d8d merged), `tests/relay_next tests/asks` gave 330 passed, 0 skipped. Ruff, the size ratchet and pyright are clean, and the pyright ratchet is at its 4558 baseline.
   - Re-checked live on the pin c1cca62 (marketplace d07aa21) at 1440×900 in el. The catalog check, the policy check and the clear all pass. Screenshots `lq28-1440-el-c2-0{7,8,9}-*.png`. Since W1 hid the fixture adapter, the add form opens on globus, whose required Endpoint fails its own check first, so the policy run picks the local adapter.
   - After a refused add, the re-rendered form shows its first adapter tab again. An error on a field of another adapter's tab would then be out of sight. The selection lives in the renderer, not in the surface's data, so this is for W12 and W3.
+- **The Compute page and its endpoint table, live** on clio-agent dc032521b with gact-tui 712c3a40c (iowarp/gact-tui#1320). The plugin came from marketplace a1fcd94, repinned to the relay branch head: 98aa79b7, then a141639f.
+  - `GET /v1/plugin-pages` lists Compute, and the left bar opens it with no session.
+  - At 1440×900 in en:
+    - the empty page: the defaults row, "Add endpoint" and "No endpoints yet.";
+    - the add form and its ID check;
+    - the add itself, which wrote sites.yaml;
+    - a Security pick on the row (`compute_set_value {row, column, value}`, `policy: open` in sites.yaml);
+    - the row menu, and Probe, which set the caption "The last probe found it ready";
+    - Edit, prefilled; Save renamed the endpoint in sites.yaml;
+    - a Protocol pick of SSH, which opens the edit card with SSH to fill in and doesn't touch the store until Save; Cancel then leaves it as it was;
+    - a defaults-row pick (`row: ""`), "Saved the defaults for new endpoints.";
+    - Remove, its confirmation, and an empty sites.yaml.
+  - At 390×844 in en and el, each row folds to one summary line, and › opens a single picker with every option's description and icon. At 1440×900 in el, CLIO's own text is Greek; relay's text stays English, the known gap.
+  - Screenshots `en-1440-01` to `en-1440-18`, `en-390-0{1,2}`, `el-1440-0{1,2,3}` and `el-390-0{1,2}` (`.png`) are in the session artifacts.
+  - Found on the way:
+    - An open, close, open race between the page's UI and the host refused the first action with 404. W12 fixed it in gact-tui 712c3a40c and W3 in clio-agent dc032521b.
+    - The edit card repeated three form fields as facts above its own heading. Fixed at a141639f.
+  - On Ares at a141639f, `tests/relay_next tests/asks` gave 339 passed, 0 skipped, with ruff, the size ratchet and pyright clean (4535, at the baseline). The option-B tests assert that a plain client sees 5 tools and an A2UI client sees 5 plus the 12 app-only tools in `ACTIONS`, and that a call without a token, or with a made-up one, is refused.
 
 ### Open items
 
@@ -1994,6 +2012,7 @@ All live on Ares, on my own stack:
 - **A plugin update doesn't reach an open session.** The session keeps its resolved snapshot until relay is removed and added again. This is probably by design; I'm noting it for the user guide.
 - **The pin.** `plugin/mcp.json` and the marketplace run `clio-relay serve` from integration 3d0ff6b, which has W14 ec6541e merged (4e81b94). A later relay change moves both pins together.
 - **Two `mcp_resource_updated` per tab action.** On the live stack, each tab action POST is followed by two adjacent `mcp_resource_updated namespace=relay uri=a2ui://clio-relay/compute` lines in the agent log, even for an action that only sets an error. Only one relay process is up. W1's tests show one notification per change inside relay, so the second is probably counted on the host side. This is for W3.
+- **A consent prompt per action tool on the page.** The first use of each relay app tool (open add, add, probe, set value, edit, save, cancel, remove, confirm) raises its own external-MCP consent. The prompt shows the raw call, such as "relay_compute_open_add: token …". It can take more than 10 s to show, sometimes only in the bell. This is for W3.
 
 ### Run sheets for the person rows
 

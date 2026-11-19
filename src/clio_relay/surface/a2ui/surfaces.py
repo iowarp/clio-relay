@@ -14,7 +14,7 @@ relay sends them.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, cast
@@ -330,11 +330,12 @@ def edit_form(
     tokens: ActionTokens,
     errors: dict[str, str],
     pending: str = "",
+    facts: Sequence[str] = (),
 ) -> str:
-    """Add one endpoint's edit form and return its id."""
+    """Add one endpoint's edit form and return its id; ``facts`` go under its heading."""
     base = f"e-{site.id}"
     path = f"/drafts/{site.id}"
-    children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4")]
+    children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4"), *facts]
     children += form_error(tree, base, errors)
     children += field_rows(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.", path)
     children.append(tree.text(f"{base}-ways", "Protocols", "h5"))
@@ -392,20 +393,24 @@ def identity_rows(tree: Tree, base: str, view: SiteView) -> list[str]:
     return rows
 
 
-def settings_rows(tree: Tree, base: str, view: SiteView, security: bool = True) -> list[str]:
-    """Add the endpoint's settings as facts; ``security`` False leaves Security out."""
+def settings_rows(tree: Tree, base: str, view: SiteView, fields: bool = True) -> list[str]:
+    """Add the endpoint's settings as facts.
+
+    ``fields`` False leaves out the settings the edit form shows as fields.
+    """
     site = view.site
     rows: list[str] = []
-    if security:
+    if fields:
         rows.append(tree.fact(f"{base}-policy", "Security", security_name(site.policy)))
     if view.reviewed is not None and site.policy == "guarded":
         rows.append(tree.fact(f"{base}-reviewed", "Reviewed packages", str(view.reviewed)))
-    rows.append(tree.fact(f"{base}-spend", "Ask before spending", spend_text(site)))
     defaults = site.defaults
-    if defaults.account:
-        rows.append(tree.fact(f"{base}-account", "Default account", defaults.account))
-    if defaults.queue:
-        rows.append(tree.fact(f"{base}-queue", "Default queue", defaults.queue))
+    if fields:
+        rows.append(tree.fact(f"{base}-spend", "Ask before spending", spend_text(site)))
+        if defaults.account:
+            rows.append(tree.fact(f"{base}-account", "Default account", defaults.account))
+        if defaults.queue:
+            rows.append(tree.fact(f"{base}-queue", "Default queue", defaults.queue))
     if defaults.duration is not None:
         rows.append(tree.fact(f"{base}-duration", "Default duration", _duration(defaults.duration)))
     if view.has_system_id:
