@@ -92,3 +92,31 @@ async def test_a_recursive_delete_walks_the_tree(tmp_path: Path) -> None:
     await files.delete("tree", recursive=True)
     assert await files.kind("/work/tree") == "missing"
     assert files.files == {}
+
+
+async def test_a_refused_last_chunk_can_be_resent_with_overwrite(tmp_path: Path) -> None:
+    files = MemoryFiles(tmp_path)
+    await files.write("big", b"abcd", final=False)
+    files.files["/work/big"] = b"old"
+    with pytest.raises(Refusal) as refused:
+        await files.write("big", b"ef", offset=4)
+    assert refused.value.reason == RefusalReason.PATH_EXISTS
+    await files.write("big", b"ef", offset=4, overwrite=True)
+    assert files.files["/work/big"] == b"abcdef"
+
+
+class NoRootStat(MemoryFiles):
+    async def kind(self, path: str) -> Kind:
+        if path == "/":
+            raise Refusal(RefusalReason.UNREACHABLE, "403 on stat /")
+        return await super().kind(path)
+
+
+@pytest.mark.parametrize("path", ["/", "/work/", "~", "/home/ada"])
+async def test_protected_paths_refuse_before_the_site_is_asked(
+    tmp_path: Path, path: str
+) -> None:
+    with pytest.raises(Refusal) as refused:
+        await NoRootStat(tmp_path).delete(path, recursive=True)
+    assert refused.value.reason == RefusalReason.INVALID_ARGUMENTS
+    assert "relay does not delete" in refused.value.message

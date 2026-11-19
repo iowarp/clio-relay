@@ -188,13 +188,14 @@ class SiteFiles(ABC):
         held = part.stat().st_size if offset and part.is_file() else 0
         if held != offset:
             raise resume_refusal(path, held)
+        # Refuse before the final chunk joins the part, so a resend with overwrite fits.
+        if final and offset and not overwrite and await self.kind(target) != "missing":
+            raise self._exists(path)
         part.parent.mkdir(parents=True, exist_ok=True)
         with part.open("ab" if offset else "wb") as handle:
             handle.write(data)
         if not final:
             return FileEntry(path=target + PART_SUFFIX, kind="file", size=offset + len(data))
-        if not overwrite and await self.kind(target) != "missing":
-            raise self._exists(path)
         await self.upload(target, part)
         part.unlink()
         return await self.describe(target)
@@ -203,11 +204,12 @@ class SiteFiles(ABC):
         if not path:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give the path to delete")
         target = self.resolve(path)
+        # Before ``kind``: a facility may refuse to stat ``/`` at all.
+        if target in {self.root, self.home, "/"}:
+            raise protected_refusal(path)
         kind = await self.kind(target)
         if kind == "missing":
             raise self._missing(path)
-        if kind == "dir" and target in {self.root, self.home, "/"}:
-            raise protected_refusal(path)
         if kind != "dir":
             await self.remove(target)
         elif await self.children(target):

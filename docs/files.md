@@ -66,9 +66,9 @@ asked for.
 | local, fixture | yes | yes | yes | The reference implementation. |
 | any adapter built on `SiteFiles` | yes | yes | yes | `SiteFiles` applies these rules over six primitives; see [adding an adapter](adding-an-adapter.md#files). |
 | worker | yes | yes | yes | The site side runs the local implementation. |
-| tapis | yes | yes | yes | Tapis Files has no append, so each chunk re-sends the part. |
+| tapis | yes | yes | yes | Tapis Files has no append, so chunks are staged locally and sent once with the final chunk. |
 | ssh | yes | yes | yes | One remote script per op, so each op costs one ssh round trip. |
-| globus | yes | not yet | not yet | |
-| iri | yes, up to the API's size limit | not yet | not yet | |
+| globus | yes | yes | yes | Built on `SiteFiles`. Chunks are kept in `.relay-parts` in the local collection and moved with one transfer on the final chunk. |
+| iri | yes | yes | yes, up to 5 MiB | Built on `SiteFiles`. The API takes at most 5 MiB per upload; a larger write refuses and points at globus. A recursive delete is one `rm`. |
 
 A site that does not take an op yet refuses it with `verb_not_implemented`.
