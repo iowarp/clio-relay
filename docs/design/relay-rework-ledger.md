@@ -1545,7 +1545,7 @@ Also on Ares:
 - **Launcher and cancel**: two jobs on one system upload the launcher tar once and make the app once; the tar holds only `tapisjob_app.sh`, mode 0755. A cancel after the job ended gets the stub's 409 and reports `completed`.
 - **Deleted as unused**: `TapisFiles.mkdir` and the `files.mkdir` call, `SshHost.partitions`, `tacc.py`'s `client_factory`, and the stub's `mkdir`, `/_stub/jobs/<uuid>/release` and `/_stub/jobs/<uuid>/status` routes with the `forced` flag behind them.
 
-**`TapisFiles` on W1's `SiteFiles`, on integration b048c686.** On Ares, `tests/relay_tapis`, the two ratchets and the catalog, skills and plugin tests: 116 passed, 0 failed, 0 skipped (junit `tests="116" failures="0" errors="0" skipped="0"`). Ruff, format and pyright are clean on the W10 paths, and `bash -n` on `tapisjob_app.sh`.
+**`TapisFiles` on W1's `SiteFiles`, on integration b048c686, and again on 0b3fda0e.** On Ares, `tests/relay_tapis`, the two ratchets and the catalog, skills and plugin tests: 116 passed, 0 failed, 0 skipped at each (junit `tests="116" failures="0" errors="0" skipped="0"`). On 0b3fda0e a final chunk refused with `path_exists` leaves the part at 5 bytes, and the same chunk resent with `overwrite` at offset 5 lands. Ruff, format and pyright are clean on the W10 paths, and `bash -n` on `tapisjob_app.sh`.
 - **One upload per chunked file**: a three-chunk upload sends no Tapis request before the final chunk; the final chunk sends exactly one `insert` (`POST /v3/files/ops/<system>/.../up/data.bin`), and no `.relay-part` is left on the system or in relay's state dir. A new adapter resumes from the staged part's size.
 - **The kit's files tests**, `test_files_chunked_write` included, and both modes (`test_tapis_modes.py`) pass on the new base. Staged inputs land in `<work dir>/.relay-content/`, and the launcher and the `tapislocal` inputs read them there.
 - **Deleted as unused**: `TapisFiles.move`, `exists` and the custom `stage`, and the stub's `moveCopy` route.
@@ -1609,8 +1609,7 @@ All are **pending**, never passed. They wait on the owner blockers below. The pe
 
 - **W13:** the package archive must hold the repo's `schemas/` beside `clio_jarvis/`, or clio-jarvis's contract loader fails at `ppl append` (job 27773).
 - **W1:** link `docs/adapters/tapis.md` from the docs index; note `tests/relay_tapis/` as a test directory.
-- **W1:** in `docs/files.md`'s adapter table, tapis's chunked-write note should now read "Tapis Files has no append, so chunks are staged locally and sent once with the final chunk".
-- **W1's `SiteFiles`:** `write` appends the final chunk to the part before checking `overwrite`, so a final chunk refused with `path_exists` stays in the part, and resending it at the same offset with `overwrite` refuses with `resume_at` past it. A client that follows `resume_at` still gets the right file. Checking the target before appending would let the same chunk be sent again.
+- **W1, done in 0b3fda0e:** the tapis note in `docs/files.md` reads "Tapis Files has no append, so chunks are staged locally and sent once with the final chunk", and `SiteFiles.write` refuses `path_exists` on a final chunk before it joins the part, so a resend with `overwrite` lands at the same offset.
 - **Shared fixture:** LQ40 edits `fx-ssh`'s `authorized_keys` only on lines with the comment `clio-relay-tapis:<system id>`, and removes them in `finally`.
 
 ## W11. globus, iri and sky
