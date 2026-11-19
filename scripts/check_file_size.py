@@ -97,7 +97,10 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: tree carries both new modules: 484/625 = 77.44%. May only RISE.
 #: Raised to 82.18 (452/550) when W1 split the Compute tab's add form and
 #: message builders out of W14's surfaces.py.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 92.95
+#: Set to 91.44 (171/187) when the old system's small modules were deleted
+#: (W8 and W9, the JARVIS repository): deleting small files lowers the share
+#: without any file growing.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 91.44
 
 #: Same guard for tests/ with its own (much lower) starting point
 #: (126/203 = 62.06% when first recorded; clio-relay#214 added
@@ -111,7 +114,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 92.95
 #: tests/relay_next/test_compute_tab_changes.py, and to 77.53 (176/227) when its
 #: form tests moved to tests/relay_next/test_compute_tab_forms.py.
 #: May only RISE.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 93.33
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 94.73
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

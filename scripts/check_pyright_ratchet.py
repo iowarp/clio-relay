@@ -58,7 +58,7 @@ from typing import Any, NamedTuple
 # ``uv sync --all-extras`` and the pinned pyright. It may only go DOWN: a change
 # that fixes errors lowers it in the same change. The history of the old
 # system's burn-down is in docs/design/relay-rework-ledger.md.
-BASELINE_TOTAL = 724
+BASELINE_TOTAL = 234
 
 # How many of the most-erroring files to name when the ratchet breaks.
 # Pyright's own multi-thousand-line dump is exactly what caused this
