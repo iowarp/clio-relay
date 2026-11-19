@@ -1,6 +1,6 @@
 """Stand-ins for Globus Compute and Globus Transfer that run on this machine.
 
-The tests and offline demos use them. :class:`LocalComputeService` runs the real
+The W11 tests use them. :class:`LocalComputeService` runs the real
 :func:`relay_task` in a detached process for each task and keeps every task in
 files under ``root``, so a new relay process observes it as it would a real
 endpoint. :class:`LocalTransferService` maps each collection id to a directory.
@@ -26,6 +26,8 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 POSIX = os.name == "posix"
+#: Run as a script, this file runs one task; see :func:`main`.
+WORKER = Path(__file__).resolve()
 
 
 class LocalComputeService:
@@ -46,7 +48,7 @@ class LocalComputeService:
         write_json_atomic(task_dir / "user_config.json", user_config)
         with open(task_dir / "worker.log", "ab") as log:
             subprocess.Popen(
-                [sys.executable, "-m", "clio_relay.adapters.globus.fakes", str(task_dir)],
+                [sys.executable, str(WORKER), str(task_dir)],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
@@ -163,7 +165,7 @@ class LocalTransferService:
 
 
 def main() -> None:
-    """Run one stand-in task: ``python -m clio_relay.adapters.globus.fakes <task dir>``."""
+    """Run one stand-in task: ``python globus_fakes.py <task dir>``."""
     task_dir = Path(sys.argv[1])
     payload: Any = json.loads((task_dir / "payload.json").read_text(encoding="utf-8"))
     (task_dir / "started").write_text("", encoding="utf-8")

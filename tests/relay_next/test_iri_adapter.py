@@ -22,12 +22,6 @@ from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.globus import tokens
 from clio_relay.adapters.iri import IriAdapter, IriConfig, iri_job_spec
 from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
-from clio_relay.adapters.iri.fakes import (
-    ATTRIBUTE_FIELDS,
-    JOB_SPEC_FIELDS,
-    RESOURCE_FIELDS,
-    FakeIriFacility,
-)
 from clio_relay.adapters.iri.files import decode_download
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobState
@@ -35,6 +29,13 @@ from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobAttributes, JobResources, JobSpec, PackageRef
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget, wait_final
+
+from .iri_fakes import (
+    ATTRIBUTE_FIELDS,
+    JOB_SPEC_FIELDS,
+    RESOURCE_FIELDS,
+    FakeIriFacility,
+)
 
 pytestmark = pytest.mark.release_platform("posix")
 
