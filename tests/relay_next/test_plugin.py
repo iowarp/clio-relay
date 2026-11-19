@@ -74,6 +74,15 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     assert paths.grant_files == {"globus": Path("/plugin-data/accounts/globus.json")}
 
 
+def test_the_setup_file_is_the_sites_file_relay_writes() -> None:
+    clio = _json(PLUGIN / "plugin.json")["extensions"]["ai.iowarp.clio"]
+    env = _json(PLUGIN / "mcp.json")["mcpServers"]["relay"]["env"]
+    data = Path("/plugin-data")
+    launched = {key: value.replace("${PLUGIN_DATA}", str(data)) for key, value in env.items()}
+    sites = RelayPaths.from_env(launched).sites_file
+    assert [data / path for path in clio["setup"]["files"]] == [sites]
+
+
 def test_the_skills_index_points_at_describe_for_the_site_guide() -> None:
     text = (PLUGIN / "skills" / "use-relay" / "SKILL.md").read_text("utf-8")
     assert text.startswith("---\nname: use-relay\n")
