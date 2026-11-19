@@ -83,7 +83,8 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: small files lowers the share without any file growing; record why here.
 #: 92.15 (141/153) after the old queue, storage and models layers were deleted.
 #: 92.11 (140/152) after the globus and iri fakes moved to tests.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 92.11
+#: 92.81 (142/153) after the conformance kit's target moved to its own module.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 92.81
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
