@@ -4,8 +4,16 @@ version = "0.1.0"
 description = "A clio-relay adapter for the Acme facility (a template to copy)"
 requires-python = ">=3.12"
 dependencies = [
-    "clio-relay[testing]",
+    "clio-relay",
     "httpx>=0.27,<1",
+]
+
+# The tests: relay's conformance kit, and a web server for the fake facility.
+[dependency-groups]
+dev = [
+    "clio-relay[testing]",
+    "fastapi",
+    "uvicorn",
 ]
 
 # This line is the whole registration: relay finds the adapter by this entry point.
@@ -20,7 +28,8 @@ build-backend = "hatchling.build"
 packages = ["src/relay_acme"]
 
 # Inside the clio-relay repository the template uses the checkout. In a copy of
-# your own, point this at a released clio-relay or a git URL instead.
+# your own, point this at your clio-relay checkout or a git URL, or delete it to
+# use the released clio-relay.
 [tool.uv.sources]
 clio-relay = { path = "../..", editable = true }
 
@@ -28,6 +37,7 @@ clio-relay = { path = "../..", editable = true }
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "-q"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.pyright]
 extraPaths = ["src", "tests"]

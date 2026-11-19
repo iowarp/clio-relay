@@ -1,4 +1,4 @@
-"""The adapter conformance kit (RL7).
+"""The adapter conformance kit.
 
 Every adapter runs this suite. Subclass :class:`AdapterConformance` in a test
 module and provide a ``target`` fixture that returns a
@@ -14,8 +14,10 @@ adapter does not implement, bounded ``exec`` output, the files semantics of
 docs/files.md, the job lifecycle, a failing job, cancel, staged inputs,
 observing a job from a fresh adapter instance (which is what a relay restart
 looks like), typed errors, cancelling a finished job and an ``exec`` call, and
-open and guarded sites. Install the ``testing`` extra for pytest and
-pytest-asyncio.
+open and guarded sites. A test for a verb the adapter leaves out checks only
+that the verb refuses, and then passes. Install the ``testing`` extra for pytest
+and pytest-asyncio; :func:`use_memory_keyring` gives a test the secrets the
+adapter reads.
 """
 
 from __future__ import annotations
@@ -508,9 +510,24 @@ class AdapterConformance:
         await _deletes(files, path)
 
 
+def use_memory_keyring(monkeypatch: pytest.MonkeyPatch, secrets: dict[str, str]) -> None:
+    """Keep relay's secrets in memory for this test and store ``secrets`` there.
+
+    An adapter reads them with ``self.context.secret(name)``, as it reads a key
+    the person typed for ``SignInNeed(provider="keyring:<name>")``.
+    """
+    from clio_relay.identity.store import TokenStore
+
+    monkeypatch.setenv("CLIO_RELAY_KEYRING", "memory")
+    store = TokenStore()
+    for name, value in secrets.items():
+        store.set_secret(name, value)
+
+
 __all__ = [
     "AdapterConformance",
     "ConformanceTarget",
     "assert_lifecycle",
+    "use_memory_keyring",
     "wait_final",
 ]

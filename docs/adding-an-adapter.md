@@ -16,7 +16,7 @@ A site is one entry in `sites.yaml`: an id, the adapter, the adapter's
 settings, and a policy.
 
 ```powershell
-clio-relay adapters                       # the adapters installed, and their settings
+clio-relay adapters                       # the adapters installed, and the verbs each one supports
 clio-relay site add my-cluster --adapter ssh --config '{"ssh_profile": "my-cluster"}' --policy open
 clio-relay describe my-cluster            # check that relay reaches it
 ```
@@ -53,7 +53,7 @@ importable from it. Its docstring lists every method and hook.
 | `name` | The adapter's name in `sites.yaml` and in the entry point. |
 | `Config` | A pydantic model of one site's settings, with `extra="forbid"`. Relay validates `sites.yaml` with it, and the Compute tab draws its form from its JSON Schema. |
 | `implements` | The verbs it supports: `describe`, `run`, `exec`, `files`, `serve`. |
-| `describe()` | Reports the site. Required; it must not change anything. |
+| `describe()` | Reports the site as a `SiteInfo`. Required; it must not change anything. A facility without a batch scheduler reports `scheduler="none"`. |
 | `run()`, `status()`, `cancel()`, `find()` | Jobs, for `run`. |
 | `exec()` | One bounded command, for `exec`. |
 | `files()` | File access, for `files`. |
@@ -69,12 +69,20 @@ rest later.
 [`examples/adapter-template`](../examples/adapter-template) is a complete
 adapter for a pretend facility, Acme, whose REST API has a token, a job queue
 and a file system. A fake of that API ships with it, and the adapter passes the
-conformance kit against the fake.
+conformance kit against the fake. It implements `describe`, `run` and `files`;
+see [Exec](#exec) for the one verb it leaves out.
 
 ```bash
 cp -r examples/adapter-template ~/relay-myfacility
 cd ~/relay-myfacility
-uv run pytest            # 18 passed, before you change anything
+```
+
+The copy's `pyproject.toml` points `[tool.uv.sources]` at `../..`, the relay
+checkout it came from. Point it at your relay checkout or a git URL, or delete
+the table to use the released `clio-relay`. Then:
+
+```bash
+uv run pytest            # all pass, before you change anything
 ```
 
 Then rename `relay_acme`, `AcmeAdapter` and the entry point, and replace each
@@ -124,18 +132,41 @@ Anything else that goes wrong is a bug, and relay reports it as one.
 ### Files
 
 A facility reached over a network subclasses `SiteFiles` and implements six
-primitives on absolute paths: `kind`, `describe`, `children`, `get`, `put`
-(a whole file) and `remove` (one file, link or empty directory). `SiteFiles`
-applies every rule in [files](files.md) on top of them: relative paths,
-`overwrite`, chunked uploads and resuming, delete refusals and the content
-store. The site needs no append and no recursive delete: chunks collect in a
-local staging directory and go up in one `put` when the last one arrives, and
-a recursive delete removes one entry at a time. Override `upload` to stream a
-large file and `remove_tree` if the site deletes a tree in one call. If the
-site caps one upload, set `max_upload_bytes` and say what to use instead in
-`upload_hint`. `files()` returns one, built with the site's work directory,
-its home directory and `self.context.state_dir / "parts"` for staging. See
-`AcmeFiles` in the template.
+primitives on absolute paths. `SiteFiles` applies every rule in
+[files](files.md) on top of them: relative paths, `overwrite`, chunked uploads
+and resuming, delete refusals and the content store.
+
+| Primitive | Does |
+| --- | --- |
+| `async kind(path) -> Kind` | Says what `path` is without following a symlink: `"file"`, `"dir"`, `"link"` or `"missing"`. A missing path is `"missing"`, not an error. |
+| `async describe(path) -> FileEntry` | The entry of an existing path, following a symlink. |
+| `async children(path) -> list[FileEntry]` | An existing directory's entries, sorted by name, with absolute paths. |
+| `async get(path, offset, limit) -> bytes` | Up to `limit` bytes of an existing file from `offset`; all of it when `limit` is `None`. |
+| `async put(path, data) -> None` | Writes `data` as the whole file, making parent directories. |
+| `async remove(path) -> None` | Removes one file, symlink (never its target) or empty directory. |
+
+A `FileEntry` has `path`, `kind` (`"file"`, `"dir"` or `"other"`), `size`
+and `modified`. `Kind` is a separate, smaller question for `kind()`: it adds
+`"link"` and `"missing"`, which never appear in an entry. `SiteFiles` calls a
+primitive on a path only after `kind` has said it exists, so a primitive
+raises `Refusal(RefusalReason.PATH_NOT_FOUND, ...)` only if the path vanished
+in between.
+
+The site needs no append and no recursive delete: chunks collect in a local
+staging directory and go up in one `put` (or `upload`) when the last one
+arrives, and a recursive delete removes one entry at a time. Override
+`upload(path, local)` to stream a large file from disk, and
+`remove_tree(path)` if the site deletes a tree in one call.
+
+If the site caps one upload, set the class attributes `max_upload_bytes` and
+`upload_hint`. The cap applies to the whole file, chunked or not: a chunked
+upload refuses at the first chunk that takes it past the cap. Relay's refusal says the file is too big and then appends
+`upload_hint`, so the hint names another way to move the file, such as a
+transfer service.
+
+`files()` returns one, built with `root` (the site's work directory), `home`
+(the person's home directory on the site) and `staging`
+(`self.context.state_dir / "parts"`). See `AcmeFiles` in the template.
 
 ### Jobs
 
@@ -159,6 +190,28 @@ its home directory and `self.context.state_dir / "parts"` for staging. See
 A handle is JSON, and relay stores it. A new adapter instance in a new process
 must be able to follow and cancel the job from the handle alone: put the
 facility's job id in `native_id` and anything else you need in `data`.
+
+### Exec
+
+`exec(command, *, timeout_s=None, max_output_bytes, on_stall=None)` runs one
+command on the site and returns an `ExecResult` once it ends.
+
+- `command` is an argv list. Run it without a shell, or quote each part.
+- The result holds `argv`, `exit_code`, `stdout`, `stderr` and `duration_s`.
+  Each of `stdout` and `stderr` keeps at most `max_output_bytes` bytes on its
+  own; set `stdout_truncated` or `stderr_truncated` when you cut one.
+- When `timeout_s` passes, stop the command on the site and return the result
+  with `timed_out=True` and `exit_code=None`. A time limit is not a refusal.
+- With no `timeout_s` the command runs until it ends. While it prints nothing,
+  call `await on_stall(idle_s, next_s)`: the seconds since its last output,
+  and the seconds until you will report again. Start after `STALL_S` (30 s)
+  of quiet and double the wait each time. The command keeps running; the
+  report lets relay tell the person it is still going.
+- The person may cancel the call. Relay then cancels your coroutine, so stop
+  the command on the site in an `except asyncio.CancelledError` or `finally`
+  block, and let the cancellation go on.
+- A program the site cannot find ends with an exit code, such as 127, and does
+  not hang.
 
 ### Policy
 
@@ -189,7 +242,8 @@ myfacility = "relay_myfacility:MyFacilityAdapter"
 ```
 
 Install your package next to relay (`uv tool install clio-relay --with
-relay-myfacility`), and `clio-relay adapters` lists it. In tests, or to try it
+relay-myfacility`, or `--with /path/to/relay-myfacility` for a local
+checkout), and `clio-relay adapters` lists it. In tests, or to try it
 without installing, `clio_relay.adapters.registry.register(MyFacilityAdapter)`
 does the same in one process.
 
@@ -197,9 +251,32 @@ does the same in one process.
 
 The kit is one test class, `AdapterConformance` in
 `clio_relay.testing.conformance`. Subclass it and say how to build your
-adapter:
+adapter. A whole test module, with a fake facility like the template's:
 
 ```python
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from fake_facility import FakeFacility, running  # your fake of the facility's API
+from relay_myfacility import MyFacilityAdapter
+
+from clio_relay.adapters import registry
+from clio_relay.testing.conformance import (
+    AdapterConformance,
+    ConformanceTarget,
+    use_memory_keyring,
+)
+
+
+@pytest.fixture
+def facility_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    use_memory_keyring(monkeypatch, {"myfacility-key": "test-key"})
+    registry.register(MyFacilityAdapter)
+    with running(FakeFacility(tmp_path / "facility", "test-key")) as url:
+        yield url
+
+
 class TestMyFacility(AdapterConformance):
     @pytest.fixture
     def target(self, tmp_path: Path, facility_url: str) -> ConformanceTarget:
@@ -207,6 +284,9 @@ class TestMyFacility(AdapterConformance):
             adapter="myfacility", config={"url": facility_url}, state_dir=tmp_path
         )
 ```
+
+`use_memory_keyring` keeps relay's secrets in memory for the test and stores
+the ones you give it, which the adapter reads with `self.context.secret`.
 
 It checks, for the verbs the adapter implements:
 
@@ -219,24 +299,29 @@ It checks, for the verbs the adapter implements:
 | `files` | Everything in [files](files.md): round trip, `overwrite`, delete, chunked upload and resume, relative paths |
 | Jobs | Lifecycle, a failing job, cancel, cancel after the end, inputs by digest, and following a job from a new adapter instance |
 | Errors | A missing path is `path_not_found`, and a missing program fails without hanging |
-| Policy | Open sites run what the agent asks; guarded sites refuse commands and anything but read-only `exec` |
+| Policy | Open sites run what the agent asks; guarded sites refuse commands and anything but read-only `exec`, and ask the person before a `files` delete or overwrite |
+
+Each test names its area. A test for a verb the adapter leaves out checks only
+that the verb refuses, and then passes, so an adapter with `describe` and
+`files` still shows every job test as passed.
 
 Run it against a fake of your facility's API, like the template's
 `tests/fake_facility.py`, so it runs anywhere in seconds. Run it against the
-real facility too, from a test you skip unless its address is set in the
-environment. `ConformanceTarget` takes the jobs and commands to try
+real facility too, from its own test module that takes the facility's address
+from the environment and fails without it; run that one where you can reach
+the facility. `ConformanceTarget` takes the jobs and commands to try
 (`ok_job`, `long_job`, `echo`, ...), for a facility whose machines lack `sleep`
 or `echo`.
 
-Install the `testing` extra for pytest and pytest-asyncio:
-`uv add --dev "clio-relay[testing]"`.
+Put the `testing` extra, which brings pytest and pytest-asyncio, in your dev
+dependencies, not your package's: `uv add --dev "clio-relay[testing]"`.
 
 ## Try it end to end
 
 ```powershell
 clio-relay adapters
-clio-relay site add acme-dev --adapter myfacility --config '{"url": "https://..."}' --policy open
-clio-relay describe acme-dev
+clio-relay site add myfacility-dev --adapter myfacility --config '{"url": "https://..."}' --policy open
+clio-relay describe myfacility-dev
 clio-relay serve          # then point an agent at it; see the README
 ```
 

@@ -1,4 +1,4 @@
-"""The adapter contract: everything an adapter implements and uses (RL6).
+"""The adapter contract: everything an adapter implements and uses.
 
 An adapter is one way into a site: SSH, a facility's REST API, a transfer
 service, a cloud. It is a subclass of :class:`BaseAdapter` with three class
@@ -22,7 +22,9 @@ What it implements, by verb (each one it leaves out refuses with
   :meth:`~BaseAdapter.cancel` and :meth:`~BaseAdapter.find`. Handles are JSON
   and outlive the process: a fresh instance must observe and cancel a job.
   Inputs named by digest come from ``context.content``.
-- ``exec``: :meth:`~BaseAdapter.exec`, one bounded command.
+- ``exec``: :meth:`~BaseAdapter.exec`, one bounded command. A time limit
+  returns ``timed_out``; with none, report quiet stretches to ``on_stall``
+  from :data:`STALL_S` on, and stop the command when the call is cancelled.
 - ``files``: :meth:`~BaseAdapter.files` returns a
   :class:`~clio_relay.jobs.handles.FileAccess` under docs/files.md. A remote
   site subclasses :class:`SiteFiles` and implements six primitives.
@@ -70,6 +72,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from clio_relay.adapters.site_files import Kind, SiteFiles
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import (
+    STALL_S,
     Endpoint,
     EndpointPort,
     ExecResult,
@@ -143,7 +146,7 @@ class AdapterContext:
 
 @runtime_checkable
 class Adapter(Protocol):
-    """The interface every adapter implements (RL6)."""
+    """The interface every adapter implements."""
 
     name: ClassVar[str]
     Config: ClassVar[type[BaseModel]]
@@ -308,6 +311,7 @@ __all__ = [
     "PackageRef",
     "Refusal",
     "RefusalReason",
+    "STALL_S",
     "ServiceSpec",
     "SignInNeed",
     "SiteAdded",

@@ -10,8 +10,11 @@ from fake_facility import FakeFacility, running
 from relay_acme import AcmeAdapter
 
 from clio_relay.adapters import registry
-from clio_relay.identity.store import TokenStore
-from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget
+from clio_relay.testing.conformance import (
+    AdapterConformance,
+    ConformanceTarget,
+    use_memory_keyring,
+)
 
 TOKEN = "fake-acme-token"
 
@@ -19,8 +22,7 @@ TOKEN = "fake-acme-token"
 @pytest.fixture
 def facility_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """Start the fake facility and give relay its token."""
-    monkeypatch.setenv("CLIO_RELAY_KEYRING", "memory")
-    TokenStore().set_secret("acme-token", TOKEN)
+    use_memory_keyring(monkeypatch, {"acme-token": TOKEN})
     # Installed, the entry point in pyproject.toml registers the adapter; this
     # registers it when the tests run from a checkout without installing it.
     registry.register(AcmeAdapter)
