@@ -255,8 +255,10 @@ does the same in one process.
 
 The kit is one test class, `AdapterConformance` in
 `clio_relay.testing.conformance`. Subclass it, name your adapter class in
-`adapter`, and say how to build a site. A whole test module, with a fake
-facility like the template's:
+`adapter`, and say how to build a site. The class tells the kit which verbs to
+test, from its `implements`, when pytest collects the tests; the target's
+`adapter` is the registered name relay builds a site from, as in `sites.yaml`.
+A whole test module, with a fake facility like the template's:
 
 ```python
 from collections.abc import Iterator

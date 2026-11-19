@@ -36,7 +36,6 @@ clio-relay = { path = "../..", editable = true }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "tests"]
-addopts = "-q"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.pyright]
