@@ -4,7 +4,7 @@
 ``local.pyright`` (:func:`clio_relay.release_validation.run_local_release_validation`)
 used to demand a bare ``uv run --no-sync pyright`` exit 0 across the whole
 strict-mode tree (``[tool.pyright]`` in ``pyproject.toml``: ``typeCheckingMode
-= "strict"``, ``include = ["src", "jarvis-packages", "tests", "scripts"]``).
+= "strict"``, ``include`` covers the source, tests and scripts).
 That was never a real gate: forensics on iowarp/clio-relay#270 traced the
 check to commit 93095eb (2026-07-13, "complete production 1.0 relay
 contracts"), which predates every 1.x release, and reproduced the same

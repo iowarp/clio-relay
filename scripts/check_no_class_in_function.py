@@ -8,8 +8,7 @@ closure. This check exists alongside the owner-module decomposition
 (iowarp/clio-relay#231) so such hidden classes get lifted to module scope,
 where they become real, importable, testable units.
 
-This check parses ``src/clio_relay/**/*.py`` and
-``jarvis-packages/clio_relay/**/*.py`` with the stdlib ``ast`` module and
+This check parses ``src/clio_relay/**/*.py`` with the stdlib ``ast`` module and
 enforces a per-file ratchet on the number of ``ClassDef`` nodes nested -- at
 any depth -- inside a ``FunctionDef`` / ``AsyncFunctionDef``:
 
@@ -46,13 +45,11 @@ from typing import NamedTuple
 # to the repository root, forward slashes.
 RATCHET_BASELINE: dict[str, int] = {
     # Modules that still define a class inside a function, at their current counts.
-    "jarvis-packages/clio_relay/clio_relay/process_containment_windows.py": 4,
-    "src/clio_relay/process_containment_windows.py": 4,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
-# (tests/, jarvis-packages/clio_relay/*/tests, ...) are intentionally excluded.
-SRC_ROOTS: tuple[str, ...] = ("src/clio_relay", "jarvis-packages/clio_relay")
+# (tests/, ...) are intentionally excluded.
+SRC_ROOTS: tuple[str, ...] = ("src/clio_relay",)
 
 
 class Failure(NamedTuple):

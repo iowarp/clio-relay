@@ -66,8 +66,7 @@ class DirectTransportConfig(BaseModel):
 
 
 # The identity anchor `frp_transport.py` (#231 R5) requires a cluster to opt into
-# before `brokered_tcp`/`udp_rendezvous` may be used -- see
-# `relay-architecture-2026-08.md` §8.3. `None` means "not opted in": modes (a)/(b)
+# before `brokered_tcp`/`udp_rendezvous` may be used. `None` means "not opted in": modes (a)/(b)
 # have no ssh-authenticated act to carry the bring-up identity document over, so a
 # cluster that has not explicitly accepted the weaker preshared-link anchor does not
 # get to use those modes by falling through to it unannounced.
