@@ -4,13 +4,14 @@ Staging a package puts its archive in relay's content store and records it in
 the catalog, one entry per archive at ``<state>/packages/<sha256>.json``. The
 entry says what the archive holds, read from the archive itself and never by
 running it: the parameters of ``_configure_menu`` in ``pkg.py``, and the
-summary, version, outputs and progress of a ``contract.yaml`` beside it when
-the package has one.
+summary, version, outputs, progress and resources of a ``contract.yaml``
+beside it when the package has one.
 
 ``describe(site=...)`` lists the catalog, so an agent finds a package by name.
 ``run`` takes ``package: {name, parameters}``, and :meth:`PackageCatalog.resolve`
 fills the version and SHA-256 before the guard sees the job, so the review is
-still pinned to one archive.
+still pinned to one archive. The contract's resources, read with the run's
+parameters, fill the walltime, queue and process layout the job leaves unset.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import json
 import sys
 import tarfile
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,7 +35,7 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import PackageRef
+from clio_relay.jobs.spec import JobSpec, PackageRef
 
 STAGE_COMMAND = "python -m clio_relay.packages stage <repository dir> <repo.package>"
 _MENU_TYPES = {"int": "integer", "float": "number", "str": "string", "bool": "boolean"}
@@ -52,6 +53,7 @@ class PackageEntry(BaseModel):
     parameters: dict[str, Any] = Field(default_factory=dict[str, Any])
     outputs: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     progress: dict[str, Any] | None = None
+    resources: dict[str, Any] | None = None
     source: dict[str, Any] | None = None
     staged_at: datetime = Field(default_factory=utc_now)
 
@@ -163,6 +165,7 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
         if isinstance(item, dict)
     ]
     progress = contract.get("progress")
+    resources = contract.get("resources")
     return PackageEntry(
         name=name,
         version=str(chosen),
@@ -178,7 +181,119 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
         }
         if isinstance(progress, dict)
         else None,
+        resources=_json(resources) if isinstance(resources, dict) else None,
         source=info.source,
+    )
+
+
+# A contract's resources (RL15): PSI/J names whose values may read the parameters
+
+_LAYOUT = ("node_count", "process_count", "processes_per_node")
+_COUNTS = (*_LAYOUT, "cpu_cores_per_process", "gpu_cores_per_process", "memory")
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def contract_value(value: Any, parameters: dict[str, Any]) -> Any:
+    """Evaluate a contract value: a literal, ``{param: name}``, or integer arithmetic.
+
+    The arithmetic is ``{div|mul|add|ceil_div: [a, b]}`` over numbers and
+    parameter names, as clio-jarvis evaluates it. A missing operand gives ``None``.
+    """
+    if not isinstance(value, dict):
+        return value
+    rule = cast(dict[str, Any], value)
+    if "param" in rule:
+        return parameters.get(str(rule["param"]))
+    if len(rule) != 1:
+        return None
+    ((operator, operands),) = rule.items()
+    if not isinstance(operands, list) or len(cast(list[Any], operands)) != 2:
+        return None
+    a, b = (
+        _number(parameters.get(item) if isinstance(item, str) else item)
+        for item in cast(list[Any], operands)
+    )
+    if a is None or b is None:
+        return None
+    if operator == "mul":
+        return a * b
+    if operator == "add":
+        return a + b
+    if operator not in ("div", "ceil_div") or int(b) == 0:
+        return None
+    return int(a) // int(b) if operator == "div" else -(-int(a) // int(b))
+
+
+def contract_resources(entry: PackageEntry, parameters: dict[str, Any]) -> dict[str, Any]:
+    """Return the PSI/J resources ``entry``'s contract asks for with ``parameters``.
+
+    A parameter the run leaves out takes its default. A value that resolves to
+    nothing, an empty queue or a count that is not a positive whole number is
+    left out, so the site's defaults still apply to it.
+    """
+    properties = cast(dict[str, Any], entry.parameters.get("properties") or {})
+    values = {
+        name: prop["default"]
+        for name, prop in properties.items()
+        if isinstance(prop, dict) and "default" in prop
+    }
+    values.update(parameters)
+    found: dict[str, Any] = {}
+    for key, rule in (entry.resources or {}).items():
+        value = contract_value(rule, values)
+        number = _number(value)
+        if key == "queue_name" and isinstance(value, str) and value.strip():
+            found[key] = value.strip()
+        elif key == "exclusive_node_use" and isinstance(value, bool):
+            found[key] = value
+        elif key == "duration" and number is not None and number > 0:
+            found[key] = timedelta(seconds=number)
+        elif key in _COUNTS and number is not None and number >= 1 and number.is_integer():
+            found[key] = int(number)
+    return found
+
+
+def with_contract_resources(spec: JobSpec, entry: PackageEntry) -> JobSpec:
+    """Fill what ``entry``'s contract sets for ``spec``'s package where ``spec`` leaves it unset.
+
+    The walltime and queue are filled one by one. The process layout (nodes,
+    processes, processes per node) is filled only when the job sets none of it.
+    """
+    if spec.package is None:
+        return spec
+    found = contract_resources(entry, spec.package.parameters)
+    attributes = {
+        key: found[key]
+        for key in ("duration", "queue_name")
+        if key in found and getattr(spec.attributes, key) is None
+    }
+    own_layout = any(getattr(spec.resources, key) is not None for key in _LAYOUT)
+    resources = {
+        key: value
+        for key, value in found.items()
+        if (key in _COUNTS and getattr(spec.resources, key) is None)
+        or (key == "exclusive_node_use" and key not in spec.resources.model_fields_set)
+        if not (own_layout and key in _LAYOUT)
+    }
+    if not attributes and not resources:
+        return spec
+    return spec.model_copy(
+        update={
+            "attributes": spec.attributes.model_copy(update=attributes),
+            "resources": spec.resources.model_copy(update=resources),
+        }
     )
 
 
@@ -233,6 +348,23 @@ class PackageCatalog:
             )
         chosen = found[-1]
         return package.model_copy(update={"version": chosen.version, "sha256": chosen.sha256})
+
+    def entry(self, package: PackageRef, content: ContentStore) -> PackageEntry | None:
+        """Return the entry of the pinned ``package``, or ``None`` if it was not staged here.
+
+        An entry staged before relay read the contract's resources is read again
+        from its archive in ``content``, and saved.
+        """
+        found = None if package.sha256 is None else self.records.get(package.sha256)
+        if found is None or "resources" in found.model_fields_set or not content.has(found.sha256):
+            return found
+        try:
+            fresh = describe_archive(content.get(found.sha256), found.name, version=found.version)
+        except Refusal:
+            return found
+        updated = found.model_copy(update={"resources": fresh.resources})
+        self.put(updated)
+        return updated
 
 
 def stage(state_dir: Path, data: bytes, name: str, *, version: str | None = None) -> PackageEntry:

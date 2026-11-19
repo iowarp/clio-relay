@@ -36,7 +36,7 @@ from clio_relay.jobs.records import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
-from clio_relay.packages import PackageCatalog
+from clio_relay.packages import PackageCatalog, with_contract_resources
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
@@ -185,9 +185,17 @@ class RelayService:
     # run
 
     def apply_defaults(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
-        """Fill the queue, account and walltime the site defaults to, and pin the package."""
+        """Pin the package, fill what its contract sets, then the site's defaults.
+
+        The package's contract (its walltime, queue and process layout, read
+        from its parameters) comes before the site's defaults, so the price, the
+        spend ask and the submitted job agree. What the job sets itself wins.
+        """
         if spec.package is not None:
-            spec = spec.model_copy(update={"package": self.packages.resolve(spec.package)})
+            package = self.packages.resolve(spec.package)
+            spec = spec.model_copy(update={"package": package})
+            entry = self.packages.entry(package, self.content)
+            spec = spec if entry is None else with_contract_resources(spec, entry)
         attributes = spec.attributes
         changes: dict[str, Any] = {}
         if attributes.queue_name is None and site.defaults.queue is not None:

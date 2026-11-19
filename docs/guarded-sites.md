@@ -162,10 +162,13 @@ Each site's `spend.ask` decides when relay asks before it submits:
 - a number: a job asks when it may use more than that many node-hours.
 
 The question shows the queue, the account, the nodes, the walltime and the
-most the job may use. Relay never sets a walltime itself. A job with no
-walltime has an unknown cost: it always asks (unless the site is `never`), and
-the question says the scheduler's default limit applies. On a cloud site the
-adapter gives its own price, in US dollars.
+most the job may use. Relay never sets a walltime itself. A package job takes
+its walltime, queue and process layout from its contract's `resources`, read
+with the run's parameters (an omitted parameter takes its default), wherever
+the job leaves them unset; the site's defaults fill what is still open. A job
+with no walltime has an unknown cost: it always asks (unless the site is
+`never`), and the question says the scheduler's default limit applies. On a
+cloud site the adapter gives its own price, in US dollars.
 
 A no submits nothing. A question nobody answers leaves the operation waiting,
 with nothing submitted, until someone answers it. An approval covers exactly
