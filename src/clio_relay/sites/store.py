@@ -128,9 +128,7 @@ class SiteStore:
                 if value is not None
             }
             try:
-                updated = NewSiteDefaults.model_validate(
-                    self.defaults().model_dump() | changes
-                )
+                updated = NewSiteDefaults.model_validate(self.defaults().model_dump() | changes)
             except ValidationError as exc:
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS,
