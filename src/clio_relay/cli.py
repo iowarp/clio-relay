@@ -264,20 +264,44 @@ def site_defaults(
     policy: Annotated[
         str | None, typer.Option(help="open or guarded, for a new site without --policy")
     ] = None,
+    spend: Annotated[
+        str | None,
+        typer.Option(
+            help="always, never, or a node-hour threshold, for a new site without --spend"
+        ),
+    ] = None,
 ) -> None:
     """Show the defaults for new sites, or change them."""
     store = SiteStore(_paths().sites_file)
     try:
-        if adapter is None and policy is None:
+        if adapter is None and policy is None and spend is None:
             shown = store.defaults()
         else:
             if adapter is not None:
                 registry.load(adapter)
-            shown = store.set_defaults(adapter=adapter, policy=policy)
+            shown = store.set_defaults(
+                adapter=adapter,
+                policy=policy,
+                spend=None if spend is None else _spend_ask(spend),
+            )
     except Refusal as refusal:
         _fail(refusal)
         return
     _print(shown.model_dump(mode="json"))
+
+
+def _spend_ask(text: str) -> str | float:
+    """Read ``--spend``: always, never, or a node-hour threshold above zero."""
+    if text in ("always", "never"):
+        return text
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        typer.echo("--spend takes always, never, or a number of node-hours above 0", err=True)
+        raise typer.Exit(2)
+    return value
 
 
 @site_app.command("add")
@@ -291,7 +315,10 @@ def site_add(
     policy: Annotated[
         str | None, typer.Option(help="open or guarded; `site defaults` when left out")
     ] = None,
-    spend: Annotated[str, typer.Option(help="always, never, or a node-hour threshold")] = "always",
+    spend: Annotated[
+        str | None,
+        typer.Option(help="always, never, or a node-hour threshold; `site defaults` when left out"),
+    ] = None,
     skill: Annotated[
         str | None, typer.Option(help="A skill name, or the path of your own Markdown skill")
     ] = None,
@@ -307,7 +334,7 @@ def site_add(
             raise typer.Exit(2)
         settings = cast(dict[str, Any], loaded)
         registry.validate_config(adapter, settings)
-        ask: Any = spend if spend in ("always", "never") else float(spend)
+        ask = defaults.spend if spend is None else _spend_ask(spend)
         entry = SiteEntry.model_validate(
             {
                 "id": site_id,

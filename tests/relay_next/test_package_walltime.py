@@ -90,7 +90,7 @@ async def test_the_spend_ask_prices_the_package_walltime(
     assert (charge["nodes"], charge["walltime_s"]) == (2, 1800)
     assert charge["node_hours"] == pytest.approx(1.0)
     (ask,) = service.outstanding(record)
-    assert "1 node-hours (2 node(s) for 30 min)" in ask.message
+    assert "Walltime: 30 min, up to 1 node-hour in all" in ask.message
     assert "sets no walltime" not in ask.message
     stored = JobSpec.model_validate(service.operation(record.operation_id).spec)
     assert stored.attributes.duration == timedelta(seconds=1800)

@@ -54,6 +54,14 @@ class JobResources(_Spec):
             return max(1, -(-self.process_count // self.processes_per_node))
         return 1
 
+    def ranks_per_node(self) -> int | None:
+        """Return the processes (MPI ranks) each node runs, or None when the job leaves it out."""
+        if self.processes_per_node is not None:
+            return self.processes_per_node
+        if self.process_count is not None:
+            return max(1, -(-self.process_count // self.nodes()))
+        return None
+
     def to_psij(self) -> psij.ResourceSpecV1:
         """Build a ``psij.ResourceSpecV1``. The bare ``ResourceSpec`` is abstract."""
         from psij import ResourceSpecV1

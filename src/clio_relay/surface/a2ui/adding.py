@@ -37,14 +37,18 @@ from clio_relay.surface.a2ui.surfaces import (
     TabState,
     protocol_name,
     protocol_order,
+    spend_draft,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.values import spend_ask
 
 
-def add_draft(forms: dict[str, Form], security: str = "guarded") -> dict[str, Any]:
-    """Return the add form's empty draft, with ``security`` picked."""
+def add_draft(
+    forms: dict[str, Form], security: str = "guarded", spend: str = "always"
+) -> dict[str, Any]:
+    """Return the add form's empty draft, with ``security`` and the ``spend`` setting picked."""
     return {
-        "site": draft(ADD_FIELDS, {"policy": security, "spend": "always"}),
+        "site": draft(ADD_FIELDS, {"policy": security, **spend_draft(spend_ask(spend))}),
         "config": {name: draft(item.fields, {}) for name, item in forms.items() if item.listed},
     }
 
@@ -66,7 +70,7 @@ def add_surface(
         },
         "drafts": {
             "add": {
-                **add_draft(forms, state.default("security")),
+                **add_draft(forms, state.default("security"), state.default("spend")),
                 "valid": valid_map(errors, ADD_ERROR_PREFIXES),
             }
         },

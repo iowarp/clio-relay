@@ -54,6 +54,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SiteView,
     TabState,
 )
+from clio_relay.surface.a2ui.surfaces import defaults_state as _defaults_state
 from clio_relay.surface.a2ui.tokens import ActionTokens
 from clio_relay.surface.a2ui.values import as_dict, pointer
 from clio_relay.surface.changes import ServerChanges
@@ -80,7 +81,7 @@ _TITLES = {
     surfaces.CONFIRM_REMOVE: "Remove an endpoint",
     surfaces.PROBE_SITE: "Probe an endpoint",
     surfaces.SWITCH_ADAPTER: "Change an endpoint's protocol",
-    surfaces.SET_VALUE: "Change an endpoint's protocol or security, or a default",
+    surfaces.SET_VALUE: "Change an endpoint's protocol, security or spending, or a default",
     surfaces.CONNECT_SITE: "Sign in to an endpoint",
 }
 
@@ -111,7 +112,7 @@ class ComputeTab(TabActions):
             defaults = self.service.sites.defaults()
         except Refusal:  # an unreadable defaults file reads as relay's own defaults
             return
-        self.state.defaults = {"protocol": defaults.adapter, "security": defaults.policy}
+        self.state.defaults = _defaults_state(defaults)
 
     def _save_state(self) -> None:
         write_json_atomic(self._state_file, self.state.to_dict())

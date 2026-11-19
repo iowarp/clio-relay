@@ -19,10 +19,12 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay.sites.models import SiteEntry
+from clio_relay.sites.models import SiteEntry, SpendAsk
+from clio_relay.sites.store import NewSiteDefaults
 from clio_relay.surface.a2ui.components import Tree, bound, event
 from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error
 from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.values import SPEND_ABOVE, SPEND_LIMIT, spend_value
 
 SITES_SURFACE = "relay-sites"
 ADD_SURFACE = "relay-add"
@@ -85,7 +87,21 @@ SECURITY = {
     "open": ("Open", "Runs what the agent writes"),
 }
 SECURITY_HELP = "Secure runs only reviewed packages. Open runs what the agent writes."
-DEFAULTS = {"protocol": "ssh", "security": "guarded"}
+# When relay asks before it submits a job. A threshold is a number of node-hours.
+SPEND_HELP = (
+    "When relay asks you before it submits a job. A job's node-hours are its nodes "
+    "times its walltime: 8 nodes for 2 hours is 16."
+)
+SPEND_ALWAYS = ("Ask every time", "Asks before it submits any job")
+SPEND_NEVER = (
+    "Always allow",
+    "Never asks, for unlimited allocations",
+)
+# Thresholds every Spending picker offers, besides the ones endpoints already use.
+SPEND_PRESETS = (10.0, 100.0)
+_SPEND_MAX = 20
+"""Spending options at most, inside the endpoint table's 24 per column."""
+DEFAULTS = {"protocol": "ssh", "security": "guarded", "spend": "always"}
 
 POLICY = Field(
     "policy",
@@ -97,9 +113,18 @@ POLICY = Field(
 )
 SPEND = Field(
     "spend",
-    "Ask before spending",
-    "text",
-    help="always, never, or the node-hours above which relay asks",
+    "Spending",
+    "choice",
+    help=SPEND_HELP,
+    options=("always", SPEND_ABOVE, "never"),
+    labels=(SPEND_ALWAYS[0], "Ask above a limit", SPEND_NEVER[0]),
+)
+SPEND_LIMIT_FIELD = Field(
+    SPEND_LIMIT,
+    "Limit (node-hours)",
+    "number",
+    help="With Ask above a limit, relay asks when a job may use more than this, "
+    "or when it sets no walltime.",
 )
 SKILL = Field("skill", "Skill", "text", help="A skill name, or the path of your own Markdown skill")
 NAME = Field("name", "Name", "text")
@@ -108,6 +133,7 @@ ADD_FIELDS = (
     NAME,
     POLICY,
     SPEND,
+    SPEND_LIMIT_FIELD,
     SKILL,
 )
 EDIT_FIELDS = (
@@ -115,6 +141,7 @@ EDIT_FIELDS = (
     Field("address", "Address", "text"),
     POLICY,
     SPEND,
+    SPEND_LIMIT_FIELD,
     SKILL,
     Field("account", "Default account", "text"),
     Field("queue", "Default queue", "text"),
@@ -182,7 +209,7 @@ class TabState:
     """A protocol picked for an endpoint that has no settings for it yet, by endpoint."""
 
     def default(self, column: str) -> str:
-        """Return the protocol or security a new endpoint starts with."""
+        """Return the protocol, security or spend setting a new endpoint starts with."""
         return self.defaults.get(column) or DEFAULTS[column]
 
     def to_dict(self) -> dict[str, Any]:
@@ -237,13 +264,79 @@ class TabState:
 # Text
 
 
-def spend_text(site: SiteEntry) -> str:
-    ask = site.spend.ask
+def spend_text(ask: SpendAsk) -> str:
+    """Return a spend setting as the page's Spending words."""
     if ask == "always":
-        return "Always"
+        return SPEND_ALWAYS[0]
     if ask == "never":
-        return "Never"
-    return f"Above {ask:g} node-hours"
+        return SPEND_NEVER[0]
+    return f"Ask above {ask:g} node-hours"
+
+
+def spend_sentence(ask: SpendAsk) -> str:
+    """Return what relay does before it spends, as the rest of a sentence about relay."""
+    if ask == "always":
+        return "asks before every job"
+    if ask == "never":
+        return "submits jobs without asking"
+    return f"asks before a job that may use more than {ask:g} node-hours"
+
+
+def spend_options(used: Iterable[str | float]) -> list[dict[str, str]]:
+    """Return the Spending choices: ask every time, each threshold, then always allow.
+
+    The thresholds are the presets and those in ``used``, the settings endpoints
+    and the defaults already have, so every current setting is a choice.
+    """
+    in_use = {ask for ask in used if not isinstance(ask, str)}
+    thresholds = sorted(in_use | set(SPEND_PRESETS))
+    if len(thresholds) > _SPEND_MAX - 2:
+        thresholds = sorted(in_use)[: _SPEND_MAX - 2]
+    options = [
+        {
+            "value": "always",
+            "label": SPEND_ALWAYS[0],
+            "description": SPEND_ALWAYS[1],
+            "icon": "notifications",
+            "tone": "positive",
+        }
+    ]
+    options += [
+        {
+            "value": spend_value(limit),
+            "label": f"Ask above {limit:g}",
+            "description": f"Over {limit:g} node-hours, or no walltime",
+            "icon": "payment",
+            "tone": "neutral",
+        }
+        for limit in thresholds
+    ]
+    options.append(
+        {
+            "value": "never",
+            "label": SPEND_NEVER[0],
+            "description": SPEND_NEVER[1],
+            "icon": "notificationsOff",
+            "tone": "warning",
+        }
+    )
+    return options
+
+
+def defaults_state(defaults: NewSiteDefaults) -> dict[str, str]:
+    """Return the site store's defaults for new endpoints as the page's column values."""
+    return {
+        "protocol": defaults.adapter,
+        "security": defaults.policy,
+        "spend": spend_value(defaults.spend),
+    }
+
+
+def spend_draft(ask: SpendAsk) -> dict[str, Any]:
+    """Return a spend setting as the form's choice and limit."""
+    if isinstance(ask, str):
+        return {"spend": ask, SPEND_LIMIT: None}
+    return {"spend": SPEND_ABOVE, SPEND_LIMIT: f"{ask:g}"}
 
 
 def _duration(value: timedelta) -> str:
@@ -274,7 +367,8 @@ def summary(views: list[SiteView], notice: str = "") -> str:
         line = f"{site.title} ({site.id}) uses {protocol_name(site.adapter)}"
         if site.alternatives:
             line += f", or {', '.join(protocol_name(name) for name in site.alternatives)}"
-        line += f". Security is {security_name(site.policy)}. {status_text(view)}."
+        line += f". Security is {security_name(site.policy)}."
+        line += f" Relay {spend_sentence(site.spend.ask)}. {status_text(view)}."
         if view.probe:
             found = _PROBE.get(str(view.probe.get("state", "")), "unknown")
             line += f" The last probe found it {found.lower()}."
@@ -290,7 +384,7 @@ def _common_draft(site: SiteEntry) -> dict[str, Any]:
         "name": site.name,
         "address": site.address,
         "policy": site.policy,
-        "spend": str(site.spend.ask),
+        **spend_draft(site.spend.ask),
         "skill": site.skill,
         "account": site.defaults.account,
         "queue": site.defaults.queue,
@@ -405,7 +499,7 @@ def settings_rows(tree: Tree, base: str, view: SiteView, fields: bool = True) ->
         rows.append(tree.fact(f"{base}-reviewed", "Reviewed packages", str(view.reviewed)))
     defaults = site.defaults
     if fields:
-        rows.append(tree.fact(f"{base}-spend", "Ask before spending", spend_text(site)))
+        rows.append(tree.fact(f"{base}-spend", "Spending", spend_text(site.spend.ask)))
         if defaults.account:
             rows.append(tree.fact(f"{base}-account", "Default account", defaults.account))
         if defaults.queue:

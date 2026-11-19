@@ -17,6 +17,8 @@ def charge(site_id: str, spec: JobSpec) -> Charge:
         queue=spec.attributes.queue_name,
         account=spec.attributes.account,
         nodes=spec.resources.nodes(),
+        ranks_per_node=spec.resources.ranks_per_node(),
+        ranks=spec.resources.process_count,
     )
     duration = spec.attributes.duration
     node_hours = spec.node_hours()

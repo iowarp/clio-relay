@@ -157,6 +157,8 @@ class Charge(BaseModel):
     queue: str | None = None
     account: str | None = None
     nodes: int
+    ranks_per_node: int | None = Field(default=None, description="None when the job leaves it out")
+    ranks: int | None = Field(default=None, description="All processes, None when left out")
     walltime_s: float | None = Field(default=None, description="None when no walltime is set")
     node_hours: float | None = Field(default=None, description="None when unknown")
     amount: float | None = None

@@ -163,8 +163,15 @@ Each site's `spend.ask` decides when relay asks before it submits:
 - `never`: no job asks;
 - a number: a job asks when it may use more than that many node-hours.
 
-The question shows the queue, the account, the nodes, the walltime and the
-most the job may use. Relay never sets a walltime itself. A package job takes
+A new site asks before every job unless you choose otherwise. Set it per site
+under Spending on the Compute page (Ask every time, Ask above N node-hours or
+Always allow), with `clio-relay site add --spend`, or in `sites.yaml`. The
+Compute page's defaults row, or `clio-relay site defaults --spend`, sets what
+new sites start with. A site where your allocation is unlimited can be set to
+Always allow.
+
+The question shows the nodes, the ranks per node, the walltime, the most the
+job may use in node-hours, the queue and the account. Relay never sets a walltime itself. A package job takes
 its walltime, queue and process layout from its contract's `resources`, read
 with the run's parameters (an omitted parameter takes its default), wherever
 the job leaves them unset; the site's defaults fill what is still open. A job

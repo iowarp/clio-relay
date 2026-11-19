@@ -25,7 +25,7 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui import surfaces
-from clio_relay.surface.a2ui.forms import FORM_ERROR, Form
+from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, FormError
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
     ADD_PATH,
@@ -35,12 +35,15 @@ from clio_relay.surface.a2ui.surfaces import (
     CATALOG_ID_ERROR,
     CATALOG_PATH,
     CATALOG_SITE_ERROR,
+    DEFAULTS,
     DEFAULTS_SUBJECT,
     EDIT_FIELDS,
     SECURITY,
     SITES_SURFACE,
     TabState,
+    defaults_state,
     protocol_name,
+    spend_sentence,
 )
 from clio_relay.surface.a2ui.values import (
     as_dict,
@@ -51,6 +54,7 @@ from clio_relay.surface.a2ui.values import (
     rendered_keys,
     sentence,
     site_values,
+    spend_ask,
 )
 
 if TYPE_CHECKING:
@@ -158,7 +162,7 @@ class TabActions:
                     "adapter": adapter,
                     "config": config,
                     "policy": common.get("policy") or self.state.default("security"),
-                    "spend": {"ask": common.get("spend", "always")},
+                    "spend": {"ask": common.get("spend") or spend_ask(self.state.default("spend"))},
                     "skill": common.get("skill"),
                 }
             )
@@ -241,7 +245,7 @@ class TabActions:
             "name": common.get("name"),
             "address": common.get("address"),
             "policy": common.get("policy") or site.policy,
-            "spend": {"ask": common.get("spend", site.spend.ask)},
+            "spend": {"ask": common.get("spend") or site.spend.ask},
             "skill": common.get("skill"),
             "defaults": defaults,
             "config": config,
@@ -337,7 +341,7 @@ class TabActions:
         return Outcome(ok=True, resend={SITES_SURFACE: ("/switch",)})
 
     async def set_value(self, subject: str, values: dict[str, Any]) -> Outcome:
-        """Change a default, or one endpoint's protocol or security, from a picker."""
+        """Change a default, or one endpoint's protocol, security or spending, from a picker."""
         if subject == DEFAULTS_SUBJECT:
             return self._set_defaults(values)
         site = self._site(subject)
@@ -349,16 +353,18 @@ class TabActions:
             return await self._set_security(site, value)
         if column == "protocol":
             return await self._set_protocol(site, value)
+        if column == "spend":
+            return await self._set_spend(site, value)
         return self._fail(site.id, {FORM_ERROR: f"Relay cannot change {column or 'that'} here"})
 
     def _set_defaults(self, values: dict[str, Any]) -> Outcome:
-        # A table row sends one column and its value; the Basic form sends both pickers.
+        # A table row sends one column and its value; the Basic form sends every picker.
         if values.get("column"):
             picked = {str(values["column"]): values.get("value")}
         else:
-            picked = {key: values[key] for key in ("protocol", "security") if key in values}
+            picked = {key: values[key] for key in DEFAULTS if key in values}
         listed = {name for name, item in self.forms().items() if item.listed}
-        changed: dict[str, str] = {}
+        changed: dict[str, Any] = {}
         for column, raw in picked.items():
             value = first(raw)
             if (column == "protocol" and value in listed) or (
@@ -366,18 +372,42 @@ class TabActions:
             ):
                 changed[column] = value
                 continue
+            if column == "spend":
+                try:
+                    changed[column] = spend_ask(value)
+                except FormError:
+                    pass
+                else:
+                    continue
             self.state.notice = "Relay has no such default for new endpoints."
             return Outcome(ok=False, resend={SITES_SURFACE: ("/defaults",)})
         try:
             saved = self.service.sites.set_defaults(
-                adapter=changed.get("protocol"), policy=changed.get("security")
+                adapter=changed.get("protocol"),
+                policy=changed.get("security"),
+                spend=changed.get("spend"),
             )
         except Refusal as refusal:
             self.state.notice = sentence(refusal.message)
             return Outcome(ok=False, resend={SITES_SURFACE: ("/defaults",)})
-        self.state.defaults = {"protocol": saved.adapter, "security": saved.policy}
+        self.state.defaults = defaults_state(saved)
         self.state.notice = "Saved the defaults for new endpoints."
         return Outcome(ok=True, resend={SITES_SURFACE: ("/defaults",)})
+
+    async def _set_spend(self, site: SiteEntry, value: str) -> Outcome:
+        try:
+            ask = spend_ask(value)
+        except FormError as exc:
+            return self._fail(site.id, {FORM_ERROR: str(exc)})
+        if ask == site.spend.ask:
+            return Outcome(ok=True)
+        try:
+            saved = self.service.sites.edit(site.id, {"spend": {"ask": ask}})
+        except Refusal as refusal:
+            return self._fail(site.id, {FORM_ERROR: sentence(refusal.message)})
+        self.state.errors.pop(site.id, None)
+        await self._saved(saved, f"Relay now {spend_sentence(ask)} on {saved.title}.")
+        return Outcome(ok=True)
 
     async def _set_security(self, site: SiteEntry, value: str) -> Outcome:
         if value not in SECURITY:

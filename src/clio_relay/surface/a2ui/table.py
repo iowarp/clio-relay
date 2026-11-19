@@ -2,7 +2,7 @@
 
 The table is one ``clio.choice-table.v1`` component, laid out like CLIO's Tools
 settings. A header row holds the defaults for new endpoints, then there is one
-row per endpoint. Each row has inline Protocol and Security pickers, its Status,
+row per endpoint. Each row has inline Protocol, Security and Spending pickers, its Status,
 and a menu of Probe, Edit and Remove. Picking a value calls
 :data:`~clio_relay.surface.a2ui.surfaces.SET_VALUE` with the row's token, and the
 host adds the column and value. An open edit form, remove confirmation or
@@ -36,6 +36,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SECURITY,
     SECURITY_HELP,
     SET_VALUE,
+    SPEND_HELP,
     SiteView,
     TabState,
     edit_draft,
@@ -45,8 +46,10 @@ from clio_relay.surface.a2ui.surfaces import (
     protocol_name,
     protocol_order,
     settings_rows,
+    spend_options,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.values import spend_ask, spend_value
 
 # clio-workspace/v1 caps labels at 120 characters and descriptions at 500.
 _LABEL = 120
@@ -69,7 +72,14 @@ _STATUS = {
 }
 
 
-def _columns(forms: dict[str, Form], views: list[SiteView]) -> list[dict[str, Any]]:
+def _spend_options(state: TabState, views: list[SiteView]) -> list[dict[str, str]]:
+    used = [view.site.spend.ask for view in views] + [spend_ask(state.default("spend"))]
+    return spend_options(used)
+
+
+def _columns(
+    forms: dict[str, Form], views: list[SiteView], state: TabState
+) -> list[dict[str, Any]]:
     listed = [name for name, item in forms.items() if item.listed]
     names = protocol_order([*listed, *(view.site.adapter for view in views)])
     protocols: list[dict[str, Any]] = []
@@ -102,6 +112,12 @@ def _columns(forms: dict[str, Form], views: list[SiteView]) -> list[dict[str, An
             "options": protocols,
         },
         {"id": "security", "title": "Security", "help": SECURITY_HELP, "options": security},
+        {
+            "id": "spend",
+            "title": "Spending",
+            "help": SPEND_HELP,
+            "options": _spend_options(state, views),
+        },
         {"id": "status", "title": "Status", "editable": False, "options": status},
     ]
 
@@ -201,7 +217,11 @@ def _clip(text: str, limit: int) -> str:
 
 def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any]:
     site = view.site
-    values = {"protocol": site.adapter, "security": site.policy}
+    values = {
+        "protocol": site.adapter,
+        "security": site.policy,
+        "spend": spend_value(site.spend.ask),
+    }
     status = str(view.status.get("state", ""))
     if status in _STATUS:
         values["status"] = status
@@ -238,7 +258,7 @@ def endpoints_surface(
             "endpoints",
             TABLE,
             label="Endpoints",
-            columns=_columns(forms, views),
+            columns=_columns(forms, views, state),
             defaults={
                 "title": "Defaults for new endpoints",
                 "values": {column: state.default(column) for column in DEFAULTS},

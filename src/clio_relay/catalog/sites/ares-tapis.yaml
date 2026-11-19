@@ -16,6 +16,4 @@ alternatives:
   ssh:
     ssh_profile: ares
 policy: open
-spend:
-  ask: never
 skill: ares-tapis
