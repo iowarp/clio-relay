@@ -85,11 +85,12 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: 92.11 (140/152) after the globus and iri fakes moved to tests.
 #: 92.81 (142/153) after the conformance kit's target moved to its own module.
 #: 93.54 (145/155) after the package catalog and package progress modules.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 93.54
+#: 93.58 (146/156) after the server instructions module.
+SRC_DISTRIBUTION_BASELINE_PERCENT = 93.58
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 95.61
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 95.65
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
