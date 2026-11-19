@@ -253,12 +253,21 @@ class FakeIriFacility:
         relay_task({"mode": "cancel", "job_dir": str(job_dir)})
         return httpx.Response(204)
 
-    def _local(self, path: str) -> Path | None:
+    def _local(self, path: str, *, ancestors: bool = False) -> Path | None:
+        """The local path for ``path``, or None when it is outside the facility.
+
+        With ``ancestors``, the directories above the root count too, so stat
+        sees ``/`` as a directory the way a real filesystem does.
+        """
         target = Path(os.path.normpath(path))
         root = Path(os.path.normpath(self.root))
-        if not target.is_absolute() or (target != root and root not in target.parents):
+        if not target.is_absolute():
             return None
-        return target
+        if target == root or root in target.parents:
+            return target
+        if ancestors and target in root.parents:
+            return target
+        return None
 
     def _filesystem(self, request: httpx.Request, version: str, rest: list[str]) -> httpx.Response:
         if len(rest) != 2:
@@ -282,7 +291,7 @@ class FakeIriFacility:
                 args = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
             else:
                 args = dict(request.url.params)
-        target = self._local(str(args.get("path", "")))
+        target = self._local(str(args.get("path", "")), ancestors=command == "stat")
         if target is None:
             return problem(403, "Forbidden", f"{args.get('path')} is outside the facility")
         status, result = self._run_file(command, target, request, args)
