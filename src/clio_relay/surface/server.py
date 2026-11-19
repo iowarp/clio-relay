@@ -50,6 +50,7 @@ from clio_relay.adapters.hooks import MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.surface import instructions
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
@@ -79,15 +80,6 @@ TASK_TOOLS = frozenset({"run", "serve"})
 _NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
-
-INSTRUCTIONS = (
-    "Relay runs work on the sites in its sites file. Call describe first. "
-    "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
-    "exec runs one short command; files lists, reads, writes and stages files; "
-    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal. "
-    "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
-    "it is also the resource relay://sites/<site>/skill, which files cannot read."
-)
 
 
 def _text(value: dict[str, Any]) -> str:
@@ -537,7 +529,7 @@ class RelayServer:
         """Return the FastMCP server."""
         server: FastMCP[Any] = FastMCP(
             "clio-relay",
-            instructions=INSTRUCTIONS,
+            instructions=instructions.current(self.service),
             auth=auth,
             tasks=False,
             strict_input_validation=True,
@@ -697,16 +689,20 @@ class RelayServer:
         return server
 
     @asynccontextmanager
-    async def _lifespan(self, _server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
+    async def _lifespan(self, server: FastMCP[Any]) -> AsyncGenerator[dict[str, Any]]:
+        # A client reads the instructions when it connects; give it today's sites.
+        server.instructions = await asyncio.to_thread(instructions.current, self.service)
         # A service that ended while relay was down is finished without anyone asking.
         observing = asyncio.create_task(self.service.observe_open_services())
         watching = asyncio.create_task(self.skills.watch(self.changes))
+        refreshing = asyncio.create_task(instructions.keep_current(server, self.service))
         try:
             yield {}
         finally:
             observing.cancel()
             watching.cancel()
-            await asyncio.gather(observing, watching, return_exceptions=True)
+            refreshing.cancel()
+            await asyncio.gather(observing, watching, refreshing, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 
