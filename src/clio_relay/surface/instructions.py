@@ -72,9 +72,7 @@ def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
     parts = [GENERAL, f"Compute sites configured for relay: {_listed(map(site_line, sites))}."]
     if packages:
         ordered = sorted(packages, key=lambda entry: entry.name)
-        parts.append(
-            f"Packages staged to run on them: {_listed(map(package_line, ordered))}."
-        )
+        parts.append(f"Packages staged to run on them: {_listed(map(package_line, ordered))}.")
     parts.append(
         "To run a code or a package on these sites, use relay's describe and run tools "
         "instead of building or launching it by hand: describe(site=...) gives a site's "

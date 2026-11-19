@@ -36,14 +36,21 @@ def _site(site_id: str, **fields: Any) -> SiteEntry:
 
 def test_the_text_names_each_site_and_package() -> None:
     text = instructions.compose(
-        [_site("ares", name="Ares", config={"scheduler": "slurm"}), _site("lab", policy="open")],
+        [
+            _site("ares", name="Ares cluster", config={"scheduler": "slurm"}),
+            _site("lab", name="LAB", policy="open"),
+        ],
         [_package(), _package("lab_kit.echo", summary=None)],
     )
     assert text.startswith(instructions.GENERAL)
-    assert "Compute sites configured for relay: ares (Ares; ssh, slurm, guarded); lab (ssh, open)." in text
+    assert (
+        "Compute sites configured for relay: ares (Ares cluster; ssh, slurm, guarded); lab (ssh, open)."
+        in text
+    )
     assert (
         "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
-        "(Xcompact3d (Incompact3d v5.0) incompressible flow simulation); lab_kit.echo 0.2.1." in text
+        "(Xcompact3d (Incompact3d v5.0) incompressible flow simulation); lab_kit.echo 0.2.1."
+        in text
     )
     assert "use relay's describe and run tools" in text
 
