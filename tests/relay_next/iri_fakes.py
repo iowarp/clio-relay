@@ -1,4 +1,4 @@
-"""A stand-in IRI facility for tests and offline demos.
+"""A stand-in IRI facility for the W11 tests.
 
 :class:`FakeIriFacility` is an ``httpx`` transport handler that answers the IRI
 Facility API calls relay makes, in either version. It follows the published
@@ -30,6 +30,8 @@ import httpx
 
 from clio_relay.adapters.globus.task import relay_task
 from clio_relay.jobs.records import write_json_atomic
+
+from .globus_fakes import WORKER
 
 # Property lists of the published schemas (JobSpec, ResourceSpec, JobAttributes).
 JOB_SPEC_FIELDS = frozenset(
@@ -222,7 +224,7 @@ class FakeIriFacility:
         write_json_atomic(job_dir / "payload.json", payload)
         with open(job_dir / "worker.log", "ab") as log:
             subprocess.Popen(
-                [sys.executable, "-m", "clio_relay.adapters.globus.fakes", str(job_dir)],
+                [sys.executable, str(WORKER), str(job_dir)],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,

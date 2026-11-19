@@ -24,7 +24,6 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig, tokens
 from clio_relay.adapters.globus.compute import ComputeService, function_digest
-from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
 from clio_relay.adapters.globus.task import relay_task
 from clio_relay.adapters.globus.transfer import PARTS_DIR, GlobusFiles, TransferService
 from clio_relay.adapters.local import LocalAdapter
@@ -34,6 +33,8 @@ from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobAttributes, JobResources, JobSpec
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget, wait_final
+
+from .globus_fakes import LocalComputeService, LocalTransferService
 
 pytestmark = pytest.mark.release_platform("posix")
 

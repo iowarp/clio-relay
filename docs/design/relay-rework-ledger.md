@@ -1655,10 +1655,10 @@ All W11 evidence below comes from unit and mock tests. None of it is a live pass
 - **The catalog entries are `guarded` with `spend: {ask: always}`.**
   - Aurora has no `endpoint`: the person sets their own, and building the site refuses `invalid_config` until they do.
   - DeltaAI sends the queue as `partition`. NCSA does not publish the template, so LQ-L8 checks that first.
-- **The fakes ship in the package for reuse (W2, W16).**
-  - `adapters.globus.fakes` provides `LocalComputeService` and `LocalTransferService`.
-  - `adapters.iri.fakes.FakeIriFacility` is an `httpx.MockTransport` handler. It validates job specs against the published field sets.
-  - `adapters/sky/fake_sky/sky/` is a stand-in `sky` package with SkyPilot 0.14.3's call shapes. It goes on the bridge's `PYTHONPATH`.
+- **The globus and iri fakes are test files.** Only the W11 tests use them, so they moved out of the package (W1's call, after the files merge):
+  - `tests/relay_next/globus_fakes.py` provides `LocalComputeService` and `LocalTransferService`. Its compute tasks run the file itself as a script, so no module path is needed.
+  - `tests/relay_next/iri_fakes.py` provides `FakeIriFacility`, an `httpx.MockTransport` handler. It validates job specs against the published field sets.
+  - `adapters/sky/fake_sky/sky/` stays in the package: it is a stand-in `sky` package with SkyPilot 0.14.3's call shapes, and goes on the bridge's `PYTHONPATH` through `FAKE_SKY_PATH`.
 - **globus and iri files are built on W1's `SiteFiles`.** `GlobusFiles` and `IriFiles` implement only the six primitives; the base applies the rules in docs/files.md, including delete and chunked writes.
   - globus keeps chunks in `<local_dir>/.relay-parts`, inside the local collection, and moves the file with one transfer on the final chunk (the coordinator's design change: no read-modify-write of a remote part). `stat` and `resume_at` answer from the local part. A recursive delete is one Transfer delete task. A link is removed, never followed: Transfer's `ls` marks it with `link_target`, or `invalid_symlink` when it is broken.
   - iri keeps chunks in `<state_dir>/parts` and uploads once on the final chunk. `max_upload_bytes` is 5 MiB, so a larger write refuses before any byte moves, with a pointer to globus. `rm` has no recursive flag and removes a tree, so a recursive delete is one `rm`. Kind uses `stat` with `dereference: false`, so a link is not followed.
