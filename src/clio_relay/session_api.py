@@ -12,6 +12,8 @@ import hmac
 from typing import Final
 
 SESSION_IDENTITY_SCHEMA: Final = "clio-relay.session-identity.v1"
+OWNER_SESSION_ID_HEADER: Final = "X-Clio-Relay-Owner-Session-Id"
+SESSION_GENERATION_ID_HEADER: Final = "X-Clio-Relay-Session-Generation-Id"
 
 
 def session_identity_document(

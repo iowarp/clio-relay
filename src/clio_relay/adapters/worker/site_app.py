@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query
 
 from clio_relay.adapters.worker.link import WORKER_PROTOCOL
 from clio_relay.adapters.worker.site_routes import SiteContext, register_adapter_routes
-from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
+from clio_relay.session_api import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.session_api import session_identity_document
 
 OWNED_SESSION_STATUS_SCHEMA: Final = "clio-relay.owned-session-status.v1"

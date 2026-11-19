@@ -27,7 +27,7 @@ from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.control_channel import ChannelDropped, ChannelEndpoint
 from clio_relay.errors import RelayError
 from clio_relay.frp_transport import BrokeredTcpTransport
-from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
+from clio_relay.session_api import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.session_api import session_identity_document
 
 WORKER_PROTOCOL: Final = 2

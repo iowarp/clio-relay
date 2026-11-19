@@ -130,7 +130,7 @@ include = ["src", "tests", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -p clio_relay.pytest_platform_partition"
+addopts = "-q"
 markers = [
     "release_platform(platform): test is executed only on its named native platform and is covered by the release matrix",
 ]

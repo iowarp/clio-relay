@@ -49,7 +49,6 @@ DEFAULT_MAX_LINES = 800
 RATCHET_BASELINE: dict[str, int] = {
     # Files still over DEFAULT_MAX_LINES, each at its current length. Lower an entry
     # when its file shrinks and drop it once the file is under the limit.
-    "src/clio_relay/spool.py": 1064,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
@@ -80,25 +79,9 @@ SWEET_SPOT_LINES = 500
 DISTRIBUTION_TARGET_PERCENT = 90.0
 
 #: Recorded percentage of src-family files under SWEET_SPOT_LINES, floored to
-#: two decimals at measurement time (478/619 = 77.22% when first recorded;
-#: clio-relay#214 added application_runtime_prediction.py (195 lines) then,
-#: in the review-fix round, execution_watch_prediction.py (122 lines),
-#: raising it to 480/621 = 77.29%; iowarp/clio-relay#285 added
-#: frp_visitor_reconciliation.py + frp_visitor_process_inspection.py, both
-#: sweet-spot-sized owner modules, raising it to 482/623 = 77.36%;
-#: clio-relay#288 recert (kit 2.10.5) split release_pin_sites_jarvis_tests.py
-#: out of release_pin_sites.py (same no-accretion move as
-#: release_pin_sites_kit.py before it) AND clio-relay#289 (read-path ACL
-#: verify-only fix) added the sweet-spot-sized owner module
-#: cluster_config_windows_read_verify.py — the two landed on independent
-#: branches, each measuring 483/624 = 77.40% on its own tree; the merged
-#: tree carries both new modules: 484/625 = 77.44%. May only RISE.
-#: Raised to 82.18 (452/550) when W1 split the Compute tab's add form and
-#: message builders out of W14's surfaces.py.
-#: Set to 91.44 (171/187) when the old system's small modules were deleted
-#: (W8 and W9, the JARVIS repository): deleting small files lowers the share
-#: without any file growing.
-#: Raised to 91.48 (172/188) when W9 split serve/report.py out of serve/runtime.py.
+#: two decimals at measurement time. May only RISE, except when deleting
+#: small files lowers the share without any file growing; record why here.
+#: Set to 91.44 (171/187) when the old system's small modules were deleted.
 SRC_DISTRIBUTION_BASELINE_PERCENT = 91.48
 
 #: Same guard for tests/ with its own (much lower) starting point

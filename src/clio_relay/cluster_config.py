@@ -1,132 +1,88 @@
-"""Local cluster registry for relay targets.
+"""The frp link settings for one site.
 
-This module is a thin facade (iowarp/clio-relay#231 split/cluster-config):
-the real implementation moved to owner modules below so every existing
-`from clio_relay.cluster_config import X` import across the codebase keeps
-resolving unchanged. Only two genuinely small, self-contained pieces stay
-resident here (`CLUSTER_REGISTRY_ENV` and `default_registry_path`), plus
-`import os` -- which `default_registry_path` needs for real, and which also
-happens to be what `tests/test_cluster_config.py` patches directly via
-`monkeypatch.setattr(cluster_config.os, ...)` (safe regardless of relocation:
-`cluster_config.os` and `<owner module>.os` are the exact same stdlib module
-object, so a patch through either reaches every caller). `import time` has no
-functional use here -- it stays only so that same test file's
-`monkeypatch.setattr(cluster_config.time, "sleep", ...)` calls keep resolving
-through the same singleton-module mechanism.
-
-Owner modules:
-    cluster_config_models          -- the Pydantic schema (DirectTransportConfig
-                                       through ClusterDefinition)
-    cluster_config_registry        -- ClusterRegistry + cluster_route_revision
-    cluster_config_io              -- bounded, integrity-checked configuration
-                                       file reads
-    cluster_config_windows_primitives -- leaf Win32 ctypes/SID primitives
-    cluster_config_windows_acl     -- reading back and verifying a Windows ACL
-    cluster_config_windows_paths   -- creating/enforcing owner-private
-                                       Windows files and directories
-    cluster_config_windows_guard   -- the parent-rename guard and opening an
-                                       existing file under an enforced ACL
-    cluster_config_windows_read_verify -- read-path-only ACL verification
-                                       (clio-relay#289): confirms, never
-                                       re-applies, the private ACL
+The worker adapter builds a one-site :class:`ClusterRegistry`, places it on the
+site as JSON, and the site server reads it back. The frp transports read the
+same :class:`ClusterDefinition`. Nothing here touches the filesystem.
 """
 
 from __future__ import annotations
 
-import os
-import time  # noqa: F401 -- see module docstring: kept for cluster_config.time patch compatibility
-from pathlib import Path
+from typing import Literal
 
-from clio_relay.cluster_config_io import (
-    CONFIG_READ_RETRY_SECONDS,
-    MAX_CLUSTER_REGISTRY_BYTES,
-    MAX_CONFIG_READ_ATTEMPTS,
-    read_bounded_configuration_bytes,
-    verify_private_configuration_path,
-)
-from clio_relay.cluster_config_models import (
-    MAX_REMOTE_MCP_ALLOW_TOOLS,
-    MAX_REMOTE_MCP_ARGS,
-    MAX_REMOTE_MCP_ARGUMENT_BYTES,
-    MAX_REMOTE_MCP_ENV_REFS,
-    MAX_REMOTE_MCP_SCHEMA_CACHE_TTL_SECONDS,
-    MAX_REMOTE_MCP_SERVERS_PER_CLUSTER,
-    ClusterDefinition,
-    ClusterTargetIdentity,
-    DirectTransportConfig,
-    FrpTransportConfig,
-    IdentityAnchor,
-    LiveTestConfig,
-    RemoteMcpContract,
-    RemoteMcpProfile,
-    RemoteMcpServerConfig,
-    WorkerCapacityPolicy,
-)
-from clio_relay.cluster_config_registry import (
-    CONFIG_REPLACE_ATTEMPTS,
-    MAX_CONFIGURED_CLUSTERS,
-    MAX_REMOTE_MCP_REGISTRATIONS,
-    ClusterRegistry,
-    cluster_route_revision,
-)
-from clio_relay.cluster_config_windows_guard import (
-    acquire_private_configuration_windows_parent_guard,
-    open_private_configuration_windows_descriptor,
-    release_private_configuration_windows_parent_guard,
-)
-from clio_relay.cluster_config_windows_paths import (
-    create_private_configuration_directory,
-    ensure_private_configuration_directory,
-    ensure_private_configuration_path,
-    ensure_private_configuration_windows_handle,
-    open_private_atomic_file,
-)
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-__all__ = [
-    "CLUSTER_REGISTRY_ENV",
-    "CONFIG_READ_RETRY_SECONDS",
-    "CONFIG_REPLACE_ATTEMPTS",
-    "MAX_CLUSTER_REGISTRY_BYTES",
-    "MAX_CONFIG_READ_ATTEMPTS",
-    "MAX_CONFIGURED_CLUSTERS",
-    "MAX_REMOTE_MCP_ALLOW_TOOLS",
-    "MAX_REMOTE_MCP_ARGS",
-    "MAX_REMOTE_MCP_ARGUMENT_BYTES",
-    "MAX_REMOTE_MCP_ENV_REFS",
-    "MAX_REMOTE_MCP_REGISTRATIONS",
-    "MAX_REMOTE_MCP_SCHEMA_CACHE_TTL_SECONDS",
-    "MAX_REMOTE_MCP_SERVERS_PER_CLUSTER",
-    "ClusterDefinition",
-    "ClusterRegistry",
-    "ClusterTargetIdentity",
-    "DirectTransportConfig",
-    "FrpTransportConfig",
-    "IdentityAnchor",
-    "LiveTestConfig",
-    "RemoteMcpContract",
-    "RemoteMcpProfile",
-    "RemoteMcpServerConfig",
-    "WorkerCapacityPolicy",
-    "acquire_private_configuration_windows_parent_guard",
-    "cluster_route_revision",
-    "create_private_configuration_directory",
-    "default_registry_path",
-    "ensure_private_configuration_directory",
-    "ensure_private_configuration_path",
-    "ensure_private_configuration_windows_handle",
-    "open_private_atomic_file",
-    "open_private_configuration_windows_descriptor",
-    "read_bounded_configuration_bytes",
-    "release_private_configuration_windows_parent_guard",
-    "verify_private_configuration_path",
-]
+from clio_relay.errors import ConfigurationError
 
-CLUSTER_REGISTRY_ENV = "CLIO_RELAY_CLUSTER_REGISTRY"
+# The bring-up identity anchor for ``brokered_tcp`` and ``udp_rendezvous``. Those
+# modes have no ssh-authenticated act to carry the identity document, so a site
+# must opt into the preshared link secret explicitly. ``None`` means not opted in.
+IdentityAnchor = Literal["preshared_link_secret"]
 
 
-def default_registry_path() -> Path:
-    """Return the default local cluster registry path."""
-    configured = os.getenv(CLUSTER_REGISTRY_ENV)
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return Path(".clio-relay/clusters.json").resolve()
+class FrpTransportConfig(BaseModel):
+    """How frpc reaches the frps rendezvous for one site."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str = "wss"
+    server_addr: str = ""
+    server_port: int = 443
+    token_env: str = "CLIO_RELAY_FRP_TOKEN"
+    stcp_secret_env: str = "CLIO_RELAY_STCP_SECRET"
+    # ``None`` resolves to a per-site default (``frp_proxy_naming``).
+    proxy_name: str | None = None
+    identity_anchor: IdentityAnchor | None = None
+
+
+class ClusterDefinition(BaseModel):
+    """One site's name, ssh destination and frp settings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=256)
+    ssh_host: str = Field(min_length=1, max_length=1_024)
+    frp_transport: FrpTransportConfig = Field(default_factory=FrpTransportConfig)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        return _label(value, field="cluster name")
+
+    @field_validator("ssh_host")
+    @classmethod
+    def _validate_ssh_host(cls, value: str) -> str:
+        if value.startswith("-") or any(c.isspace() or not c.isprintable() for c in value):
+            raise ValueError(
+                "ssh_host must be one non-option SSH destination without whitespace or controls"
+            )
+        return value
+
+
+class ClusterRegistry(BaseModel):
+    """Site definitions keyed by name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clusters: dict[str, ClusterDefinition] = Field(default_factory=dict, max_length=512)
+
+    @model_validator(mode="after")
+    def _keys_match_names(self) -> ClusterRegistry:
+        mismatches = sorted(key for key, item in self.clusters.items() if item.name != key)
+        if mismatches:
+            raise ValueError(
+                "cluster registry keys must match ClusterDefinition.name: " + ", ".join(mismatches)
+            )
+        return self
+
+    def require(self, name: str) -> ClusterDefinition:
+        """Return a configured site or raise a configuration error."""
+        try:
+            return self.clusters[name]
+        except KeyError as exc:
+            raise ConfigurationError(f"cluster is not configured: {name}") from exc
+
+
+def _label(value: str, *, field: str) -> str:
+    if value != value.strip() or any(not c.isprintable() for c in value):
+        raise ValueError(f"{field} must not contain surrounding whitespace or controls")
+    return value

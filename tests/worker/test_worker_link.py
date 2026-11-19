@@ -24,7 +24,7 @@ from clio_relay.adapters.worker.adapter import (
 )
 from clio_relay.adapters.worker.link import WORKER_PROTOCOL
 from clio_relay.adapters.worker.site_app import SiteSettings, site_app
-from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
+from clio_relay.session_api import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.session_api import SESSION_IDENTITY_SCHEMA, session_identity_document

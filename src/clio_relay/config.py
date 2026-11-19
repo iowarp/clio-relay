@@ -1,528 +1,59 @@
-"""Configuration loading for clio-relay."""
+"""Process settings read from the environment."""
 
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Self
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from clio_relay.identifiers import DurableRecordId
-from clio_relay.models_owner_session_lease import DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS
-from clio_relay.spool import (
-    DEFAULT_MAX_LOG_BYTES_PER_JOB,
-    DEFAULT_MAX_LOG_BYTES_PER_STREAM,
-)
-from clio_relay.storage_policy import (
-    DEFAULT_JOB_CORE_ALLOWANCE_BYTES,
-    DEFAULT_JOB_RESULT_ALLOWANCE_BYTES,
-    DEFAULT_RUNTIME_CHECK_INTERVAL_SECONDS,
-    StorageLimits,
-)
-
-_DEFAULT_STORAGE_LIMITS = StorageLimits()
-DEFAULT_INPUT_FILE_MAX_BYTES = 1 * 1024 * 1024
-DEFAULT_INPUT_TOTAL_MAX_BYTES = 4 * 1024 * 1024
-DEFAULT_INPUT_FILE_MAX_COUNT = 16
-MAX_INPUT_FILE_MAX_BYTES = 64 * 1024 * 1024
-MAX_INPUT_TOTAL_MAX_BYTES = 256 * 1024 * 1024
-ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV = "CLIO_RELAY_ALLOW_UNAUTHENTICATED_OWNED_SESSION"
-REMOTE_TRANSPORT_MODE_ENV = "CLIO_RELAY_REMOTE_TRANSPORT_MODE"
-REMOTE_TRANSPORT_INTERACTIVE_ENV = "CLIO_RELAY_REMOTE_TRANSPORT_INTERACTIVE"
+from typing import Literal
 
 TransportMode = Literal["brokered_tcp", "udp_rendezvous", "ssh_forward"]
 """How one remote connection reaches its remote relay.
 
-The mode is a deployment-time configuration choice, made per connection, not a
-runtime decision.  Nothing may probe one mode and switch to another: a link
-failure re-establishes the *same* configured mode or reports a typed failure.
-An operator picks ``brokered_tcp`` (TCP joined by an internet-accessible
-server), ``udp_rendezvous`` (the same rendezvous with NAT traversal), or
-``ssh_forward`` for infrastructure that permits nothing else.
+The mode is a deployment-time choice, made per connection. Nothing probes one
+mode and switches to another: a link failure re-establishes the same mode or
+reports a typed failure. ``brokered_tcp`` is TCP joined by a reachable server,
+``udp_rendezvous`` is the same rendezvous with NAT traversal, and
+``ssh_forward`` is for infrastructure that permits nothing else.
 """
 
-TRANSPORT_MODES: tuple[TransportMode, ...] = (
-    "brokered_tcp",
-    "udp_rendezvous",
-    "ssh_forward",
-)
-DEFAULT_REMOTE_TRANSPORT_MODE: TransportMode = "ssh_forward"
 
+@dataclass(frozen=True)
+class RelaySettings:
+    """The local tools relay starts."""
 
-class RelaySettings(BaseModel):
-    """Runtime settings loaded from environment variables."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    core_dir: Path = Field(default_factory=lambda: Path(".clio-relay/core"))
-    spool_dir: Path = Field(default_factory=lambda: Path(".clio-relay/spool"))
-    #: Explicit override for the local cluster-registry path threaded through
-    #: to ``load_virtual_remote_mcp_catalog``/``_configured_cluster_names``
-    #: (clio-relay#289). ``None`` (the default, unchanged production
-    #: behavior) means every reader falls back to ``default_registry_path()``
-    #: lazily, exactly as before this field existed -- this is deliberately
-    #: NOT a ``default_factory=default_registry_path`` field, since that
-    #: would bake the checkout-local fallback into every settings object at
-    #: construction time instead of leaving it a per-call decision.
-    cluster_registry_path: Path | None = None
-    spool_max_log_bytes_per_stream: int = Field(
-        default=DEFAULT_MAX_LOG_BYTES_PER_STREAM,
-        ge=1,
-    )
-    spool_max_log_bytes_per_job: int = Field(
-        default=DEFAULT_MAX_LOG_BYTES_PER_JOB,
-        ge=1,
-    )
-    storage_core_high_water_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.core_high_water_bytes,
-        ge=1,
-    )
-    storage_spool_high_water_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.spool_high_water_bytes,
-        ge=1,
-    )
-    storage_total_high_water_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.total_high_water_bytes,
-        ge=1,
-    )
-    storage_minimum_free_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.minimum_free_bytes,
-        ge=0,
-    )
-    storage_max_job_reservation_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_job_reservation_bytes,
-        ge=1,
-    )
-    storage_max_scan_entries: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_scan_entries,
-        ge=1,
-    )
-    storage_max_scan_depth: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_scan_depth,
-        ge=1,
-    )
-    storage_max_scan_accounted_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_scan_accounted_bytes,
-        ge=1,
-    )
-    storage_max_ledger_bytes: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_ledger_bytes,
-        ge=1,
-    )
-    storage_max_reservations: int = Field(
-        default=_DEFAULT_STORAGE_LIMITS.max_reservations,
-        ge=1,
-    )
-    storage_lock_timeout_seconds: float = Field(
-        default=_DEFAULT_STORAGE_LIMITS.lock_timeout_seconds,
-        gt=0,
-        le=300,
-    )
-    storage_job_core_allowance_bytes: int = Field(
-        default=DEFAULT_JOB_CORE_ALLOWANCE_BYTES,
-        ge=1,
-    )
-    storage_job_result_allowance_bytes: int = Field(
-        default=DEFAULT_JOB_RESULT_ALLOWANCE_BYTES,
-        ge=1,
-    )
-    storage_runtime_check_interval_seconds: float = Field(
-        default=DEFAULT_RUNTIME_CHECK_INTERVAL_SECONDS,
-        gt=0,
-        le=300,
-    )
-    frps_addr: str | None = None
-    frp_token: str | None = None
-    jarvis_bin: str = "jarvis"
     frpc_bin: str = "frpc"
-    api_token: str | None = None
-    owner_session_id: str | None = None
-    owner_session_generation_id: DurableRecordId | None = None
-    owner_session_cluster: str | None = None
-    owner_session_api_port: int | None = Field(default=None, gt=0, le=65_535)
-    #: 0 (the default) disables lease expiry entirely -- no timeout ever
-    #: destroys a live session; teardown is the only terminator. Positive
-    #: values (>= 30) opt a deployment into bounded self-clean. Values 1-29
-    #: are refused by the validator below as reap-storm footguns.
-    owner_session_lease_ttl_seconds: int = Field(
-        default=DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
-        ge=0,
-        le=86_400,
-    )
-    remote_transport_mode: TransportMode = DEFAULT_REMOTE_TRANSPORT_MODE
-    remote_transport_interactive: bool = True
-    remote_cluster: str | None = None
-    session_owner_token: str | None = None
-    allow_unauthenticated_owned_session: bool = False
-    agent_bin: str = "agent"
-    agent_adapter: str = "exec"
-    agent_args: list[str] = Field(default_factory=list)
-    input_workspace_root: Path | None = None
-    input_file_max_bytes: int = Field(
-        default=DEFAULT_INPUT_FILE_MAX_BYTES,
-        ge=1,
-        le=MAX_INPUT_FILE_MAX_BYTES,
-    )
-    input_total_max_bytes: int = Field(
-        default=DEFAULT_INPUT_TOTAL_MAX_BYTES,
-        ge=1,
-        le=MAX_INPUT_TOTAL_MAX_BYTES,
-    )
-    input_file_max_count: int = Field(default=DEFAULT_INPUT_FILE_MAX_COUNT, ge=1, le=1_000)
-
-    @model_validator(mode="after")
-    def validate_owner_session_lease_ttl(self) -> Self:
-        """Refuse the 1-29s lease-TTL footgun band; 0 means expiry disabled."""
-        if 0 < self.owner_session_lease_ttl_seconds < 30:
-            raise ValueError(
-                "owner_session_lease_ttl_seconds must be 0 (expiry disabled, the default) "
-                "or at least 30; values under 30 seconds would reap sessions faster than "
-                "a client can renew them"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_owner_session_identity(self) -> Self:
-        """Require session id and generation to appear as one authoritative identity."""
-        if (self.owner_session_id is None) != (self.owner_session_generation_id is None):
-            raise ValueError(
-                "owner_session_id and owner_session_generation_id must be configured together"
-            )
-        if self.owner_session_cluster is not None and self.owner_session_id is None:
-            raise ValueError(
-                "owner_session_cluster requires owner_session_id and owner_session_generation_id"
-            )
-        if (
-            self.owner_session_cluster is not None
-            and self.remote_cluster is not None
-            and self.owner_session_cluster != self.remote_cluster
-        ):
-            raise ValueError(
-                "owner_session_cluster and remote_cluster must match when both are configured"
-            )
-        if self.allow_unauthenticated_owned_session:
-            if self.owner_session_id is None:
-                raise ValueError(
-                    "allow_unauthenticated_owned_session requires an owned session identity"
-                )
-            if self.api_token is not None:
-                raise ValueError(
-                    "allow_unauthenticated_owned_session cannot be combined with an API token"
-                )
-        return self
-
-    def resolved_owner_session_cluster(self) -> str | None:
-        """Return the explicit owner destination or a safe legacy locality binding."""
-        return self.owner_session_cluster or self.remote_cluster
-
-    @model_validator(mode="after")
-    def validate_storage_policy(self) -> Self:
-        """Validate limits and ensure default per-job sizing fits the configured cap."""
-        self.storage_limits()
-        default_total = (
-            2 * self.spool_max_log_bytes_per_job
-            + self.storage_job_core_allowance_bytes
-            + self.storage_job_result_allowance_bytes
-        )
-        default_core = self.spool_max_log_bytes_per_job + self.storage_job_core_allowance_bytes
-        default_spool = self.spool_max_log_bytes_per_job + self.storage_job_result_allowance_bytes
-        if default_total > self.storage_max_job_reservation_bytes:
-            raise ValueError(
-                "default storage reservation exceeds storage_max_job_reservation_bytes"
-            )
-        if default_core > self.storage_core_high_water_bytes:
-            raise ValueError("default core reservation exceeds storage core high-water limit")
-        if default_spool > self.storage_spool_high_water_bytes:
-            raise ValueError("default spool reservation exceeds storage spool high-water limit")
-        if default_total > self.storage_total_high_water_bytes:
-            raise ValueError("default storage reservation exceeds storage total high-water limit")
-        return self
-
-    @model_validator(mode="after")
-    def validate_input_staging_policy(self) -> Self:
-        """Require coherent bounds for transparent local input staging."""
-        if self.input_total_max_bytes < self.input_file_max_bytes:
-            raise ValueError("input_total_max_bytes must be at least input_file_max_bytes")
-        return self
-
-    def storage_limits(self) -> StorageLimits:
-        """Build the validated queue and spool storage safety limits."""
-        return StorageLimits(
-            core_high_water_bytes=self.storage_core_high_water_bytes,
-            spool_high_water_bytes=self.storage_spool_high_water_bytes,
-            total_high_water_bytes=self.storage_total_high_water_bytes,
-            minimum_free_bytes=self.storage_minimum_free_bytes,
-            max_job_reservation_bytes=self.storage_max_job_reservation_bytes,
-            max_scan_entries=self.storage_max_scan_entries,
-            max_scan_depth=self.storage_max_scan_depth,
-            max_scan_accounted_bytes=self.storage_max_scan_accounted_bytes,
-            max_ledger_bytes=self.storage_max_ledger_bytes,
-            max_reservations=self.storage_max_reservations,
-            lock_timeout_seconds=self.storage_lock_timeout_seconds,
-        )
 
     @classmethod
     def from_env(cls) -> RelaySettings:
-        """Load settings from the current process environment."""
-        return cls(
-            core_dir=_env_or_bootstrap_data_dir("CLIO_RELAY_CORE_DIR", "core"),
-            spool_dir=_env_or_bootstrap_data_dir("CLIO_RELAY_SPOOL_DIR", "spool"),
-            spool_max_log_bytes_per_stream=_positive_int_env(
-                "CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_STREAM",
-                DEFAULT_MAX_LOG_BYTES_PER_STREAM,
-            ),
-            spool_max_log_bytes_per_job=_positive_int_env(
-                "CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_JOB",
-                DEFAULT_MAX_LOG_BYTES_PER_JOB,
-            ),
-            storage_core_high_water_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_CORE_HIGH_WATER_BYTES",
-                _DEFAULT_STORAGE_LIMITS.core_high_water_bytes,
-            ),
-            storage_spool_high_water_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_SPOOL_HIGH_WATER_BYTES",
-                _DEFAULT_STORAGE_LIMITS.spool_high_water_bytes,
-            ),
-            storage_total_high_water_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_TOTAL_HIGH_WATER_BYTES",
-                _DEFAULT_STORAGE_LIMITS.total_high_water_bytes,
-            ),
-            storage_minimum_free_bytes=_nonnegative_int_env(
-                "CLIO_RELAY_STORAGE_MINIMUM_FREE_BYTES",
-                _DEFAULT_STORAGE_LIMITS.minimum_free_bytes,
-            ),
-            storage_max_job_reservation_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_JOB_RESERVATION_BYTES",
-                _DEFAULT_STORAGE_LIMITS.max_job_reservation_bytes,
-            ),
-            storage_max_scan_entries=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_SCAN_ENTRIES",
-                _DEFAULT_STORAGE_LIMITS.max_scan_entries,
-            ),
-            storage_max_scan_depth=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_SCAN_DEPTH",
-                _DEFAULT_STORAGE_LIMITS.max_scan_depth,
-            ),
-            storage_max_scan_accounted_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_SCAN_ACCOUNTED_BYTES",
-                _DEFAULT_STORAGE_LIMITS.max_scan_accounted_bytes,
-            ),
-            storage_max_ledger_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_LEDGER_BYTES",
-                _DEFAULT_STORAGE_LIMITS.max_ledger_bytes,
-            ),
-            storage_max_reservations=_positive_int_env(
-                "CLIO_RELAY_STORAGE_MAX_RESERVATIONS",
-                _DEFAULT_STORAGE_LIMITS.max_reservations,
-            ),
-            storage_lock_timeout_seconds=_positive_float_env(
-                "CLIO_RELAY_STORAGE_LOCK_TIMEOUT_SECONDS",
-                _DEFAULT_STORAGE_LIMITS.lock_timeout_seconds,
-            ),
-            storage_job_core_allowance_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_JOB_CORE_ALLOWANCE_BYTES",
-                DEFAULT_JOB_CORE_ALLOWANCE_BYTES,
-            ),
-            storage_job_result_allowance_bytes=_positive_int_env(
-                "CLIO_RELAY_STORAGE_JOB_RESULT_ALLOWANCE_BYTES",
-                DEFAULT_JOB_RESULT_ALLOWANCE_BYTES,
-            ),
-            storage_runtime_check_interval_seconds=_positive_float_env(
-                "CLIO_RELAY_STORAGE_RUNTIME_CHECK_INTERVAL_SECONDS",
-                DEFAULT_RUNTIME_CHECK_INTERVAL_SECONDS,
-            ),
-            frps_addr=os.getenv("CLIO_RELAY_FRPS_ADDR"),
-            frp_token=os.getenv("CLIO_RELAY_FRP_TOKEN"),
-            jarvis_bin=_env_or_bootstrap_bin("CLIO_RELAY_JARVIS_BIN", "jarvis"),
-            frpc_bin=_env_or_bootstrap_bin("CLIO_RELAY_FRPC_BIN", "frpc"),
-            api_token=os.getenv("CLIO_RELAY_API_TOKEN"),
-            owner_session_id=os.getenv("CLIO_RELAY_OWNER_SESSION_ID"),
-            owner_session_generation_id=os.getenv("CLIO_RELAY_SESSION_GENERATION_ID"),
-            owner_session_cluster=os.getenv("CLIO_RELAY_OWNER_SESSION_CLUSTER"),
-            owner_session_api_port=_optional_positive_int_env(
-                "CLIO_RELAY_OWNER_SESSION_API_PORT",
-            ),
-            owner_session_lease_ttl_seconds=_nonnegative_int_env(
-                "CLIO_RELAY_OWNER_SESSION_LEASE_TTL_SECONDS",
-                DEFAULT_OWNER_SESSION_LEASE_TTL_SECONDS,
-            ),
-            remote_transport_mode=_transport_mode_env(),
-            remote_transport_interactive=_boolean_env(
-                REMOTE_TRANSPORT_INTERACTIVE_ENV,
-                True,
-            ),
-            remote_cluster=os.getenv("CLIO_RELAY_REMOTE_CLUSTER"),
-            session_owner_token=os.getenv("CLIO_RELAY_SESSION_OWNER_TOKEN"),
-            allow_unauthenticated_owned_session=_boolean_env(
-                ALLOW_UNAUTHENTICATED_OWNED_SESSION_ENV,
-                False,
-            ),
-            agent_bin=os.getenv(
-                "CLIO_RELAY_AGENT_BIN",
-                "agent",
-            ),
-            agent_adapter=os.getenv("CLIO_RELAY_AGENT_ADAPTER", "exec"),
-            agent_args=_split_args(os.getenv("CLIO_RELAY_AGENT_ARGS")),
-            input_workspace_root=_optional_path_env("CLIO_RELAY_INPUT_WORKSPACE_ROOT"),
-            input_file_max_bytes=_positive_int_env(
-                "CLIO_RELAY_INPUT_FILE_MAX_BYTES",
-                DEFAULT_INPUT_FILE_MAX_BYTES,
-            ),
-            input_total_max_bytes=_positive_int_env(
-                "CLIO_RELAY_INPUT_TOTAL_MAX_BYTES",
-                DEFAULT_INPUT_TOTAL_MAX_BYTES,
-            ),
-            input_file_max_count=_positive_int_env(
-                "CLIO_RELAY_INPUT_FILE_MAX_COUNT",
-                DEFAULT_INPUT_FILE_MAX_COUNT,
-            ),
-        )
+        """Resolve settings from ``CLIO_RELAY_*`` variables and the local tool paths."""
+        return cls(frpc_bin=_tool_bin("CLIO_RELAY_FRPC_BIN", "frpc"))
 
 
-def _env_or_bootstrap_data_dir(env_name: str, family: str) -> Path:
-    configured = os.getenv(env_name)
-    if configured:
-        return Path(configured).expanduser().resolve()
-    bootstrap_path = Path.home() / ".local" / "share" / "clio-relay" / family
-    if bootstrap_path.exists():
-        return bootstrap_path.resolve()
-    return Path(".clio-relay") / family
-
-
-def _env_or_bootstrap_bin(env_name: str, executable_name: str) -> str:
+def _tool_bin(env_name: str, name: str) -> str:
+    """Return the configured tool, else the first working one on PATH or in a known place."""
     configured = os.getenv(env_name)
     if configured:
         return configured
-    path_executable = shutil.which(executable_name)
-    if path_executable is not None and _candidate_is_usable(executable_name, Path(path_executable)):
-        return executable_name
-    bootstrap_path = Path.home() / ".local" / "bin" / executable_name
-    if bootstrap_path.exists() and _candidate_is_usable(executable_name, bootstrap_path):
-        return str(bootstrap_path)
-    local_tool_path = _local_tool_bin(executable_name)
-    if local_tool_path is not None and _candidate_is_usable(executable_name, local_tool_path):
-        return str(local_tool_path)
-    return executable_name
+    on_path = shutil.which(name)
+    if on_path is not None and _works(Path(on_path)):
+        return name
+    candidates = [Path.home() / ".local" / "bin" / name, Path.cwd() / ".tools" / "frp" / "bin" / name]
+    if os.name == "nt":
+        candidates.append(Path.cwd() / ".tools" / "frp" / "bin" / f"{name}.exe")
+    for candidate in candidates:
+        if candidate.exists() and _works(candidate):
+            return str(candidate.resolve())
+    return name
 
 
-def _candidate_is_usable(executable_name: str, path: Path) -> bool:
-    if executable_name not in {"frpc", "frps"}:
-        return True
+def _works(path: Path) -> bool:
     try:
         result = subprocess.run(
-            [str(path), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+            [str(path), "--version"], capture_output=True, text=True, timeout=5, check=False
         )
-    except OSError:
-        return False
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
-
-
-def _local_tool_bin(executable_name: str) -> Path | None:
-    candidates = [Path.cwd() / ".tools" / "frp" / "bin" / executable_name]
-    if os.name == "nt" and not executable_name.lower().endswith(".exe"):
-        candidates.append(Path.cwd() / ".tools" / "frp" / "bin" / f"{executable_name}.exe")
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return None
-
-
-def _split_args(value: str | None) -> list[str]:
-    if value is None or value.strip() == "":
-        return []
-    return shlex.split(value)
-
-
-def _optional_path_env(name: str) -> Path | None:
-    """Return one configured absolute path without requiring it to exist yet."""
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return None
-    return Path(value).expanduser().resolve()
-
-
-def _boolean_env(name: str, default: bool) -> bool:
-    """Return one explicit zero-or-one boolean environment value."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    if raw == "1":
-        return True
-    if raw == "0":
-        return False
-    raise ValueError(f"{name} must be either 0 or 1")
-
-
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _transport_mode_env() -> TransportMode:
-    """Read the configured transport mode; never infer or probe one."""
-    raw = os.getenv(REMOTE_TRANSPORT_MODE_ENV)
-    if raw is None or raw == "":
-        return DEFAULT_REMOTE_TRANSPORT_MODE
-    normalized = raw.strip().lower()
-    if normalized not in TRANSPORT_MODES:
-        supported = ", ".join(TRANSPORT_MODES)
-        raise ValueError(f"{REMOTE_TRANSPORT_MODE_ENV} must be one of: {supported}")
-    return normalized
-
-
-def _optional_positive_int_env(name: str) -> int | None:
-    """Read one optional positive integer without inventing a default."""
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _nonnegative_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a non-negative integer") from exc
-    if value < 0:
-        raise ValueError(f"{name} must be a non-negative integer")
-    return value
-
-
-def _positive_float_env(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive number") from exc
-    if not 0 < value <= 300:
-        raise ValueError(f"{name} must be greater than zero and at most 300")
-    return value
