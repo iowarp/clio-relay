@@ -160,8 +160,8 @@ async def test_a_deleted_review_stays_withdrawn_once_its_operation_ended(
     assert again.data["asks"][0]["binding"]["package_hash"] == digest
     assert guard.reviews.all() == []
 
-    answer(guard, "ask-2", hpc.id, review["message"], {**review["binding"], "site": hpc.id},
-           operation_id="op-2")
+    rebound = {**review["binding"], "site": hpc.id}
+    answer(guard, "ask-2", hpc.id, review["message"], rebound, operation_id="op-2")
     assert (await guard.check_run(hpc, package_spec(digest))).data["review"]["ask_id"] == "ask-2"
 
 
