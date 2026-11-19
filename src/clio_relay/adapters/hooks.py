@@ -62,7 +62,10 @@ class Ask(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     answered_at: datetime | None = None
     completed_at: datetime | None = Field(
-        default=None, description="When a URL ask's page reported the sign-in finished"
+        default=None,
+        description=(
+            "When a URL ask's page reported the sign-in finished, or when a files approval was used"
+        ),
     )
 
     def bind(self, binding: dict[str, Any]) -> None:

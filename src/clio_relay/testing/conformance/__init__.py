@@ -473,6 +473,40 @@ class AdapterConformance:
             await guard.prepare(guarded, target.ok_job, adapter=adapter)
         assert kept_out.value.reason == RefusalReason.POLICY_REFUSED
 
+    @pytest.mark.asyncio
+    async def test_guarded_files_ask_first(self, target: ConformanceTarget) -> None:
+        """docs/guarded-sites.md: on a guarded site, delete and a write that replaces
+        a file need the person's yes; a new file and any open-site op do not."""
+        from clio_relay.sites.models import SiteEntry
+        from clio_relay.surface.files_approval import approval_action
+
+        if await _refuses(target, "files"):
+            return
+        files = await target.build().files()
+
+        def site(policy: str) -> SiteEntry:
+            return SiteEntry.model_validate(
+                {"id": target.site_id, "adapter": target.adapter, "policy": policy}
+            )
+
+        opened, guarded = site("open"), site("guarded")
+        path = f"{target.files_dir}/{new_id('g')}.txt"
+        assert await approval_action(guarded, files, "write", path, overwrite=True) is None
+        await files.write(path, b"first")
+        for policy in (opened, guarded):
+            assert await approval_action(policy, files, "write", f"{path}.new") is None
+        assert await approval_action(opened, files, "write", path, overwrite=True) is None
+        assert await approval_action(opened, files, "delete", path) is None
+        replace = await approval_action(guarded, files, "write", path, overwrite=True)
+        assert replace is not None and path in replace
+        middle = await approval_action(
+            guarded, files, "write", path, overwrite=True, offset=5, final=False
+        )
+        assert middle is None, "only the first and the last chunk of an upload ask"
+        assert await approval_action(guarded, files, "delete", path) is not None
+        assert await approval_action(guarded, files, "delete", f"{path}.gone") is not None
+        await _deletes(files, path)
+
 
 __all__ = [
     "AdapterConformance",

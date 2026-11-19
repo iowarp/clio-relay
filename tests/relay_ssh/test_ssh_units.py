@@ -91,6 +91,12 @@ def test_a_remote_command_exit_255_is_not_an_ssh_failure(tmp_path: Path) -> None
     _adapter(tmp_path).transport.raise_for_failure(_failed("my tool failed"), "exec")
 
 
+def test_a_missing_remote_program_is_not_a_missing_ssh(tmp_path: Path) -> None:
+    _adapter(tmp_path).transport.raise_for_failure(
+        _failed("bash: relay-no-such-program: command not found", code=127), "exec"
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_missing_ssh_program_is_adapter_unavailable(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path, ssh_command="/nonexistent/ssh-relay-test")

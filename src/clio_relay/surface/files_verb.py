@@ -1,4 +1,8 @@
-"""The ``files`` verb: small files inline, larger ones staged by digest."""
+"""The ``files`` verb: small files inline, larger ones in chunks.
+
+On a guarded site a delete or a replace asks the person first: in the call
+when the client can show a form, else as a ``needs_approval`` refusal.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +11,29 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import mcp_types
+from fastmcp import Context
+from fastmcp.tools import InputRequiredToolResult, ToolResult
+
+from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.file_rules import CHUNK_BYTES
+from clio_relay.jobs.handles import FileAccess
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.sites.models import SiteEntry
+from clio_relay.surface.elicit import (
+    elicit_request,
+    elicitation_modes,
+    modern,
+    refusal_result,
+    response_parts,
+)
+from clio_relay.surface.files_approval import (
+    FILES_KIND,
+    NeedsPerson,
+    approval_action,
+    approve,
+    used,
+)
 from clio_relay.surface.service import RelayService
 
 MAX_INLINE_BYTES = CHUNK_BYTES
@@ -61,9 +86,45 @@ async def files_call(
     service: RelayService, site: str, args: FilesArgs
 ) -> tuple[dict[str, Any], str]:
     """Do one files op and return its structured result and text. Refuses on error."""
+    if args.path and args.path.startswith("relay://"):
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            "relay:// names a relay resource, not a file on the site; describe(site=...) "
+            "returns the site's guide as skill.text",
+            path=args.path,
+        )
     entry = service.site(site)
     adapter = service.adapter_for(entry, "files")
     access = await adapter.files()
+    approved = await _approved(service, entry, access, args)
+    structured, text = await _dispatch(access, args)
+    if approved is not None and (args.op == "delete" or args.final):
+        used(service, approved)
+    return structured, text
+
+
+async def _approved(
+    service: RelayService, entry: SiteEntry, access: FileAccess, args: FilesArgs
+) -> Ask | None:
+    """On a guarded site, the person's yes this op needs, or None when it needs none."""
+    if args.op not in {"delete", "write"} or not args.path:
+        return None
+    action = await approval_action(
+        entry,
+        access,
+        args.op,
+        args.path,
+        overwrite=args.overwrite,
+        offset=args.offset,
+        final=args.final,
+        recursive=args.recursive,
+    )
+    if action is None:
+        return None
+    return await approve(service, entry, args.op, args.path, action, recursive=args.recursive)
+
+
+async def _dispatch(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any], str]:
     op, path, offset = args.op, args.path, args.offset
     structured: dict[str, Any]
     if op == "list":
@@ -117,3 +178,74 @@ async def files_call(
             RefusalReason.VERB_NOT_IMPLEMENTED, f"files op {op!r} is not available yet", op=op
         )
     return structured, text
+
+
+async def files_tool(
+    service: RelayService, ctx: Context, site: str, args: FilesArgs
+) -> ToolResult | InputRequiredToolResult:
+    """The ``files`` tool: one files op, with the person's yes when the site needs it."""
+    try:
+        if ctx.request_state and ctx.input_responses is not None:
+            _answer(service, site, args, ctx.request_state, ctx.input_responses)
+        try:
+            structured, text = await files_call(service, site, args)
+        except NeedsPerson as waiting:
+            ask = waiting.ask
+            if "form" not in elicitation_modes(ctx):
+                return _needs_person(service, ask)
+            if modern(ctx):
+                return InputRequiredToolResult(
+                    mcp_types.InputRequiredResult(
+                        input_requests={ask.ask_id: elicit_request(ask)},
+                        request_state=ask.ask_id,
+                    )
+                )
+            response = await ctx.session.elicit_form(
+                message=ask.message,
+                requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
+            )
+            action, content = response_parts(response)
+            service.answer(ask.ask_id, action, content, by="elicitation")
+            try:
+                structured, text = await files_call(service, site, args)
+            except NeedsPerson as still:
+                return _needs_person(service, still.ask)
+    except Refusal as refusal:
+        return refusal_result(refusal)
+    return ToolResult(
+        content=[mcp_types.TextContent(type="text", text=text)],
+        structured_content=structured,
+    )
+
+
+def _answer(
+    service: RelayService, site: str, args: FilesArgs, ask_id: str, responses: dict[str, Any]
+) -> None:
+    """Record the answer a retried files call carries, for this site and path only."""
+    ask = service.asks.get(ask_id)
+    if ask is None or ask_id not in responses:
+        return
+    bound = ask.binding
+    if bound.get("kind") != FILES_KIND or ask.site != site or bound.get("path") != args.path:
+        return
+    action, content = response_parts(responses[ask_id])
+    service.answer(ask_id, action, content, by="input_required")
+
+
+def _needs_person(service: RelayService, ask: Ask) -> ToolResult:
+    refusal = Refusal(
+        RefusalReason.NEEDS_APPROVAL,
+        "the site is guarded, so relay asks the person before it deletes or replaces "
+        "a file. Open the page, or run `clio-relay asks answer`, then call files "
+        "again with the same arguments",
+        ask_id=ask.ask_id,
+        asks=[
+            {
+                "ask_id": ask.ask_id,
+                "kind": ask.kind,
+                "message": ask.message,
+                "page": service.ask_provider.page_address(ask),
+            }
+        ],
+    )
+    return refusal_result(refusal)

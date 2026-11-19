@@ -80,11 +80,29 @@ def test_skill_resources_list_and_read(relay_paths: RelayPaths) -> None:
 
             described: Any = (await client.call_tool("describe", {})).structured_content
             by_id = {site["id"]: site for site in described["sites"]}
-            assert by_id["fx"]["skill"] == {"linked": "fx-notes", "uri": site_skill_uri("fx")}
+            assert by_id["fx"]["skill"] == {
+                "linked": "fx-notes",
+                "uri": site_skill_uri("fx"),
+                "title": "Using fx",
+                "read_with": "describe(site='fx')",
+            }
             assert by_id["bare"]["skill"] is None
             assert by_id["lost"]["skill"]["uri"] is None
-            one: Any = (await client.call_tool("describe", {"site": "fx"})).structured_content
+            result = await client.call_tool("describe", {"site": "fx"})
+            one: Any = result.structured_content
             assert one["skill"]["uri"] == site_skill_uri("fx")
+            assert one["skill"]["text"] == "# Using fx\nSubmit with run.\n"
+            texts = [getattr(block, "text", "") for block in result.content]
+            assert texts[-1] == "# Using fx\nSubmit with run.\n"
+            assert '"text": "(below)"' in texts[0]
+            through_files = await client.call_tool(
+                "files",
+                {"site": "fx", "op": "read", "path": site_skill_uri("fx")},
+                raise_on_error=False,
+            )
+            refusal: Any = through_files.structured_content
+            assert refusal["refusal"]["reason"] == "invalid_arguments"
+            assert "describe(site=...)" in refusal["refusal"]["message"]
 
     asyncio.run(scenario())
 
@@ -99,6 +117,8 @@ def test_a_site_links_a_skill_file_by_path(relay_paths: RelayPaths, tmp_path: Pa
     assert skill_link(entry, relay_paths.config_dir) == {
         "linked": str(outside),
         "uri": site_skill_uri("fx"),
+        "title": "Outside",
+        "read_with": "describe(site='fx')",
     }
     (relay_paths.config_dir / "fx-rel.md").write_text("# Relative\n", "utf-8")
     _link(relay_paths, "fx", "fx-rel.md")

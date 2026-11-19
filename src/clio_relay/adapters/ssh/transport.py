@@ -385,12 +385,14 @@ class SshTransport:
                 site=self.site_id,
             )
         local_programs = (self.config.ssh_command, self.config.scp_command)
+        # Only the spawn failure in ``run_process`` writes exactly this; a remote
+        # shell's "bash: <program>: command not found" is the job's own failure.
         if (
             result.exit_code == 127
             and not result.stdout
-            and b"command not found" in result.stderr
             and result.argv
             and result.argv[0] in local_programs
+            and result.stderr == f"{result.argv[0]}: command not found".encode()
         ):
             raise Refusal(
                 RefusalReason.ADAPTER_UNAVAILABLE,
