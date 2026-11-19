@@ -7,6 +7,7 @@ fastmcp, runs a job and answers a form and a URL question, on both protocol eras
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import socket
 import subprocess
@@ -31,6 +32,8 @@ from mcp.client.session import ElicitationFnT
 from mcp.client.stdio import StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
 
+from clio_relay.jobs.file_rules import CHUNK_BYTES
+from clio_relay.surface.http_limits import MAX_HTTP_BODY_BYTES
 from clio_relay.surface.settings import RelayPaths
 
 from .conftest import add_site, answer_page
@@ -174,6 +177,47 @@ def test_http_task(relay_paths: RelayPaths, relay_http: tuple[str, str]) -> None
             assert result.structured_content["state"] == "completed"
 
     asyncio.run(scenario())
+
+
+def test_http_takes_a_full_files_chunk(
+    relay_paths: RelayPaths, relay_http: tuple[str, str]
+) -> None:
+    """A 4 MiB chunk is 5.6 MB of base64, over the SDK's default 4 MiB body limit."""
+    add_site(relay_paths)
+    url, token = relay_http
+    data = os.urandom(CHUNK_BYTES)
+
+    async def scenario() -> None:
+        async with FastMCPClient(StreamableHttpTransport(url, auth=token)) as client:
+            written = await client.call_tool(
+                "files",
+                {
+                    "site": "fx",
+                    "op": "write",
+                    "path": "chunk.bin",
+                    "content_base64": base64.b64encode(data).decode("ascii"),
+                },
+            )
+            assert written.structured_content is not None
+            assert written.structured_content["size"] == CHUNK_BYTES
+            read = await client.call_tool(
+                "files", {"site": "fx", "op": "read", "path": "chunk.bin"}
+            )
+            assert read.structured_content is not None
+            assert base64.b64decode(read.structured_content["content_base64"]) == data
+
+    asyncio.run(scenario())
+
+
+def test_http_still_refuses_an_oversized_body(relay_http: tuple[str, str]) -> None:
+    url, token = relay_http
+    refused = httpx.post(
+        url,
+        content=b" " * (MAX_HTTP_BODY_BYTES + 1),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    assert refused.status_code == 413
 
 
 @pytest.mark.parametrize("mode", MODES)

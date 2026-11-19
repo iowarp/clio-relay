@@ -44,6 +44,18 @@ def _kill(process: asyncio.subprocess.Process) -> None:
             process.kill()
 
 
+def _close_transport(process: asyncio.subprocess.Process) -> None:
+    """Close the pipes now, on this loop.
+
+    A process killed on a cancel or a timeout may not be reaped before the
+    caller's loop ends, and a transport closed later by the garbage collector
+    raises "Event loop is closed". ``Process`` has no public close.
+    """
+    transport = getattr(process, "_transport", None)
+    if isinstance(transport, asyncio.SubprocessTransport):
+        transport.close()
+
+
 async def run_bounded(
     argv: list[str],
     *,
@@ -150,6 +162,7 @@ async def run_bounded(
         for step in work:
             step.cancel()
         await asyncio.gather(*work, return_exceptions=True)
+        _close_transport(process)
     return ExecResult(
         argv=argv,
         exit_code=None if timed_out else process.returncode,

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import sys
 import time
+from typing import Any
 
 import pytest
 
@@ -33,6 +35,27 @@ async def test_cancelled_caller_kills_the_command() -> None:
     with pytest.raises(asyncio.CancelledError):
         await call
     assert time.monotonic() - started < 20
+
+
+def test_a_cancelled_call_leaves_nothing_for_the_collector() -> None:
+    """The loop may end before the killed child is reaped; its pipes close first."""
+    seen: list[Any] = []
+
+    async def scenario() -> None:
+        call = asyncio.ensure_future(run_bounded(SLOW, timeout_s=60, max_output_bytes=100))
+        await asyncio.sleep(1)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    previous = sys.unraisablehook
+    sys.unraisablehook = seen.append
+    try:
+        asyncio.run(scenario())
+        gc.collect()
+    finally:
+        sys.unraisablehook = previous
+    assert not seen, [repr(item.exc_value) for item in seen]
 
 
 @pytest.mark.asyncio

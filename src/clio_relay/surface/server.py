@@ -64,6 +64,7 @@ from clio_relay.surface.elicit import (
 )
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
+from clio_relay.surface.http_limits import allow_chunk_bodies
 from clio_relay.surface.progress import progress_message
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -739,6 +740,7 @@ def create_server(
         if not token or not base_url:
             raise ValueError("HTTP transport needs a bearer token and a base URL")
         auth = RelayBearer(token, base_url=base_url)
+        allow_chunk_bodies()
     server = RelayServer(service).build(auth=auth)
     if transport == "http" and isinstance(service.ask_provider, MountsPages):
         service.ask_provider.mount(server)

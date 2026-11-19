@@ -151,7 +151,8 @@ refuses the work directory, your home and `/`, even through a symlink to them.
 
 On Ares, from the login node, a 4 MiB chunk takes about 2 s through the
 adapter, of which 0.9 s is opening the ssh connection, and a 4 MiB read about
-0.8 s.
+0.8 s. Carrying a chunk through relay's MCP server adds 0.1 to 0.3 s on an
+idle machine; a loaded login node can make that several times longer.
 
 ## Serving a port
 
