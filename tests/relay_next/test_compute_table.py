@@ -8,10 +8,13 @@ pick and menu item changes the same site store the CLI does.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
+from typer.testing import CliRunner
 
+from clio_relay import cli
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui.components import COMPONENTS, TABLE
 from clio_relay.surface.service import RelayService
@@ -291,6 +294,47 @@ def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
             assert host.table()["defaults"]["values"]["security"] == "guarded"
 
     asyncio.run(scenario())
+
+
+def test_the_page_and_the_cli_share_the_defaults(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLIO_RELAY_CONFIG_DIR", str(relay_paths.config_dir))
+    monkeypatch.setenv("CLIO_RELAY_STATE_DIR", str(relay_paths.state_dir))
+    store = SiteStore(relay_paths.sites_file)
+    runner = CliRunner()
+
+    async def pick() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            await host.choose("", "protocol", "local")
+            await host.choose("", "security", "open")
+
+    async def shown() -> dict[str, Any]:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            return host.table()["defaults"]["values"]
+
+    asyncio.run(pick())
+    assert store.defaults().model_dump() == {"adapter": "local", "policy": "open"}
+    assert store.path.with_name("site-defaults.yaml").is_file()
+
+    # The CLI's site add leaves out --adapter and --policy and gets the page's defaults.
+    added = runner.invoke(cli.app, ["site", "add", "here"])
+    assert added.exit_code == 0, added.output
+    site = store.get("here")
+    assert (site.adapter, site.policy) == ("local", "open")
+
+    refused = runner.invoke(cli.app, ["site", "defaults", "--adapter", "nope"])
+    assert refused.exit_code != 0
+    refused = runner.invoke(cli.app, ["site", "defaults", "--policy", "loose"])
+    assert refused.exit_code != 0
+    changed = runner.invoke(cli.app, ["site", "defaults", "--policy", "guarded"])
+    assert changed.exit_code == 0, changed.output
+    assert json.loads(changed.output) == {"adapter": "local", "policy": "guarded"}
+    assert asyncio.run(shown()) == {"protocol": "local", "security": "guarded"}
 
 
 def test_the_row_menu_probes_edits_and_removes(relay_paths: RelayPaths) -> None:

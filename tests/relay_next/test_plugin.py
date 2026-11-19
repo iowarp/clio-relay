@@ -74,8 +74,9 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     assert paths.grant_files == {"globus": Path("/plugin-data/accounts/globus.json")}
 
 
-def test_the_skills_index_points_at_the_skill_resources() -> None:
+def test_the_skills_index_points_at_describe_for_the_site_guide() -> None:
     text = (PLUGIN / "skills" / "use-relay" / "SKILL.md").read_text("utf-8")
     assert text.startswith("---\nname: use-relay\n")
-    assert "relay://sites/<site>/skill" in text
-    assert "relay://skills/<name>" in text
+    assert "describe(site=...)" in text
+    assert "second text block" in text
+    assert "`files` refuses `relay://` URIs" in text

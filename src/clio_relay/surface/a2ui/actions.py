@@ -368,7 +368,14 @@ class TabActions:
                 continue
             self.state.notice = "Relay has no such default for new endpoints."
             return Outcome(ok=False, resend={SITES_SURFACE: ("/defaults",)})
-        self.state.defaults.update(changed)
+        try:
+            saved = self.service.sites.set_defaults(
+                adapter=changed.get("protocol"), policy=changed.get("security")
+            )
+        except Refusal as refusal:
+            self.state.notice = sentence(refusal.message)
+            return Outcome(ok=False, resend={SITES_SURFACE: ("/defaults",)})
+        self.state.defaults = {"protocol": saved.adapter, "security": saved.policy}
         self.state.notice = "Saved the defaults for new endpoints."
         return Outcome(ok=True, resend={SITES_SURFACE: ("/defaults",)})
 

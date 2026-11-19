@@ -107,6 +107,11 @@ class ComputeTab(TabActions):
         except (OSError, ValueError):
             data = None
         self.state = TabState.from_dict(data)
+        try:
+            defaults = self.service.sites.defaults()
+        except Refusal:  # an unreadable defaults file reads as relay's own defaults
+            return
+        self.state.defaults = {"protocol": defaults.adapter, "security": defaults.policy}
 
     def _save_state(self) -> None:
         write_json_atomic(self._state_file, self.state.to_dict())
@@ -252,6 +257,7 @@ class ComputeTab(TabActions):
         digest = hashlib.sha256()
         for path in (
             self.service.paths.sites_file,
+            self.service.sites.defaults_path,
             probes_file(self.service.paths),
             self._state_file,
         ):

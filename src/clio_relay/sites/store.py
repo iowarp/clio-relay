@@ -11,17 +11,42 @@ from typing import Any, cast
 
 import yaml
 from filelock import FileLock
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.sites.models import CatalogEntry, SiteEntry
+from clio_relay.sites.models import CatalogEntry, SiteEntry, SitePolicy
+
+
+class NewSiteDefaults(BaseModel):
+    """What a new site starts with when whoever adds it leaves the choice out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    adapter: str = "ssh"
+    policy: SitePolicy = "guarded"
+
+
+def _dump_atomic(path: Path, data: Any) -> None:
+    text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 class SiteStore:
-    """Reads and writes the person's ``sites.yaml``, a top-level list of entries."""
+    """Reads and writes the person's ``sites.yaml``, a top-level list of entries.
+
+    The defaults for new sites sit beside it, in ``site-defaults.yaml``.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.defaults_path = path.with_name("site-defaults.yaml")
 
     @contextmanager
     def _locked(self) -> Generator[None]:
@@ -71,15 +96,49 @@ class SiteStore:
             item["id"] = entry.id
             item["adapter"] = entry.adapter
             item["policy"] = entry.policy
-        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        fd, tmp = tempfile.mkstemp(prefix=".sites.", dir=self.path.parent)
+        _dump_atomic(self.path, data)
+
+    def defaults(self) -> NewSiteDefaults:
+        """Return the adapter and policy a new site starts with."""
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-            os.replace(tmp, self.path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+            loaded: object = yaml.safe_load(self.defaults_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return NewSiteDefaults()
+        try:
+            return NewSiteDefaults.model_validate(loaded or {})
+        except ValidationError as exc:
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG,
+                f"{self.defaults_path} is not valid site defaults",
+                path=str(self.defaults_path),
+                errors=exc.errors(include_url=False, include_context=False),
+            ) from exc
+
+    def set_defaults(
+        self, adapter: str | None = None, policy: str | None = None
+    ) -> NewSiteDefaults:
+        """Change the defaults for new sites; what is left out stays as it was.
+
+        The caller checks that ``adapter`` is an installed adapter.
+        """
+        with self._locked():
+            changes = {
+                key: value
+                for key, value in (("adapter", adapter), ("policy", policy))
+                if value is not None
+            }
+            try:
+                updated = NewSiteDefaults.model_validate(
+                    self.defaults().model_dump() | changes
+                )
+            except ValidationError as exc:
+                raise Refusal(
+                    RefusalReason.INVALID_ARGUMENTS,
+                    "those are not valid defaults for new sites",
+                    errors=exc.errors(include_url=False, include_context=False),
+                ) from exc
+            _dump_atomic(self.defaults_path, updated.model_dump())
+        return updated
 
     def list(self) -> list[SiteEntry]:
         """Return every site, in file order."""

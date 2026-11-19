@@ -1924,7 +1924,7 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
   - A Basic-only client gets the same page as cards, with a defaults section and an "Add endpoint" button. An older host that rejects relay's catalog falls back to it.
   - Visible copy says endpoint, Protocol (SSH, Worker, Tapis, Globus, IRI, SkyPilot, Local) and Security (Secure runs only reviewed packages; Open runs what the agent writes). Config keys (`adapter`, `policy`, `guarded`, `open`) don't change.
   - A row pick edits the store directly. Security sets `policy`. Protocol switches to an alternative, or adds one when an empty config validates (local). Otherwise the endpoint's edit card opens on that protocol, and saving it switches.
-  - The defaults (protocol and security for new endpoints) shape the add form and live in the page's state file (`state/a2ui/compute-tab.json`), not in the site store. The CLI's `site add` doesn't read them.
+  - The defaults (protocol and security for new endpoints) shape the add form and live in the site store, in `site-defaults.yaml` beside `sites.yaml`. The CLI's `site add` uses them when `--adapter` or `--policy` is left out, and `clio-relay site defaults [--adapter X] [--policy Y]` shows or changes them, so the page and the CLI share one pair.
   - 12 app-only actions: an A2UI client sees 17 tools, a plain client 5.
 - **Server-sent copy is English.** No locale reaches MCP servers in W3's contract. Translating the tab's server-sent text needs a host-to-server locale, and that gap is reported to the coordinator.
 
