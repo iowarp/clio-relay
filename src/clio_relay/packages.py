@@ -244,11 +244,10 @@ def contract_resources(entry: PackageEntry, parameters: dict[str, Any]) -> dict[
     left out, so the site's defaults still apply to it.
     """
     properties = cast(dict[str, Any], entry.parameters.get("properties") or {})
-    values = {
-        name: prop["default"]
-        for name, prop in properties.items()
-        if isinstance(prop, dict) and "default" in prop
-    }
+    values: dict[str, Any] = {}
+    for name, prop in properties.items():
+        if isinstance(prop, dict) and "default" in prop:
+            values[name] = cast(dict[str, Any], prop)["default"]
     values.update(parameters)
     found: dict[str, Any] = {}
     for key, rule in (entry.resources or {}).items():
