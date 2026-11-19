@@ -31,7 +31,6 @@ An import graph from the entry points in `pyproject.toml` does not reach these, 
 - `identity/github.py`, `identity/globus.py`, `identity/oauth.py`: loaded through the identity registry.
 - `serve/_site/hop_proxy.py`: copied to the site and run there.
 - `testing/conformance/`: the adapter conformance kit that contributors run.
-- `adapters/globus/fakes.py` and `adapters/iri/fakes.py`: test doubles for the facility APIs, used by the tests and by contributors who copy them.
 
 ## Every module
 
@@ -203,7 +202,6 @@ Owner is the workstream that answers for the module.
 | `adapters/globus/__init__.py` | 242 | W11 | The ``globus`` adapter: Globus Compute for jobs, Globus Transfer for files. |
 | `adapters/globus/adapter.py` | 19,909 | W11 | The ``globus`` adapter (RL12): jobs through Globus Compute, files through Globus Transfer. |
 | `adapters/globus/compute.py` | 9,042 | W11 | How the ``globus`` adapter talks to Globus Compute. |
-| `adapters/globus/fakes.py` | 8,064 | W11 | Stand-ins for Globus Compute and Globus Transfer that run on this machine. |
 | `adapters/globus/task.py` | 8,076 | W11 | The function relay sends to a Globus Compute endpoint. |
 | `adapters/globus/tokens.py` | 7,164 | W11 | Globus credentials for the adapters that use them (``globus`` and ``iri``). |
 | `adapters/globus/transfer.py` | 14,583 | W11 | ``files`` for the ``globus`` adapter, over Globus Transfer. |
@@ -215,7 +213,6 @@ Owner is the workstream that answers for the module.
 | `adapters/iri/__init__.py` | 201 | W11 | The ``iri`` adapter: the DOE IRI Facility API (RL13). |
 | `adapters/iri/adapter.py` | 15,793 | W11 | The ``iri`` adapter (RL13): the DOE Integrated Research Infrastructure Facility API. |
 | `adapters/iri/client.py` | 9,449 | W11 | A small client for the DOE IRI Facility API. |
-| `adapters/iri/fakes.py` | 17,446 | W11 | A stand-in IRI facility for tests and offline demos. |
 | `adapters/iri/files.py` | 8,742 | W11 | ``files`` for the ``iri`` adapter, over the IRI ``/filesystem`` calls. |
 
 ### adapters/sky/ (35,531 bytes)
