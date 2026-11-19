@@ -20,7 +20,7 @@
       "navigation": {
         "id": "compute",
         "title": "Compute",
-        "icon": "server",
+        "icon": "cpu",
         "resource": "a2ui://clio-relay/compute"
       },
       "accounts": [
