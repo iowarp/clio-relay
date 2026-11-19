@@ -30,7 +30,7 @@ from pydantic import BaseModel
 
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
-from clio_relay.adapters.ssh import pricing, scripts, signals, store
+from clio_relay.adapters.ssh import pricing, scripts, signals, slurm_paths, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
@@ -381,6 +381,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         command = [str(part) for part in psij_context["launch_command"]]
         command[1] = str(root / "psij" / launcher_dir / Path(command[1]).name)
         command[3] = ""
+        # PSI/J's launcher takes the stdin, stdout and stderr paths as arguments 6 to 8.
+        marks = slurm_paths.mark(command, range(6, 9)) if scheduler == "slurm" else {}
         psij_context["launch_command"] = command
         psij_context["script_dir"] = str(job_dir)
         buffer = io.StringIO()
@@ -390,6 +392,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             # PSI/J 0.9.11's pbspro template writes -N="name", which qsub refuses.
             script = script.replace(f'#PBS -N="{name}"', f"#PBS -N {name}")
         elif scheduler == "slurm":
+            script = slurm_paths.expand(script, marks)
             script = signals.forward_signals(script, command[1], str(job_dir))
         rendered.files["submit.sh"] = script
         script_path = cast(Path, _SitePath(job_dir / "submit.sh"))

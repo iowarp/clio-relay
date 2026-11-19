@@ -79,7 +79,10 @@ and the gate asks for it unless the site's `spend.ask` is `never`.
    was cancelled before it started.
 3. One `ssh` call writes the script into the job's directory and submits it.
    The directory is `<remote_dir>/jobs/<operation id>/` and holds the script,
-   the submit result, `stdout`, `stderr` and the exit code.
+   the submit result, `stdout`, `stderr` and the exit code. On Slurm, a job's
+   `stdin_path`, `stdout_path` and `stderr_path` may use sbatch's filename
+   patterns (`%j`, `%x`, `%u`, `%N`, `%A`, `%a` and `%%`), so
+   `hostname-%j.out` becomes `hostname-27874.out`.
 4. `status` asks the scheduler through psij's own status command, and reads
    the exit code from the job's directory once the job ends.
 
