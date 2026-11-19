@@ -98,8 +98,10 @@ A site entry names the Tapis tenant and, for a host you reach yourself, the
     ssh:
       ssh_profile: ares
   policy: open
-  spend: {ask: never}
 ```
+
+Relay asks before every job on this site until you set its Spending to
+Always allow (`spend: {ask: never}`) on the Compute page.
 
 ## Settings
 

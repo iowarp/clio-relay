@@ -22,6 +22,10 @@ A site entry names a host from your ssh configuration:
   spend: {ask: never}
 ```
 
+`spend: {ask: never}` submits every job without asking, for a site whose
+allocation is unlimited. Leave it out and relay asks before every job; the
+Compute page's Spending picker changes it.
+
 Check that `ssh ares hostname` works in a terminal first. If it asks you
 anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 

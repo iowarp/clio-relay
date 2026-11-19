@@ -9,8 +9,6 @@ adapter: ssh
 config:
   ssh_profile: ares
 policy: open
-spend:
-  ask: never
 defaults:
   queue: compute
 skill: ares

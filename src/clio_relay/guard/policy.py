@@ -242,6 +242,8 @@ class Guard:
             queue=spec.attributes.queue_name,
             account=spec.attributes.account,
             nodes=spec.resources.nodes(),
+            ranks_per_node=spec.resources.ranks_per_node(),
+            ranks=spec.resources.process_count,
             walltime_s=None if duration is None else duration.total_seconds(),
             node_hours=None if node_hours is None else round(node_hours, 4),
         )
@@ -252,6 +254,8 @@ class Guard:
             update={
                 "queue": priced.queue or charge.queue,
                 "account": priced.account or charge.account,
+                "ranks_per_node": priced.ranks_per_node or charge.ranks_per_node,
+                "ranks": priced.ranks or charge.ranks,
             }
         )
 

@@ -26,6 +26,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SECURITY,
     SECURITY_HELP,
     SET_VALUE,
+    SPEND_HELP,
     SWITCH_ADAPTER,
     SiteView,
     TabState,
@@ -36,9 +37,11 @@ from clio_relay.surface.a2ui.surfaces import (
     protocol_name,
     protocol_order,
     settings_rows,
+    spend_options,
     status_text,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.values import spend_ask
 
 
 def _status_rows(tree: Tree, base: str, view: SiteView) -> list[str]:
@@ -98,7 +101,9 @@ def protocol_options(forms: dict[str, Form], first: str = "") -> list[dict[str, 
     return [{"label": protocol_name(name), "value": name} for name in names]
 
 
-def _defaults_section(tree: Tree, forms: dict[str, Form], tokens: ActionTokens) -> str:
+def _defaults_section(
+    tree: Tree, views: list[SiteView], state: TabState, forms: dict[str, Form], tokens: ActionTokens
+) -> str:
     title = tree.text("defaults-title", "Defaults for new endpoints", "h4")
     protocol = tree.add(
         "defaults-protocol",
@@ -119,6 +124,19 @@ def _defaults_section(tree: Tree, forms: dict[str, Form], tokens: ActionTokens) 
         displayStyle="chips",
     )
     help_text = tree.text("defaults-security-help", SECURITY_HELP, "caption")
+    used = [view.site.spend.ask for view in views] + [spend_ask(state.default("spend"))]
+    spend = tree.add(
+        "defaults-spend",
+        "ChoicePicker",
+        label="Spending",
+        options=[
+            {"label": option["label"], "value": option["value"]} for option in spend_options(used)
+        ],
+        value=bound("/defaults/spend"),
+        variant="mutuallyExclusive",
+        displayStyle="chips",
+    )
+    spend_help = tree.text("defaults-spend-help", SPEND_HELP, "caption")
     save = tree.button(
         "defaults-save",
         "Save defaults",
@@ -127,7 +145,7 @@ def _defaults_section(tree: Tree, forms: dict[str, Form], tokens: ActionTokens) 
             {"token": tokens.mint(SET_VALUE, DEFAULTS_SUBJECT), "values": bound("/defaults")},
         ),
     )
-    return tree.column("defaults", [title, protocol, security, help_text, save])
+    return tree.column("defaults", [title, protocol, security, help_text, spend, spend_help, save])
 
 
 def site_card(
@@ -219,7 +237,7 @@ def sites_surface(
     children = [tree.row("sites-header", [title, add], justify="spaceBetween", align="center")]
     if state.notice:
         children.append(tree.text("sites-notice", state.notice))
-    children.append(_defaults_section(tree, forms, tokens))
+    children.append(_defaults_section(tree, views, state, forms, tokens))
     if not views:
         children.append(tree.text("sites-empty", "No endpoints yet."))
     for view in views:

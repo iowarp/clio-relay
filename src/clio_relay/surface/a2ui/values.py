@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from clio_relay.adapters import registry
 from clio_relay.jobs.refusals import Refusal
+from clio_relay.sites.models import SpendAsk
 from clio_relay.surface.a2ui.forms import FORM_ERROR, Field, FormError, form, parse, parse_value
 
 
@@ -40,33 +41,72 @@ def located(errors: object, prefix: str, known: set[str]) -> dict[str, str]:
     return found
 
 
-def spend_ask(raw: Any) -> str | float:
-    """Return the spend gate's setting from what the person typed."""
+SPEND_LIMIT = "spend_limit"
+"""The form field that holds the node-hours above which relay asks."""
+SPEND_ABOVE = "above"
+"""The spend form's choice that asks above a limit."""
+
+
+def spend_ask(raw: Any) -> SpendAsk:
+    """Return the spend gate's setting from a picker or a typed value.
+
+    ``always`` asks before every job, ``never`` never asks, and a number asks
+    above that many node-hours.
+    """
     text = str(raw or "").strip().lower() or "always"
-    if text in ("always", "never"):
-        return text
+    if text == "always":
+        return "always"
+    if text == "never":
+        return "never"
     try:
         value = float(text)
     except ValueError:
-        raise FormError("spend", "Enter always, never, or a number of node-hours") from None
+        raise FormError("spend", "Choose when relay asks before it spends") from None
     if value <= 0:
         raise FormError("spend", "Enter a number of node-hours above 0")
+    return value
+
+
+def spend_value(ask: str | float) -> str:
+    """Return a spend setting as the picker's value: ``always``, ``never`` or the node-hours."""
+    return ask if isinstance(ask, str) else f"{ask:g}"
+
+
+def spend_choice(choice: Any, limit: Any) -> str | float | None:
+    """Return the spend setting a form's choice and limit describe, or None when unset."""
+    picked = parse_value(Field("spend", "", "choice"), choice)
+    if picked is None:
+        return None
+    if picked != SPEND_ABOVE:
+        return spend_ask(picked)
+    text = "" if limit is None else str(limit).strip()
+    try:
+        value = float(text)
+    except ValueError:
+        raise FormError(SPEND_LIMIT, "Enter the node-hours above which relay asks") from None
+    if value <= 0:
+        raise FormError(SPEND_LIMIT, "Enter a number of node-hours above 0")
     return value
 
 
 def site_values(
     fields: Sequence[Field], values: dict[str, Any], errors: dict[str, str]
 ) -> dict[str, Any]:
-    """Parse the site fields of a form. Errors go to ``errors`` under ``site.<key>``."""
+    """Parse the site fields of a form. Errors go to ``errors`` under ``site.<key>``.
+
+    The spend choice and its limit parse together, as ``spend``.
+    """
     parsed: dict[str, Any] = {}
     for item in fields:
+        if item.key == SPEND_LIMIT:
+            continue
         try:
             if item.key == "spend":
-                parsed[item.key] = spend_ask(values.get(item.key))
+                parsed[item.key] = spend_choice(values.get("spend"), values.get(SPEND_LIMIT))
             else:
                 parsed[item.key] = parse_value(item, values.get(item.key))
         except FormError as exc:
-            errors[f"site.{item.key}"] = str(exc)
+            errors[f"site.{exc.key}"] = str(exc)
     return parsed
 
 

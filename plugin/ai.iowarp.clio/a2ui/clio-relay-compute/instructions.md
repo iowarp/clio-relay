@@ -5,8 +5,10 @@ of the Basic catalog it uses (`Text`, `Row`, `Column`, `Card`, `Tabs`,
 `Divider`, `Button`, `TextField`, `CheckBox` and `ChoicePicker`, each
 unmodified) and CLIO's choice table, `clio.choice-table.v1`. The table lays
 the endpoints out like CLIO's Tools settings: a row of defaults for new
-endpoints, then one row per endpoint with its Protocol and Security pickers,
-its Status and a menu of Probe, Edit and Remove. A client that does not list
+endpoints, then one row per endpoint with its Protocol, Security and Spending
+pickers, its Status and a menu of Probe, Edit and Remove. Spending decides
+when relay asks the person before it submits a job there: every time, above a
+node-hour threshold, or never (Always allow). A client that does not list
 this catalog gets the same page as Basic cards.
 
 Relay's MCP server writes these surfaces itself. It sends the page when CLIO

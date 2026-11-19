@@ -14,7 +14,7 @@ from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.sites.models import CatalogEntry, SiteEntry, SitePolicy
+from clio_relay.sites.models import CatalogEntry, SiteEntry, SitePolicy, SpendAsk, SpendPolicy
 
 
 class NewSiteDefaults(BaseModel):
@@ -24,6 +24,8 @@ class NewSiteDefaults(BaseModel):
 
     adapter: str = "ssh"
     policy: SitePolicy = "guarded"
+    spend: SpendAsk = "always"
+    """When relay asks before spending on a new site: ``spend.ask`` of :class:`SpendPolicy`."""
 
 
 def _dump_atomic(path: Path, data: Any) -> None:
@@ -99,7 +101,7 @@ class SiteStore:
         _dump_atomic(self.path, data)
 
     def defaults(self) -> NewSiteDefaults:
-        """Return the adapter and policy a new site starts with."""
+        """Return the adapter, policy and spend setting a new site starts with."""
         try:
             loaded: object = yaml.safe_load(self.defaults_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -115,7 +117,10 @@ class SiteStore:
             ) from exc
 
     def set_defaults(
-        self, adapter: str | None = None, policy: str | None = None
+        self,
+        adapter: str | None = None,
+        policy: str | None = None,
+        spend: str | float | None = None,
     ) -> NewSiteDefaults:
         """Change the defaults for new sites; what is left out stays as it was.
 
@@ -124,7 +129,7 @@ class SiteStore:
         with self._locked():
             changes = {
                 key: value
-                for key, value in (("adapter", adapter), ("policy", policy))
+                for key, value in (("adapter", adapter), ("policy", policy), ("spend", spend))
                 if value is not None
             }
             try:
@@ -167,8 +172,14 @@ class SiteStore:
         return entry
 
     def add_from_catalog(self, catalog: CatalogEntry, site_id: str | None = None) -> SiteEntry:
-        """Copy a catalog entry into ``sites.yaml``, where the person edits it."""
-        return self.add(catalog.to_site(site_id))
+        """Copy a catalog entry into ``sites.yaml``, where the person edits it.
+
+        An entry that sets no spend setting takes the person's default for new sites.
+        """
+        site = catalog.to_site(site_id)
+        if "spend" not in catalog.model_fields_set:
+            site = site.model_copy(update={"spend": SpendPolicy(ask=self.defaults().spend)})
+        return self.add(site)
 
     def edit(self, site_id: str, changes: dict[str, Any]) -> SiteEntry:
         """Apply top-level field changes to a site and validate the result."""
