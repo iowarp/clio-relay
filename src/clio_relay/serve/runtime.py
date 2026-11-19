@@ -60,6 +60,8 @@ EXEC_TIMEOUT_S = 120.0
 EXEC_OUTPUT = 65536
 STOP_MARGIN_S = 30.0
 CANCEL_RETRY_S = 60.0
+FOLLOW_FIRST_S = 1.0
+FOLLOW_MAX_S = 10.0
 LOG_TAIL = 4096
 # frpc's log line: "2026-11-18 12:38:59.277 [W] [client/service.go:319] text".
 _FRPC_LINE = re.compile(r"^\S+ \S+ \[([A-Z])\] \[[^\]]*\] (.*)$")
@@ -106,6 +108,26 @@ def _site_id(site: Any) -> str:
     return site if isinstance(site, str) else str(site.id)
 
 
+def _times(count: int) -> str:
+    return "once" if count == 1 else f"{count} times"
+
+
+def handle_job_dir(handle: JobHandle) -> str | None:
+    """Return the job directory from a handle, looking inside one an adapter wraps.
+
+    The worker adapter puts the handle its site-side adapter made under ``data["remote"]``.
+    """
+    data: dict[str, Any] | None = handle.data
+    while data is not None:
+        job_dir = data.get("job_dir")
+        if job_dir:
+            return str(job_dir)
+        remote = data.get("remote")
+        inner = cast(dict[str, Any], remote).get("data") if isinstance(remote, dict) else None
+        data = cast(dict[str, Any], inner) if isinstance(inner, dict) else None
+    return None
+
+
 class ServeRuntime:
     """Every service this relay host started, and their desktop ports."""
 
@@ -129,6 +151,7 @@ class ServeRuntime:
         self.sites: dict[str, Any] = {}
         self.notes: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._followers: dict[str, asyncio.Task[None]] = {}
         self._resumed = False
 
     # The hook
@@ -170,9 +193,17 @@ class ServeRuntime:
             if status.state.final:
                 return await self._finish(plan, adapter, status), None
             await self._follow_binding(plan, adapter)
+            if plan.stop_requested_at is not None:
+                note = (
+                    self.notes.get(plan.operation_id) or "stopping: waiting for the service to end"
+                )
+                return status.model_copy(update={"message": note}), None
             if status.state != JobState.RUNNING:
                 return status, None
-            return await self._running(plan, adapter, status)
+            status, endpoint = await self._running(plan, adapter, status)
+        if endpoint is None:
+            self._follow(plan, adapter, handle, status)
+        return status, endpoint
 
     async def stop(self, site: Any, adapter: Any, record: OperationRecord) -> JobStatus:
         """Close the desktop port, then stop the service with its grace period."""
@@ -180,17 +211,26 @@ class ServeRuntime:
         plan = self._plan(record.operation_id)
         if plan.final is not None:
             return JobStatus.model_validate(plan.final)
-        handle = await self._handle(plan, adapter, record)
-        await self._close_desktop(plan)
-        if plan.stop_requested_at is None:
-            plan.stop_requested_at = utc_now()
-            self._save(plan)
-        if handle is None:
-            final = JobStatus(state=JobState.CANCELLED, message="stopped before it was submitted")
-            plan.final = final.model_dump(mode="json")
-            self._save(plan)
-            return final
-        await self._request_stop(plan, adapter, handle)
+        follower = self._followers.pop(plan.operation_id, None)
+        if follower is not None:
+            follower.cancel()
+        # Under the lock, so a status call in flight cannot bind or mount it again.
+        async with self._lock(plan.operation_id):
+            if plan.final is not None:
+                return JobStatus.model_validate(plan.final)
+            if plan.stop_requested_at is None:
+                plan.stop_requested_at = utc_now()
+                self._save(plan)
+            handle = await self._handle(plan, adapter, record)
+            await self._close_desktop(plan)
+            if handle is None:
+                final = JobStatus(
+                    state=JobState.CANCELLED, message="stopped before it was submitted"
+                )
+                plan.final = final.model_dump(mode="json")
+                self._save(plan)
+                return final
+            await self._request_stop(plan, adapter, handle)
         grace = plan.site_serve.stop_grace_s + STOP_MARGIN_S
         started = time.monotonic()
         last_cancel = 0.0
@@ -218,6 +258,9 @@ class ServeRuntime:
 
     async def close(self) -> None:
         """Release the desktop ports and mounted sessions. Services keep running."""
+        for follower in list(self._followers.values()):
+            follower.cancel()
+        self._followers.clear()
         for forward in list(self.forwards.values()):
             await forward.close()
         self.forwards.clear()
@@ -286,6 +329,8 @@ class ServeRuntime:
         check_wrappable(spec)
         mode = self._mode(adapter, site, loaded.rendezvous is not None)
         ports = plan_ports(spec)
+        if any(port.protocol == "mcp" for port in ports):
+            self._refuse_a_second_mount(site_id, service_name(spec), operation_id)
         idle = spec.lifetime.idle_release
         plan = ServePlan(
             operation_id=operation_id,
@@ -321,11 +366,34 @@ class ServeRuntime:
             self._save(plan)
             raise
         plan.handle = handle
-        job_dir = handle.data.get("job_dir")
-        plan.job_dir = str(job_dir) if job_dir else None
+        plan.job_dir = handle_job_dir(handle)
         self._save(plan)
         self._record_handle(plan)
         return plan.endpoint(note="starting", connect_command=self.connect_command(plan))
+
+    def _refuse_a_second_mount(self, site_id: str, service: str, operation_id: str) -> None:
+        """Refuse a served MCP server whose tool names a live one on this host already uses."""
+        for other in self.store.all():
+            if other.operation_id == operation_id or other.final is not None:
+                continue
+            if other.stop_requested_at is not None or (other.site, other.service) != (
+                site_id,
+                service,
+            ):
+                continue
+            if not any(port.protocol == "mcp" for port in other.ports):
+                continue
+            record = self.records.get(other.operation_id)
+            if record is not None and record.state.final:
+                continue
+            raise Refusal(
+                RefusalReason.INVALID_SPEC,
+                f"{other.operation_id} already serves an MCP server named {service!r} on "
+                f"{site_id}, and its tools are mounted as {tool_prefix(site_id, service)}*. "
+                "Stop it, or give this job another name",
+                site=site_id,
+                operation_id=other.operation_id,
+            )
 
     def _mode(self, adapter: Any, site: SiteServe, has_rendezvous: bool) -> Any:
         has_ssh = callable(getattr(adapter, "ssh_argv", None))
@@ -348,11 +416,8 @@ class ServeRuntime:
     async def _exec(
         self, adapter: Any, plan: ServePlan, argv: list[str], *, check: bool = True
     ) -> ExecResult:
-        hop_exec: Any = getattr(adapter, "hop_exec", None)
-        if hop_exec is not None:
-            raw: Any = await hop_exec(plan.site, argv)
-        else:
-            raw = await adapter.exec(argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT)
+        run: Any = getattr(adapter, "hop_exec", None) or adapter.exec
+        raw: Any = await run(argv, timeout_s=EXEC_TIMEOUT_S, max_output_bytes=EXEC_OUTPUT)
         result = cast(ExecResult, raw)
         if check and result.exit_code != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
@@ -430,8 +495,10 @@ class ServeRuntime:
         if plan.handle is None:
             plan.handle = record.handle or await adapter.find(plan.operation_id)
             if plan.handle is not None:
-                job_dir = plan.handle.data.get("job_dir")
-                plan.job_dir = plan.job_dir or (str(job_dir) if job_dir else None)
+                self._save(plan)
+        if plan.handle is not None and plan.job_dir is None:
+            plan.job_dir = handle_job_dir(plan.handle)
+            if plan.job_dir is not None:
                 self._save(plan)
         if plan.handle is not None and record.handle is None:
             record.handle = plan.handle
@@ -535,7 +602,7 @@ class ServeRuntime:
         if mount_note:
             notes.append(mount_note)
         if plan.rebinds:
-            notes.append(f"desktop port bound again {plan.rebinds} times")
+            notes.append(f"desktop port bound again {_times(plan.rebinds)}")
         direct = forward.direct_note()
         if direct:
             notes.append(self._redact(plan, direct))
@@ -545,6 +612,44 @@ class ServeRuntime:
         message = "serving" + (f": {'; '.join(notes)}" if notes else "")
         endpoint = plan.endpoint(note=message, connect_command=self.connect_command(plan))
         return status.model_copy(update={"message": message}), endpoint
+
+    def _follow(self, plan: ServePlan, adapter: Any, handle: JobHandle, status: JobStatus) -> None:
+        """Keep bringing a running service up until it is served, with no client poll.
+
+        A client may stop polling once the task says the service is running and wait
+        for ``tools/list_changed`` instead; this binds the desktop port and mounts an
+        MCP server for it.
+        """
+        if plan.operation_id in self._followers:
+            return
+
+        async def follow() -> None:
+            delay = FOLLOW_FIRST_S
+            try:
+                while plan.final is None and plan.stop_requested_at is None:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, FOLLOW_MAX_S)
+                    try:
+                        async with self._lock(plan.operation_id):
+                            if plan.final is not None or plan.stop_requested_at is not None:
+                                return
+                            if (await adapter.status(handle)).state != JobState.RUNNING:
+                                return
+                            _, endpoint = await self._running(plan, adapter, status)
+                        if endpoint is not None:
+                            return
+                    except Exception:
+                        logger.warning(
+                            "service %s: bringing it up, retrying in %.0f s",
+                            plan.operation_id,
+                            delay,
+                            exc_info=True,
+                        )
+            finally:
+                self._followers.pop(plan.operation_id, None)
+
+        with contextlib.suppress(RuntimeError):
+            self._followers[plan.operation_id] = asyncio.get_running_loop().create_task(follow())
 
     async def _ensure_forward(self, plan: ServePlan, adapter: Any) -> Forward:
         forward = self.forwards.get(plan.operation_id)
@@ -683,9 +788,9 @@ class ServeRuntime:
             parts.append("its job was cancelled")
         restarts = stopped.get("frpc_restarts")
         if restarts:
-            parts.append(f"the site's frp client restarted {restarts} times")
+            parts.append(f"the site's frp client restarted {_times(int(restarts))}")
         if plan.rebinds:
-            parts.append(f"the desktop port was bound again {plan.rebinds} times")
+            parts.append(f"the desktop port was bound again {_times(plan.rebinds)}")
         return "; ".join(parts)
 
     # Reaching the service from another machine
