@@ -31,11 +31,11 @@ from typing import Any, cast
 
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.client import TapisCallError
+from clio_relay.adapters.tapis.files import WORK_DIR_NAME
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 
 KEY_BITS = 4096
-WORK_DIR_NAME = ".clio-relay/tapis"
 
 
 @dataclass

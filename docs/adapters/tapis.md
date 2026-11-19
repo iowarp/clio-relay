@@ -170,7 +170,8 @@ your work directory as well.
    holding one shell script. Relay uploads the archive to `<work dir>/launcher/`
    through Tapis Files. The app version holds the script's digest, so a new
    launcher is a new app version.
-2. Inputs are staged by content into `<work dir>/content/` through Tapis Files.
+2. Inputs are staged by content into `<work dir>/.relay-content/` through Tapis
+   Files.
    An input already there is not sent again. The job lists each input as a
    `tapislocal` file input, so Tapis does not copy it.
 3. Relay submits the job with `submitJob`. The job's description carries the
@@ -232,18 +233,23 @@ the operation id, so a retried `run` never submits a second copy.
 
 The `files` tool works through Tapis Files and follows relay's
 [files contract](../files.md). Relative paths are under the site's work
-directory; absolute paths are under the system's root directory.
+directory; absolute paths are under the system's root directory. Tapis does
+not report a home directory, so `~` is your home only on a host relay
+registered, where the work directory is `~/.clio-relay/tapis`. On any other
+system, `~` is the work directory.
 
 - `list` returns every entry, however many pages Tapis takes.
 - `read` with an offset asks Tapis for that byte range only.
-- A large upload moves in chunks of up to 4 MiB into `<path>.relay-part`, and
-  the last chunk moves it into place. Tapis Files cannot append, so each chunk
-  sends the part again; a very large upload is better staged another way. An
-  upload that stopped resumes from the part's size, even after relay restarts.
+- A large upload comes in chunks of up to 4 MiB. Tapis Files cannot append, so
+  relay keeps the chunks in its own state directory and sends the whole file
+  to Tapis once, with the last chunk. An upload that stopped resumes from what
+  relay holds, even after relay restarts; `stat` on `<path>.relay-part` gives
+  that size.
 - A write never lands inside a directory standing at the path, and never
   replaces a file unless `overwrite` is set, checked again at the last chunk.
 - `delete` removes a link as itself, never what it points at. It refuses the
-  work directory and every directory above it.
+  work directory and every directory above it, and a recursive delete is one
+  Tapis call.
 
 ## Guarded sites
 

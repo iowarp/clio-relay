@@ -1,79 +1,101 @@
 """File access on a Tapis system through Tapis Files (RL46).
 
-Paths are the system's own paths. An absolute path is taken from the
-system's root directory; a relative one is under relay's work directory.
-Content addressed files go in ``<work dir>/content/<sha256>`` (RL16).
+Paths are the system's own paths: an absolute one is taken from the system's
+root directory, a relative one is under relay's work directory. The rules in
+docs/files.md come from :class:`~clio_relay.adapters.site_files.SiteFiles`;
+this module only moves bytes with Tapis Files.
+
+Tapis Files has no append, so a chunked upload collects in relay's local
+staging directory and goes up once, with one ``insert``, on its final chunk.
 """
 
 from __future__ import annotations
 
-import hashlib
 import posixpath
-import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
+from clio_relay.adapters.site_files import Kind, SiteFiles
 from clio_relay.adapters.tapis.client import TapisCallError, acall, aread_range
-from clio_relay.jobs.file_rules import (
-    check_offset,
-    not_empty_refusal,
-    part_path,
-    protected_refusal,
-    resume_refusal,
-)
+from clio_relay.jobs.file_rules import protected_refusal
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 LIST_PAGE = 1000
 """Tapis ``listFiles`` returns at most this many entries a call by default; relay pages."""
 
+WORK_DIR_NAME = ".clio-relay/tapis"
+"""Where relay's work directory sits under the person's home on a host relay registered."""
 
-class TapisFiles:
+
+def home_for(work_dir: str) -> str:
+    """Return the home directory relay can tell from ``work_dir``.
+
+    Tapis does not report a home. On a host relay registered, the work
+    directory is ``<home>/.clio-relay/tapis``; anywhere else ``~`` is the work
+    directory itself.
+    """
+    work_dir = posixpath.normpath(work_dir)
+    suffix = "/" + WORK_DIR_NAME
+    if work_dir.endswith(suffix) and len(work_dir) > len(suffix):
+        return work_dir.removesuffix(suffix)
+    return work_dir
+
+
+class TapisFiles(SiteFiles):
     """``FileAccess`` over one Tapis system."""
 
-    def __init__(self, client: Callable[[], Awaitable[Any]], system_id: str, work_dir: str) -> None:
+    def __init__(
+        self,
+        client: Callable[[], Awaitable[Any]],
+        system_id: str,
+        work_dir: str,
+        *,
+        staging: Path,
+        home: str | None = None,
+    ) -> None:
+        super().__init__(root=work_dir, home=home or home_for(work_dir), staging=staging)
         self._client = client
         self.system_id = system_id
-        self.work_dir = work_dir.rstrip("/") or "/"
 
-    def resolve(self, path: str) -> str:
-        """Return the Tapis path for a path the caller gave."""
-        if path.startswith("/"):
-            joined = posixpath.normpath(path)
-        else:
-            joined = posixpath.normpath(posixpath.join(self.work_dir, path))
-            if not (joined + "/").startswith(self.work_dir.rstrip("/") + "/"):
-                raise Refusal(
-                    RefusalReason.INVALID_ARGUMENTS,
-                    "a relative path must stay inside relay's work directory",
-                    path=path,
-                )
-        return joined
-
-    def content_path(self, digest: str) -> str:
-        return f"{self.work_dir}/content/{digest}"
-
-    async def _call(self, operation: str, /, **kwargs: Any) -> Any:
+    async def _call(self, operation: str, path: str, /, **kwargs: Any) -> Any:
         client = await self._client()
-        return await acall(client, "files", operation, systemId=self.system_id, **kwargs)
+        try:
+            return await acall(
+                client, "files", operation, systemId=self.system_id, path=_api(path), **kwargs
+            )
+        except TapisCallError as exc:
+            if exc.not_found:
+                raise self._missing(path) from None
+            raise exc.refusal(path=path) from None
 
-    @staticmethod
-    def _missing(exc: TapisCallError, path: str) -> Refusal:
-        if exc.not_found:
-            return Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
-        return exc.refusal(path=path)
+    async def kind(self, path: str) -> Kind:
+        try:
+            info = cast(dict[str, Any], await self._call("getStatInfo", path, followLinks=False))
+        except Refusal as refusal:
+            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
+                return "missing"
+            raise
+        if info.get("link"):
+            return "link"
+        return "dir" if info.get("dir") else "file"
 
-    async def list(self, path: str) -> list[FileEntry]:
-        target = self.resolve(path)
+    async def describe(self, path: str) -> FileEntry:
+        info = cast(dict[str, Any], await self._call("getStatInfo", path, followLinks=True))
+        is_dir = bool(info.get("dir"))
+        return FileEntry(
+            path=path,
+            kind="dir" if is_dir else "file",
+            size=None if is_dir else int(info.get("size") or 0),
+            modified=_when(info.get("modifyTime")),
+        )
+
+    async def children(self, path: str) -> list[FileEntry]:
         found: list[dict[str, Any]] = []
         while True:
-            try:
-                page = await self._call(
-                    "listFiles", path=target.lstrip("/") or "/", limit=LIST_PAGE, offset=len(found)
-                )
-            except TapisCallError as exc:
-                raise self._missing(exc, path) from None
+            page = await self._call("listFiles", path, limit=LIST_PAGE, offset=len(found))
             items = cast(list[dict[str, Any]], page or [])
             found.extend(items)
             if len(items) < LIST_PAGE:
@@ -89,180 +111,57 @@ class TapisFiles:
                     modified=_when(item.get("lastModified")),
                 )
             )
-        return entries
+        return sorted(entries, key=lambda entry: posixpath.basename(entry.path))
 
-    async def _stat_info(self, path: str, *, follow: bool) -> dict[str, Any]:
-        target = self.resolve(path)
-        try:
-            found = await self._call("getStatInfo", path=target.lstrip("/"), followLinks=follow)
-        except TapisCallError as exc:
-            raise self._missing(exc, path) from None
-        return cast(dict[str, Any], found)
-
-    async def stat(self, path: str) -> FileEntry:
-        target = self.resolve(path)
-        info = await self._stat_info(path, follow=True)
-        is_dir = bool(info.get("dir"))
-        modified = info.get("modifyTime")
-        return FileEntry(
-            path=target,
-            kind="dir" if is_dir else "file",
-            size=None if is_dir else int(info.get("size") or 0),
-            modified=(
-                datetime.fromtimestamp(float(modified), UTC)
-                if isinstance(modified, int | float)
-                else _when(modified)
-            ),
-        )
-
-    async def exists(self, path: str) -> bool:
-        try:
-            await self.stat(path)
-        except Refusal as refusal:
-            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
-                return False
-            raise
-        return True
-
-    async def _size(self, path: str) -> int:
-        """Return the size of ``path``, or 0 when it is not there."""
-        try:
-            return (await self.stat(path)).size or 0
-        except Refusal as refusal:
-            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
-                return 0
-            raise
-
-    async def read(self, path: str, *, offset: int = 0, limit: int | None = None) -> bytes:
-        check_offset(path, offset)
-        target = self.resolve(path)
-        if limit is not None and limit <= 0:
+    async def get(self, path: str, offset: int, limit: int | None) -> bytes:
+        if limit == 0:
             return b""
         if limit is None and offset:
-            size = (await self.stat(path)).size or 0
+            size = (await self.describe(path)).size or 0
             if offset >= size:
                 return b""
             limit = size - offset
+        if limit is None:
+            data = await self._call("getContents", path)
+            return data if isinstance(data, bytes) else str(data).encode("utf-8")
+        client = await self._client()
         try:
-            if limit is None:
-                data = await self._call("getContents", path=target.lstrip("/"))
-                return data if isinstance(data, bytes) else str(data).encode("utf-8")
-            client = await self._client()
-            return await aread_range(client, self.system_id, target.lstrip("/"), offset, limit)
+            return await aread_range(client, self.system_id, _api(path), offset, limit)
         except TapisCallError as exc:
-            raise self._missing(exc, path) from None
+            if exc.not_found:
+                raise self._missing(path) from None
+            raise exc.refusal(path=path) from None
 
-    async def write(
-        self,
-        path: str,
-        data: bytes,
-        *,
-        overwrite: bool = False,
-        offset: int = 0,
-        final: bool = True,
-    ) -> FileEntry:
-        """Write a whole file, or one chunk of a larger one (docs/files.md).
-
-        Tapis Files has no append, so a chunk is added by reading the part back
-        and inserting it again with the chunk on the end. Each chunk is at most
-        4 MiB, so this costs the part's size once per chunk.
-        """
-        check_offset(path, offset)
-        target = self.resolve(path)
-        if offset == 0:
-            await self._check_target(path, target, overwrite)
-            if final:
-                await self._insert(target, data)
-                return await self.stat(target)
-        part = part_path(target)
-        if offset:
-            held = await self._size(part)
-            if held != offset:
-                raise resume_refusal(path, held)
-            data = await self.read(part) + data
-        if final:
-            await self._check_target(path, target, overwrite)
-        await self._insert(part, data)
-        if not final:
-            return await self.stat(part)
-        await self.move(part, target)
-        return await self.stat(target)
-
-    async def _check_target(self, path: str, target: str, overwrite: bool) -> None:
-        """Refuse a write onto an existing path without ``overwrite``, or onto a directory.
-
-        Tapis moves a part into a directory that stands at the target, so relay
-        never lets the target be a directory.
-        """
-        try:
-            entry = await self.stat(target)
-        except Refusal as refusal:
-            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
-                return
-            raise
-        if not overwrite:
-            raise Refusal(
-                RefusalReason.PATH_EXISTS, f"{path} exists; pass overwrite to replace it", path=path
-            )
-        if entry.kind == "dir":
+    async def put(self, path: str, data: bytes) -> None:
+        """Insert ``data`` as ``path``, refusing a directory there: Tapis would write into it."""
+        if await self.kind(path) == "dir":
             raise Refusal(
                 RefusalReason.PATH_EXISTS, f"{path} is a directory; relay writes files", path=path
             )
+        await self._call("insert", path, file=data)
 
-    async def _insert(self, target: str, data: bytes) -> None:
-        try:
-            await self._call("insert", path=target.lstrip("/"), file=data)
-        except TapisCallError as exc:
-            raise exc.refusal(path=target) from None
+    async def remove(self, path: str) -> None:
+        await self._call("delete", path)
 
-    async def move(self, source: str, target: str) -> None:
-        try:
-            await self._call(
-                "moveCopy",
-                path=self.resolve(source).lstrip("/"),
-                operation="MOVE",
-                newPath=self.resolve(target).lstrip("/"),
-            )
-        except TapisCallError as exc:
-            raise exc.refusal(path=source) from None
+    async def remove_tree(self, path: str) -> None:
+        """Delete a tree with one Tapis call, never one that holds relay's work directory.
 
-    async def delete(self, path: str, *, recursive: bool = False) -> None:
-        """Delete a file, a symlink or a directory.
-
-        Tapis always deletes a directory with everything in it, so relay checks
-        ``recursive`` first. A symlink is looked at without following it, and
-        Tapis removes the link itself. Tapis does not report the home directory,
-        so relay refuses the work directory and every directory above it, which
-        takes in home when the work directory is under it.
+        Tapis does not report the home directory, so relay refuses every
+        directory at or above its work directory.
         """
-        if not path:
-            raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give the path to delete")
-        target = self.resolve(path)
-        if (self.work_dir.rstrip("/") + "/").startswith(target.rstrip("/") + "/"):
+        if (self.root.rstrip("/") + "/").startswith(path.rstrip("/") + "/"):
             raise protected_refusal(path)
-        info = await self._stat_info(path, follow=False)
-        if info.get("dir") and not info.get("link") and not recursive and await self.list(path):
-            raise not_empty_refusal(path)
-        try:
-            await self._call("delete", path=target.lstrip("/"))
-        except TapisCallError as exc:
-            raise self._missing(exc, path) from None
+        await self._call("delete", path)
 
-    async def stage(self, data: bytes) -> str:
-        digest = hashlib.sha256(data).hexdigest()
-        if await self.has(digest):
-            return digest
-        final = self.content_path(digest)
-        partial = f"{final}.part-{uuid.uuid4().hex[:12]}"
-        await self._insert(partial, data)
-        await self.move(partial, final)
-        return digest
 
-    async def has(self, digest: str) -> bool:
-        return await self.exists(self.content_path(digest.lower()))
+def _api(path: str) -> str:
+    """Return ``path`` as Tapis Files takes it: relative to the system's root."""
+    return path.lstrip("/") or "/"
 
 
 def _when(value: Any) -> datetime | None:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return datetime.fromtimestamp(float(value), UTC)
     if not isinstance(value, str) or not value:
         return None
     try:
