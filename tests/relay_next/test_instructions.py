@@ -44,8 +44,8 @@ def test_the_text_names_each_site_and_package() -> None:
     )
     assert text.startswith(instructions.GENERAL)
     assert (
-        "Compute sites configured for relay: ares (Ares cluster; ssh, slurm, guarded); lab (ssh, open)."
-        in text
+        "Compute sites configured for relay: ares (Ares cluster; ssh, slurm, guarded); "
+        "lab (ssh, open)." in text
     )
     assert (
         "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
