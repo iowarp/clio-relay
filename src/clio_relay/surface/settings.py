@@ -77,6 +77,11 @@ class RelayPaths:
         """Return the content store's root."""
         return self.state_dir / "content"
 
+    @property
+    def packages_dir(self) -> Path:
+        """Return where the package catalog lives."""
+        return self.state_dir / "packages"
+
     def adapter_dir(self, site_id: str, adapter: str) -> Path:
         """Return one site's state directory for one adapter."""
         return self.state_dir / "sites" / site_id / adapter

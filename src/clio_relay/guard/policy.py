@@ -43,11 +43,12 @@ _MAX_LISTED_FILES = 40
 _PRICE: str = "price"  # an optional adapter method (sky); not on BaseAdapter
 
 PROCEED = (
-    "Write or pick a JARVIS package for the work (the clio-jarvis packages, or a new one "
-    "written with the JARVIS package skill), build its archive with `python -m "
-    "clio_relay.jarvis_site archive <repository dir> <repo.package> --stage`, and call run "
-    "with `package: {name, version, sha256, parameters}` instead of an executable. The "
-    "person reviews the package once, by its hash, before it runs."
+    "Pick a JARVIS package for the work: describe(site=...) lists the packages relay has, "
+    "with their parameters. Call run with `package: {name, parameters}` instead of an "
+    "executable; relay pins the newest version and its SHA-256. For a package relay does "
+    "not have yet (a new one written with the JARVIS package skill), stage it first with "
+    "`python -m clio_relay.packages stage <repository dir> <repo.package>`. The person "
+    "reviews each package once, by its hash, before it runs."
 )
 
 
@@ -165,13 +166,14 @@ class Guard:
         review = await asyncio.to_thread(self.reviewed, site.id, package)
         if review is not None:
             return GuardDecision(allowed=True, data={"review": _review_data(review)})
-        info = await asyncio.to_thread(read_archive, self.content, package.name, package.sha256)
-        archive = self.content.path_for(package.sha256)
+        version, sha256 = package.pinned()
+        info = await asyncio.to_thread(read_archive, self.content, package.name, sha256)
+        archive = self.content.path_for(sha256)
         binding: dict[str, Any] = {
             "kind": REVIEW_KIND,
             "package": package.name,
-            "version": package.version,
-            "package_hash": package.sha256,
+            "version": version,
+            "package_hash": sha256,
             "source": info.source,
             "files": len(info.files),
         }

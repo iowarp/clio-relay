@@ -51,6 +51,10 @@ Optional hooks, found by name when an adapter defines them:
 
 - ``on_site_added(site)``: :class:`SiteAdded`; set the site up when it is saved.
 - ``job_name(operation_id) -> str``: the scheduler job name relay shows.
+- ``job_dir(handle) -> str | None``: the job's directory, as ``files`` names it,
+  when it is not ``handle.data["job_dir"]``. Relay reads a package job's live
+  step and outputs from the JARVIS records there (see
+  :mod:`clio_relay.surface.package_progress`) unless ``status`` reports them.
 - ``price(spec) -> Charge``: what a job would cost, for the spend question.
 - ``system_id()``: the facility's own id for the site, shown in the tab.
 - ``ssh_argv``, ``hop_exec``, ``transport``: SSH-based adapters only, for the

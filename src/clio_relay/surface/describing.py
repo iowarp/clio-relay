@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
 from clio_relay.jobs.refusals import Refusal
+from clio_relay.jobs.spec import PackageRef
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.skills import skill_link, skills
 
@@ -55,14 +56,36 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
     }
 
 
+def package_listing(service: RelayService, site: SiteEntry) -> list[dict[str, Any]]:
+    """List the newest staged version of each package, and whether this site reviewed it."""
+    reviewed = getattr(service.guard, "reviewed", None)
+    entries = service.packages.all()
+    listed: list[dict[str, Any]] = []
+    for entry in service.packages.newest():
+        item = entry.model_dump(mode="json", exclude={"staged_at"})
+        older = [other.version for other in entries if other.name == entry.name]
+        if len(older) > 1:
+            item["versions"] = older
+        if site.policy == "guarded" and callable(reviewed):
+            package = PackageRef(name=entry.name, version=entry.version, sha256=entry.sha256)
+            item["reviewed"] = reviewed(site.id, package) is not None
+        listed.append(item)
+    return listed
+
+
 async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
-    """Report one site: its entry, the route for each verb, and what its adapter says."""
+    """Report one site: its entry, the route for each verb, and what its adapter says.
+
+    ``packages`` are the JARVIS packages relay can run there. ``run`` takes one
+    as ``package: {name, parameters}`` and pins its version and SHA-256.
+    """
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
         "routes": [item.model_dump(mode="json") for item in service.site_routes(site)],
         "skill": await asyncio.to_thread(
             skill_link, site, service.paths.config_dir, with_text=True
         ),
+        "packages": await asyncio.to_thread(package_listing, service, site),
     }
     try:
         adapter = service.adapter_for(site, "describe")

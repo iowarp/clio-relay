@@ -65,7 +65,7 @@ from clio_relay.surface.elicit import (
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
-from clio_relay.surface.progress import progress_message
+from clio_relay.surface.progress import latest_note, observation_line
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.skills import SkillResources
@@ -100,6 +100,10 @@ def _summary(view: dict[str, Any]) -> str:
         line += f" with exit code {view['exit_code']}"
     line += "."
     result: dict[str, Any] = view.get("result") or {}
+    if not OperationState(view["state"]).final:
+        seen = observation_line(view)
+        if seen:
+            line += f"\n{seen}."
     endpoint: dict[str, Any] = result.get("endpoint") or {}
     ports: list[dict[str, Any]] = endpoint.get("ports") or []
     for port in ports:
@@ -208,7 +212,7 @@ class RelayTasksExtension(ServerExtension):
         if latest is not None:
             shown = record.state.value if record.state.final else "starting"
             return f"the service is {shown}: {latest}"
-        note = progress_message(record)
+        note = latest_note(record)
         return f"relay operation is {record.state.value}" + (f": {note}" if note else "")
 
     def _fields(self, record: OperationRecord) -> dict[str, Any]:
@@ -550,9 +554,11 @@ class RelayServer:
             site: Annotated[str | None, Field(description="A site id")] = None,
             job: Annotated[str | None, Field(description="An operation id")] = None,
         ) -> ToolResult:
-            """Without arguments, list the sites. With site, describe it and its routes,
+            """Without arguments, list the sites. With site, describe it, its routes and
+            the JARVIS packages relay can run there (packages, with their parameters),
             and return its guide (skill.text) when it has one: read it before the first
-            run there. With job, observe one operation."""
+            run there. With job, observe one operation: its state, when relay last looked
+            (result.observed_at), the latest step (result.progress) and the outputs."""
             try:
                 described = await relay.service.describe(site, job)
             except Refusal as refusal:
@@ -584,8 +590,10 @@ class RelayServer:
                 float, Field(ge=0, le=300, description="Seconds to wait without a task")
             ] = 20,
         ) -> ToolResult | InputRequiredToolResult:
-            """Submit a job. With tasks this returns a task; without, it waits up to
-            wait_s and returns the operation, which describe(job=...) observes."""
+            """Submit a job: an executable, or a JARVIS package as package: {name,
+            parameters} (relay pins its version and SHA-256). With tasks this returns a
+            task; without, it waits up to wait_s and returns the operation, which
+            describe(job=...) observes."""
             return await relay.run(ctx, site, spec, cancel, resume, wait_s)
 
         server.add_tool(_task_optional(run, "run", "Run a job on a site"))

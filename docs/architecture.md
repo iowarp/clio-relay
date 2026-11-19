@@ -52,7 +52,7 @@ and both plain files:
 | Directory | Holds |
 | --- | --- |
 | Config (`CLIO_RELAY_CONFIG_DIR`) | `sites.yaml`, `guard.yaml`, your own skills |
-| State (`CLIO_RELAY_STATE_DIR`) | Operation records, asks, the content store, each adapter's own files, reviewed packages, the rendezvous settings |
+| State (`CLIO_RELAY_STATE_DIR`) | Operation records, asks, the content store, the staged package catalog, each adapter's own files, reviewed packages, the rendezvous settings |
 
 An operation record holds the spec, its digest, the site, the adapter's job
 handle and the states seen. Any relay process can observe, answer or cancel

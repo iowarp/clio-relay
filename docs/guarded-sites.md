@@ -46,20 +46,27 @@ anywhere else the site lets relay write, does not ask.
 
 A package is one JARVIS package from a JARVIS repository, such as
 `clio_jarvis.gray_scott` from clio-jarvis, or one the agent writes with the
-JARVIS package skill. The agent builds its archive on the relay machine and
-puts it in relay's content store:
+JARVIS package skill. Whoever runs relay stages it once, on the relay machine:
 
 ```powershell
-python -m clio_relay.jarvis_site archive ~/src/clio-jarvis/clio_jarvis clio_jarvis.gray_scott --stage
+python -m clio_relay.packages stage ~/src/clio-jarvis/clio_jarvis clio_jarvis.gray_scott
 ```
 
-That prints the archive's SHA-256, its size, its file count and where it came
-from (repository, tag, commit, and whether the checkout had uncommitted
-changes). The archive holds the package's own directory, the repository's
-shared Python modules, and the `schemas/` directory next to the repository.
-Building it twice from the same files gives the same hash.
+That builds the package's archive, puts it in relay's content store and adds
+it to relay's package catalog. It prints the name, the version, the archive's
+SHA-256 and where it came from (repository, tag, commit, and whether the
+checkout had uncommitted changes). The archive holds the package's own
+directory, the repository's shared Python modules, and the `schemas/`
+directory next to the repository. Building it twice from the same files gives
+the same hash. The version comes from the package's `contract.yaml`, else the
+checkout's git tag; give `--version` when it has neither.
+`python -m clio_relay.packages list` shows what is staged.
 
-The agent then calls `run` with a package instead of an executable:
+An agent finds the packages with `describe(site=...)`. Each one comes with its
+version, SHA-256, summary, parameters (as a JSON Schema, read from the
+package's `pkg.py` and `contract.yaml` without running them), outputs, and
+whether this site has reviewed it. The agent then calls `run` with a package
+instead of an executable, by name:
 
 ```json
 {
@@ -67,14 +74,16 @@ The agent then calls `run` with a package instead of an executable:
   "spec": {
     "package": {
       "name": "clio_jarvis.gray_scott",
-      "version": "0.1.0",
-      "sha256": "<the printed hash>",
       "parameters": {"nprocs": 4}
     },
     "attributes": {"queue_name": "debug", "account": "myproject"}
   }
 }
 ```
+
+Relay pins the newest staged version and its SHA-256 before anything is
+checked, so the review below is still of one exact archive. The agent can
+give `version`, or `version` and `sha256`, to pick another.
 
 Relay copies the archive to the site by its hash. A small runner script
 checks the hash again, unpacks the archive into the job directory, makes a
@@ -86,6 +95,12 @@ A package started as a service (such as pvserver) does not end when it is
 ready. The runner starts the pipeline, keeps the job running, and stops the
 pipeline when relay stops the service. An application package runs the
 pipeline once, from start to stop.
+
+While a package job runs, and after it ends, `describe(job=...)` shows the
+latest step the package reported (`result.progress`) and its outputs, each
+with its path on the site and, when the package declares one, its view
+descriptor. Relay reads them from the job's JARVIS records with the site's
+`files` verb, so this works the same on every adapter that has `files`.
 
 The runner exits with a clear code when something is wrong: 64 for a package
 name that is not `<repository>.<package>`, 65 when the archive's hash does not
