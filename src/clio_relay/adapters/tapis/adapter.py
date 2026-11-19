@@ -13,9 +13,11 @@ Every Tapis call is made with the person's own token.
 from __future__ import annotations
 
 import hashlib
+import json
 import posixpath
 import re
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
@@ -31,9 +33,13 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
 if TYPE_CHECKING:
+    from clio_relay.adapters.tapis.register import SshHost
     from clio_relay.sites.models import SiteEntry
 
 TAPIS_ID_MAX = 80
+# What on_site_added keeps so a system missing after the sign-in can be registered.
+WAY_IN_FILE = "way-in.json"
+WAY_IN_KEYS = ("ssh_profile", "ssh_config", "ssh_options")
 _EXIT_IN_MESSAGE = re.compile(r"exit(?:ed)?(?: with)? code[ :=]*(-?\d+)", re.IGNORECASE)
 _HIDDEN_OUTPUTS = ("tapisjob", "relay.")
 
@@ -65,6 +71,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         )
         self._client_cache: tuple[str, Any] | None = None
         self._system: dict[str, Any] | None = None
+        self._registered_here = False
         self._apps: set[tuple[str, str]] = set()
         self.records_dir = context.state_dir / "jobs"
 
@@ -136,12 +143,19 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         self._system = None
 
     async def system(self) -> dict[str, Any]:
-        """Return the Tapis system record, fetched once per adapter."""
+        """Return the Tapis system record, fetched once per adapter.
+
+        A relay-named system that is missing is registered here, from the way in
+        saved when the site was added: the site is usually added before the
+        person signs in, so its own set-up could not register it then.
+        """
         if self._system is None:
             system_id = await self.system_id()
             try:
                 found = await self.tapis_call("systems", "getSystem", systemId=system_id)
             except TapisCallError as exc:
+                if exc.not_found and await self._register_on_first_use():
+                    return await self.system()
                 if exc.not_found:
                     raise Refusal(
                         RefusalReason.INVALID_CONFIG,
@@ -192,8 +206,16 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         """Register the person's host with Tapis, unless its credential already works.
 
         Safe to run again: a credential that passes Tapis's check is left alone.
+        The site's way in is saved first, so a site added before the sign-in is
+        registered on its first use after it.
         """
-        from clio_relay.adapters.tapis.register import register_host, ssh_for_site
+        from clio_relay.adapters.tapis.register import ssh_for_site
+
+        self._save_way_in(site)
+        return await self._set_up(ssh_for_site(site), site.address)
+
+    async def _set_up(self, ssh: SshHost | None, address: str | None) -> dict[str, Any]:
+        from clio_relay.adapters.tapis.register import register_host
 
         username = await self.username()
         system_id = await self.system_id()
@@ -205,8 +227,36 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             pass
         else:
             return {"system_id": system_id, "registered": False, "credential": "ok"}
-        registration = await register_host(self, ssh_for_site(site), address=site.address)
+        registration = await register_host(self, ssh, address=address)
         return {"registered": True, "credential": "ok", **asdict(registration)}
+
+    @property
+    def _way_in_file(self) -> Path:
+        return self.context.state_dir / WAY_IN_FILE
+
+    def _save_way_in(self, site: SiteEntry) -> None:
+        """Keep what registering needs: the ssh profile names and the address. No secrets."""
+        ssh = site.config if site.adapter == "ssh" else site.alternatives.get("ssh")
+        record = {
+            "address": site.address,
+            "ssh": {key: ssh[key] for key in WAY_IN_KEYS if ssh.get(key)} if ssh else None,
+        }
+        self._way_in_file.parent.mkdir(parents=True, exist_ok=True)
+        self._way_in_file.write_text(json.dumps(record), encoding="utf-8")
+
+    async def _register_on_first_use(self) -> bool:
+        """Register a missing relay-named system once; True when it was tried."""
+        if self.config.system_id or self._registered_here or not self._way_in_file.is_file():
+            return False
+        from clio_relay.adapters.tapis.register import SshHost
+
+        self._registered_here = True
+        record = cast(dict[str, Any], json.loads(self._way_in_file.read_text(encoding="utf-8")))
+        ssh = cast(dict[str, Any] | None, record.get("ssh"))
+        address = cast(str | None, record.get("address"))
+        await self._set_up(SshHost.from_alternative(ssh) if ssh else None, address)
+        self.forget_system()
+        return True
 
     # describe
 

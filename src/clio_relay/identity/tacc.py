@@ -226,8 +226,9 @@ class TaccIdentity:
         if not self.settings.client_id:
             raise Refusal(
                 RefusalReason.INVALID_CONFIG,
-                "relay has no OAuth client for the TACC tenant yet; set "
-                "CLIO_RELAY_TACC_CLIENT_ID (and CLIO_RELAY_TACC_CLIENT_KEY for refresh)",
+                "relay has no OAuth client for the TACC tenant yet. Create one with your "
+                "TACC account (the tapis adapter page, 'your OAuth client', shows how) and "
+                "set CLIO_RELAY_TACC_CLIENT_ID and CLIO_RELAY_TACC_CLIENT_KEY",
                 provider=PROVIDER,
             )
         return self.settings.client_id
@@ -396,6 +397,17 @@ class TaccIdentity:
                     self._client(), "authenticator", "generate_device_code", client_id=client_id
                 )
             except TapisCallError as exc:
+                if exc.status == 400 and "invalid client" in exc.message.lower():
+                    raise Refusal(
+                        RefusalReason.INVALID_CONFIG,
+                        f"TACC has no OAuth client {client_id}. Create one with your TACC "
+                        "account (the tapis adapter page, 'your OAuth client', shows how) "
+                        "and set CLIO_RELAY_TACC_CLIENT_ID and CLIO_RELAY_TACC_CLIENT_KEY",
+                        provider=PROVIDER,
+                        tapis_operation=exc.operation,
+                        tapis_status=exc.status,
+                        tapis_message=exc.message,
+                    ) from None
                 raise exc.refusal(RefusalReason.UNREACHABLE, provider=PROVIDER) from None
             data = cast(dict[str, Any], result or {})
             now = self.clock()
