@@ -1,10 +1,10 @@
 """A pretend facility with a REST API, for the template's tests.
 
-It stands in for a real facility: an API token, a job queue and a file system,
-over HTTP on 127.0.0.1. Jobs run as local processes and the site's file system
-is a directory on this machine, so the conformance kit runs end to end with no
-network and no account. Point the tests at your facility's sandbox instead, or
-keep a fake like this one for fast tests.
+It stands in for a real facility: an API token, a job queue, a command runner
+and a file system, over HTTP on 127.0.0.1. Jobs and commands run as local
+processes and the site's file system is a directory on this machine, so the
+conformance kit runs end to end with no network and no account. Point the tests
+at your facility's sandbox instead, or keep a fake like this one for fast tests.
 """
 
 # pyright: reportUnusedFunction=false
@@ -20,12 +20,67 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 
 USER = "ada"
+KEEP_BYTES = 1024 * 1024
+"""How much of each output stream the fake keeps, as a real facility caps it."""
+
+
+class _Command:
+    """One command started through ``POST /commands``, with its output counted."""
+
+    def __init__(self, command: list[str], cwd: Path) -> None:
+        self.kept = {"stdout": bytearray(), "stderr": bytearray()}
+        self.sizes = {"stdout": 0, "stderr": 0}
+        self.readers: list[threading.Thread] = []
+        self.exit_code: int | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        cwd.mkdir(parents=True, exist_ok=True)
+        try:
+            self.process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError:
+            self.exit_code = 127
+            return
+        for name, pipe in (("stdout", self.process.stdout), ("stderr", self.process.stderr)):
+            assert pipe is not None
+            reader = threading.Thread(target=self._read, args=(name, pipe), daemon=True)
+            reader.start()
+            self.readers.append(reader)
+
+    def _read(self, name: str, pipe: IO[bytes]) -> None:
+        with pipe:
+            while chunk := os.read(pipe.fileno(), 65536):
+                self.sizes[name] += len(chunk)
+                room = KEEP_BYTES - len(self.kept[name])
+                if room > 0:
+                    self.kept[name] += chunk[:room]
+
+    def view(self) -> dict[str, Any]:
+        done = not any(reader.is_alive() for reader in self.readers)
+        if self.process is not None and self.exit_code is None and done:
+            self.exit_code = self.process.poll()
+        return {
+            "exit_code": self.exit_code,
+            "stdout_bytes": self.sizes["stdout"],
+            "stderr_bytes": self.sizes["stderr"],
+        }
+
+    def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+        for reader in self.readers:
+            reader.join(timeout=10)
 
 
 @dataclass
@@ -55,6 +110,7 @@ class FakeFacility:
         self.root = root
         self.token = token
         self.jobs: dict[str, _Job] = {}
+        self.commands: dict[str, _Command] = {}
         self.app = self._build()
 
     def host(self, path: str) -> Path:
@@ -121,6 +177,27 @@ class FakeFacility:
                 found.process.wait()
             return found.view()
 
+        @app.post("/commands")
+        def start_command(body: dict[str, Any]) -> dict[str, str]:
+            command_id = str(len(self.commands) + 1)
+            self.commands[command_id] = _Command(body["command"], self.host(f"/home/{USER}"))
+            return {"id": command_id}
+
+        @app.get("/commands/{command_id}")
+        def command(command_id: str) -> dict[str, Any]:
+            return self.commands[command_id].view()
+
+        @app.get("/commands/{command_id}/output")
+        def command_output(command_id: str, stream: str, limit: int) -> Response:
+            kept = self.commands[command_id].kept[stream]
+            return Response(bytes(kept[:limit]), media_type="application/octet-stream")
+
+        @app.delete("/commands/{command_id}")
+        def stop_command(command_id: str) -> dict[str, Any]:
+            found = self.commands[command_id]
+            found.stop()
+            return found.view()
+
         @app.get("/fs/kind")
         def kind(path: str) -> dict[str, str]:
             host = self.host(path)
@@ -181,3 +258,5 @@ def running(facility: FakeFacility) -> Generator[str]:
             if job.process is not None and job.process.poll() is None:
                 job.process.kill()
                 job.process.wait()
+        for command in facility.commands.values():
+            command.stop()

@@ -1,14 +1,18 @@
 """A relay adapter for the Acme facility's REST API. Copy this package to start yours.
 
 The adapter is one class, :class:`AcmeAdapter`, plus :class:`AcmeFiles` for
-the ``files`` verb. Everything it uses comes from ``clio_relay.adapters.base``.
-Rename ``acme``, keep the shape, and replace each ``self._call`` with your
-facility's API. docs/adding-an-adapter.md walks through every method.
+the ``files`` verb. It implements ``describe``, ``run``, ``exec`` and
+``files``. Everything it uses comes from ``clio_relay.adapters.base``. Rename
+``acme``, keep the shape, and replace each ``self.call`` with your facility's
+API. docs/adding-an-adapter.md walks through every method.
 """
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
+import time
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -16,7 +20,9 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.adapters.base import (
+    STALL_S,
     BaseAdapter,
+    ExecResult,
     FileEntry,
     JobHandle,
     JobSpec,
@@ -29,8 +35,12 @@ from clio_relay.adapters.base import (
     SignInNeed,
     SiteFiles,
     SiteInfo,
+    StallReport,
     Verb,
 )
+
+POLL_S = 0.2
+"""How often ``exec`` asks the facility whether a command has ended."""
 
 # The facility's job states, mapped onto relay's five.
 STATES = {
@@ -100,7 +110,7 @@ class AcmeAdapter(BaseAdapter[AcmeConfig]):
 
     name: ClassVar[str] = "acme"
     Config: ClassVar[type[BaseModel]] = AcmeConfig
-    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
+    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
 
     # Talking to the facility
 
@@ -157,6 +167,65 @@ class AcmeAdapter(BaseAdapter[AcmeConfig]):
             facts={"user": who["user"], "home": who["home"]},
             verbs=sorted(self.implements),
         )
+
+    # exec
+
+    async def exec(
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
+    ) -> ExecResult:
+        started = time.monotonic()
+        created = (await self.call("POST", "/commands", json={"command": command})).json()
+        url = f"/commands/{created['id']}"
+        timed_out = False
+        sizes, quiet_since, report_at = (0, 0), started, STALL_S
+        try:
+            while True:
+                state = (await self.call("GET", url)).json()
+                if state["exit_code"] is not None:
+                    break
+                now = time.monotonic()
+                if timeout_s is not None and now - started >= timeout_s:
+                    # A time limit is not a refusal: stop the command, return what it printed.
+                    state = (await self.call("DELETE", url)).json()
+                    timed_out = True
+                    break
+                printed = (state["stdout_bytes"], state["stderr_bytes"])
+                if printed != sizes:
+                    sizes, quiet_since, report_at = printed, now, STALL_S
+                elif on_stall is not None and now - quiet_since >= report_at:
+                    idle = now - quiet_since
+                    report_at *= 2
+                    await on_stall(idle, report_at - idle)
+                await asyncio.sleep(POLL_S)
+        except asyncio.CancelledError:
+            # The person cancelled the call: stop the command on the facility too,
+            # and let the cancellation go on even if the facility does not answer.
+            with suppress(Refusal):
+                await self.call("DELETE", url)
+            raise
+        stdout = await self._output(url, "stdout", max_output_bytes)
+        stderr = await self._output(url, "stderr", max_output_bytes)
+        return ExecResult(
+            argv=command,
+            exit_code=None if timed_out else state["exit_code"],
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=state["stdout_bytes"] > max_output_bytes,
+            stderr_truncated=state["stderr_bytes"] > max_output_bytes,
+            timed_out=timed_out,
+            duration_s=time.monotonic() - started,
+        )
+
+    async def _output(self, url: str, stream: str, limit: int) -> str:
+        """The first ``limit`` bytes of one stream, cut at a whole character."""
+        params = {"stream": stream, "limit": limit}
+        data = (await self.call("GET", f"{url}/output", params=params)).content
+        return data.decode(errors="ignore")
 
     # files
 

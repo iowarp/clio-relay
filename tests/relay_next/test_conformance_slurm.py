@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.local import LocalAdapter
 from clio_relay.jobs.records import new_id
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget
 
@@ -18,6 +19,8 @@ pytestmark = pytest.mark.release_platform("posix")
 
 
 class TestLocalSlurm(AdapterConformance):
+    adapter = LocalAdapter
+
     @pytest.fixture
     def target(self) -> ConformanceTarget:
         state = Path(os.environ["RELAY_TEST_SLURM_DIR"]) / new_id("conformance")

@@ -1,23 +1,28 @@
 """The adapter conformance kit.
 
 Every adapter runs this suite. Subclass :class:`AdapterConformance` in a test
-module and provide a ``target`` fixture that returns a
-:class:`ConformanceTarget`::
+module, set ``adapter`` to your adapter class, and provide a ``target`` fixture
+that returns a :class:`ConformanceTarget`::
 
     class TestMyAdapter(AdapterConformance):
+        adapter = MyAdapter
+
         @pytest.fixture
         def target(self, tmp_path: Path) -> ConformanceTarget:
             return ConformanceTarget(adapter="mine", config={...}, state_dir=tmp_path)
 
-The suite checks the shape of ``describe``, typed refusals for the verbs the
-adapter does not implement, bounded ``exec`` output, the files semantics of
-docs/files.md, the job lifecycle, a failing job, cancel, staged inputs,
-observing a job from a fresh adapter instance (which is what a relay restart
-looks like), typed errors, cancelling a finished job and an ``exec`` call, and
-open and guarded sites. A test for a verb the adapter leaves out checks only
-that the verb refuses, and then passes. Install the ``testing`` extra for pytest
-and pytest-asyncio; :func:`use_memory_keyring` gives a test the secrets the
-adapter reads.
+The suite checks the shape of ``describe``, bounded ``exec`` output, the files
+semantics of docs/files.md, the job lifecycle, a failing job, cancel, staged
+inputs, observing a job from a fresh adapter instance (which is what a relay
+restart looks like), typed errors, cancelling a finished job and an ``exec``
+call, and open and guarded sites.
+
+The kit collects tests only for the verbs in the adapter's ``implements``. For
+each verb the adapter leaves out it collects one test instead,
+``test_<verb>_is_left_out``, which checks that the verb refuses with
+``verb_not_implemented``. So ``pytest -v`` names exactly what was tested.
+Install the ``testing`` extra for pytest and pytest-asyncio;
+:func:`use_memory_keyring` gives a test the secrets the adapter reads.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS, AdapterContext, BaseAdapter
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.file_rules import PART_SUFFIX, part_path
-from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus
+from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobSpec
@@ -123,8 +128,20 @@ def assert_lifecycle(seen: list[JobState]) -> None:
     assert sum(1 for state in seen if state.final) == 1, f"more than one final state: {seen}"
 
 
-def _implements(target: ConformanceTarget, verb: str) -> bool:
-    return verb in registry.load(target.adapter).implements
+#: The verbs an adapter may leave out; ``describe`` is always there.
+_OPTIONAL_VERBS = ("run", "exec", "files", "serve")
+
+#: Kit test name to the verbs it exercises. A test is collected when the
+#: adapter implements any of them.
+_NEEDS: dict[str, frozenset[str]] = {}
+
+
+def _needs[T: Callable[..., Any]](*verbs: str) -> Callable[[T], T]:
+    def mark(test: T) -> T:
+        _NEEDS[test.__name__] = frozenset(verbs)
+        return test
+
+    return mark
 
 
 async def _call(adapter: BaseAdapter[Any], target: ConformanceTarget, verb: str) -> Any:
@@ -140,28 +157,45 @@ async def _call(adapter: BaseAdapter[Any], target: ConformanceTarget, verb: str)
     return await adapter.serve(spec, operation_id=new_id("op"))
 
 
-async def _refuses(target: ConformanceTarget, verb: str) -> bool:
-    """Check the typed refusal of a verb the adapter leaves out; True if it does."""
-    if _implements(target, verb):
-        return False
-    with pytest.raises(Refusal) as refused:
-        await _call(target.build(), target, verb)
-    assert refused.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED, verb
-    return True
+def _left_out(verb: str) -> Callable[..., Any]:
+    """The one test collected for a verb the adapter leaves out."""
 
+    @pytest.mark.asyncio
+    async def test(self: Any, target: ConformanceTarget) -> None:
+        with pytest.raises(Refusal) as refused:
+            await _call(target.build(), target, verb)
+        assert refused.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED, verb
 
-async def _deletes(files: FileAccess, path: str) -> bool:
-    """Delete ``path``; False if the site cannot delete yet."""
-    try:
-        await files.delete(path)
-    except Refusal as refusal:
-        assert refusal.reason == RefusalReason.VERB_NOT_IMPLEMENTED, refusal
-        return False
-    return True
+    test.__name__ = test.__qualname__ = f"test_{verb}_is_left_out"
+    test.__doc__ = (
+        f"The adapter leaves out {verb}: the kit checks only that it refuses with "
+        f"verb_not_implemented, and collects none of the other {verb} tests."
+    )
+    return test
 
 
 class AdapterConformance:
-    """The suite. Subclasses provide the ``target`` fixture."""
+    """The suite. Subclasses set ``adapter`` and provide the ``target`` fixture."""
+
+    #: The adapter class under test. Its ``implements`` decides which tests run.
+    adapter: ClassVar[type[BaseAdapter[Any]]]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        adapter: type[BaseAdapter[Any]] | None = getattr(cls, "adapter", None)
+        if adapter is None:
+            if cls.__name__.startswith("Test"):
+                raise TypeError(
+                    f"{cls.__name__} must set `adapter = <your adapter class>` so the "
+                    "conformance kit knows which verbs to test"
+                )
+            return
+        for name, verbs in _NEEDS.items():
+            if not verbs & adapter.implements:
+                setattr(cls, name, None)
+        for verb in _OPTIONAL_VERBS:
+            if verb not in adapter.implements:
+                setattr(cls, f"test_{verb}_is_left_out", _left_out(verb))
 
     @pytest.fixture
     def target(self) -> ConformanceTarget:
@@ -178,6 +212,10 @@ class AdapterConformance:
     @pytest.mark.asyncio
     async def test_describe_shape(self, target: ConformanceTarget) -> None:
         adapter = target.build()
+        assert isinstance(adapter, self.adapter), (
+            f"the target builds {type(adapter).__name__}, but the class names "
+            f"{self.adapter.__name__} as the adapter under test"
+        )
         info = await adapter.describe()
         assert info.adapter == target.adapter
         assert "describe" in info.verbs
@@ -185,15 +223,9 @@ class AdapterConformance:
         assert set(info.verbs) <= set(VERBS)
         info.model_dump_json()
 
-    @pytest.mark.asyncio
-    async def test_unimplemented_verbs_refuse(self, target: ConformanceTarget) -> None:
-        for verb in ("run", "exec", "files", "serve"):
-            await _refuses(target, verb)
-
+    @_needs("exec")
     @pytest.mark.asyncio
     async def test_exec_bounded(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "exec"):
-            return
         adapter = target.build()
         result = await adapter.exec(target.echo, timeout_s=30, max_output_bytes=4096)
         assert result.exit_code == 0, result
@@ -206,20 +238,18 @@ class AdapterConformance:
         assert slow.exit_code is None
         assert slow.duration_s < 20
 
+    @_needs("exec")
     @pytest.mark.asyncio
     async def test_exec_without_time_limit(self, target: ConformanceTarget) -> None:
         """No hard limit on agent actions: exec with no timeout runs to the end."""
-        if await _refuses(target, "exec"):
-            return
         result = await target.build().exec(target.echo, max_output_bytes=4096)
         assert result.exit_code == 0, result
         assert not result.timed_out
         assert target.ok_marker in result.stdout
 
+    @_needs("files")
     @pytest.mark.asyncio
     async def test_files_round_trip(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "files"):
-            return
         files = await target.build().files()
         payload = b"relay conformance \x00\x01 payload\n" * 64
         path = f"{target.files_dir}/{new_id('f')}.bin"
@@ -243,17 +273,15 @@ class AdapterConformance:
         assert await files.has(digest)
         assert await files.stage(payload) == digest
 
+    @_needs("files")
     @pytest.mark.asyncio
     async def test_files_delete(self, target: ConformanceTarget) -> None:
         """docs/files.md: delete refuses a missing path, needs recursive for a
         directory that is not empty, and never removes relay's work directory."""
-        if await _refuses(target, "files"):
-            return
         files = await target.build().files()
         folder = f"{target.files_dir}/{new_id('d')}"
         await files.write(f"{folder}/inner/a.txt", b"a")
-        if not await _deletes(files, f"{folder}/inner/a.txt"):
-            return
+        await files.delete(f"{folder}/inner/a.txt")
         with pytest.raises(Refusal) as gone:
             await files.stat(f"{folder}/inner/a.txt")
         assert gone.value.reason == RefusalReason.PATH_NOT_FOUND
@@ -274,20 +302,15 @@ class AdapterConformance:
                 await files.delete(root, recursive=True)
             assert kept.value.reason == RefusalReason.INVALID_ARGUMENTS, root
 
+    @_needs("files")
     @pytest.mark.asyncio
     async def test_files_chunked_write(self, target: ConformanceTarget) -> None:
         """docs/files.md: chunks collect in <path>.relay-part, a wrong offset says
         where to resume, and the final chunk moves the file into place."""
-        if await _refuses(target, "files"):
-            return
         files = await target.build().files()
         path = f"{target.files_dir}/{new_id('c')}.bin"
         first, second, third = b"a" * 1000, b"b" * 700, b"c" * 300
-        try:
-            part = await files.write(path, first, final=False)
-        except Refusal as refusal:
-            assert refusal.reason == RefusalReason.VERB_NOT_IMPLEMENTED, refusal
-            return
+        part = await files.write(path, first, final=False)
         assert part.path.endswith(PART_SUFFIX)
         assert part.size == len(first)
         with pytest.raises(Refusal) as not_yet:
@@ -313,20 +336,18 @@ class AdapterConformance:
         await files.write(path, b"bytes", overwrite=True, offset=4)
         assert await files.read(path) == b"new bytes"
 
+    @_needs("files")
     @pytest.mark.asyncio
     async def test_files_relative_paths_stay_inside(self, target: ConformanceTarget) -> None:
         """docs/files.md: a relative path may not leave relay's work directory."""
-        if await _refuses(target, "files"):
-            return
         files = await target.build().files()
         with pytest.raises(Refusal) as escaped:
             await files.write("../relay-escape.txt", b"x")
         assert escaped.value.reason == RefusalReason.INVALID_ARGUMENTS
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_job_lifecycle(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "run"):
-            return
         adapter = target.build()
         handle = await adapter.run(target.ok_job, operation_id=new_id("op"))
         assert handle.adapter == target.adapter
@@ -337,10 +358,9 @@ class AdapterConformance:
         assert status.exit_code == 0
         assert status.outputs, "a finished job lists its outputs"
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_job_failure(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "run"):
-            return
         adapter = target.build()
         handle = await adapter.run(target.fail_job, operation_id=new_id("op"))
         status, seen = await wait_final(adapter, handle, target.job_timeout_s, target.poll_s)
@@ -348,10 +368,9 @@ class AdapterConformance:
         assert status.state == JobState.FAILED, status
         assert status.exit_code not in (None, 0)
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_job_cancel(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "run"):
-            return
         adapter = target.build()
         handle = await adapter.run(target.long_job, operation_id=new_id("op"))
         first = await adapter.status(handle)
@@ -363,10 +382,9 @@ class AdapterConformance:
         again = await target.build().status(handle)
         assert again.state == JobState.CANCELLED
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_job_observed_after_restart(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "run"):
-            return
         operation_id = new_id("op")
         handle = await target.build().run(target.ok_job, operation_id=operation_id)
         stored = handle.model_dump_json()
@@ -380,10 +398,9 @@ class AdapterConformance:
         assert found is not None, "find() reconciles a job whose handle was not recorded"
         assert found.native_id == handle.native_id
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_inputs_by_digest(self, target: ConformanceTarget) -> None:
-        if await _refuses(target, "run"):
-            return
         adapter = target.build()
         payload = f"input {new_id('x')}\n".encode()
         digest = target.context().content.put(payload)
@@ -397,15 +414,16 @@ class AdapterConformance:
             await adapter.run(missing, operation_id=new_id("op"))
         assert refused.value.reason == RefusalReason.INPUT_MISSING
 
+    @_needs("files", "exec")
     @pytest.mark.asyncio
     async def test_errors_are_typed(self, target: ConformanceTarget) -> None:
         """A missing path is path_not_found; a missing program fails, it does not hang."""
-        if not await _refuses(target, "files"):
+        if "files" in self.adapter.implements:
             files = await target.build().files()
             with pytest.raises(Refusal) as missing:
                 await files.list(f"{target.files_dir}/no-such-dir-{new_id('d')}")
             assert missing.value.reason == RefusalReason.PATH_NOT_FOUND
-        if not await _refuses(target, "exec"):
+        if "exec" in self.adapter.implements:
             program = [f"relay-no-such-program-{new_id('p')}"]
             try:
                 result = await target.build().exec(program, timeout_s=30, max_output_bytes=1000)
@@ -417,11 +435,10 @@ class AdapterConformance:
             else:
                 assert result.exit_code not in (None, 0), result
 
+    @_needs("run")
     @pytest.mark.asyncio
     async def test_cancel_after_finish(self, target: ConformanceTarget) -> None:
         """Cancelling a finished job changes nothing: its final state stands."""
-        if await _refuses(target, "run"):
-            return
         adapter = target.build()
         handle = await adapter.run(target.ok_job, operation_id=new_id("op"))
         status, _ = await wait_final(adapter, handle, target.job_timeout_s, target.poll_s)
@@ -429,11 +446,10 @@ class AdapterConformance:
         assert (await adapter.cancel(handle)).state == JobState.COMPLETED
         assert (await target.build().status(handle)).state == JobState.COMPLETED
 
+    @_needs("exec")
     @pytest.mark.asyncio
     async def test_exec_cancelled(self, target: ConformanceTarget) -> None:
         """Cancelling an exec call with no time limit stops it promptly."""
-        if await _refuses(target, "exec"):
-            return
         adapter = target.build()
         call = asyncio.create_task(adapter.exec(target.slow, max_output_bytes=1000))
         await asyncio.sleep(1)
@@ -475,6 +491,7 @@ class AdapterConformance:
             await guard.prepare(guarded, target.ok_job, adapter=adapter)
         assert kept_out.value.reason == RefusalReason.POLICY_REFUSED
 
+    @_needs("files")
     @pytest.mark.asyncio
     async def test_guarded_files_ask_first(self, target: ConformanceTarget) -> None:
         """docs/guarded-sites.md: on a guarded site, delete and a write that replaces
@@ -482,8 +499,6 @@ class AdapterConformance:
         from clio_relay.sites.models import SiteEntry
         from clio_relay.surface.files_approval import approval_action
 
-        if await _refuses(target, "files"):
-            return
         files = await target.build().files()
 
         def site(policy: str) -> SiteEntry:

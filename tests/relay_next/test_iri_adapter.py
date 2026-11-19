@@ -103,6 +103,8 @@ def local_config(tmp_path: Path, version: str = "v2") -> dict[str, Any]:
 
 
 class TestIriConformanceV2(AdapterConformance):
+    adapter = LocalIriAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(
@@ -115,6 +117,8 @@ class TestIriConformanceV2(AdapterConformance):
 
 
 class TestIriConformanceV1(AdapterConformance):
+    adapter = LocalIriAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(

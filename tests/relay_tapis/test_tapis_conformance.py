@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget
 from tests.fixtures.tapis_stub import TapisStub
 from tests.fixtures.tapis_stub.support import seed_host, sign_in, tapis_config, use_memory_keyring
@@ -22,6 +23,8 @@ pytestmark = pytest.mark.release_platform("posix")
 
 
 class TestTapisAdapter(AdapterConformance):
+    adapter = TapisAdapter
+
     @pytest.fixture
     def target(
         self, stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -31,6 +31,8 @@ def facility_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[st
 
 
 class TestAcme(AdapterConformance):
+    adapter = AcmeAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path, facility_url: str) -> ConformanceTarget:
         return ConformanceTarget(adapter="acme", config={"url": facility_url}, state_dir=tmp_path)

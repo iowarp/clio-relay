@@ -47,6 +47,8 @@ def placed_link() -> Path:
 
 
 class TestWorker(AdapterConformance):
+    adapter = WorkerAdapter
+
     @pytest.fixture
     def target(self, placed_link: Path) -> ConformanceTarget:
         state = Path(os.environ["RELAY_TEST_WORKER_DIR"]) / new_id("conformance")

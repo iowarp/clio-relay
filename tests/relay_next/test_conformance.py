@@ -6,12 +6,16 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.local import LocalAdapter
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget
+from clio_relay.testing.fixture_adapter import FixtureAdapter
 
 pytestmark = pytest.mark.release_platform("posix")
 
 
 class TestFixtureAdapter(AdapterConformance):
+    adapter = FixtureAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(
@@ -24,6 +28,8 @@ class TestFixtureAdapter(AdapterConformance):
 
 
 class TestLocalSupervised(AdapterConformance):
+    adapter = LocalAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(

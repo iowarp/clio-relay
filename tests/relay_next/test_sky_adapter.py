@@ -59,6 +59,8 @@ def local_config(tmp_path: Path) -> dict[str, Any]:
 
 
 class TestSkyConformance(AdapterConformance):
+    adapter = SkyAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(

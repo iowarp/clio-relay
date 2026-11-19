@@ -69,8 +69,8 @@ rest later.
 [`examples/adapter-template`](../examples/adapter-template) is a complete
 adapter for a pretend facility, Acme, whose REST API has a token, a job queue
 and a file system. A fake of that API ships with it, and the adapter passes the
-conformance kit against the fake. It implements `describe`, `run` and `files`;
-see [Exec](#exec) for the one verb it leaves out.
+conformance kit against the fake. It implements `describe`, `run`, `exec` and
+`files`.
 
 ```bash
 cp -r examples/adapter-template ~/relay-myfacility
@@ -213,6 +213,10 @@ command on the site and returns an `ExecResult` once it ends.
 - A program the site cannot find ends with an exit code, such as 127, and does
   not hang.
 
+`AcmeAdapter.exec` in the template does all of this over a facility API that
+starts a command, reports whether it has ended and how much it has printed,
+returns the first bytes of each stream, and stops it.
+
 ### Policy
 
 Each site is `open` or `guarded`. Relay's guard sits in front of every adapter
@@ -250,8 +254,9 @@ does the same in one process.
 ## Test it with the conformance kit
 
 The kit is one test class, `AdapterConformance` in
-`clio_relay.testing.conformance`. Subclass it and say how to build your
-adapter. A whole test module, with a fake facility like the template's:
+`clio_relay.testing.conformance`. Subclass it, name your adapter class in
+`adapter`, and say how to build a site. A whole test module, with a fake
+facility like the template's:
 
 ```python
 from collections.abc import Iterator
@@ -278,6 +283,8 @@ def facility_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[st
 
 
 class TestMyFacility(AdapterConformance):
+    adapter = MyFacilityAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path, facility_url: str) -> ConformanceTarget:
         return ConformanceTarget(
@@ -288,22 +295,25 @@ class TestMyFacility(AdapterConformance):
 `use_memory_keyring` keeps relay's secrets in memory for the test and stores
 the ones you give it, which the adapter reads with `self.context.secret`.
 
-It checks, for the verbs the adapter implements:
+It collects tests only for the verbs in your adapter's `implements`:
 
 | Area | What it checks |
 | --- | --- |
 | Settings | The `Config` schema is an object and unknown settings refuse with `invalid_config` |
 | `describe` | Its shape, and that it lists exactly the verbs in `implements` |
-| Verbs left out | Each one refuses with `verb_not_implemented` |
+| Verbs left out | One test each, `test_<verb>_is_left_out`: the verb refuses with `verb_not_implemented` |
 | `exec` | Output is bounded, a time limit holds, no time limit runs to the end, and cancelling the call stops it |
 | `files` | Everything in [files](files.md): round trip, `overwrite`, delete, chunked upload and resume, relative paths |
 | Jobs | Lifecycle, a failing job, cancel, cancel after the end, inputs by digest, and following a job from a new adapter instance |
 | Errors | A missing path is `path_not_found`, and a missing program fails without hanging |
 | Policy | Open sites run what the agent asks; guarded sites refuse commands and anything but read-only `exec`, and ask the person before a `files` delete or overwrite |
 
-Each test names its area. A test for a verb the adapter leaves out checks only
-that the verb refuses, and then passes, so an adapter with `describe` and
-`files` still shows every job test as passed.
+Each test names its area. For a verb you leave out, the kit collects none of
+its tests, only `test_<verb>_is_left_out`. So an adapter with `describe` and
+`files` shows the settings, `describe`, `files`, errors and policy tests, plus
+`test_run_is_left_out`, `test_exec_is_left_out` and `test_serve_is_left_out`;
+`pytest -v` lists exactly what was tested. Add a verb to `implements` and its
+tests appear.
 
 Run it against a fake of your facility's API, like the template's
 `tests/fake_facility.py`, so it runs anywhere in seconds. Run it against the

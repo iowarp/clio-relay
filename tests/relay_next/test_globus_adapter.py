@@ -97,6 +97,8 @@ def local_config(tmp_path: Path) -> dict[str, Any]:
 
 
 class TestGlobusConformance(AdapterConformance):
+    adapter = LocalGlobusAdapter
+
     @pytest.fixture
     def target(self, tmp_path: Path) -> ConformanceTarget:
         return ConformanceTarget(

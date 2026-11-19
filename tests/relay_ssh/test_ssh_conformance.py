@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.ssh.adapter import SshAdapter
 from clio_relay.jobs.records import new_id
 from clio_relay.testing.conformance import AdapterConformance, ConformanceTarget
 
@@ -53,18 +54,24 @@ def _clean_remote(fx: dict[str, str]) -> Iterator[None]:  # pyright: ignore[repo
 
 
 class TestSshDetached(AdapterConformance):
+    adapter = SshAdapter
+
     @pytest.fixture
     def target(self, fx: dict[str, str], tmp_path: Path) -> ConformanceTarget:
         return ssh_target(fx, tmp_path, "fx-ssh", "auto", poll_s=1.0, job_timeout_s=120)
 
 
 class TestSshSlurm(AdapterConformance):
+    adapter = SshAdapter
+
     @pytest.fixture
     def target(self, fx: dict[str, str], tmp_path: Path) -> ConformanceTarget:
         return ssh_target(fx, tmp_path, "fx-slurm", "auto", poll_s=2.0, job_timeout_s=300)
 
 
 class TestSshPbs(AdapterConformance):
+    adapter = SshAdapter
+
     @pytest.fixture
     def target(self, fx: dict[str, str], tmp_path: Path) -> ConformanceTarget:
         return ssh_target(fx, tmp_path, "fx-pbs", "auto", poll_s=2.0, job_timeout_s=300)

@@ -81,24 +81,3 @@ def protected_refusal(path: str) -> Refusal:
         path=path,
     )
 
-
-def whole_writes_only(path: str, offset: int, final: bool) -> None:
-    """Refuse a chunked write on a site that does not take one yet."""
-    check_offset(path, offset)
-    if offset or not final:
-        raise Refusal(
-            RefusalReason.VERB_NOT_IMPLEMENTED,
-            "this site does not take chunked writes yet; write the file whole",
-            path=path,
-            op="write",
-        )
-
-
-def no_delete(path: str) -> Refusal:
-    """The refusal of a site that cannot delete yet."""
-    return Refusal(
-        RefusalReason.VERB_NOT_IMPLEMENTED,
-        "this site cannot delete files yet",
-        path=path,
-        op="delete",
-    )
