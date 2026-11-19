@@ -48,9 +48,9 @@ the site shows as needing sign-in and calls are refused with `needs_sign_in`.
 | `identity` | `globus` | Relay identity that holds the token |
 | `resource_server`, `scope` | none | The facility's Globus scope, for sign-in |
 | `token_command` | none | A command that prints an access token instead |
-| `root` | none | Where relative paths start; needed for relative paths |
+| `root` | none | Relay's work directory, where relative paths start; needed for relative paths and staged inputs |
+| `home` | none | Your home directory on the facility; needed for `~` paths |
 | `job_root` | `.clio-relay/jobs` | Where job directories go, under `root` |
-| `content_dir` | `.clio-relay/content` | Where staged inputs go |
 | `poll_s` | 1 | First wait between polls of a file operation |
 | `stall_s` | 600 | How long a file operation may stay unchanged before relay stops waiting |
 
@@ -67,11 +67,23 @@ the site shows as needing sign-in and calls are refused with `needs_sign_in`.
 
 ## Files
 
-Each file call is a facility task that relay polls until it ends; there is no
-time limit while the task is changing. The API moves files of up to 5 MiB
-through `read` and `write`. For anything larger, use the facility's Globus
-collection with the `globus` adapter. Facilities return downloads in different
-shapes; the adapter reads plain text and the base64 forms.
+`files` follows the rules in [files](../files.md). Each file call is a facility
+task that relay polls until it ends; there is no time limit while the task is
+changing. The API moves files of up to 5 MiB through `read` and `write`. For
+anything larger, use the facility's Globus collection with the `globus`
+adapter. Facilities return downloads in different shapes; the adapter reads
+plain text and the base64 forms.
+
+- The API reports neither a work directory nor a home directory, so set `root`
+  and `home`. A path that needs one that is missing is refused with
+  `invalid_config`.
+- A chunked write collects its chunks on relay's machine, since the API cannot
+  append, and uploads the whole file once with the final chunk. A write that
+  would pass 5 MiB is refused before any byte moves.
+- Delete removes a file or a symlink, never the link's target. The API's `rm`
+  removes a directory with everything in it, so relay checks that a directory
+  is empty unless you pass `recursive`; a recursive delete is one `rm` task.
+- Staged content goes under `<root>/.relay-content`.
 
 ## Versions
 

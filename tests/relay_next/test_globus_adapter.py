@@ -26,7 +26,7 @@ from clio_relay.adapters.globus import GlobusAdapter, GlobusConfig, tokens
 from clio_relay.adapters.globus.compute import ComputeService, function_digest
 from clio_relay.adapters.globus.fakes import LocalComputeService, LocalTransferService
 from clio_relay.adapters.globus.task import relay_task
-from clio_relay.adapters.globus.transfer import TransferService
+from clio_relay.adapters.globus.transfer import PARTS_DIR, GlobusFiles, TransferService
 from clio_relay.adapters.local import LocalAdapter
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import ExecResult, JobState, StallReport
@@ -512,6 +512,77 @@ async def test_sdk_transfer_deletes_moves_and_makes_directories() -> None:
     assert [item["path"] for item in data["DATA"]] == ["/d"]
     assert client.calls[1] == ("operation_rename", (SITE_COLLECTION, "/a", "/b"))
     assert client.calls[2] == ("operation_mkdir", (SITE_COLLECTION, "/d"))
+
+
+class CountingTransfer(LocalTransferService):
+    """The Transfer stand-in, recording each copy and delete."""
+
+    def __init__(self, collections: dict[str, Path]) -> None:
+        super().__init__(collections)
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def copy(self, source: str, source_path: str, destination: str, dest_path: str) -> None:
+        self.calls.append(("copy", source, source_path, destination, dest_path))
+        await super().copy(source, source_path, destination, dest_path)
+
+    async def delete(self, collection: str, path: str, *, recursive: bool) -> None:
+        self.calls.append(("delete", path, recursive))
+        await super().delete(collection, path, recursive=recursive)
+
+
+def _globus_files(tmp_path: Path) -> tuple[GlobusFiles, CountingTransfer, Path]:
+    site, local = tmp_path / "site", tmp_path / "local"
+    (site / "home").mkdir(parents=True)
+    transfer = CountingTransfer({SITE_COLLECTION: site, LOCAL_COLLECTION: local})
+    files = GlobusFiles(
+        transfer,
+        collection=SITE_COLLECTION,
+        root="/~/",
+        local_collection=LOCAL_COLLECTION,
+        local_path="/",
+        local_dir=local,
+        state_dir=tmp_path / "state",
+    )
+    return files, transfer, site / "home"
+
+
+@pytest.mark.asyncio
+async def test_chunks_collect_locally_and_move_in_one_transfer(tmp_path: Path) -> None:
+    files, transfer, home = _globus_files(tmp_path)
+    parts = tmp_path / "local" / PARTS_DIR
+    part = await files.write("c.bin", b"a" * 10, final=False)
+    assert part.path == "/~/c.bin.relay-part"
+    assert len(list(parts.iterdir())) == 1
+    await files.write("c.bin", b"b" * 10, offset=10, final=False)
+    assert transfer.calls == []
+    await files.write("c.bin", b"c" * 10, offset=20)
+    assert (home / "c.bin").read_bytes() == b"a" * 10 + b"b" * 10 + b"c" * 10
+    copies = [call for call in transfer.calls if call[0] == "copy"]
+    assert len(copies) == 1
+    assert copies[0][1] == LOCAL_COLLECTION
+    assert copies[0][2].startswith(f"/{PARTS_DIR}/")
+    assert copies[0][4] == "/~/c.bin"
+    assert not list(parts.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_link_targets_and_removes_a_tree_in_one_task(tmp_path: Path) -> None:
+    files, transfer, home = _globus_files(tmp_path)
+    (home / "kept" / "deep").mkdir(parents=True)
+    (home / "kept" / "deep" / "k.txt").write_bytes(b"k")
+    (home / "tree" / "a").mkdir(parents=True)
+    (home / "tree" / "a" / "c.txt").write_bytes(b"c")
+    (home / "tree" / "link").symlink_to(home / "kept")
+    assert await files.kind("/~/tree/link") == "link"
+    assert await files.kind("/~/tree/a") == "dir"
+    assert await files.kind("/~") == "dir"
+    assert files.resolve("~/x") == "/~/x"
+    await files.delete("tree/link")
+    assert (home / "kept" / "deep" / "k.txt").is_file()
+    transfer.calls.clear()
+    await files.delete("tree", recursive=True)
+    assert transfer.calls == [("delete", "/~/tree", True)]
+    assert not (home / "tree").exists()
 
 
 def test_relay_task_runs_as_plain_source(tmp_path: Path) -> None:

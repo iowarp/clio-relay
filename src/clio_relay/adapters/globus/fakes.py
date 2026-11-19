@@ -109,11 +109,15 @@ class LocalTransferService:
             raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
         items: list[dict[str, Any]] = []
         for child in sorted(target.iterdir(), key=lambda item: item.name):
-            info = child.stat()
+            # Like Transfer: a symlink shows its target's type and size, with link_target set.
+            link = os.readlink(child) if child.is_symlink() else None
+            broken = link is not None and not child.exists()
+            info = child.lstat() if broken else child.stat()
             items.append(
                 {
                     "name": child.name,
-                    "type": "dir" if child.is_dir() else "file",
+                    "type": "invalid_symlink" if broken else "dir" if child.is_dir() else "file",
+                    "link_target": link,
                     "size": info.st_size,
                     "last_modified": datetime.fromtimestamp(info.st_mtime, UTC).strftime(
                         "%Y-%m-%d %H:%M:%S+00:00"

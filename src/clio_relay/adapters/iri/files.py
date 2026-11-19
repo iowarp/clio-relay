@@ -1,24 +1,26 @@
 """``files`` for the ``iri`` adapter, over the IRI ``/filesystem`` calls.
 
 Every call is an asynchronous task the client polls. The API moves files of up
-to 5 MiB, so larger reads and writes are refused with a pointer to Globus.
+to 5 MiB, so larger reads and writes are refused with a pointer to Globus. The
+rules of docs/files.md come from :class:`~clio_relay.adapters.site_files.SiteFiles`.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import posixpath
 import stat as stat_module
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from pathlib import Path
+from typing import Any, ClassVar, Literal, cast
 
 from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
-from clio_relay.jobs.file_rules import check_relative, no_delete, whole_writes_only
+from clio_relay.adapters.site_files import Kind, SiteFiles
 from clio_relay.jobs.handles import FileEntry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
+GLOBUS_HINT = "Use the site's globus adapter for larger files."
 _DIR_TYPES = ("d", "dir", "directory")
 _FILE_TYPES = ("-", "f", "file", "regular file")
 
@@ -76,38 +78,94 @@ def decode_download(result: dict[str, Any]) -> bytes:
     raise Refusal(RefusalReason.UNREACHABLE, "the IRI download returned no content")
 
 
-class IriFileAccess:
-    """File access on one IRI filesystem resource."""
+class IriFiles(SiteFiles):
+    """``files`` on one IRI filesystem resource, from the six primitives of :class:`SiteFiles`.
+
+    ``root`` and ``home`` are optional settings, since the API reports neither.
+    A path that needs one that is not set is refused with ``invalid_config``.
+    """
+
+    max_upload_bytes: ClassVar[int | None] = FILE_SIZE_LIMIT
+    upload_hint: ClassVar[str] = GLOBUS_HINT
 
     def __init__(
-        self, client: IriClient, *, resource_id: str, root: str | None, content_dir: str
+        self,
+        client: IriClient,
+        *,
+        resource_id: str,
+        root: str | None,
+        home: str | None,
+        staging: Path,
     ) -> None:
+        super().__init__(root=root or "/", home=home or "/", staging=staging)
         self.client = client
         self.resource_id = resource_id
-        self.root = root
-        self.content_dir = content_dir
+        self.has_root = root is not None
+        self.has_home = home is not None
 
     def resolve(self, path: str) -> str:
-        """Return the absolute path on the facility."""
-        check_relative(path)
-        if path.startswith("/"):
-            return posixpath.normpath(path)
-        if self.root is None:
+        """Return the absolute path on the facility, once its setting is there."""
+        in_home = path == "~" or path.startswith("~/")
+        if in_home and not self.has_home:
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG,
+                "paths under ~ need the home directory; set home in the site's iri settings",
+            )
+        if not path.startswith("/") and not in_home and not self.has_root:
             raise Refusal(
                 RefusalReason.INVALID_CONFIG,
                 "relative paths need a root; set root in the site's iri settings",
             )
-        return posixpath.normpath(posixpath.join(self.root, path or "."))
+        return super().resolve(path)
+
+    def content_path(self, digest: str) -> str:
+        if not self.has_root:
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG,
+                "staging content needs a root; set root in the site's iri settings",
+            )
+        return super().content_path(digest)
 
     async def _task(self, command: str, args: dict[str, Any], **kw: Any) -> dict[str, Any]:
         return await self.client.file_task(command, self.resource_id, args, **kw)
 
-    async def list(self, path: str) -> list[FileEntry]:
-        target = self.resolve(path)
+    async def _stat(self, path: str, *, dereference: bool) -> dict[str, Any]:
+        result = await self._task("stat", {"path": path, "dereference": dereference})
+        output: Any = result.get("output")
+        if not isinstance(output, dict):
+            raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
+        return cast(dict[str, Any], output)
+
+    async def kind(self, path: str) -> Kind:
+        try:
+            info = await self._stat(path, dereference=False)
+        except Refusal as refusal:
+            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
+                return "missing"
+            raise
+        mode = _size(info.get("mode")) or 0
+        if stat_module.S_ISLNK(mode):
+            return "link"
+        return "dir" if stat_module.S_ISDIR(mode) else "file"
+
+    async def describe(self, path: str) -> FileEntry:
+        info = await self._stat(path, dereference=True)
+        mode = _size(info.get("mode")) or 0
+        kind: Literal["file", "dir", "other"] = (
+            "dir" if stat_module.S_ISDIR(mode) else "file" if stat_module.S_ISREG(mode) else "other"
+        )
+        return FileEntry(
+            path=path,
+            kind=kind,
+            size=_size(info.get("size")) if kind == "file" else None,
+            modified=_time(info.get("mtime")),
+        )
+
+    async def children(self, path: str) -> list[FileEntry]:
         result = await self._task(
             "ls",
             {
-                "path": target,
+                "path": path,
                 "showHidden": True,
                 "numericUid": False,
                 "recursive": False,
@@ -122,101 +180,43 @@ class IriFileAccess:
             item = cast(dict[str, Any], raw)
             name = str(item.get("name", ""))
             kind = _kind(item.get("type"))
-            full = name if name.startswith("/") else posixpath.join(target, name)
             entries.append(
                 FileEntry(
-                    path=full,
+                    path=name if name.startswith("/") else posixpath.join(path, name),
                     kind=kind,
                     size=_size(item.get("size")) if kind == "file" else None,
                     modified=_time(item.get("last_modified") or item.get("lastModified")),
                 )
             )
-        return entries
+        return sorted(entries, key=lambda entry: entry.path)
 
-    async def stat(self, path: str) -> FileEntry:
-        target = self.resolve(path)
-        result = await self._task("stat", {"path": target, "dereference": True})
-        output: Any = result.get("output")
-        if not isinstance(output, dict):
-            raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} does not exist", path=path)
-        info = cast(dict[str, Any], output)
-        mode = _size(info.get("mode")) or 0
-        kind: Literal["file", "dir", "other"] = (
-            "dir" if stat_module.S_ISDIR(mode) else "file" if stat_module.S_ISREG(mode) else "other"
-        )
-        return FileEntry(
-            path=target,
-            kind=kind,
-            size=_size(info.get("size")) if kind == "file" else None,
-            modified=_time(info.get("mtime")),
-        )
-
-    async def _exists(self, path: str) -> FileEntry | None:
-        try:
-            return await self.stat(path)
-        except Refusal as refusal:
-            if refusal.reason == RefusalReason.PATH_NOT_FOUND:
-                return None
-            raise
-
-    async def mkdir(self, path: str) -> None:
-        """Make a directory and its parents when it does not exist."""
-        target = self.resolve(path)
-        if await self._exists(target) is None:
-            await self._task("mkdir", {"path": target, "parent": True})
-
-    async def read(self, path: str, *, offset: int = 0, limit: int | None = None) -> bytes:
-        entry = await self.stat(path)
-        if entry.kind != "file":
-            raise Refusal(RefusalReason.PATH_NOT_FOUND, f"{path} is not a file", path=path)
+    async def get(self, path: str, offset: int, limit: int | None) -> bytes:
+        entry = await self.describe(path)
         if entry.size is not None and entry.size > FILE_SIZE_LIMIT:
             raise Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
                 f"{path} is {entry.size} bytes; the IRI API moves files up to "
-                f"{FILE_SIZE_LIMIT} bytes, so use the site's globus adapter for it",
+                f"{FILE_SIZE_LIMIT} bytes. {GLOBUS_HINT}",
+                path=path,
             )
-        data = decode_download(await self._task("download", {"path": entry.path}))
-        start = max(0, offset)
-        return data[start:] if limit is None else data[start : start + max(0, limit)]
+        data = decode_download(await self._task("download", {"path": path}))
+        return data[offset:] if limit is None else data[offset : offset + limit]
 
-    async def write(
-        self,
-        path: str,
-        data: bytes,
-        *,
-        overwrite: bool = False,
-        offset: int = 0,
-        final: bool = True,
-    ) -> FileEntry:
-        whole_writes_only(path, offset, final)
-        if len(data) > FILE_SIZE_LIMIT:
-            raise Refusal(
-                RefusalReason.INVALID_ARGUMENTS,
-                f"the IRI API moves files up to {FILE_SIZE_LIMIT} bytes; use the site's "
-                "globus adapter for larger files",
-            )
-        if not overwrite and await self._exists(path) is not None:
-            raise Refusal(
-                RefusalReason.PATH_EXISTS, f"{path} exists; pass overwrite to replace it", path=path
-            )
+    async def mkdir(self, path: str) -> None:
+        """Make a directory and its parents when it does not exist."""
         target = self.resolve(path)
-        parent = posixpath.dirname(target)
+        if await self.kind(target) == "missing":
+            await self._task("mkdir", {"path": target, "parent": True})
+
+    async def put(self, path: str, data: bytes) -> None:
+        parent = posixpath.dirname(path)
         if parent:
             await self.mkdir(parent)
-        await self._task("upload", {"path": target}, content=data)
-        return await self.stat(target)
+        await self._task("upload", {"path": path}, content=data)
 
-    async def delete(self, path: str, *, recursive: bool = False) -> None:
-        raise no_delete(path)
+    async def remove(self, path: str) -> None:
+        await self._task("rm", {"path": path})
 
-    def _cas(self, digest: str) -> str:
-        return posixpath.join(self.content_dir, digest)
-
-    async def stage(self, data: bytes) -> str:
-        digest = hashlib.sha256(data).hexdigest()
-        if not await self.has(digest):
-            await self.write(self._cas(digest), data, overwrite=True)
-        return digest
-
-    async def has(self, digest: str) -> bool:
-        return await self._exists(self._cas(digest)) is not None
+    async def remove_tree(self, path: str) -> None:
+        # The API's rm removes a directory with everything in it, in one task.
+        await self._task("rm", {"path": path})

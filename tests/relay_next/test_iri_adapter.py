@@ -395,6 +395,64 @@ def test_relative_paths_need_a_root(tmp_path: Path) -> None:
     with pytest.raises(Refusal) as refused:
         files.resolve("relative")
     assert refused.value.reason == RefusalReason.INVALID_CONFIG
+    with pytest.raises(Refusal) as no_home:
+        files.resolve("~/a.txt")
+    assert no_home.value.reason == RefusalReason.INVALID_CONFIG
+    with pytest.raises(Refusal) as no_store:
+        files.content_path("ab" * 32)
+    assert no_store.value.reason == RefusalReason.INVALID_CONFIG
+
+
+def test_home_paths_use_the_home_setting(tmp_path: Path) -> None:
+    files = _build(tmp_path, home="/global/homes/u/user")._files()  # pyright: ignore[reportPrivateUsage]
+    assert files.resolve("~/a.txt") == "/global/homes/u/user/a.txt"
+    assert files.resolve("~") == "/global/homes/u/user"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["v1", "v2"])
+async def test_a_recursive_delete_is_one_rm_and_links_are_not_followed(
+    tmp_path: Path, version: str
+) -> None:
+    adapter = _build(tmp_path, version)
+    root = Path(adapter.config.root or "")
+    facility = FakeIriFacility(root=root)
+    adapter.client.transport = facility.transport()
+    (root / "kept" / "deep").mkdir(parents=True)
+    (root / "kept" / "deep" / "k.txt").write_bytes(b"k")
+    (root / "tree" / "a" / "b").mkdir(parents=True)
+    (root / "tree" / "a" / "b" / "c.txt").write_bytes(b"c")
+    (root / "tree" / "link").symlink_to(root / "kept")
+    files = await adapter.files()
+    await files.delete("tree/link")
+    assert (root / "kept" / "deep" / "k.txt").is_file()
+    facility.requests.clear()
+    await files.delete("tree", recursive=True)
+    assert not (root / "tree").exists()
+    assert sum("/filesystem/rm" in item["path"] for item in facility.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_chunks_upload_once_and_refuse_past_the_limit_before_moving_bytes(
+    tmp_path: Path,
+) -> None:
+    adapter = _build(tmp_path)
+    root = Path(adapter.config.root or "")
+    facility = FakeIriFacility(root=root)
+    adapter.client.transport = facility.transport()
+    files = await adapter.files()
+    await files.write("c.bin", b"a" * 10, final=False)
+    await files.write("c.bin", b"b" * 10, offset=10, final=False)
+    await files.write("c.bin", b"c" * 10, offset=20)
+    assert (root / "c.bin").read_bytes() == b"a" * 10 + b"b" * 10 + b"c" * 10
+    assert sum("/filesystem/upload" in item["path"] for item in facility.requests) == 1
+    facility.requests.clear()
+    await files.write("big.bin", b"x" * 1024, final=False)
+    with pytest.raises(Refusal) as refused:
+        await files.write("big.bin", b"y", offset=FILE_SIZE_LIMIT, final=False)
+    assert refused.value.reason == RefusalReason.INVALID_ARGUMENTS
+    assert "globus" in refused.value.message
+    assert not any("/filesystem/upload" in item["path"] for item in facility.requests)
 
 
 @pytest.mark.asyncio
