@@ -199,6 +199,7 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - The doc told contributors to skip real-site tests, against CONTRIBUTING's no-skip rule. It now says what CONTRIBUTING says.
   - Smaller items: the `clio-relay adapters` comment, a local-path `--with`, `acme-dev` for `myfacility`, `scheduler="none"`, and the "(RL6)" and "(RL7)" tags in docstrings.
   - Contract points left as they are, for whoever extends it next: the config type is declared twice (the generic parameter and `Config`); `max_upload_bytes` is a class attribute, so a per-site cap needs a subclass; `AdapterContext.secret` reads the global keyring rather than an injected store; and the kit has no "not applicable" outcome.
+  - Recheck at 0b3fda0e, same agent and the same reading rules: 9 of the 11 points fixed and 2 partly. The template has no `exec` to copy, and pytest still shows tests for verbs left out as plain passes. Following "Start from the template" literally gave 19 passed, and kiln moved to `use_memory_keyring` and the documented `on_stall` arguments and passed 24.
 ### Published interfaces (M1)
 
 Owned by W1, not frozen. A change goes through W1, which reruns every consumer's contract tests first.

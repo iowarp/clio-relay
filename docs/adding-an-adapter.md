@@ -160,9 +160,9 @@ arrives, and a recursive delete removes one entry at a time. Override
 
 If the site caps one upload, set the class attributes `max_upload_bytes` and
 `upload_hint`. The cap applies to the whole file, chunked or not: a chunked
-upload refuses at the first chunk that takes it past the cap. Relay's refusal says the file is too big and then appends
-`upload_hint`, so the hint names another way to move the file, such as a
-transfer service.
+upload refuses at the first chunk that takes it past the cap. Relay's refusal
+says the file is too big and then appends `upload_hint`, so the hint names
+another way to move the file, such as a transfer service.
 
 `files()` returns one, built with `root` (the site's work directory), `home`
 (the person's home directory on the site) and `staging`
