@@ -30,9 +30,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -40,7 +39,7 @@ import pytest
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS, BaseAdapter
 from clio_relay.jobs.file_rules import PART_SUFFIX, part_path
-from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
+from clio_relay.jobs.handles import JobHandle, JobState
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import InputRef, JobSpec

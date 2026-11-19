@@ -80,4 +80,3 @@ def protected_refusal(path: str) -> Refusal:
         f"relay does not delete {path}: it is the work directory, the home directory or /",
         path=path,
     )
-
