@@ -57,9 +57,8 @@ and:
 
 **Known limitation (D7, documented rather than fixed):** on Windows, a
 ``parent_pid`` this module observes as "alive" is only ever cross-checked
-against the CURRENT snapshot's own pid column -- never against a start-time
-identity the way ``process_containment_recorded.process_start_identity``
-does for OWNED processes elsewhere in this codebase. If the ORIGINAL parent
+against the CURRENT snapshot's own pid column -- never against a recorded
+process start time. If the ORIGINAL parent
 CLI process exits and the OS reuses its exact pid for an unrelated process
 before this module's next reconciliation pass runs, a genuinely orphaned
 visitor is misclassified as "parent still alive" and is never reaped by
