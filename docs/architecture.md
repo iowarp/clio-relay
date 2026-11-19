@@ -24,7 +24,10 @@ flowchart LR
 1. **Surface.** `surface/server.py` serves the tools `describe`, `run`,
    `exec`, `files` and `serve` over stdio or Streamable HTTP. `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
-   The tools only translate arguments; all behaviour is in the service.
+   The tools only translate arguments; all behaviour is in the service. The
+   server's `instructions`, which a client reads when it connects, name the
+   configured sites and the staged packages (`surface/instructions.py`), so an
+   agent knows what relay can run before it calls a tool.
 2. **Service.** `surface/service.py` holds `RelayService`, which the MCP
    server, the CLI and the tests all drive. It loads the site from
    `sites.yaml`, picks the adapter for the verb, and keeps a durable record of
