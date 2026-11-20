@@ -49,12 +49,12 @@ A package is one JARVIS package from a JARVIS repository, such as
 JARVIS package skill. It is staged once, on the relay machine. An agent stages
 it with relay's `packages` tool:
 
-- `packages(op="stage", package="clio_jarvis.gray_scott")` fetches relay's
-  pinned clio-jarvis commit and stages the package from it;
-- `git` and `commit` (and `path`, when the JARVIS repository sits deeper in
-  the checkout) stage from another git repository at one fixed commit;
+- `packages(op="stage", package="clio_jarvis.gray_scott")` stages the package
+  from relay's package sources, the copies its host installed with it (the
+  CLIO plugin ships clio-jarvis at its pinned commit). It fetches nothing;
 - `dir` stages from a directory on the relay machine, such as the person's
-  workspace;
+  workspace. It is never pushed to any repository: the archive reaches the
+  site as a job input, through the site adapter's transfer;
 - `op="list"` shows what is staged, and `op="remove"` takes a package out of
   the catalog (every version, unless `version` or `sha256` narrows it). Its
   archive leaves the content store too, unless an unfinished operation still
@@ -254,14 +254,6 @@ last ran in it, counted from the end of the last command. That is an idle
 timer on an allocation, not a limit on anything running: while a step runs in
 the allocation it stays, and the holder never stops a running step. Cancel it
 sooner with `run` and `cancel`.
-
-## Adding clio-jarvis to a site
-
-The clio-jarvis packages can also live in the site's own JARVIS, at a tagged
-release. Relay's `clio_relay.jarvis_site.add_clio_jarvis` clones the tag into
-`~/.clio-relay/clio-jarvis/<tag>` on the site, checks the tag's commit when you
-give it, and runs `jarvis repo add` unless that repository is already there.
-Running it again changes nothing.
 
 ## Settings
 

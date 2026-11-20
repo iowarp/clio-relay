@@ -118,6 +118,10 @@ class ServePlan(BaseModel):
     ssh_argv: list[str] = Field(default_factory=list[str])
     login_host: str | None = None
     host: str | None = None
+    host_keys: list[str] = Field(
+        default_factory=list[str],
+        description="known_hosts lines for ``host``, read on the login host over its checked link",
+    )
     ready_at: datetime | None = None
     stop_requested_at: datetime | None = None
     cancel_sent: bool = False

@@ -41,6 +41,7 @@ from clio_relay import jarvis_submit
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
+from clio_relay.jobs import psij_executors
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -122,6 +123,7 @@ _executors_lock = threading.Lock()
 
 
 def _executor(scheduler: SchedulerName, work_dir: Path) -> BatchSchedulerExecutor:
+    psij_executors.prepare()
     from psij import JobExecutor
     from psij.executors.batch.batch_scheduler_executor import (
         BatchSchedulerExecutor,

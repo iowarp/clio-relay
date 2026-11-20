@@ -44,6 +44,7 @@ from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
 from clio_relay.adapters.ssh.transport import SshTransport
+from clio_relay.jobs import psij_executors
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -82,6 +83,7 @@ _executors_lock = threading.Lock()
 
 def _executor(scheduler: SchedulerName, work_dir: Path) -> BatchSchedulerExecutor:
     """Return PSI/J's executor for ``scheduler``. It only renders and parses here."""
+    psij_executors.prepare()
     from psij import JobExecutor
     from psij.executors.batch.batch_scheduler_executor import (
         BatchSchedulerExecutor,

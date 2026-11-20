@@ -57,3 +57,22 @@ def missing(command: str) -> str:
     return (
         f"relay cannot find {command} on this machine's PATH; install it or configure its full path"
     )
+
+
+# Windows refuses to start, or deletes, a file its antivirus flags.
+ANTIVIRUS_ERRORS = frozenset({225, 226})
+
+
+def blocked(exc: OSError) -> bool:
+    """Return whether starting a program failed because the host's antivirus blocked it."""
+    return getattr(exc, "winerror", None) in ANTIVIRUS_ERRORS
+
+
+def start_failed(command: str, exc: OSError) -> str:
+    """Say why ``command`` would not start, naming an antivirus block plainly."""
+    if blocked(exc):
+        return (
+            f"this machine's antivirus blocked {command} as unwanted software; allow that "
+            "program in the antivirus settings, or configure the full path of a copy it permits"
+        )
+    return f"cannot start {command}: {exc.strerror or exc}"

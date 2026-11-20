@@ -1,4 +1,4 @@
-"""The shell scripts relay sends to a site: the JARVIS site script, the warm holder, RL42.
+"""The shell scripts relay sends to a site: the JARVIS site script and the warm holder.
 
 They run under /bin/sh or bash with stand-in ``jarvis``, ``scontrol`` and
 ``squeue`` programs that log what they were asked.
@@ -15,10 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.adapters.base import AdapterContext
-from clio_relay.adapters.local import LocalAdapter, LocalConfig
 from clio_relay.guard.warm import HOLDER, WARM_EXECUTABLE
-from clio_relay.jarvis_site import add_clio_jarvis, archive_package
+from clio_relay.jarvis_site import archive_package
 from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
     EXIT_MISSING,
@@ -34,7 +32,7 @@ from clio_relay.jarvis_submit import (
     parse_handle,
 )
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.refusals import RefusalReason
 
 from .conftest import make_repo
 
@@ -269,71 +267,3 @@ def test_a_holder_without_slurm_watches_its_marker(tmp_path: Path) -> None:
     done = _holder(_env(tmp_path, tmp_path / "bin"), tmp_path, limit=1, step=1)
     assert done.returncode == 0
     assert "released" in done.stdout
-
-
-def _clio_jarvis_remote(tmp_path: Path) -> tuple[Path, str]:
-    remote = tmp_path / "clio-jarvis"
-    package = remote / "clio_jarvis" / "clio_jarvis" / "hello"
-    package.mkdir(parents=True)
-    (package / "pkg.py").write_text("# hello\n")
-
-    def git(*args: str) -> str:
-        return subprocess.run(
-            ["git", "-C", str(remote), *args], capture_output=True, text=True, check=True
-        ).stdout.strip()
-
-    git("init", "-q")
-    git("add", ".")
-    git(
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-qm",
-        "x",
-    )
-    git("tag", "v0.1.0")
-    return remote, git("rev-parse", "HEAD")
-
-
-@pytest.mark.asyncio
-async def test_rl42_adds_a_tagged_clio_jarvis_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    remote, commit = _clio_jarvis_remote(tmp_path)
-    jarvis = _program(tmp_path / "bin", "jarvis", FAKE_JARVIS)
-    for key, value in _env(tmp_path, tmp_path / "bin").items():
-        monkeypatch.setenv(key, value)
-    adapter = LocalAdapter(
-        LocalConfig(),
-        AdapterContext(
-            site_id="here", state_dir=tmp_path / "state", content=ContentStore(tmp_path / "c")
-        ),
-    )
-    base = tmp_path / "site" / "clio-jarvis"
-    first = await add_clio_jarvis(
-        adapter, url=str(remote), tag="v0.1.0", commit=commit, base=str(base), jarvis=str(jarvis)
-    )
-    repo = base / "v0.1.0" / "clio_jarvis"
-    assert first == {"tag": "v0.1.0", "commit": commit, "repo": str(repo), "added": True}
-    again = await add_clio_jarvis(
-        adapter, url=str(remote), tag="v0.1.0", base=str(base), jarvis=str(jarvis)
-    )
-    assert again["added"] is False
-    adds = [
-        line for line in (tmp_path / "jarvis.log").read_text().splitlines() if "repo add" in line
-    ]
-    assert adds == [f"JARVIS_ROOT= repo add {repo}"]
-    with pytest.raises(Refusal) as raised:
-        await add_clio_jarvis(
-            adapter,
-            url=str(remote),
-            tag="v0.1.0",
-            commit="0" * 40,
-            base=str(base),
-            jarvis=str(jarvis),
-        )
-    assert "not " + "0" * 40 in raised.value.message

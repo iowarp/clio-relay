@@ -747,17 +747,6 @@ class RelayServer:
             package: Annotated[
                 str | None, Field(description="<repository>.<package>, for stage and remove")
             ] = None,
-            git: Annotated[
-                str | None,
-                Field(description="Stage from this git repository; give commit with it"),
-            ] = None,
-            commit: Annotated[
-                str | None, Field(description="The commit to stage from git, 7 to 40 hex digits")
-            ] = None,
-            path: Annotated[
-                str | None,
-                Field(description="Where the JARVIS repository sits in the git checkout"),
-            ] = None,
             dir: Annotated[  # noqa: A002 - the source is a directory
                 str | None,
                 Field(description="Stage from this absolute directory on the relay host"),
@@ -772,17 +761,16 @@ class RelayServer:
             sha256: Annotated[str | None, Field(description="remove: only this archive")] = None,
         ) -> ToolResult:
             """run needs a staged package: stage one before its first run. stage builds the
-            package's archive from git at one commit (git, commit; with neither, relay's
-            pinned clio-jarvis) or from dir, a directory on the relay host, and adds it to
-            relay's catalog. list shows what is staged; remove takes a package out (version
-            or sha256 narrow it). Staging runs nothing: a guarded site reviews the archive
-            by its SHA-256 before its first run there."""
+            package's archive on the relay host and adds it to relay's catalog: naming only
+            package, from relay's package sources (directories its host installed, listed
+            in sources); with dir, from that directory on the relay host, such as a package
+            the person wrote. Staging fetches nothing and runs no git. list shows what is
+            staged; remove takes a package out (version or sha256 narrow it). Staging runs
+            nothing: a guarded site reviews the archive by its SHA-256 before its first run
+            there, and the archive reaches the site through relay's own transfer."""
             arguments = PackagesArgs(
                 op=op,
                 package=package,
-                git=git,
-                commit=commit,
-                path=path,
                 dir=dir,
                 version=version,
                 sha256=sha256,

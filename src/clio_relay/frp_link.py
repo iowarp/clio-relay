@@ -576,7 +576,12 @@ def spawn_frp_process(*args: Any, **kwargs: Any) -> FrpProcess:
     program = programs.resolved(argv, kwargs.get("env"))
     if program is None:
         raise FileNotFoundError(programs.missing(argv[0] if argv else "frpc"))
-    return cast(FrpProcess, subprocess.Popen(program, *args[1:], **kwargs))
+    try:
+        return cast(FrpProcess, subprocess.Popen(program, *args[1:], **kwargs))
+    except OSError as exc:
+        if programs.blocked(exc):
+            raise PermissionError(exc.errno, programs.start_failed(argv[0], exc)) from exc
+        raise
 
 
 class HeldFrpVisitor:

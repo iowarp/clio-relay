@@ -262,8 +262,12 @@ idle machine; a loaded login node can make that several times longer.
 
 ## Serving a port
 
-`serve` forwards a port from the site with `ssh -L`, adding `-J` through the
-login node when the service runs on a compute node.
+`serve` forwards a port from the site with `ssh -L`. When the service runs on a
+compute node, the forward reaches it through the login node with an
+`ssh -W` hop as its `ProxyCommand`. The hop runs the same `ssh` relay found on
+your PATH, and the node gets the user and key your ssh config gives the login
+node (read with `ssh -G`). Relay reads the node's host key from the login
+node's `known_hosts` files, so you don't need the node in your own.
 
 ## When the connection drops
 

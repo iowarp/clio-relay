@@ -26,7 +26,6 @@ import hashlib
 import io
 import json
 import re
-import shlex
 import subprocess
 import tarfile
 from collections.abc import Iterator
@@ -35,7 +34,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from clio_relay import programs
-from clio_relay.adapters.base import BaseAdapter
 from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -268,111 +266,9 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
             RefusalReason.INPUT_MISSING,
             f"the archive of {name} ({digest}) is not in relay's content store, so nobody can "
             "review what would run. Stage it with the packages tool: "
-            'packages(op="stage", package="<repo.package>"), from git at a commit or from a '
-            "directory on the relay host (dir), then run again",
+            'packages(op="stage", package="<repo.package>"), from relay\'s package sources or '
+            "from a directory on the relay host (dir), then run again",
             digest=digest,
             package=name,
         )
     return inspect_archive(content.get(digest), name)
-
-
-# RL42: clio-jarvis on a site
-
-
-DEFAULT_CLIO_JARVIS_BASE = "~/.clio-relay/clio-jarvis"
-CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
-CLIO_JARVIS_REF = "jaimecernuda-spack-linkage"
-CLIO_JARVIS_COMMIT = "aa8b3d56e7912cc798615fe72c248f2e843132e0"
-"""The clio-jarvis relay is proven with: pvserver 0.3.1, which reports a TCP service."""
-
-
-def _site_path(path: str) -> str:
-    """Quote ``path`` for sh, letting a leading ``~/`` mean the home directory."""
-    if path == "~":
-        return '"$HOME"'
-    if path.startswith("~/"):
-        return '"$HOME"/' + shlex.quote(path[2:])
-    return shlex.quote(path)
-
-
-def clio_jarvis_script(
-    *,
-    url: str,
-    tag: str,
-    commit: str | None = None,
-    base: str = DEFAULT_CLIO_JARVIS_BASE,
-    jarvis: str,
-) -> str:
-    """The script that puts clio-jarvis ``tag`` in the site's JARVIS, once (RL42).
-
-    ``jarvis`` is that JARVIS's path, absolute or from ``~/``: it is never looked
-    up on the site's ``PATH``. The script clones the tag into ``<base>/<tag>``,
-    checks the tag's commit when one is given, and runs ``jarvis repo add``
-    unless that directory is already registered. It prints ``@@repo <dir>`` and
-    ``@@added`` or ``@@present``.
-    """
-    q = shlex.quote
-    expected = q(commit or "")
-    return f"""set -eu
-base={_site_path(base)}
-dest="$base"/{q(tag)}
-jarvis={_site_path(jarvis)}
-[ -f "$jarvis" ] && [ -x "$jarvis" ] || {{ echo "@@error $jarvis is not a program"; exit 69; }}
-if [ ! -d "$dest/.git" ]; then
-  mkdir -p "$base"
-  rm -rf "$dest.partial"
-  git -c advice.detachedHead=false clone --quiet --depth 1 --branch {q(tag)} {q(url)} \
-    "$dest.partial"
-  mv "$dest.partial" "$dest"
-fi
-got=$(git -C "$dest" rev-parse HEAD)
-want={expected}
-if [ -n "$want" ] && [ "$got" != "$want" ]; then
-  echo "@@error tag {tag} is $got, not $want"; exit 65
-fi
-repo="$dest/clio_jarvis"
-[ -d "$repo/clio_jarvis" ] || {{ echo "@@error $dest has no clio_jarvis/clio_jarvis"; exit 65; }}
-echo "@@commit $got"
-echo "@@repo $repo"
-if "$jarvis" repo list 2>/dev/null | grep -F -- "($repo)" >/dev/null; then
-  echo "@@present"
-else
-  "$jarvis" repo add "$repo" >/dev/null
-  echo "@@added"
-fi
-"""
-
-
-async def add_clio_jarvis(
-    adapter: BaseAdapter[Any],
-    *,
-    url: str = CLIO_JARVIS_URL,
-    tag: str = CLIO_JARVIS_REF,
-    commit: str | None = CLIO_JARVIS_COMMIT,
-    base: str = DEFAULT_CLIO_JARVIS_BASE,
-    jarvis: str,
-) -> dict[str, Any]:
-    """Add clio-jarvis ``tag`` to the JARVIS on ``adapter``'s site (RL42).
-
-    It defaults to the pinned clio-jarvis. Idempotent: a second call finds the
-    repository registered and changes nothing.
-    """
-    script = clio_jarvis_script(url=url, tag=tag, commit=commit, base=base, jarvis=jarvis)
-    result = await adapter.exec(["sh", "-c", script], max_output_bytes=65536)
-    lines = result.stdout.splitlines()
-    marks = {
-        line[2:].split(" ", 1)[0]: line[2:].split(" ", 1)[1:] for line in lines if line[:2] == "@@"
-    }
-    if result.exit_code != 0 or "error" in marks:
-        reason = " ".join(marks.get("error", [])) or result.stderr.strip() or "it failed"
-        raise Refusal(
-            RefusalReason.SUBMIT_FAILED,
-            f"could not add clio-jarvis {tag} to the site's JARVIS: {reason}",
-            exit_code=result.exit_code,
-        )
-    return {
-        "tag": tag,
-        "commit": (marks.get("commit") or [""])[0],
-        "repo": (marks.get("repo") or [""])[0],
-        "added": "added" in marks,
-    }
