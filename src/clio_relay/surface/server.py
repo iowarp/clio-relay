@@ -64,6 +64,7 @@ from clio_relay.surface.elicit import (
     response_parts,
     tasks_opted_in,
 )
+from clio_relay.surface.endpoints import address as _address
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
@@ -124,7 +125,7 @@ def _summary(view: dict[str, Any]) -> str:
     endpoint: dict[str, Any] = result.get("endpoint") or {}
     ports: list[dict[str, Any]] = endpoint.get("ports") or []
     for port in ports:
-        line += f"\n{port['name']}: {port['host']}:{port['port']}"
+        line += f"\n{port['name']}: {_address(port)}"
     tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
@@ -813,7 +814,8 @@ class RelayServer:
         ) -> ToolResult | InputRequiredToolResult:
             """Start a job with ports and return how to reach it. With tasks this returns
             a task whose status names the endpoint; without, it waits up to wait_s for
-            the service to be ready. service observes one; stop ends it."""
+            the service to be ready. service observes one; stop ends it. Each endpoint
+            port has an address, host:port: that is what you hand to clients."""
             return await relay.serve(ctx, site, spec, service, stop, wait_s)
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
