@@ -24,7 +24,6 @@ time a package is needed there. :func:`clio_jarvis_script` is the script and
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import io
 import json
@@ -43,6 +42,7 @@ from clio_relay import programs
 from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.stable_gzip import stable_gzip
 
 SOURCE_FILE = ".clio-relay-source.json"
 """The archive member that says where the package came from."""
@@ -238,8 +238,9 @@ def _portable(data: bytes) -> tuple[bytes, int]:
 def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None = None) -> bytes:
     """Return the deterministic archive of package ``name`` from ``repo_dir``.
 
-    The same files give the same bytes, so the same SHA-256, on any machine and
-    from any checkout of them (:func:`_portable`).
+    The same files give the same bytes, so the same SHA-256, on any machine, from
+    any checkout of them (:func:`_portable`) and under any Python, whatever zlib it
+    links (:func:`~clio_relay.stable_gzip.stable_gzip`).
     """
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
@@ -256,10 +257,7 @@ def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None 
             members.append((f"{split_name(name)[0]}/{REQUIREMENTS_FILE}", listed, 0o644))
         for arcname, data, mode in sorted(members):
             tar.addfile(_member(arcname, len(data), mode), io.BytesIO(data))
-    packed = io.BytesIO()
-    with gzip.GzipFile(filename="", mode="wb", fileobj=packed, mtime=0) as handle:
-        handle.write(raw.getvalue())
-    return packed.getvalue()
+    return stable_gzip(raw.getvalue())
 
 
 def _git(checkout: Path, *args: str) -> str | None:
