@@ -41,7 +41,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
-| `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run |
+| `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run. A bare name is looked up on the PATH relay hands the child, with PATHEXT on Windows, so an `ssh.cmd` early on the PATH wins. A path is used as given |
 | `connect_timeout_s` | 30 | ssh's `ConnectTimeout` |
 | `command_timeout_s` | 300 | When a `describe`, `status` or `cancel` call counts as stalled. The next poll tries again |
 | `retries` | 5 | How many times relay repeats a call or copy whose connection failed or dropped, waiting 2, 4, 8, 16, then 30 seconds. exec, and a write that may not overwrite, are repeated only when the connection never opened |
@@ -291,7 +291,7 @@ repeated: trying again would give the same answer.
 | `timeout` | A `describe`, `status` or `cancel` call stalled. The next poll tries again |
 | `interactive_auth_required` | The site asks for a code. Turn on `interactive_sign_in`, or use the `worker` adapter |
 | `needs_sign_in` | The signed-in connection closed. Sign in again on relay's page |
-| `adapter_unavailable` | `ssh` or `scp` is not installed on this machine |
+| `adapter_unavailable` | `ssh` or `scp` is not on this machine's PATH; the message names the command |
 
 | `cause` | What to do |
 | --- | --- |

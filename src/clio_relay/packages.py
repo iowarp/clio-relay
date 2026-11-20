@@ -37,6 +37,7 @@ from typing import Any, cast
 import yaml
 from pydantic import BaseModel, Field
 
+from clio_relay import programs
 from clio_relay.jarvis_site import (
     CLIO_JARVIS_COMMIT,
     CLIO_JARVIS_URL,
@@ -583,9 +584,12 @@ def stage_dir(
 def _git(args: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    git = programs.find("git", env)
+    if git is None:
+        raise Refusal(RefusalReason.INVALID_CONFIG, programs.missing("git"), command="git")
     try:
         return subprocess.run(
-            ["git", "-c", "protocol.ext.allow=never", *args],
+            [git, "-c", "protocol.ext.allow=never", *args],
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,

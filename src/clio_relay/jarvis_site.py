@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from clio_relay import programs
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
 from clio_relay.jobs.content import ContentStore
@@ -149,9 +150,12 @@ def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None 
 
 
 def _git(checkout: Path, *args: str) -> str | None:
+    git = programs.find("git")
+    if git is None:
+        return None
     try:
         done = subprocess.run(
-            ["git", "-C", str(checkout), *args], capture_output=True, text=True, check=False
+            [git, "-C", str(checkout), *args], capture_output=True, text=True, check=False
         )
     except OSError:
         return None

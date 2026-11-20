@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from clio_relay import programs
 from clio_relay.adapters.ssh import errors
 from clio_relay.adapters.ssh.config import SshConfig
 from clio_relay.asks import askpass
@@ -130,9 +131,12 @@ async def run_process(
     out = _Sink(max_output_bytes)
     err = _Sink(max_output_bytes)
     piped = stdin is not None or hold_stdin
+    program = programs.resolved(command, env)
+    if program is None:
+        return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
     try:
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *program,
             stdin=asyncio.subprocess.PIPE if piped else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -396,8 +400,9 @@ class SshTransport:
         ):
             raise Refusal(
                 RefusalReason.ADAPTER_UNAVAILABLE,
-                f"{result.argv[0]} is not installed on this machine",
+                programs.missing(result.argv[0]),
                 site=self.site_id,
+                command=result.argv[0],
             )
         refusal = errors.refusal(
             result.error_text(),
@@ -499,10 +504,13 @@ class SshTransport:
         merged.update(env)
         if self.config.askpass:
             merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
+        program = programs.resolved(argv, merged)
+        if program is None:
+            raise RuntimeError(programs.missing(argv[0]))
         # The backgrounded master keeps its stderr, so a pipe would never close.
         with tempfile.TemporaryFile() as log:
             process = await asyncio.create_subprocess_exec(
-                *argv,
+                *program,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=log,

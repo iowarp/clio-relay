@@ -19,6 +19,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from clio_relay import programs
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.serve import frp
 from clio_relay.serve.plan import ServePlan
@@ -199,11 +200,14 @@ class Forward:
 
     async def _spawn(self) -> None:
         argv, env = self._command()
+        program = programs.resolved(argv, env)
+        if program is None:
+            raise Refusal(RefusalReason.UNREACHABLE, programs.missing(argv[0]), command=argv[0])
         self.directory.mkdir(parents=True, exist_ok=True)
         log = self.log_path.open("ab")
         try:
             self.process = await asyncio.create_subprocess_exec(
-                *argv,
+                *program,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=log,
                 stderr=asyncio.subprocess.STDOUT,

@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_submit, programs
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.worker.files import WorkerFileAccess
@@ -537,13 +537,22 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         assert link.session_owner_token is not None
         script = self.placement_script(link, session_owner_token=link.session_owner_token)
         self._drop_connection()
+        env = {**os.environ, **(env or {})}
+        argv = programs.resolved(self.ssh_argv(), env)
+        if argv is None:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                programs.missing("ssh"),
+                site=self.context.site_id,
+                command="ssh",
+            )
         # No time limit: the person may be typing a code on the sign-in page.
         process = await asyncio.create_subprocess_exec(
-            *self.ssh_argv(),
+            *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **(env or {})},
+            env=env,
             start_new_session=os.name == "posix",
         )
         out, err = await process.communicate(script.encode("utf-8"))
@@ -753,9 +762,17 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         argv = self.ssh_argv()
         argv[argv.index("BatchMode=no")] = "BatchMode=yes"
         script = prune_script(targets, keep)
+        program = programs.resolved(argv)
+        if program is None:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                programs.missing(argv[0]),
+                site=self.context.site_id,
+                command=argv[0],
+            )
         try:
             process = await asyncio.create_subprocess_exec(
-                *argv,
+                *program,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
