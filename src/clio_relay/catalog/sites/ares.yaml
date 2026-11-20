@@ -8,7 +8,6 @@ source: https://grc.iit.edu/docs/ares/ares-user-guide/
 adapter: ssh
 config:
   ssh_profile: ares
-policy: open
 defaults:
   queue: compute
 skill: ares

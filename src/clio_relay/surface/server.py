@@ -73,6 +73,7 @@ from clio_relay.surface.progress import latest_note, observation_line
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.skills import SkillResources
+from clio_relay.wording import with_article
 
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
@@ -481,7 +482,7 @@ class RelayServer:
         if record.kind != "serve":
             raise Refusal(
                 RefusalReason.INVALID_ARGUMENTS,
-                f"{operation_id!r} is a {record.kind} operation, not a service",
+                f"{operation_id!r} is {with_article(record.kind)} operation, not a service",
                 operation_id=operation_id,
             )
         return record

@@ -26,6 +26,7 @@ from clio_relay.jobs.spec import canonical_digest
 from clio_relay.login_load import LoginLimits
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.files_approval import NeedsPerson
+from clio_relay.wording import with_article
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -72,7 +73,7 @@ def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
     if len(shown) > SHOWN_CHARS:
         shown = f"{shown[:SHOWN_CHARS]}... ({len(shown) - SHOWN_CHARS} more characters)"
     return (
-        f"Run a {plan.kind} plan on {site.title}'s login node? {plan.summary}\n\n"
+        f"Run {with_article(plan.kind)} plan on {site.title}'s login node? {plan.summary}\n\n"
         f"The site is guarded, so relay asks before a command that is not read-only. It runs "
         f"once, at low priority, for at most {PLAN_TIMEOUT_S:.0f} s. Command (sha256 "
         f"{argv_digest(command)[:16]}):\n{shown}"

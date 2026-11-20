@@ -25,6 +25,7 @@ from clio_relay.surface.a2ui.components import Tree, bound, event
 from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error
 from clio_relay.surface.a2ui.tokens import ActionTokens
 from clio_relay.surface.a2ui.values import SPEND_ABOVE, SPEND_LIMIT, spend_value
+from clio_relay.wording import with_article
 
 SITES_SURFACE = "relay-sites"
 ADD_SURFACE = "relay-add"
@@ -353,8 +354,13 @@ def status_text(view: SiteView) -> str:
     state = str(view.status.get("state", ""))
     shown = _STATUS.get(state, state)
     if state == "needs_sign_in" and view.status.get("provider"):
-        return f"Needs a {view.status['provider']} sign-in"
+        return sign_in_text(str(view.status["provider"]))
     return shown
+
+
+def sign_in_text(provider: str) -> str:
+    """Return what a site that needs ``provider``'s sign-in shows: "Needs an ssh sign-in"."""
+    return f"Needs {with_article(provider)} sign-in"
 
 
 def summary(views: list[SiteView], notice: str = "") -> str:
