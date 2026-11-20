@@ -19,7 +19,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from clio_relay.adapters.base import ShutsDown
 from clio_relay.config import RelaySettings
@@ -36,6 +36,11 @@ MAX_TIMEOUT_S = 120.0
 LOCAL = "local"
 _JOB_KINDS = ("run", "serve")
 _SELF_EXIT_DELAY_S = 1.0
+_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_INVALID_PARAMETER = 87
+_STILL_ACTIVE = 259
+
+Probe = Literal["relay", "other", "gone", "unknown"]
 
 
 def servers_dir(paths: RelayPaths) -> Path:
@@ -65,14 +70,6 @@ def _cmdline(pid: int) -> str | None:
         except OSError:
             return None
         return raw.replace(b"\0", b" ").decode(errors="replace")
-    if os.name == "nt":
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return result.stdout if str(pid) in result.stdout else None
     try:
         result = subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
@@ -82,25 +79,129 @@ def _cmdline(pid: int) -> str | None:
     return result.stdout.strip() or None
 
 
-def _is_relay(pid: int, word: str) -> bool:
-    """Whether ``pid`` is a relay process running ``word`` (Windows shows only the image)."""
+def _probe_windows(pid: int) -> tuple[Probe, str]:
+    """Probe ``pid`` through the process handle; ``tasklist`` hides other identities."""
+    if sys.platform != "win32":
+        return "unknown", "no Windows process API here"
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    handle = kernel32.OpenProcess(_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == _ERROR_INVALID_PARAMETER:
+            return "gone", ""
+        return "unknown", (
+            f"process {pid} cannot be opened (Windows error {error}); it may run as another "
+            "user or outside this sandbox, so relay cannot confirm or stop it"
+        )
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != _STILL_ACTIVE:
+            return "gone", ""
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return "unknown", (
+                f"process {pid} is running, but its program cannot be read "
+                f"(Windows error {ctypes.get_last_error()})"
+            )
+        image = Path(buffer.value).name.lower()
+    finally:
+        kernel32.CloseHandle(handle)
+    if any(name in image for name in ("python", "clio-relay", "clio_relay")):
+        return "relay", ""
+    return "other", ""
+
+
+def _probe(pid: int, word: str) -> tuple[Probe, str]:
+    """Whether ``pid`` is relay running ``word``, another program, gone, or unknown, and why.
+
+    Windows shows only the program's image, so ``word`` is not checked there.
+    """
+    if os.name == "nt":
+        return _probe_windows(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "gone", ""
+    except PermissionError:
+        return "unknown", f"process {pid} belongs to another user; relay cannot confirm or stop it"
+    except OSError as exc:
+        return "unknown", f"process {pid} cannot be checked: {exc}"
     line = _cmdline(pid)
     if line is None:
-        return False
+        return "unknown", f"process {pid} is running, but its command line cannot be read"
+    if ("clio-relay" in line or "clio_relay" in line) and word in line:
+        return "relay", ""
+    return "other", ""
+
+
+def _terminate(pid: int) -> str | None:
+    """Stop ``pid``; return why it could not be stopped, or None once it is stopped."""
     if os.name == "nt":
-        return any(name in line.lower() for name in ("python", "clio-relay", "clio_relay"))
-    return ("clio-relay" in line or "clio_relay" in line) and word in line
-
-
-def _terminate(pid: int) -> bool:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True, check=False
+            )
+        except OSError as exc:
+            return f"taskkill could not run: {exc}"
+        if result.returncode == 0 or _probe(pid, "")[0] == "gone":
+            return None
+        output = (result.stderr or result.stdout).strip()
+        return f"taskkill exited {result.returncode}: {output or 'no output'}"
     try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return False
-    return True
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        return f"SIGTERM failed: {exc}"
+    return None
+
+
+def _stop_record(
+    record: Path,
+    pid: int | None,
+    word: str,
+    stop: dict[str, Any],
+    failures: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Stop the process ``record`` names; return ``stop`` with its pid once it is stopped.
+
+    The record is dropped only when its process is stopped, has exited, or is another
+    program that took the pid. A process relay cannot confirm or stop keeps its
+    record and is reported in ``failures`` with the reason; it is never dropped
+    silently. ``stop`` holds the entry's site, kind and detail.
+    """
+
+    def keep(reason: str) -> None:
+        where = str(record) if pid is None else f"{record}, pid {pid}"
+        failures.append(
+            {
+                "site": stop["site"],
+                "error": RefusalReason.UNREACHABLE.value,
+                "detail": f"{stop['detail']} was not stopped ({where}): {reason}",
+            }
+        )
+
+    if pid is None:
+        keep("the record names no process id")
+        return None
+    state, reason = _probe(pid, word)
+    if state == "unknown":
+        keep(reason)
+        return None
+    if state == "relay":
+        failed = _terminate(pid)
+        if failed is not None:
+            keep(failed)
+            return None
+    with contextlib.suppress(OSError):
+        record.unlink()
+    return {**stop, "pid": pid} if state == "relay" else None
 
 
 def _read_pid(path: Path) -> int | None:
@@ -116,7 +217,9 @@ def _read_pid(path: Path) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def _stop_connectors(paths: RelayPaths, operations: dict[str, str], site: str | None) -> list[Any]:
+def _stop_connectors(
+    paths: RelayPaths, operations: dict[str, str], site: str | None, failures: list[Any]
+) -> list[Any]:
     """Stop ``clio-relay connect`` holders: all of them, or those of ``site``'s operations."""
     from clio_relay.serve.desktop import CONNECTOR_PIDFILE
 
@@ -127,25 +230,20 @@ def _stop_connectors(paths: RelayPaths, operations: dict[str, str], site: str | 
         if site is not None and owner != site:
             continue
         pid = _read_pid(pidfile)
-        if pid is None or pid == os.getpid() or not _is_relay(pid, "connect"):
-            with contextlib.suppress(OSError):
-                pidfile.unlink()
+        if pid == os.getpid():
             continue
-        if _terminate(pid):
-            with contextlib.suppress(OSError):
-                pidfile.unlink()
-            stopped.append(
-                {
-                    "site": owner,
-                    "kind": "connector",
-                    "pid": pid,
-                    "detail": f"clio-relay connect for service {operation}",
-                }
-            )
+        stop = {
+            "site": owner,
+            "kind": "connector",
+            "detail": f"clio-relay connect for service {operation}",
+        }
+        found = _stop_record(pidfile, pid, "connect", stop, failures)
+        if found is not None:
+            stopped.append(found)
     return stopped
 
 
-def _stop_servers(paths: RelayPaths) -> list[dict[str, Any]]:
+def _stop_servers(paths: RelayPaths, failures: list[Any]) -> list[dict[str, Any]]:
     """Stop recorded ``serve --http`` processes; this one exits after it answers."""
     stopped: list[dict[str, Any]] = []
     for record in sorted(servers_dir(paths).glob("*.json")):
@@ -162,17 +260,14 @@ def _stop_servers(paths: RelayPaths) -> list[dict[str, Any]]:
             with contextlib.suppress(RuntimeError):
                 asyncio.get_running_loop().call_later(_SELF_EXIT_DELAY_S, _exit_self)
             continue
-        if pid is not None and _is_relay(pid, "serve") and _terminate(pid):
-            stopped.append(
-                {
-                    "site": LOCAL,
-                    "kind": "local_server",
-                    "pid": pid,
-                    "detail": "a detached clio-relay serve --http",
-                }
-            )
-        with contextlib.suppress(OSError):
-            record.unlink()
+        stop = {
+            "site": LOCAL,
+            "kind": "local_server",
+            "detail": "a detached clio-relay serve --http",
+        }
+        found = _stop_record(record, pid, "serve", stop, failures)
+        if found is not None:
+            stopped.append(found)
     return stopped
 
 
@@ -319,7 +414,7 @@ async def shutdown(
 
     await asyncio.gather(*(one(entry) for entry in entries))
     operations = {record.operation_id: record.site for record in service.operations.all()}
-    stopped.extend(_stop_connectors(service.paths, operations, site))
+    stopped.extend(_stop_connectors(service.paths, operations, site, failures))
     if site is None:
         try:
             stopped.extend(_reap_visitors())
@@ -327,7 +422,7 @@ async def shutdown(
             failures.append(
                 {"site": LOCAL, "error": RefusalReason.UNREACHABLE.value, "detail": str(exc)}
             )
-        stopped.extend(_stop_servers(service.paths))
+        stopped.extend(_stop_servers(service.paths, failures))
     hop_stopped = {item["site"] for item in stopped if item["kind"] == "hop_proxy"}
     return {
         "schema": SCHEMA,
