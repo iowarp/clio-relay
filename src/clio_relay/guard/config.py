@@ -6,6 +6,7 @@ The file is optional. Each key under ``sites`` is a site id::
       polaris:
         jarvis: ~/venvs/jarvis/bin/jarvis
         read_only: [myquota]
+        spack: [.clio-relay/spack/bin/spack, /opt/spack/bin/spack]
         warm_idle_s: 600
 
 The file is read on every check, so an edit takes effect without a restart.
@@ -22,6 +23,8 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 WARM_IDLE_S = 600
 """A warm allocation nobody uses for this long releases itself (RL26)."""
+CLIO_SPACK = (".clio-relay/spack/bin/spack",)
+"""The CLIO Spack (clio-kit's ``spack_prepare_site``), relative to the home directory."""
 
 
 class SiteGuard(BaseModel):
@@ -39,6 +42,13 @@ class SiteGuard(BaseModel):
     read_only: list[str] = Field(
         default_factory=list[str],
         description="Programs added to the site's read-only exec list, by exact argv[0]",
+    )
+    spack: list[str] = Field(
+        default_factory=lambda: list(CLIO_SPACK),
+        description=(
+            "Spack executables, by exact argv[0], whose find, info and spec exec allows "
+            "besides a bare spack. Relative paths are from the home directory"
+        ),
     )
     warm_idle_s: int = Field(default=WARM_IDLE_S, ge=60)
 

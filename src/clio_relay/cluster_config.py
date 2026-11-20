@@ -32,6 +32,8 @@ class FrpTransportConfig(BaseModel):
     # ``None`` resolves to a per-site default (``frp_proxy_naming``).
     proxy_name: str | None = None
     identity_anchor: IdentityAnchor | None = None
+    # The STUN server an xtcp punch asks for its public address; None is frpc's own default.
+    stun_server: str | None = None
 
 
 class ClusterDefinition(BaseModel):

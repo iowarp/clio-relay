@@ -95,7 +95,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "96283b3f7ff1a5f5ee0a825f74f62ba1978b924e"
+JARVIS_PIN = "9bf89f96921ebeee818e3ba001ab2f1f38877c7b"
 """The jarvis-cd commit relay installs on a site that has none."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -1385,6 +1385,12 @@ def install_message(report: Mapping[str, Any], *, site: str, package: str) -> st
         if item["missing"]:
             detail = f"{detail} ({item['missing']} missing)"
         built.append(detail)
+    if not built and choice_issues(report):
+        return (
+            f"JARVIS needs {len(choice_issues(report))} choice(s) from you before {package} "
+            f"runs on {site}; nothing has to be built. It applies your answers in a short "
+            "job on the site, then the run goes ahead. Go ahead?"
+        )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
@@ -1406,22 +1412,62 @@ def choice_options(issue: Mapping[str, Any]) -> list[str]:
     return options
 
 
+def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
+    constraint = candidate.get("constraint")
+    if not isinstance(constraint, str) or not constraint:
+        return None
+    facts: list[str] = []
+    source = candidate.get("source")
+    if isinstance(source, str) and source:
+        facts.append(source)
+    modules = candidate.get("modules")
+    if isinstance(modules, list) and modules:
+        facts.append("modules " + ", ".join(str(item) for item in cast(list[object], modules)))
+    prefix = candidate.get("prefix")
+    if isinstance(prefix, str) and prefix:
+        facts.append(prefix)
+    implies = candidate.get("implies")
+    if isinstance(implies, str) and implies:
+        facts.append(implies)
+    return f"{constraint} ({'; '.join(facts)})" if facts else constraint
+
+
 def choice_message(issue: Mapping[str, Any]) -> str:
-    """Return the question to ask for one of JARVIS's answerable issues."""
+    """Return the question to ask for one of JARVIS's answerable issues.
+
+    Each candidate is listed with where it comes from, its prefix and its modules
+    (an ``ambiguous_provider`` MPI that is a site module carries ``modules``).
+    """
     question = issue.get("question")
     subject = issue.get("package") or issue.get("subject") or "the package"
-    if isinstance(question, str) and question:
-        return question
-    return f"JARVIS needs a choice for {subject}: pick one"
+    text = (
+        question
+        if isinstance(question, str) and question
+        else f"JARVIS needs a choice for {subject}: pick one"
+    )
+    lines = [
+        line
+        for candidate in cast(list[object], issue.get("candidates") or [])
+        if (line := _candidate_line(_dict(candidate)))
+    ]
+    if issue.get("kind") == "ambiguous_provider" and issue.get("scope") == "site":
+        text = f"{text} JARVIS keeps the answer for every later run on the site."
+    return f"{text} Options: {'. '.join(lines)}." if lines else text
 
 
 def install_needed(report: Mapping[str, Any], *, site: str) -> Refusal:
     """The refusal for a submit that exited 3: the software is missing or needs a choice."""
     summary = install_summary(report)
+    message = (
+        f"the package's software is not installed on {site}: JARVIS builds "
+        f"{len(summary['build'])} package(s) once you approve"
+    )
+    if not summary["build"] and choice_issues(report):
+        kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})
+        message = f"JARVIS needs a choice on {site} before the run ({', '.join(kinds)})"
     return Refusal(
         RefusalReason.NEEDS_APPROVAL,
-        f"the package's software is not installed on {site}: JARVIS builds "
-        f"{len(summary['build'])} package(s) once you approve",
+        message,
         needs=NEEDS_INSTALL,
         install_report=dict(report),
         summary=summary,

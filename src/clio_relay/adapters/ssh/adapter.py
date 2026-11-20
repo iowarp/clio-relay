@@ -57,6 +57,7 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import direct_refused
+from clio_relay.site_prune import parse_report, prune_script, spack_keeps
 
 if TYPE_CHECKING:
     from psij import Job
@@ -148,6 +149,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
     Config: ClassVar[type[BaseModel]] = SshConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
     runs_packages: ClassVar[bool] = True
+    clean_over_connection: ClassVar[bool] = True
 
     def __init__(self, config: SshConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
@@ -156,6 +158,29 @@ class SshAdapter(BaseAdapter[SshConfig]):
         self.outbox = context.state_dir / "ssh-outbox"
 
     # helpers
+
+    async def shutdown(self) -> list[dict[str, Any]]:
+        """Close the signed-in ssh control connection, if relay holds one. Jobs keep running."""
+        transport = self.transport
+        if not transport.config.interactive_sign_in or not transport.control_path.exists():
+            return []
+        pid = await transport.master_pid()
+        await transport.stop_master()
+        stopped: dict[str, Any] = {
+            "kind": "tunnel",
+            "detail": f"ssh control connection to {self.config.ssh_profile}",
+        }
+        if pid:
+            stopped["pid"] = pid
+        return [stopped]
+
+    def clean_targets(self) -> tuple[list[str], list[str]]:
+        """Relay's directory on the site, which holds jobs, scripts and JARVIS; Spack stays."""
+        return [self.config.remote_dir], spack_keeps(self.config.remote_dir)
+
+    async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
+        """Prune over this adapter's own ``ssh``."""
+        return parse_report(await self._ssh(prune_script(targets, keep), "cleaning the site"))
 
     def ssh_argv(self) -> list[str]:
         """Return the base ``ssh`` argv (program, options, host) for ``serve``."""

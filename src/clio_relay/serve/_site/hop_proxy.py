@@ -25,6 +25,8 @@ Modes:
   "-" as advertise means this host's own name.
 - ``lease hop_dir operation job_dir job_name``: say which job holds the lease.
 - ``release hop_dir operation``: end the lease.
+- ``shutdown hop_dir -``: stop the running hop and drop every lease; print
+  ``{"running", "pid"?}``. Jobs keep running, but their served ports lose the hop.
 """
 
 import base64
@@ -148,6 +150,37 @@ def live_leases() -> List[Dict[str, Any]]:
                 pass
     return alive
 
+
+if mode == "shutdown":
+    if not os.path.isdir(hop_dir):
+        print(json.dumps({"running": False}))
+        sys.exit(0)
+    start_lock = open_lock("start.lock")
+    fcntl.flock(start_lock, fcntl.LOCK_EX)
+    run_lock = open_lock("run.lock")
+    if try_lock(run_lock):
+        print(json.dumps({"running": False}))
+        sys.exit(0)
+    info = read_json(info_path) or {}
+    pid = 0
+    try:
+        pid = int(info.get("pid", 0))
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    deadline = time.time() + 10
+    while not try_lock(run_lock):
+        if time.time() > deadline:
+            sys.exit("hop: the hop on this site did not stop")
+        time.sleep(0.2)
+    names = os.listdir(leases) if os.path.isdir(leases) else []
+    for path in [info_path] + [os.path.join(leases, name) for name in names]:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    print(json.dumps({"running": True, "pid": pid}))
+    sys.exit(0)
 
 if not os.path.isdir(leases):
     os.makedirs(leases, 0o700)

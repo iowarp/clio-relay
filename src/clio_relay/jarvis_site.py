@@ -276,6 +276,10 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
 
 
 DEFAULT_CLIO_JARVIS_BASE = "~/.clio-relay/clio-jarvis"
+CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
+CLIO_JARVIS_REF = "jaimecernuda-spack-linkage"
+CLIO_JARVIS_COMMIT = "aa8b3d56e7912cc798615fe72c248f2e843132e0"
+"""The clio-jarvis relay is proven with: pvserver 0.3.1, which reports a TCP service."""
 
 
 def _site_path(path: str) -> str:
@@ -336,15 +340,16 @@ fi
 async def add_clio_jarvis(
     adapter: BaseAdapter[Any],
     *,
-    url: str,
-    tag: str,
-    commit: str | None = None,
+    url: str = CLIO_JARVIS_URL,
+    tag: str = CLIO_JARVIS_REF,
+    commit: str | None = CLIO_JARVIS_COMMIT,
     base: str = DEFAULT_CLIO_JARVIS_BASE,
     jarvis: str = "jarvis",
 ) -> dict[str, Any]:
     """Add clio-jarvis ``tag`` to the JARVIS on ``adapter``'s site (RL42).
 
-    Idempotent: a second call finds the repository registered and changes nothing.
+    It defaults to the pinned clio-jarvis. Idempotent: a second call finds the
+    repository registered and changes nothing.
     """
     script = clio_jarvis_script(url=url, tag=tag, commit=commit, base=base, jarvis=jarvis)
     result = await adapter.exec(["sh", "-c", script], max_output_bytes=65536)

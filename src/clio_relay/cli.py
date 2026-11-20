@@ -18,7 +18,7 @@ from clio_relay import catalog
 from clio_relay.adapters import registry
 from clio_relay.adapters.worker.cli import worker_app
 from clio_relay.cli_asks import app as asks_app
-from clio_relay.jobs.refusals import Refusal
+from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import routes
 from clio_relay.sites.store import SiteStore
@@ -112,6 +112,9 @@ def serve(
     uvicorn_config: dict[str, Any] = {"access_log": False}
     if tls_cert is not None and tls_key is not None:
         uvicorn_config.update(ssl_certfile=str(tls_cert), ssl_keyfile=str(tls_key))
+    from clio_relay.shutdown import register_server
+
+    register_server(paths, f"{origin}{normalized}")
     server.run(
         transport="http",
         host=host,
@@ -181,6 +184,47 @@ def _no_service_runtime(exc: ModuleNotFoundError) -> None:
         raise exc
     typer.echo("verb_not_implemented: the service runtime is not installed", err=True)
     raise typer.Exit(2)
+
+
+def _json_flag(extra: list[str] | None) -> None:
+    """Accept the trailing ``+json``; relay's commands print JSON either way."""
+    unknown = [item for item in extra or [] if item != "+json"]
+    if unknown:
+        typer.echo(f"unexpected arguments: {' '.join(unknown)}", err=True)
+        raise typer.Exit(2)
+
+
+@app.command()
+def shutdown(
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+    site: Annotated[str | None, typer.Option(help="Stop one site's relay processes")] = None,
+    all_sites: Annotated[
+        bool, typer.Option("--all", help="Stop every site's, and relay on this host")
+    ] = False,
+    timeout_s: Annotated[float | None, typer.Option(help="Seconds per site; 15 by default")] = None,
+) -> None:
+    """Stop relay's long-lived processes. Jobs keep running and are listed."""
+    from clio_relay.shutdown import shutdown as stop_all
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+    if (site is None) == (not all_sites):
+        typer.echo("give exactly one of --site S or --all", err=True)
+        raise typer.Exit(2)
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return await stop_all(
+                service, {"all": all_sites or None, "site": site, "timeout_s": timeout_s}
+            )
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
 
 
 @app.command()
@@ -413,6 +457,72 @@ def site_switch(site_id: str, adapter: str) -> None:
         _fail(refusal)
         return
     _saved(switched)
+
+
+@site_app.command("clean")
+def site_clean(
+    site_id: str,
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the ask: you approve here")] = False,
+    remove_spack: Annotated[
+        bool, typer.Option(help="Delete the Spack store too; rebuilding it takes hours")
+    ] = False,
+    wait_s: Annotated[float, typer.Option(help="How long to wait for the answer")] = 600.0,
+) -> None:
+    """Remove relay's deployment on a site, so the next use deploys it again.
+
+    It stops relay's processes there first, and keeps the Spack store unless told.
+    """
+    from clio_relay import site_clean as cleaning
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+
+    async def approved(service: RelayService, planned: dict[str, Any]) -> bool:
+        if yes:
+            return True
+        ask = await service.ask_provider.approve(
+            site=service.site(site_id),
+            operation_id=None,
+            message=cleaning.describe_plan(planned),
+            binding={"action": "site_clean", **planned},
+        )
+        if service.asks.get(ask.ask_id) is None:
+            service.asks.put(ask.ask_id, ask)
+        if sys.stdin.isatty():
+            if typer.confirm(ask.message, default=False, err=True):
+                service.answer(ask.ask_id, "accept", {"approve": True}, by="cli")
+            else:
+                service.answer(ask.ask_id, "decline", by="cli")
+        else:
+            page = service.ask_provider.page_address(ask)
+            where = f"Answer at {page}" if page else f"Answer: clio-relay asks answer {ask.ask_id}"
+            typer.echo(f"waiting for ask {ask.ask_id}: {ask.message} {where}", err=True)
+        deadline = asyncio.get_running_loop().time() + wait_s
+        while True:
+            current = service.asks.get(ask.ask_id)
+            state = current.state if current is not None else "cancelled"
+            if state != "pending":
+                return state == "accepted"
+            if asyncio.get_running_loop().time() > deadline:
+                service.answer(ask.ask_id, "cancel", by="cli")
+                return False
+            await asyncio.sleep(1.0)
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            planned = cleaning.plan(service, site_id, remove_spack=remove_spack)
+            if not await approved(service, planned):
+                raise Refusal(RefusalReason.POLICY_REFUSED, f"cleaning {site_id} was not approved")
+            return await cleaning.clean(service, planned)
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
 
 
 def main() -> None:

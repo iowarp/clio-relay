@@ -394,7 +394,7 @@ class UdpRendezvousTransport(_FrpChannelTransport):
             f"udp_rendezvous hole punch failed for cluster {self._cluster!r}: {detail}. "
             "Reconnecting retries the same xtcp handshake in the same configured mode; it "
             "never substitutes brokered_tcp's stcp visitor automatically. If punching keeps "
-            "failing, configure this cluster's remote_transport_mode as brokered_tcp instead, "
+            "failing, configure this link as brokered_tcp instead, "
             "or verify UDP reachability/firewall rules between both relays and the relay point."
         )
 

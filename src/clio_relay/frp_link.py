@@ -112,6 +112,7 @@ class FrpLinkConfig:
     token: str
     secret_key: str
     proxy_name: str
+    stun_server: str | None = None
 
     @classmethod
     def from_cluster(
@@ -161,6 +162,7 @@ class FrpLinkConfig:
             token=token,
             secret_key=secret_key,
             proxy_name=proxy_name,
+            stun_server=transport.stun_server,
         )
 
 
@@ -279,6 +281,7 @@ def render_visitor_config(
             bind_port=local_bind_port,
             secret_key=config.secret_key,
             keep_tunnel_open=keep_tunnel_open,
+            stun_server=config.stun_server if visitor_type == "xtcp" else None,
         )
     )
 
@@ -302,6 +305,7 @@ def render_proxy_config(
             local_ip=local_ip,
             local_port=local_port,
             secret_key=config.secret_key,
+            stun_server=config.stun_server if proxy_type == "xtcp" else None,
         )
     )
 

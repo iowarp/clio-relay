@@ -35,7 +35,7 @@ from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve.config import SiteServe
-from clio_relay.serve.forward import Forward
+from clio_relay.serve.forward import CLOSED_MARKER, Forward, kill_recorded
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
     HopState,
@@ -124,6 +124,16 @@ async def _maybe(value: Any) -> Any:
 
 def _site_id(site: Any) -> str:
     return site if isinstance(site, str) else str(site.id)
+
+
+def _tunnel(operation_id: str, plan: ServePlan, pid: int | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "kind": "tunnel",
+        "detail": f"desktop ports of service {operation_id} ({plan.mode})",
+    }
+    if pid:
+        entry["pid"] = pid
+    return entry
 
 
 class ServeRuntime:
@@ -266,6 +276,75 @@ class ServeRuntime:
         self.forwards.clear()
         await self.mounter.close()
 
+    async def shutdown_site(self, site_id: str, adapter: Any | None) -> list[dict[str, Any]]:
+        """Close the site's desktop ports and stop its login hop. Services keep running.
+
+        It closes this process's forwards, and those another relay process recorded and
+        left, and keeps them closed. The hop is stopped when a service still uses it. It
+        returns one ``{kind, pid?, detail}`` per process stopped. A hop that will not
+        stop raises a refusal, after the ports are closed.
+        """
+        stopped: list[dict[str, Any]] = []
+        plans = {plan.operation_id: plan for plan in self.store.all() if plan.site == site_id}
+        plans.update({op: plan for op, plan in self.plans.items() if plan.site == site_id})
+        hop_plan: ServePlan | None = None
+        for op, plan in plans.items():
+            if plan.hop is not None and plan.final is None:
+                hop_plan = plan
+            async with self._lock(op):
+                if plan.final is None and plan.desktop_closed_at is None:
+                    plan.desktop_closed_at = utc_now()
+                    self._save(plan)
+                directory = self.state_dir / "serve" / "forwards" / op
+                with contextlib.suppress(OSError):
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / CLOSED_MARKER).touch()
+                forward = self.forwards.pop(op, None)
+                await self.mounter.unmount(op)
+                if forward is not None:
+                    process = forward.process
+                    live = process is not None and process.returncode is None
+                    held = live or forward.bound()
+                    pid = process.pid if live and process is not None else plan.forward_pid
+                    await forward.close()
+                    if held:
+                        stopped.append(_tunnel(op, plan, pid))
+                    continue
+                if plan.final is None and plan.forward_pid and plan.ports:
+                    marker = (
+                        str(directory)
+                        if plan.mode == "frp"
+                        else f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
+                    )
+                    if kill_recorded(plan.forward_pid, marker):
+                        stopped.append(_tunnel(op, plan, plan.forward_pid))
+        if adapter is None or hop_plan is None:
+            return stopped
+        site = hop_plan.site_serve
+        hop_dir = f"{site.hop_dir.rstrip('/')}/{_safe_name(site_id)}"
+        argv = [site.python, "-c", site_file("hop_proxy.py").decode(), "shutdown", hop_dir, "-"]
+        run: Any = getattr(adapter, "hop_exec", None) or adapter.exec
+        result = cast(
+            ExecResult,
+            await run(light_argv(argv, site.login_limits), timeout_s=20.0, max_output_bytes=4096),
+        )
+        lines = [line for line in result.stdout.splitlines() if line.strip().startswith("{")]
+        if result.exit_code != 0 or not lines:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"stopping the login hop on {site_id} failed: "
+                f"{detail[-1] if detail else result.exit_code}",
+                site=site_id,
+            )
+        report = json.loads(lines[-1])
+        if report.get("running"):
+            hop: dict[str, Any] = {"kind": "hop_proxy", "detail": f"login hop in {hop_dir}"}
+            if isinstance(report.get("pid"), int) and report["pid"]:
+                hop["pid"] = report["pid"]
+            stopped.append(hop)
+        return stopped
+
     # What the surface may also call
 
     def attach(self, server: Any, changes: Any) -> None:
@@ -303,7 +382,12 @@ class ServeRuntime:
         self._resumed = True
         for plan in self.store.all():
             self.plans.setdefault(plan.operation_id, plan)
-            if plan.final is None and plan.ready_at is not None and plan.stop_requested_at is None:
+            if (
+                plan.final is None
+                and plan.ready_at is not None
+                and plan.stop_requested_at is None
+                and plan.desktop_closed_at is None
+            ):
                 record = self.records.get(plan.operation_id)
                 if record is not None and record.state.final:
                     continue
@@ -592,6 +676,9 @@ class ServeRuntime:
                 plan.host = str(ready.get("host") or "") or None
             plan.ready_at = utc_now()
             self._save(plan)
+        if plan.desktop_closed_at is not None:
+            message = "running; relay's desktop ports were closed by shutdown"
+            return status.model_copy(update={"message": message}), None
         forward = await self._ensure_forward(plan, adapter)
         if not forward.bound():
             message = "the service is up; binding the desktop port"

@@ -51,6 +51,27 @@ fresh worker generation with new secrets and stops the previous one.
 When the link drops, calls are refused with `unreachable`. If the worker is
 gone, sign in again.
 
+## The link
+
+`link_mode` picks how relay reaches the worker:
+
+| `link_mode` | frp type | How calls travel |
+| --- | --- | --- |
+| `brokered_tcp` (default) | `stcp` | Through the rendezvous server. Works wherever both ends reach frps |
+| `udp_rendezvous` | `xtcp` | Straight to the cluster, once a UDP hole punch through the rendezvous succeeds |
+
+Set it in the site's config, or pick it on the Compute page, where the site's
+form shows it as a choice. The worker's proxy follows the mode, so changing it
+asks for a sign-in, which places the worker again.
+
+In `udp_rendezvous` a punch that fails is refused with `punch_failed`. Relay
+does not switch to `brokered_tcp` on its own. Retrying tries the same punch.
+To go through the rendezvous, set `link_mode: brokered_tcp`.
+
+Services that `serve` starts get their own tunnels; the rendezvous `direct`
+setting in [running a rendezvous host](../rendezvous-host.md#point-relay-at-it)
+picks those.
+
 ## Settings
 
 | Setting | Default | What it does |
@@ -66,6 +87,7 @@ gone, sign in again.
 | `site_frpc` | upload relay's frpc | An frpc already on the cluster |
 | `python` | `3.12` | The Python `uv` installs the worker with |
 | `submit_timeout_s` | 60 | How long one scheduler submit command may take |
+| `link_mode` | `brokered_tcp` | `brokered_tcp` or `udp_rendezvous`; see [the link](#the-link) |
 
 `rendezvous` takes:
 
@@ -75,6 +97,7 @@ gone, sign in again.
 | `protocol` | `wss` (default), `websocket` or `tcp` |
 | `site_address`, `site_port` | frps as the cluster reaches it, when that differs |
 | `token_env` or `token_file` | Where relay reads the frps token |
+| `stun_server` | The STUN server both ends ask in `udp_rendezvous`; `stun.nextcloud.com:3478` by default. It must support RFC 5780 |
 
 ## How a job runs
 

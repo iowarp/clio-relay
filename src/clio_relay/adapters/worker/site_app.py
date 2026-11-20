@@ -1,7 +1,7 @@
 """The worker's HTTP API on the site.
 
-It answers three things over the held link: the identity challenge (no
-credential), the session status, and the adapter verbs
+It answers four things over the held link: the identity challenge (no
+credential), the session status, a shutdown request, and the adapter verbs
 (:mod:`clio_relay.adapters.worker.site_routes`). Everything but the identity
 challenge needs the bearer token and the session headers that placement fixed.
 """
@@ -9,7 +9,9 @@ challenge needs the bearer token and the session headers that placement fixed.
 from __future__ import annotations
 
 import hmac
-from dataclasses import dataclass
+import os
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Final
 
@@ -37,6 +39,8 @@ class SiteSettings:
     session_owner_token: str
     state_dir: Path
     port: int
+    # Asks site-serve to exit; jobs run detached from it, so they keep running.
+    on_shutdown: Callable[[], None] | None = field(default=None, compare=False)
 
 
 def site_app(settings: SiteSettings) -> FastAPI:
@@ -88,6 +92,13 @@ def site_app(settings: SiteSettings) -> FastAPI:
             "evidence": "live_api_self_report",
             "worker_protocol": WORKER_PROTOCOL,
         }
+
+    @app.post("/shutdown", dependencies=[auth])
+    def shutdown() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        if settings.on_shutdown is None:
+            raise HTTPException(status_code=501, detail="this worker cannot be stopped this way")
+        settings.on_shutdown()
+        return {"stopping": True, "pid": os.getpid()}
 
     register_adapter_routes(
         app,

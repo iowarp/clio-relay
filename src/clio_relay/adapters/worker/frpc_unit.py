@@ -43,6 +43,7 @@ def render_frpc_proxy_toml(
         token=_env_template(transport.token_env),
         secret_key=_env_template(transport.stcp_secret_env),
         proxy_name=canonical_proxy_name(definition, cluster=cluster),
+        stun_server=transport.stun_server,
     )
     return render_proxy_config(
         config, proxy_type=proxy_type, local_ip=local_ip, local_port=local_port

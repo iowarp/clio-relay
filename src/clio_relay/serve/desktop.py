@@ -27,6 +27,9 @@ from clio_relay.serve.forward import Forward, port_bound
 from clio_relay.serve.plan import PortPlan, ServePlan, free_loopback_port
 from clio_relay.surface.settings import RelayPaths
 
+CONNECTOR_PIDFILE = "connect.pid"
+"""In ``<state>/serve/connect/<op>``: the pid of the ``clio-relay connect`` holding it."""
+
 
 def decode(handle: str) -> dict[str, Any]:
     """Return the payload of a connect handle."""
@@ -89,6 +92,9 @@ async def hold(plan: ServePlan, directory: Path) -> None:
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGTERM, signal.SIGHUP):
             loop.add_signal_handler(signum, stop.set)
+    directory.mkdir(parents=True, exist_ok=True)
+    pidfile = directory / CONNECTOR_PIDFILE
+    pidfile.write_text(str(os.getpid()), encoding="utf-8")
     await forward.start()
     try:
         while not forward.bound():
@@ -105,6 +111,8 @@ async def hold(plan: ServePlan, directory: Path) -> None:
                 await asyncio.wait_for(stop.wait(), 1)
     finally:
         await forward.close()
+        with contextlib.suppress(OSError):
+            pidfile.unlink()
 
 
 def connect(handle: str, *, paths: RelayPaths, ports: dict[str, int] | None = None) -> None:

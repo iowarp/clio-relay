@@ -14,7 +14,14 @@ from datetime import timedelta
 from typing import Any, cast
 
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
+from clio_relay.adapters.base import (
+    AdapterContext,
+    BaseAdapter,
+    PartitionInfo,
+    SiteAdded,
+    SiteInfo,
+    Verb,
+)
 from clio_relay.adapters.hooks import (
     Ask,
     AskProvider,
@@ -37,15 +44,22 @@ from clio_relay.jobs.records import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
-from clio_relay.packages import PackageCatalog, pipeline_conflict, with_contract_resources
+from clio_relay.login_load import light_argv
+from clio_relay.packages import (
+    PackageCatalog,
+    pipeline_conflict,
+    with_contract_resources,
+    with_site_cores,
+)
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface import installing
+from clio_relay.surface import exec_plan, installing
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
+from clio_relay.surface.exec_plan import ExecPlan
 from clio_relay.surface.guarding import approval_message, review_asks
-from clio_relay.surface.outputs import marked_status, stdout_tail
+from clio_relay.surface.outputs import marked_status, run_provenance, stdout_tail
 from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
@@ -54,6 +68,15 @@ from clio_relay.surface.transient import drop_transient
 logger = logging.getLogger(__name__)
 
 SUBMIT_GRACE = timedelta(minutes=2)
+CORES_DESCRIBE_TIMEOUT_S = 20.0
+
+
+def partition_for(info: SiteInfo, queue: str | None) -> PartitionInfo | None:
+    """Return the partition ``queue`` names, or the site's default one."""
+    if queue:
+        return next((found for found in info.partitions if found.name == queue), None)
+    return next((found for found in info.partitions if found.default), None)
+
 
 _JOB_TO_OPERATION = {
     JobState.QUEUED: OperationState.QUEUED,
@@ -245,12 +268,39 @@ class RelayService:
             return spec
         return spec.model_copy(update={"attributes": attributes.model_copy(update=changes)})
 
+    async def site_cores(self, site: SiteEntry, spec: JobSpec, verb: Verb) -> JobSpec:
+        """Set the steps' ``cores_per_node`` from the partition's physical cores.
+
+        The partition is the one the job names, else the site's default, as
+        ``describe`` reads it live from the scheduler. The guard's cached
+        ``describe`` is used when it has one. A site that cannot be described
+        now leaves the parameter to the package.
+        """
+        if not spec.steps():
+            return spec
+        info: SiteInfo | None = None
+        try:
+            reader = getattr(self.guard, "site_info", None)
+            if reader is not None:
+                info = await reader(site)
+            else:
+                adapter = self.adapter_for(site, verb)
+                if "describe" in adapter.implements:
+                    info = await asyncio.wait_for(adapter.describe(), CORES_DESCRIBE_TIMEOUT_S)
+        except Exception as error:  # noqa: BLE001 - the package's own setting applies then
+            logger.info("not setting cores_per_node on %s: %s", site.id, error)
+        partition = partition_for(info, spec.attributes.queue_name) if info else None
+        if partition is None:
+            return spec
+        entries = [self.packages.entry(step, self.content) for step in spec.steps()]
+        return with_site_cores(spec, entries, partition.physical_cores)
+
     async def start_run(
         self, site_id: str, spec: JobSpec, *, task: bool = False
     ) -> OperationRecord:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
-        spec = self.apply_defaults(site, spec)
+        spec = await self.site_cores(site, self.apply_defaults(site, spec), "run")
         what = spec.executable or _steps_label(spec) or "a job"
         return await self._open(
             site,
@@ -280,6 +330,7 @@ class RelayService:
                 site=site.id,
             )
         spec = self.prepare_service(site, spec)
+        spec = spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
         ports = ", ".join(port.name for port in spec.ports)
         what = spec.job.executable or _steps_label(spec.job) or "a service"
         return await self._open(
@@ -830,18 +881,47 @@ class RelayService:
         timeout_s: float | None = None,
         max_output_bytes: int,
         on_stall: StallReport | None = None,
+        plan: ExecPlan | None = None,
     ) -> dict[str, Any]:
-        """Run one command (RL9). With no ``timeout_s`` it runs until it ends."""
+        """Run one command (RL9). With no ``timeout_s`` it runs until it ends.
+
+        On a guarded site a command that is not read-only runs only with a
+        ``plan`` the person approved (:mod:`clio_relay.surface.exec_plan`);
+        until then this raises :class:`NeedsPerson`.
+        """
         site = self.site(site_id)
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
-        (await self.guard.check_exec(site, command)).raise_if_refused()
+        decision = await self.guard.check_exec(site, command)
+        approved: Ask | None = None
+        if not decision.allowed:
+            if (
+                plan is None
+                or site.policy != "guarded"
+                or decision.reason != RefusalReason.POLICY_REFUSED
+            ):
+                decision.raise_if_refused()
+            else:
+                approved = await exec_plan.approve(self, site, command, plan)
+                cap = exec_plan.PLAN_TIMEOUT_S
+                timeout_s = min(timeout_s or cap, cap)
+        light = approved is not None or bool(decision.data.get("light"))
         name, config, skipped = self.route(site, "exec")
         adapter = self._build(site, name, config)
-        result = await adapter.exec(
-            command, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
-        )
+        argv = light_argv(command, exec_plan.PLAN_LIMITS) if light else command
+        try:
+            result = await adapter.exec(
+                argv, timeout_s=timeout_s, max_output_bytes=max_output_bytes, on_stall=on_stall
+            )
+        finally:
+            if approved is not None:
+                exec_plan.used(self, approved)
         shown = result.model_dump(mode="json")
+        shown["argv"] = list(command)
+        if light:
+            shown["light"] = True
+        if approved is not None:
+            shown["ask_id"] = approved.ask_id
         if skipped:
             shown["skipped"] = [item.model_dump() for item in skipped]
         return shown
@@ -871,6 +951,7 @@ class RelayService:
             "native_id": record.handle.native_id if record.handle else None,
             "exit_code": record.exit_code,
             "outputs": [item.model_dump(mode="json") for item in record.outputs],
+            "provenance": run_provenance(record.outputs),
             "asks": asks,
             "steps": _steps_view(record),
             "result": record.result,

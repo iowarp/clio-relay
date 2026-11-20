@@ -123,6 +123,10 @@ class ServePlan(BaseModel):
     cancel_sent: bool = False
     forward_pid: int | None = None
     rebinds: int = 0
+    desktop_closed_at: datetime | None = Field(
+        default=None,
+        description="When ``clio-relay shutdown`` closed the desktop ports; relay keeps them shut",
+    )
     package: bool = Field(
         default=False,
         description="A JARVIS pipeline: jarvis execution stop ends it, and serve/idle asks to",

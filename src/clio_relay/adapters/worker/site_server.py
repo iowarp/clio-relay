@@ -3,14 +3,15 @@
 ``clio-relay worker site-serve --state-dir D`` is what the ``worker`` adapter's
 placement starts on the site, detached, after its one ssh pass. It reads what
 placement wrote under ``D/run``, binds the worker's API on loopback,
-holds an frpc ``stcp`` proxy to the rendezvous server, and writes
+holds an frpc proxy to the rendezvous server (``stcp``, or ``xtcp`` when the
+link mode is ``udp_rendezvous``), and writes
 ``D/run/ready.json`` once both are up. It needs no systemd user manager, so it
 runs on hosts that have none.
 
 Files placement writes (all 0600):
 
-- ``run/settings.json``: cluster, session and generation ids, the API token and
-  the session owner token.
+- ``run/settings.json``: cluster, session and generation ids, the API token,
+  the session owner token and the link mode.
 - ``run/registry.json``: a one-cluster registry, for the frp settings.
 - ``run/frp.env``: the rendezvous token and the stcp secret, ``NAME=value`` lines.
 
@@ -34,12 +35,20 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
 import typer
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
+
+LinkMode = Literal["brokered_tcp", "udp_rendezvous"]
+"""How relay reaches a placed worker: through the rendezvous, or by a UDP hole punch."""
+PROXY_TYPE: Final[dict[str, Literal["stcp", "xtcp"]]] = {
+    "brokered_tcp": "stcp",
+    "udp_rendezvous": "xtcp",
+}
+"""The frp proxy type site-serve holds for each link mode."""
 
 SETTINGS_FILE = "settings.json"
 REGISTRY_FILE = "registry.json"
@@ -191,6 +200,17 @@ def serve_site(state_dir: Path, *, idle_exit_s: float = IDLE_EXIT_S) -> None:
     definition = registry.require(cluster)
     frp_secrets = _read_env_file(run / FRP_ENV_FILE)
     port = _free_loopback_port()
+    mode = str(settings.get("link_mode") or "brokered_tcp")
+    if mode not in PROXY_TYPE:
+        raise SystemExit(f"unknown link mode {mode!r} in {run / SETTINGS_FILE}")
+    stopped = {"reason": "stopped"}
+    server: uvicorn.Server | None = None
+
+    def request_shutdown() -> None:
+        stopped["reason"] = "shutdown"
+        if server is not None:
+            server.should_exit = True
+
     activity = _Activity(
         site_app(
             SiteSettings(
@@ -201,12 +221,18 @@ def serve_site(state_dir: Path, *, idle_exit_s: float = IDLE_EXIT_S) -> None:
                 session_owner_token=str(settings["session_owner_token"]),
                 state_dir=state_dir,
                 port=port,
+                on_shutdown=request_shutdown,
             )
         )
     )
 
     frpc_toml = run / FRPC_TOML
-    _write_private(frpc_toml, render_frpc_proxy_toml(definition, cluster=cluster, local_port=port))
+    _write_private(
+        frpc_toml,
+        render_frpc_proxy_toml(
+            definition, cluster=cluster, local_port=port, proxy_type=PROXY_TYPE[mode]
+        ),
+    )
     frpc_bin = str(settings.get("frpc") or "frpc")
     keeper = _FrpcKeeper(
         [frpc_bin, "-c", str(frpc_toml)],
@@ -219,11 +245,11 @@ def serve_site(state_dir: Path, *, idle_exit_s: float = IDLE_EXIT_S) -> None:
             activity, host="127.0.0.1", port=port, access_log=False, timeout_keep_alive=300
         )
     )
-    stopped = {"reason": "stopped"}
+    serving = server
 
     async def announce() -> None:
-        while not server.started:
-            if server.should_exit:
+        while not serving.started:
+            if serving.should_exit:
                 return
             await asyncio.sleep(0.1)
         keeper.start()
@@ -235,16 +261,16 @@ def serve_site(state_dir: Path, *, idle_exit_s: float = IDLE_EXIT_S) -> None:
     async def idle_watch() -> None:
         if idle_exit_s <= 0:
             return
-        while not server.should_exit:
+        while not serving.should_exit:
             await asyncio.sleep(min(30.0, max(idle_exit_s / 10, 0.5)))
             if activity.idle_s() >= idle_exit_s:
                 stopped["reason"] = "idle"
-                server.should_exit = True
+                serving.should_exit = True
 
     async def main() -> None:
         tasks = [asyncio.create_task(announce()), asyncio.create_task(idle_watch())]
         try:
-            await server.serve()
+            await serving.serve()
         finally:
             for task in tasks:
                 task.cancel()

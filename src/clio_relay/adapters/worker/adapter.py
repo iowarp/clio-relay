@@ -31,6 +31,7 @@ import hashlib
 import importlib
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -46,7 +47,7 @@ from clio_relay import jarvis_submit
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.worker.files import WorkerFileAccess
-from clio_relay.adapters.worker.site_server import IDLE_EXIT_S
+from clio_relay.adapters.worker.site_server import IDLE_EXIT_S, LinkMode
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -59,6 +60,8 @@ from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import LoginLimits, light_function
+from clio_relay.serve.config import DEFAULT_STUN_SERVER
+from clio_relay.site_prune import parse_report, prune_script, spack_keeps
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.link import WorkerConnection
@@ -70,6 +73,7 @@ READY_MARKER = "CLIO_RELAY_WORKER_READY "
 _MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024
 _CONNECT_ATTEMPTS = 20
 _CALL_S = 120.0
+CLEAN_TIMEOUT_S = 60.0
 # How long one exec poll waits on the site for output news before answering.
 _EXEC_POLL_WAIT_S = 20.0
 _REMOTE_DIR_PATTERN = re.compile(r"^(~/)?[A-Za-z0-9_./-]+$")
@@ -91,6 +95,14 @@ class Rendezvous(BaseModel):
         default=None, description="Environment variable holding the frps token"
     )
     token_file: str | None = Field(default=None, description="File holding the frps token")
+    stun_server: str = Field(
+        default=DEFAULT_STUN_SERVER,
+        min_length=1,
+        description=(
+            "The STUN server both ends ask in udp_rendezvous. It must support RFC 5780, "
+            "as frp needs"
+        ),
+    )
 
 
 class WorkerConfig(BaseModel):
@@ -151,6 +163,14 @@ class WorkerConfig(BaseModel):
         default_factory=LoginLimits,
         description="What the worker may use on the site's login node",
     )
+    link_mode: LinkMode = Field(
+        default="brokered_tcp",
+        description=(
+            "How relay reaches the worker. brokered_tcp carries every call through the "
+            "rendezvous (frp stcp). udp_rendezvous punches a UDP hole to the site (frp xtcp); "
+            "a failed punch is refused, and relay never switches to brokered_tcp on its own"
+        ),
+    )
 
     @field_validator("remote_dir")
     @classmethod
@@ -182,6 +202,8 @@ class WorkerLink(BaseModel):
     remote_dir: str
     # Links stored by an older relay lack it; their worker is placed again.
     session_owner_token: str | None = None
+    # The worker's proxy type follows it, so a changed link_mode places it again.
+    link_mode: LinkMode = "brokered_tcp"
 
 
 # --- the askpass seam (W6) -------------------------------------------------
@@ -238,6 +260,33 @@ def _close_all_connections() -> None:
 
 
 atexit.register(_close_all_connections)
+
+
+async def _in_daemon_thread[T](function: Callable[[], T]) -> T:
+    """Run ``function`` in a daemon thread; a cancelled caller leaves it to finish alone."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[T] = loop.create_future()
+
+    def settle(result: T | None, error: BaseException | None) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(cast(T, result))
+
+    def run() -> None:
+        try:
+            result = function()
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(settle, None, exc)
+            return
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(settle, result, None)
+
+    threading.Thread(target=run, name="clio-relay-worker", daemon=True).start()
+    return await future
 
 
 def _env_key(text: str) -> str:
@@ -338,6 +387,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 stcp_secret_env=secret_env,
                 proxy_name=link.proxy_name,
                 identity_anchor="preshared_link_secret",
+                stun_server=rendezvous.stun_server,
             ),
         )
 
@@ -428,6 +478,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             "api_token": link.api_token,
             "session_owner_token": session_owner_token,
             "frpc": "__FRPC__",
+            "link_mode": link.link_mode,
         }
         parts += [
             self._text_file("REGISTRY", "$D/run/registry.json", registry.model_dump_json()),
@@ -483,6 +534,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             port=0,
             remote_dir=self._remote_dir(),
             session_owner_token=secrets.token_urlsafe(48),
+            link_mode=self.config.link_mode,
         )
         assert link.session_owner_token is not None
         script = self.placement_script(link, session_owner_token=link.session_owner_token)
@@ -529,8 +581,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             held.close()
 
     async def _connection(self, *, attempts: int = 1) -> WorkerConnection:
-        from clio_relay.adapters.worker.link import WorkerConnection, WorkerOutdated
-        from clio_relay.config import RelaySettings
+        from clio_relay.adapters.worker.link import WorkerOutdated
+        from clio_relay.frp_transport import TransportPunchFailed
 
         link = self.load_link()
         if link is None:
@@ -542,6 +594,15 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             )
         if link.session_owner_token is None:
             raise self._outdated("its link was stored by an older relay")
+        if link.link_mode != self.config.link_mode:
+            raise Refusal(
+                RefusalReason.NEEDS_SIGN_IN,
+                f"the worker on {self.config.ssh_profile} was placed for {link.link_mode}, and "
+                f"the site now asks for {self.config.link_mode}; sign in again so relay can "
+                "place it for the new link",
+                site=self.context.site_id,
+                provider="ssh",
+            )
         key = self._connection_key(link)
         with _connections_lock:
             held = _connections.get(key)
@@ -555,15 +616,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         os.environ[local.frp_transport.stcp_secret_env] = link.stcp_secret
         last: Exception | None = None
         for attempt in range(attempts):
-            connection = WorkerConnection(
-                definition=local,
-                session_id=link.session_id,
-                generation_id=link.generation_id,
-                remote_api_port=link.port,
-                api_token=link.api_token,
-                session_owner_token=link.session_owner_token,
-                frpc_bin=RelaySettings.from_env().frpc_bin,
-            )
+            connection = self._new_connection(link)
             try:
                 await asyncio.to_thread(connection.connect)
             except WorkerOutdated as exc:
@@ -576,6 +629,15 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             with _connections_lock:
                 _connections[key] = connection
             return connection
+        if isinstance(last, TransportPunchFailed):
+            raise Refusal(
+                RefusalReason.PUNCH_FAILED,
+                f"relay could not hole punch to the worker on {self.config.ssh_profile} "
+                f"({last}). Relay does not fall back to the rendezvous on its own; set the "
+                "site's link_mode to brokered_tcp to carry calls through it",
+                site=self.context.site_id,
+                link_mode=link.link_mode,
+            )
         idle = (
             f" It exits after {self.config.idle_exit_s} s with no request from relay."
             if self.config.idle_exit_s
@@ -597,6 +659,134 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             site=self.context.site_id,
             provider="ssh",
         )
+
+    def _new_connection(self, link: WorkerLink) -> WorkerConnection:
+        """Return an unconnected link to the placed worker, its secrets in the environment."""
+        from clio_relay.adapters.worker.link import WorkerConnection
+        from clio_relay.config import RelaySettings
+
+        assert link.session_owner_token is not None
+        _, token = self._rendezvous()
+        local = self._definition(link, site_view=False)
+        os.environ[local.frp_transport.token_env] = token
+        os.environ[local.frp_transport.stcp_secret_env] = link.stcp_secret
+        return WorkerConnection(
+            definition=local,
+            session_id=link.session_id,
+            generation_id=link.generation_id,
+            remote_api_port=link.port,
+            api_token=link.api_token,
+            session_owner_token=link.session_owner_token,
+            frpc_bin=RelaySettings.from_env().frpc_bin,
+            mode=link.link_mode,
+        )
+
+    async def shutdown(self) -> list[dict[str, Any]]:
+        """Stop the placed worker and relay's link to it. Jobs keep running.
+
+        Bring-up and the request run in daemon threads, so that a caller's timeout
+        never leaves a thread that holds the interpreter open.
+        """
+        link = self.load_link()
+        if link is None or link.session_owner_token is None:
+            return []
+        with _connections_lock:
+            held = _connections.pop(self._connection_key(link), None)
+        connection = held if held is not None and held.connected else None
+        if connection is None:
+            if held is not None:
+                held.close()
+            connection = self._new_connection(link)
+            try:
+                await _in_daemon_thread(connection.connect)
+            except Exception as exc:
+                connection.close()
+                raise Refusal(
+                    RefusalReason.UNREACHABLE,
+                    f"the worker on {self.config.ssh_profile} did not answer ({exc}). It may "
+                    "have exited idle already",
+                    site=self.context.site_id,
+                ) from exc
+        try:
+            answer = await _in_daemon_thread(
+                lambda: connection.request_json(
+                    method="POST", path="/shutdown", body={}, response_timeout_seconds=10.0
+                )
+            )
+        except Exception as exc:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"the worker on {self.config.ssh_profile} did not take the shutdown ({exc})",
+                site=self.context.site_id,
+            ) from exc
+        finally:
+            connection.close()
+        answered = cast(dict[str, Any], answer) if isinstance(answer, dict) else {}
+        pid = answered.get("pid")
+        stopped: dict[str, Any] = {
+            "kind": "site_serve",
+            "detail": f"worker site-serve in {link.remote_dir} and its frpc proxy",
+        }
+        if isinstance(pid, int):
+            stopped["pid"] = pid
+        if held is None:
+            return [stopped]
+        return [stopped, {"kind": "frpc", "detail": "relay's link visitor to the worker"}]
+
+    def clean_targets(self) -> tuple[list[str], list[str]]:
+        """The worker's directory and job homes; the Spack store under each home stays."""
+        link = self.load_link()
+        remote_dir = link.remote_dir if link is not None and link.remote_dir else self._remote_dir()
+        targets = [remote_dir]
+        keep = spack_keeps(posixpath.join(remote_dir, "adapter", "*"))
+        if self.config.work_dir is not None:
+            work_dir = self.config.work_dir
+            targets += [
+                posixpath.join(work_dir, jarvis_submit.BOOTSTRAP_DIR),
+                posixpath.join(work_dir, "jobs"),
+                posixpath.join(work_dir, "psij"),
+            ]
+            keep += spack_keeps(work_dir)
+        return targets, keep
+
+    async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
+        """Prune over a plain ``ssh``: the worker is stopped by then, so its link is gone."""
+        self._drop_connection()
+        argv = self.ssh_argv()
+        argv[argv.index("BatchMode=no")] = "BatchMode=yes"
+        script = prune_script(targets, keep)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
+            )
+        except OSError as exc:
+            raise Refusal(
+                RefusalReason.UNREACHABLE, f"ssh did not start: {exc}", site=self.context.site_id
+            ) from exc
+        try:
+            out, err = await asyncio.wait_for(
+                process.communicate(script.encode("utf-8")), CLEAN_TIMEOUT_S
+            )
+        except TimeoutError as exc:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            raise Refusal(
+                RefusalReason.TIMEOUT,
+                f"cleaning {self.config.ssh_profile} took over {CLEAN_TIMEOUT_S:g} s",
+                site=self.context.site_id,
+            ) from exc
+        if process.returncode != 0:
+            raise Refusal(
+                RefusalReason.NEEDS_SIGN_IN,
+                f"cleaning {self.config.ssh_profile} needs an ssh that signs in without a "
+                f"prompt (exit {process.returncode}): {err.decode('utf-8', 'replace')[-1000:]}",
+                site=self.context.site_id,
+            )
+        return parse_report(out.decode("utf-8", "replace"))
 
     def _site_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
