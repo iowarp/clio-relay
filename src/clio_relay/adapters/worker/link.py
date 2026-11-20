@@ -33,10 +33,11 @@ from clio_relay.session_api import (
     session_identity_document,
 )
 
-WORKER_PROTOCOL: Final = 4
+WORKER_PROTOCOL: Final = 5
 """3: the site's local adapter hands package jobs to ``jarvis ppl submit``. 4: it also
 stops them, installs their software and installs jarvis-cd (``/stop``, ``/install``,
-``/install-jarvis``), and takes multi-package pipelines."""
+``/install-jarvis``), and takes multi-package pipelines. 5: it runs light on the login
+node, one per user and site, exits when idle, and refuses direct jobs on a batch host."""
 MAX_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 _IDLE_STREAMS: Final = 4
 # The site keeps an idle stream open for 300 s; relay drops its own sooner.

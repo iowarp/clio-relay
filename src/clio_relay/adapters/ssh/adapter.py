@@ -56,6 +56,7 @@ from clio_relay.jobs.handles import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.login_load import direct_refused
 
 if TYPE_CHECKING:
     from psij import Job
@@ -236,8 +237,25 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 RefusalReason.UNREACHABLE,
                 f"cannot create {root}/incoming on {self.config.ssh_profile}",
             )
-        detected = _one(check, "scheduler") or "none"
+        detected = _one(check, "scheduler")
+        if detected is None:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"{self.config.ssh_profile} did not say which scheduler it has, so relay will "
+                "not run the job there",
+                site=self.config.ssh_profile,
+            )
         scheduler = cast(SchedulerName, detected) if detected in _SCHEDULERS else None
+        if scheduler is None and detected != "none":
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG,
+                f"{self.config.ssh_profile} reported scheduler {detected!r}, which relay "
+                "does not know",
+                site=self.config.ssh_profile,
+            )
+        hints = (_one(check, "batch_hint") or "").split()
+        if scheduler is None and hints:
+            raise direct_refused(hints, site=self.config.ssh_profile)
         jarvis_mode = False
         if spec.steps():
             if scheduler is None:

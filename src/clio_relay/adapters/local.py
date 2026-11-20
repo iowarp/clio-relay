@@ -53,6 +53,7 @@ from clio_relay.jobs.handles import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.login_load import batch_hints, direct_refused
 
 if TYPE_CHECKING:
     from psij.executors.batch.batch_scheduler_executor import BatchSchedulerExecutor
@@ -166,7 +167,10 @@ class LocalConfig(BaseModel):
 
     scheduler: SchedulerChoice = Field(
         default="auto",
-        description="auto picks the scheduler whose submit command is on PATH",
+        description=(
+            "auto picks the scheduler whose submit command is on PATH, and refuses to run jobs "
+            "here when it finds none but the host shows a batch system. none runs them here"
+        ),
     )
     work_dir: str | None = Field(
         default=None,
@@ -252,6 +256,10 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
         job_dir = self._job_dir(operation_id)
         scheduler = self.scheduler()
+        if scheduler is None and self.config.scheduler == "auto":
+            hints = await asyncio.to_thread(batch_hints)
+            if hints:
+                raise direct_refused(hints, site=self.context.site_id)
         jarvis_mode = False
         if spec.steps():
             if scheduler is None:

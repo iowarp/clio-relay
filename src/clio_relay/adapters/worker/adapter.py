@@ -4,7 +4,9 @@ The person signs in to the site once. In that one ssh pass relay installs
 itself in a private directory on the site, writes the worker's identity and
 starts ``clio-relay worker site-serve`` detached. That process serves the
 worker's API on loopback and holds an frpc ``stcp`` proxy to the
-rendezvous server. Relay then reaches it over the one held link
+rendezvous server. It runs on the login node, so it starts light and exits
+after ``idle_exit_s`` with no request from relay; the next sign-in places it
+again (:mod:`clio_relay.login_load`). Relay then reaches it over the one held link
 (``brokered_tcp``), and nothing uses SSH after that.
 
 On the site the verbs run through the ``local`` adapter, so scheduler coverage
@@ -44,6 +46,7 @@ from clio_relay import jarvis_submit
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.worker.files import WorkerFileAccess
+from clio_relay.adapters.worker.site_server import IDLE_EXIT_S
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -55,6 +58,7 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.records import new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.login_load import LoginLimits, light_function
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.link import WorkerConnection
@@ -134,6 +138,18 @@ class WorkerConfig(BaseModel):
             "The jarvis command on the site, which runs package jobs. A leading ~/ "
             "means the home directory"
         ),
+    )
+    idle_exit_s: int = Field(
+        default=IDLE_EXIT_S,
+        ge=0,
+        description=(
+            "The worker on the site exits after this many seconds with no request from relay, "
+            "and the next sign-in places it again. 0 keeps it until it is stopped"
+        ),
+    )
+    login_limits: LoginLimits = Field(
+        default_factory=LoginLimits,
+        description="What the worker may use on the site's login node",
     )
 
     @field_validator("remote_dir")
@@ -424,11 +440,19 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 "$D/run/frp.env",
                 f"CLIO_RELAY_FRP_TOKEN={token}\nCLIO_RELAY_STCP_SECRET={link.stcp_secret}\n",
             ),
-            'setsid nohup "$D/bin/clio-relay" worker site-serve --state-dir "$D" '
+            light_function(self.config.login_limits).rstrip("\n"),
+            # In a subshell, so that clio_light's ulimit fallback limits only the worker.
+            '( clio_light setsid nohup "$D/bin/clio-relay" worker site-serve --state-dir "$D" '
+            f"--idle-exit-s {self.config.idle_exit_s} ) "
             '> "$D/run/site.log" 2>&1 < /dev/null &',
             "pid=$!",
+            "alive() {",
+            '  kill -0 "$pid" 2>/dev/null \\',
+            '    || { [ -s "$D/run/site.pid" ] \\',
+            '      && kill -0 "$(cat "$D/run/site.pid")" 2>/dev/null; }',
+            "}",
             'while [ ! -s "$D/run/ready.json" ]; do',
-            '  if ! kill -0 "$pid" 2>/dev/null; then tail -n 40 "$D/run/site.log" >&2; exit 3; fi',
+            '  if ! alive; then tail -n 40 "$D/run/site.log" >&2; exit 3; fi',
             "  sleep 0.2",
             "done",
             f'printf "{READY_MARKER}%s %s\\n" "$D" "$(cat "$D/run/ready.json")"',
@@ -552,10 +576,17 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             with _connections_lock:
                 _connections[key] = connection
             return connection
+        idle = (
+            f" It exits after {self.config.idle_exit_s} s with no request from relay."
+            if self.config.idle_exit_s
+            else ""
+        )
         raise Refusal(
-            RefusalReason.UNREACHABLE,
-            f"the worker on {self.config.ssh_profile} did not answer over the rendezvous: {last}",
+            RefusalReason.NEEDS_SIGN_IN,
+            f"the worker on {self.config.ssh_profile} did not answer over the rendezvous "
+            f"({last}).{idle} Sign in again so relay can place it",
             site=self.context.site_id,
+            provider="ssh",
         )
 
     def _outdated(self, why: str) -> Refusal:

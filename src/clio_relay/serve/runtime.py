@@ -32,6 +32,7 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import ServiceSpec
+from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve.config import SiteServe
 from clio_relay.serve.forward import Forward
@@ -75,6 +76,15 @@ FOLLOW_FIRST_S = 1.0
 FOLLOW_MAX_S = 10.0
 
 _runtime: ServeRuntime | None = None
+
+
+def _safe_name(text: str) -> str:
+    return "".join(char if char.isalnum() or char in "._-" else "_" for char in text) or "site"
+
+
+def _scheduler_job_name(operation_id: str) -> str:
+    """The batch job name relay's adapters give an operation; the hop finds a queued job by it."""
+    return f"relay-{operation_id}"
 
 
 def factory(context: Any) -> ServeRuntime:
@@ -364,6 +374,7 @@ class ServeRuntime:
         plan.job_dir = handle_job_dir(handle)
         self._save(plan)
         self._record_handle(plan)
+        await self._lease_hop(adapter, plan)
         return plan.endpoint(note="starting", connect_command=self.connect_command(plan))
 
     def _refuse_a_second_mount(self, site_id: str, service: str, operation_id: str) -> None:
@@ -424,23 +435,36 @@ class ServeRuntime:
             )
         return result
 
+    async def _hop(self, adapter: Any, plan: ServePlan, mode: str, *args: str) -> ExecResult:
+        """Run the login hop's ``mode`` on the site, light (:mod:`clio_relay.login_load`)."""
+        site = plan.site_serve
+        hop_dir = f"{site.hop_dir.rstrip('/')}/{_safe_name(plan.site)}"
+        argv = [
+            site.python,
+            "-c",
+            site_file("hop_proxy.py").decode(),
+            mode,
+            hop_dir,
+            plan.operation_id,
+            *args,
+        ]
+        return await self._exec(adapter, plan, light_argv(argv, site.login_limits))
+
     async def _start_hop(self, adapter: Any, plan: ServePlan) -> HopState:
         rendezvous = plan.rendezvous
         if rendezvous is None:
             raise Refusal(RefusalReason.INVALID_CONFIG, "no rendezvous host is set")
         site = plan.site_serve
-        argv = [
-            site.python,
-            "-c",
-            site_file("hop_proxy.py").decode(),
+        result = await self._hop(
+            adapter,
+            plan,
+            "start",
             site.address or rendezvous.address,
             str(site.port or rendezvous.port),
             site.hop_bind,
             site.hop_advertise or "-",
             str(HOP_IDLE_EXIT_S),
-            plan.operation_id,
-        ]
-        result = await self._exec(adapter, plan, argv)
+        )
         lines = [line for line in result.stdout.splitlines() if line.strip().startswith("{")]
         try:
             return HopState.model_validate(json.loads(lines[-1]))
@@ -451,11 +475,24 @@ class ServeRuntime:
                 site=plan.site,
             ) from exc
 
+    async def _lease_hop(self, adapter: Any, plan: ServePlan) -> None:
+        """Tie the hop's lease to the submitted job, so the hop ends when the job does."""
+        if plan.hop is None or not plan.job_dir:
+            return
+        try:
+            await self._hop(
+                adapter, plan, "lease", plan.job_dir, _scheduler_job_name(plan.operation_id)
+            )
+        except Refusal as refusal:
+            # The lease still ends SUBMIT_GRACE_S after the start without a job.
+            logger.info("service %s: hop lease not tied (%s)", plan.operation_id, refusal)
+
     async def _stop_hop(self, adapter: Any, plan: ServePlan) -> None:
+        """Release this job's lease. The hop exits once no job holds one."""
         if plan.hop is None:
             return
         with contextlib.suppress(Exception):
-            await self._exec(adapter, plan, ["kill", str(plan.hop.pid)], check=False)
+            await self._hop(adapter, plan, "release")
 
     # Observing
 
@@ -495,6 +532,7 @@ class ServeRuntime:
             plan.job_dir = handle_job_dir(plan.handle)
             if plan.job_dir is not None:
                 self._save(plan)
+                await self._lease_hop(adapter, plan)
         if plan.handle is not None and record.handle is None:
             record.handle = plan.handle
             self._record_handle(plan)

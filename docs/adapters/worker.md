@@ -102,3 +102,25 @@ in the same directory. Jobs and staged content there stay.
 The worker has no commands to run by hand. Placement starts it as
 `clio-relay worker site-serve`. [Operations](../operations.md) lists what it
 keeps in its directory and how to check, stop or remove it.
+
+It runs on the login node, so it stays light:
+
+- It runs at the lowest CPU and I/O priority (`nice -n 19`, `ionice -c3`).
+- Where the site's systemd user manager lingers, it runs in a
+  `systemd-run --user --scope` with `CPUQuota=25%` and `MemoryMax=512M`.
+  Elsewhere it runs under `ulimit -v` (2 GiB of address space) and `ulimit -t`
+  (7200 CPU seconds a process). `login_limits` changes these.
+- One runs per user and site. It holds a lock on `run/site.lock`, and a second
+  one refuses.
+- It exits after `idle_exit_s` (1800 s by default, 0 for never) with no request
+  from relay, and writes `run/stopped.json` with the reason. The site's next
+  call asks for a sign-in, which places it again. Jobs keep running meanwhile:
+  JARVIS submitted them, not the worker.
+
+What the worker runs for a call, such as `jarvis ppl submit` or `spack spec`,
+runs under the same limits. A site whose Spack concretization needs more
+memory raises `login_limits.memory_mb`.
+
+`scheduler: auto` refuses to run jobs on the login node when it finds no
+scheduler but the host shows a batch system, as on
+[`ssh`](ssh.md#hosts-with-no-scheduler).

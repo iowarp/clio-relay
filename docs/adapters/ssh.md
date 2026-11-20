@@ -119,10 +119,18 @@ rather than being called failed. A later poll can still find an exit code, and
 
 ### Hosts with no scheduler
 
-With `scheduler: none`, or on a host where `auto` finds none, the job runs
+With `scheduler: none` the job runs on the ssh host itself,
 detached in its own session (`setsid`, or `nohup` where the host has no
 `setsid`). It keeps running after ssh disconnects, and a later `status` reads
 its exit code from the job directory. `cancel` stops the whole process group.
+
+`auto` never falls back to that on its own on a batch site's login node. When
+it finds no submit command it can use but the host still shows a batch system
+(`squeue`, `sinfo`, `qstat` or `flux` on its `PATH` or a login shell's, or a
+Slurm, PBS or LSF configuration file), `run` refuses with `invalid_config` and
+names what it found. Set the site's `scheduler` to the right one, or to `none`
+to run jobs on that host on purpose. A check that gives no scheduler answer at
+all is refused too.
 
 ### Package jobs
 

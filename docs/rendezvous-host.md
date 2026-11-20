@@ -102,15 +102,32 @@ host:
 | --- | --- |
 | `frpc` | Where `frpc` is on the site. Without it, set `frpc_binary` to a local `frpc` built for the site and relay copies it in with the job. |
 | `address`, `port` | The rendezvous host as the site sees it, when that differs from the desktop's view. |
-| `hop` | `none`: compute nodes dial out themselves. `login`: relay starts a small proxy on the login node for the life of the service, and the node's frp client goes through it. `http_proxy`: use the site's own HTTP proxy, named in `proxy_url`. |
+| `hop` | `none`: compute nodes dial out themselves. `login`: relay starts a small proxy on the login node while the site's services run, and the node's frp client goes through it. `http_proxy`: use the site's own HTTP proxy, named in `proxy_url`. |
 | `hop_advertise` | The login node's address as compute nodes see it, when its host name doesn't resolve there. |
+| `hop_dir` | Where the login hop keeps its lock, leases and password on the site, one directory per site. `~/.clio-relay/hop` by default. |
+| `login_limits` | What the login hop may use: `cpu_quota_percent`, `memory_mb`, `address_space_mb` and `cpu_s`. |
 | `path` | `auto` (the default) uses frp when a rendezvous host is set, and `ssh -L` otherwise. `frp` or `ssh` forces one. |
 | `stun_server` | The STUN server for this site's frp client, when the site can't reach the rendezvous one. |
 | `stop_grace_s` | Seconds a service gets to write its final files after a stop. 30 by default. |
 
-The login hop asks for a per-service password and only connects to the
-rendezvous host, so other users on the login node can't use it to reach
-anything else.
+The login hop asks for a password that only relay and your jobs have, and only
+connects to the rendezvous host, so other users on the login node can't use it
+to reach anything else.
+
+### The login hop on a login node
+
+The hop is light and never outlives the jobs it serves:
+
+- It runs at the lowest CPU and I/O priority, capped the way the
+  [worker](adapters/worker.md#on-the-cluster) is.
+- One hop runs per user and site. Services that start while it runs reuse it.
+- Each service job holds a lease on it. The lease ends when relay releases it
+  or when the job is over: its connector wrote `serve/stopped.json`, its
+  `serve/heartbeat` (touched every 30 s) is three minutes old, or it left the
+  Slurm queue before it started. A lease relay never tied to a job ends after
+  15 minutes.
+- The hop exits once no lease is left. It also exits an hour after its last
+  connection ends, unless a job it serves is still waiting in the queue.
 
 ## Using a remote relay
 

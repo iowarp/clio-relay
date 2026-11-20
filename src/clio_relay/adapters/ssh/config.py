@@ -37,7 +37,11 @@ class SshConfig(BaseModel):
     )
     scheduler: SchedulerChoice = Field(
         default="auto",
-        description="auto picks the scheduler whose submit command the site has",
+        description=(
+            "auto picks the scheduler whose submit command the site has, and refuses to run "
+            "jobs on the login host when it finds none but the host shows a batch system. "
+            "none runs them on that host"
+        ),
     )
     jarvis: str = Field(
         default="jarvis",

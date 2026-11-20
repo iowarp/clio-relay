@@ -15,6 +15,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.login_load import LoginLimits
 
 FrpProtocol = Literal["tcp", "kcp", "quic", "websocket", "wss"]
 Hop = Literal["none", "login", "http_proxy"]
@@ -125,6 +126,14 @@ class SiteServe(BaseModel):
         default=None, description="A local frpc built for the site, to stage"
     )
     python: str = Field(default="python3", description="Python on the login side, for the hop")
+    hop_dir: str = Field(
+        default="~/.clio-relay/hop",
+        min_length=1,
+        description="Where the login hop keeps its lock, leases and token, one directory per site",
+    )
+    login_limits: LoginLimits = Field(
+        default_factory=LoginLimits, description="What the login hop may use on the login node"
+    )
     stun_server: str | None = Field(
         default=None, description="STUN server for this site's frpc. Defaults to the rendezvous one"
     )
