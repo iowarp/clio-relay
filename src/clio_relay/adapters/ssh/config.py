@@ -39,6 +39,14 @@ class SshConfig(BaseModel):
         default="auto",
         description="auto picks the scheduler whose submit command the site has",
     )
+    jarvis: str = Field(
+        default="jarvis",
+        min_length=1,
+        description=(
+            "The jarvis command on the site, which runs package jobs. A leading ~/ "
+            "means the home directory"
+        ),
+    )
     interactive_sign_in: bool = Field(
         default=False,
         description=(

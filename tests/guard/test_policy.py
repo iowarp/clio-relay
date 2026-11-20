@@ -188,19 +188,19 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
     assert lowered.package is None
     assert lowered.executable == "/bin/bash"
     assert lowered.arguments[2:8] == [
-        "clio-relay-package",
+        "clio-relay-jarvis",
+        "run",
         digest,
         "demo.hello",
         "jarvis",
         "",
-        "run",
     ]
-    assert lowered.arguments[8:] == ["out=result.txt", "steps=3"]
+    assert lowered.arguments[8].splitlines()[-2:] == ["  out: result.txt", "  steps: 3"]
     assert [(item.name, item.sha256) for item in lowered.inputs] == [
         (f"{ARCHIVE_DIR}/{digest}.tar.gz", digest)
     ]
     served = await guard.prepare(hpc, package_spec(digest), adapter=adapter, service=True)
-    assert served.arguments[7] == "service"
+    assert served.arguments == lowered.arguments, "JARVIS's run holds while a service is up"
 
     class Runs(FixtureAdapter):
         runs_packages: ClassVar[bool] = True

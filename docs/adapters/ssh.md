@@ -38,6 +38,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `ssh_options` | none | Extra `Key=Value` options, passed with `-o` |
 | `remote_dir` | `.clio-relay` | Relay's directory on the site, under your home unless absolute |
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
+| `jarvis` | `jarvis` | The `jarvis` command on the site, for [package jobs](#package-jobs) |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
 | `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run |
@@ -122,6 +123,45 @@ With `scheduler: none`, or on a host where `auto` finds none, the job runs
 detached in its own session (`setsid`, or `nohup` where the host has no
 `setsid`). It keeps running after ssh disconnects, and a later `status` reads
 its exit code from the job directory. `cancel` stops the whole process group.
+
+### Package jobs
+
+A JARVIS package job is submitted by JARVIS, not by relay, so the safeguards
+in `jarvis ppl submit` all apply: the sealed execution directory, its typed
+`.jarvis-execution.json` record, the allocation's hostfile, the log
+directories made before the submit, and the bound interpreter and
+`JARVIS_ROOT`. Relay never runs `sbatch` for a package.
+
+1. Relay writes `relay.pipeline.yaml` into the job directory. Its `scheduler:`
+   key carries the run's resources: `nodes`, `ntasks_per_node`, `time` (the
+   walltime above), `partition` and `account`, and `output` and `error` only
+   when the job sets `stdout_path` or `stderr_path`. Otherwise JARVIS writes
+   the logs into the execution directory.
+2. `relay-jarvis.sh` checks the archive against the reviewed hash, unpacks it,
+   makes a JARVIS root for this job only (`<job dir>/.relay-jarvis`), adds the
+   package's repository and runs
+   `jarvis ppl submit relay.pipeline.yaml --execution-id <operation id> +json`.
+   It keeps JARVIS's handle in `relay.submission.json`.
+3. `status` reads `jarvis execution get`, and the outputs come from
+   `jarvis execution artifacts` once the record is terminal.
+
+The `jarvis` setting names the command on the site (default `jarvis`). When
+it is not there, `run` is refused with `adapter_unavailable` before anything
+is submitted.
+
+Some things JARVIS 1.8.1 cannot do yet, so relay refuses them rather than
+working around JARVIS:
+
+- `cancel` of a package job that is still running is refused with
+  `not_cancellable` ("needs jarvis execution cancel"). Relay does not run
+  `scancel` behind JARVIS's back.
+- A package started as a service (such as pvserver) is refused with
+  `adapter_unavailable` ("needs jarvis execution stop").
+- Package jobs need Slurm. On PBS, LSF or Cobalt, `run` is refused with
+  `adapter_unavailable`, naming the JARVIS scheduler it needs.
+- A package job's `directory` and `stdin_path` are refused. Its inputs are in
+  the job directory, so give packages absolute paths.
+- JARVIS has no cleanup command, so the execution directory stays on the site.
 
 ## Sites that ask for a code
 

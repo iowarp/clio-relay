@@ -22,7 +22,13 @@ from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_proce
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobAttributes, JobResources, JobSpec, PackageRef
+from clio_relay.jobs.spec import (
+    JobAttributes,
+    JobResources,
+    JobSpec,
+    ServicePort,
+    ServiceSpec,
+)
 from clio_relay.sites.models import SpendPolicy
 
 pytestmark = pytest.mark.release_platform("posix")
@@ -121,12 +127,77 @@ async def test_a_closed_port_is_unreachable(tmp_path: Path) -> None:
     assert refused.value.reason == RefusalReason.UNREACHABLE
 
 
-@pytest.mark.asyncio
-async def test_a_package_job_is_an_invalid_spec(tmp_path: Path) -> None:
-    spec = JobSpec(package=PackageRef(name="p", version="1", sha256="a" * 64))
+def _package_spec(**update: object) -> JobSpec:
+    return JobSpec.model_validate(
+        {
+            "package": {
+                "name": "clio_jarvis.xcompact3d",
+                "version": "0.2.2",
+                "sha256": "a" * 64,
+                "parameters": {"case": "tgv", "nx": 257},
+            },
+            "resources": {"process_count": 128, "processes_per_node": 32},
+            "attributes": {
+                "duration": 1800,
+                "queue_name": "compute",
+                "account": "lab",
+            },
+            **update,
+        }
+    )
+
+
+def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
+    adapter = _adapter(tmp_path, jarvis="~/jv/bin/jarvis")
+    job_dir = PurePosixPath("/home/u/.clio-relay/jobs/op_x")
+    rendered = adapter._render_jarvis(_package_spec(), "op_x", job_dir, "relay-op_x")  # pyright: ignore[reportPrivateUsage]
+    pipeline = rendered.files["relay.pipeline.yaml"]
+    assert pipeline.splitlines()[:11] == [
+        "name: relay_op_x",
+        "scheduler:",
+        "  name: slurm",
+        "  job_name: relay-op_x",
+        "  nodes: 4",
+        "  ntasks_per_node: 32",
+        "  time: 00:30:00",
+        "  partition: compute",
+        "  account: lab",
+        "pkgs:",
+        "- pkg_type: clio_jarvis.xcompact3d",
+    ]
+    assert "sbatch" not in pipeline
+    assert rendered.files["relay-jarvis.sh"].startswith("set -eu")
+    assert rendered.submit_command == (
+        f"bash relay-jarvis.sh submit {'a' * 64} clio_jarvis.xcompact3d '~/jv/bin/jarvis' op_x"
+    )
+
+
+def test_a_jarvis_handle_comes_from_the_submit_line(tmp_path: Path) -> None:
+    adapter = _adapter(tmp_path)
+    line = (
+        '{"cluster":null,"execution_id":"op_x","mode":"scheduler","pipeline_id":"relay_op_x",'
+        '"schema_version":"jarvis.execution.handle.v1","scheduler_native_id":"27873",'
+        '"scheduler_provider":"slurm"}'
+    )
+    root = PurePosixPath("/home/u/.clio-relay")
+    handle = adapter._handle("jarvis", f"queued\n{line}", root, root / "jobs/op_x", "relay-op_x")  # pyright: ignore[reportPrivateUsage]
+    assert handle.native_id == "27873"
+    assert handle.data["mode"] == "jarvis"
+    assert handle.data["execution_dir"] == (
+        "/home/u/.clio-relay/jobs/op_x/.relay-jarvis/shared/relay_op_x/executions/op_x"
+    )
     with pytest.raises(Refusal) as refused:
-        await _adapter(tmp_path).run(spec, operation_id="op_x")
-    assert refused.value.reason == RefusalReason.INVALID_SPEC
+        adapter._handle("jarvis", "no json", root, root / "jobs/op_x", "relay-op_x")  # pyright: ignore[reportPrivateUsage]
+    assert refused.value.reason == RefusalReason.SUBMIT_FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_package_service_needs_jarvis_execution_stop(tmp_path: Path) -> None:
+    service = ServiceSpec(job=_package_spec(), ports=[ServicePort(name="pvserver")])
+    with pytest.raises(Refusal) as refused:
+        await _adapter(tmp_path).serve(service, operation_id="op_x")
+    assert refused.value.reason == RefusalReason.ADAPTER_UNAVAILABLE
+    assert refused.value.data["needs"] == "jarvis execution stop"
 
 
 @pytest.mark.asyncio

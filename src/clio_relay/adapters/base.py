@@ -44,8 +44,10 @@ setting is ``invalid_config``, and a missing path is ``path_not_found``.
 
 Policy: a site is open or guarded. The guard sits in front of every adapter,
 so an adapter does not enforce it. On a guarded site the guard turns a reviewed
-JARVIS package into a plain command job, unless the adapter sets
-``runs_packages`` and runs :attr:`JobSpec.package` itself.
+JARVIS package into a plain command job that runs it with JARVIS's direct run
+(:func:`clio_relay.jarvis_submit.direct_job`), unless the adapter sets
+``runs_packages`` and runs :attr:`JobSpec.package` itself, which a batch
+adapter does by handing it to ``jarvis ppl submit``.
 
 Optional hooks, found by name when an adapter defines them:
 

@@ -17,6 +17,11 @@ The job directory holds ``spec.json``, ``inputs.json``, ``scheduler``,
 ``submit.sh`` or ``supervise.sh`` and ``child.sh``, ``submit.out``,
 ``submit.err``, ``submit.rc``, ``states`` (one ``<time> <state> <detail>`` line
 per change), ``cancel`` once cancelled, and ``final`` once the job ended.
+
+A package job on Slurm is JARVIS's instead (``scheduler`` says ``jarvis``): the
+directory holds ``relay.pipeline.yaml`` and ``relay-jarvis.sh`` from
+:mod:`clio_relay.jarvis_submit`, the handle ``ppl submit`` printed, and the
+job's JARVIS root ``.relay-jarvis``, whose execution record is the job record.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
+from clio_relay import jarvis_submit
 from clio_relay.adapters.ssh import store
 
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -54,6 +60,8 @@ INTERNAL_FILES = frozenset(
         "pid",
         "child_pid",
         "signalled",
+        "inputs.dropped",
+        *jarvis_submit.SITE_FILES,
     }
 )
 
@@ -326,6 +334,44 @@ def status_script(
     body += '[ -e cancel ] && echo "@@cancel"\n'
     body += "exit 0\n"
     return body
+
+
+def jarvis_status_script(job_dir: str, operation_id: str) -> str:
+    """One poll of a job JARVIS submitted: ``jarvis execution get``, and its artifacts.
+
+    ``execution get`` reconciles the record with the scheduler and commits it,
+    so relay keeps no state of its own. The artifacts are read once the record
+    is terminal.
+    """
+    get = jarvis_submit.execution_shell("get", operation_id, job_dir=job_dir)
+    artifacts = jarvis_submit.execution_shell("artifacts", operation_id, job_dir=job_dir)
+    execution = q(jarvis_submit.execution_dir(job_dir, operation_id))
+    return (
+        f"J={q(job_dir)}\n"
+        + _ENTER_JOB
+        + 'echo "@@inputs"; cat inputs.json 2>/dev/null; echo\n'
+        + '[ -e inputs.dropped ] && echo "@@dropped"\n'
+        + f"fresh {execution}; jarvis=$(cat {jarvis_submit.JARVIS_FILE} 2>/dev/null)\n"
+        + '[ -n "$jarvis" ] || { echo "@@nojarvis"; exit 0; }\n'
+        + f"out=$({get} 2>&1 </dev/null); rc=$?\n"
+        + 'echo "@@getrc $rc"; echo "@@get"; printf "%s\\n" "$out"\n'
+        + 'if [ "$rc" -eq 0 ] && printf \'%s\\n\' "$out" | tail -n 1 | grep -qF '
+        + "'\"terminal\":true'; then\n"
+        + f'  echo "@@artifacts"; {artifacts} 2>/dev/null </dev/null; echo\n'
+        + "fi\n"
+        + "exit 0\n"
+    )
+
+
+def drop_inputs_script(job_dir: str, root: str, inputs: Sequence[store.StagedInput]) -> str:
+    """Once a JARVIS job ended: drop spent and transient inputs from the content store."""
+    return (
+        f"J={q(job_dir)}\n"
+        + 'cd "$J" || exit 3\n'
+        + FRESH
+        + store.drop_script(root, inputs)
+        + ": > inputs.dropped\n"
+    )
 
 
 def record_script(

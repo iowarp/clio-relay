@@ -13,9 +13,9 @@ from clio_relay.jarvis_site import (
     archive_package,
     inspect_archive,
     package_files,
-    package_job,
     read_archive,
 )
+from clio_relay.jarvis_submit import SITE_SCRIPT, direct_job
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
@@ -115,7 +115,7 @@ def test_read_archive_explains_how_to_stage(tmp_path: Path) -> None:
     assert read_archive(content, "demo.hello", digest).sha256 == digest
 
 
-def test_package_job_keeps_resources_and_inputs() -> None:
+def test_direct_job_keeps_resources_and_inputs() -> None:
     spec = JobSpec.model_validate(
         {
             "package": {
@@ -124,26 +124,35 @@ def test_package_job_keeps_resources_and_inputs() -> None:
                 "sha256": "b" * 64,
                 "parameters": {"flag": True, "n": 2},
             },
-            "directory": "/scratch/run",
             "inputs": [{"name": "in.dat", "sha256": "c" * 64}],
             "resources": {"node_count": 2},
             "attributes": {"queue_name": "debug"},
         }
     )
-    job = package_job(spec, jarvis="~/jv/bin/jarvis")
-    assert job.directory is None
-    assert job.arguments[2:] == [
-        "clio-relay-package",
+    job = direct_job(spec, jarvis="~/jv/bin/jarvis")
+    assert job.package is None
+    assert job.executable == "/bin/bash"
+    assert job.arguments[1] == SITE_SCRIPT
+    assert job.arguments[2:8] == [
+        "clio-relay-jarvis",
+        "run",
         "b" * 64,
         "demo.hello",
         "~/jv/bin/jarvis",
-        "/scratch/run",
-        "run",
-        "flag=true",
-        "n=2",
+        "",
     ]
-    assert package_job(spec, service=True).arguments[7] == "service"
+    assert job.arguments[8].splitlines() == [
+        f"name: relay_{'b' * 12}",
+        "pkgs:",
+        "- pkg_type: demo.hello",
+        "  pkg_name: pkg",
+        "  flag: true",
+        "  n: 2",
+    ]
     assert [item.name for item in job.inputs] == ["in.dat", f".relay-package/{'b' * 64}.tar.gz"]
     assert job.resources.node_count == 2
     assert job.attributes.queue_name == "debug"
     assert job.name == "demo-hello"
+    with pytest.raises(Refusal) as raised:
+        direct_job(spec.model_copy(update={"directory": "/scratch/run"}))
+    assert raised.value.reason == RefusalReason.INVALID_SPEC

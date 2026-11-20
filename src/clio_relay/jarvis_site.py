@@ -9,10 +9,10 @@ top-level files, and a ``schemas/`` directory next to the repository ride
 along, because packages import or read them (clio-jarvis's contract reads
 ``<repo dir>/../schemas``).
 
-The package runner turns a package job into a plain bash job any batch adapter
-can submit. On the site it checks the archive's SHA-256 against the reviewed
-one, unpacks it, and runs it with JARVIS under a JARVIS root private to the
-job, so the site's own pipelines are never touched.
+JARVIS runs the package: :mod:`clio_relay.jarvis_submit` renders the
+pipeline and the site script that checks the archive's SHA-256 against the
+reviewed one, unpacks it into a JARVIS root private to the job and hands the
+pipeline to ``jarvis ppl submit`` or JARVIS's direct run.
 
 RL42 adds clio-jarvis, at a tagged release, to a site's own JARVIS the first
 time a package is needed there. :func:`clio_jarvis_script` is the script and
@@ -35,15 +35,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from clio_relay.adapters.base import BaseAdapter
+from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec
 
 SOURCE_FILE = ".clio-relay-source.json"
 """The archive member that says where the package came from."""
-
-ARCHIVE_DIR = ".relay-package"
-"""Where the runner finds the archive, relative to the job directory."""
 
 SHARED_SIBLINGS = ("schemas",)
 """Directories next to the repository directory that its packages read."""
@@ -273,113 +270,6 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
             package=name,
         )
     return inspect_archive(content.get(digest), name)
-
-
-# The package runner
-
-RUNNER = r"""set -eu
-digest=$1 name=$2 jarvis=$3 workdir=$4 mode=$5
-shift 5
-case $jarvis in "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
-fail() { echo "clio-relay package runner: $2" >&2; exit "$1"; }
-case $mode in run|service) ;; *) fail 64 "mode $mode is not run or service" ;; esac
-printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$' \
-  || fail 64 "package name $name is not <repo>.<package>"
-archive="$PWD/.relay-package/$digest.tar.gz"
-[ -f "$archive" ] || fail 66 "the package archive $archive is missing"
-if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$archive" | cut -d' ' -f1)
-else got=$(shasum -a 256 "$archive" | cut -d' ' -f1); fi
-[ "$got" = "$digest" ] || fail 65 "the archive's SHA-256 is $got, not the reviewed $digest"
-root="$PWD/.relay-jarvis"
-repo=${name%%.*}
-rm -rf "$root"
-mkdir -p "$root/src"
-tar -xzf "$archive" -C "$root/src"
-[ -d "$root/src/$repo/$repo" ] || fail 66 "the archive has no $repo/$repo directory"
-command -v "$jarvis" >/dev/null 2>&1 || fail 69 "$jarvis is not on PATH on this site"
-export JARVIS_ROOT="$root"
-"$jarvis" init "$root/config" "$root/private" "$root/shared" >/dev/null
-"$jarvis" repo add "$root/src/$repo" >/dev/null
-if [ -n "${SLURM_JOB_NODELIST:-}" ] && command -v scontrol >/dev/null 2>&1; then
-  scontrol show hostnames "$SLURM_JOB_NODELIST" > "$root/hostfile"
-elif [ -n "${PBS_NODEFILE:-}" ] && [ -f "$PBS_NODEFILE" ]; then
-  sort -u "$PBS_NODEFILE" > "$root/hostfile"
-fi
-[ -s "$root/hostfile" ] && "$jarvis" hostfile set "$root/hostfile" >/dev/null
-"$jarvis" ppl create "relay_$(printf %.12s "$digest")" >/dev/null
-"$jarvis" ppl append "$name" pkg "$@"
-[ -z "$workdir" ] || cd "$workdir"
-[ "$mode" = run ] && exec "$jarvis" ppl run
-sleeper=
-stop() {
-  trap - TERM INT HUP
-  [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null || true
-  rc=0
-  "$jarvis" ppl stop || rc=$?
-  [ "$rc" -eq 0 ] || exit "$rc"
-  exit "$1"
-}
-trap 'stop 0' TERM INT HUP
-started=0
-"$jarvis" ppl start || started=$?
-if [ "$started" -ne 0 ]; then
-  trap - TERM INT HUP
-  "$jarvis" ppl stop || true
-  exit "$started"
-fi
-while :; do
-  sleep 60 &
-  sleeper=$!
-  wait "$sleeper" || stop 0
-done
-"""
-
-
-def _parameter(key: str, value: CustomValue) -> str:
-    if isinstance(value, bool):
-        return f"{key}={'true' if value else 'false'}"
-    return f"{key}={value}"
-
-
-def package_job(spec: JobSpec, *, jarvis: str = "jarvis", service: bool = False) -> JobSpec:
-    """Lower a package job to the bash job that runs it with JARVIS.
-
-    The archive becomes an input, so the adapter stages it by digest. The
-    runner checks the hash again on the site before it unpacks anything.
-
-    An application runs ``jarvis ppl run``, which is start then stop. A service
-    (``service=True``) runs ``jarvis ppl start`` and stays up until the job is
-    told to stop (TERM, INT or HUP), then runs ``jarvis ppl stop`` and exits 0
-    (or with the stop's code if the stop fails). A failed wait, such as a cancel
-    that kills only the sleeping child, stops it the same way. A failed start
-    runs ``jarvis ppl stop`` and exits with the start's code.
-    """
-    package = spec.package
-    if package is None:
-        return spec
-    split_name(package.name)
-    digest = package.pinned()[1]
-    archive = InputRef(name=f"{ARCHIVE_DIR}/{digest}.tar.gz", sha256=digest)
-    data = spec.model_dump(mode="json", exclude={"package", "executable", "arguments"})
-    data["inputs"] = [
-        *[item for item in data["inputs"] if item["name"] != archive.name],
-        archive.model_dump(mode="json"),
-    ]
-    data["directory"] = None
-    data["executable"] = "/bin/bash"
-    data["arguments"] = [
-        "-c",
-        RUNNER,
-        "clio-relay-package",
-        digest,
-        package.name,
-        jarvis,
-        spec.directory or "",
-        "service" if service else "run",
-        *[_parameter(key, value) for key, value in sorted(package.parameters.items())],
-    ]
-    data["name"] = spec.name or package.name.replace(".", "-")
-    return JobSpec.model_validate(data)
 
 
 # RL42: clio-jarvis on a site

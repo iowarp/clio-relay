@@ -1,4 +1,4 @@
-"""The shell scripts relay sends to a site: the package runner, the warm holder, RL42.
+"""The shell scripts relay sends to a site: the JARVIS site script, the warm holder, RL42.
 
 They run under /bin/sh or bash with stand-in ``jarvis``, ``scontrol`` and
 ``squeue`` programs that log what they were asked.
@@ -6,12 +6,11 @@ They run under /bin/sh or bash with stand-in ``jarvis``, ``scontrol`` and
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import signal
 import subprocess
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -19,9 +18,23 @@ import pytest
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.local import LocalAdapter, LocalConfig
 from clio_relay.guard.warm import HOLDER, WARM_EXECUTABLE
-from clio_relay.jarvis_site import RUNNER, add_clio_jarvis, archive_package
+from clio_relay.jarvis_site import add_clio_jarvis, archive_package
+from clio_relay.jarvis_submit import (
+    EXIT_DIGEST,
+    EXIT_MISSING,
+    EXIT_NO_JARVIS,
+    EXIT_USAGE,
+    EXITCODE_FILE,
+    JARVIS_FILE,
+    PIPELINE_FILE,
+    REFUSAL_FILE,
+    SITE_SCRIPT,
+    SUBMISSION_FILE,
+    missing_jarvis,
+    parse_handle,
+)
 from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.refusals import Refusal
+from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 from .conftest import make_repo
 
@@ -33,8 +46,10 @@ case "$1 $2" in
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
-  "ppl start") [ -z "${JARVIS_START_SLEEP:-}" ] || sleep "$JARVIS_START_SLEEP"
-    exit "${JARVIS_START_RC:-0}" ;;
+  "ppl submit")
+    if [ -n "${JARVIS_SUBMIT_RC:-}" ]; then echo "sbatch said no" >&2; exit "$JARVIS_SUBMIT_RC"; fi
+    echo "submitting $3"
+    printf '{"execution_id":"%s","schema_version":"jarvis.execution.handle.v1"}\\n' "$5" ;;
 esac
 """
 
@@ -70,11 +85,14 @@ def _job_dir(tmp_path: Path) -> tuple[Path, str]:
     return job, digest
 
 
-def _runner(
+PIPELINE = "name: relay_op_x\npkgs:\n- pkg_type: demo.hello\n  pkg_name: pkg\n"
+
+
+def _site(
     job: Path, env: dict[str, str], *args: str, mode: str = "run"
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["/bin/bash", "-c", RUNNER, "clio-relay-package", *args[:4], mode, *args[4:]],
+        ["/bin/bash", "-c", SITE_SCRIPT, "clio-relay-jarvis", mode, *args],
         cwd=job,
         env=env,
         capture_output=True,
@@ -83,179 +101,115 @@ def _runner(
     )
 
 
-def test_the_runner_builds_a_private_jarvis_pipeline_and_runs_it(tmp_path: Path) -> None:
+def _jarvis(tmp_path: Path) -> Path:
+    return _program(tmp_path / "bin", "jarvis", FAKE_JARVIS)
+
+
+def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
-    bin_dir = tmp_path / "bin"
-    _program(bin_dir, "jarvis", FAKE_JARVIS)
-    _program(bin_dir, "scontrol", "#!/bin/sh\nprintf 'n1\\nn2\\n'\n")
-    workdir = tmp_path / "work"
-    workdir.mkdir()
-    env = _env(tmp_path, bin_dir, SLURM_JOB_NODELIST="n[1-2]")
-    done = _runner(job, env, digest, "demo.hello", "jarvis", str(workdir), "out=r.txt", "n=2")
+    jarvis = _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == f"ran in {workdir}"
     root = job / ".relay-jarvis"
     log = (tmp_path / "jarvis.log").read_text().splitlines()
     assert log == [
         f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
         f"JARVIS_ROOT={root} repo add {root}/src/demo",
-        f"JARVIS_ROOT={root} hostfile set {root}/hostfile",
-        f"JARVIS_ROOT={root} ppl create relay_{digest[:12]}",
-        f"JARVIS_ROOT={root} ppl append demo.hello pkg out=r.txt n=2",
-        f"JARVIS_ROOT={root} ppl run",
+        f"JARVIS_ROOT={root} ppl submit {job}/{PIPELINE_FILE} --execution-id op_x +json",
     ]
-    assert (root / "hostfile").read_text() == "n1\nn2\n"
+    assert "sbatch" not in done.stdout
+    handle = parse_handle((job / SUBMISSION_FILE).read_text())
+    assert handle is not None and handle["execution_id"] == "op_x"
+    assert (job / EXITCODE_FILE).read_text() == "0\n"
+    assert (job / JARVIS_FILE).read_text() == f"{jarvis}\n"
     assert (root / "src" / "demo" / "demo" / "hello" / "pkg.py").is_file()
     assert (root / "src" / "schemas" / "package-contract.v1.json").is_file()
     assert not (root / "src" / "demo" / "demo" / "other").exists()
 
 
-def test_the_runner_runs_only_the_reviewed_bytes(tmp_path: Path) -> None:
+def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
-    bin_dir = tmp_path / "bin"
-    _program(bin_dir, "jarvis", FAKE_JARVIS)
-    env = _env(tmp_path, bin_dir)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_SUBMIT_RC="3")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 3
+    assert "sbatch said no" in done.stderr
+    assert not (job / SUBMISSION_FILE).exists()
+    assert (job / EXITCODE_FILE).read_text() == "3\n"
+
+
+def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == f"ran in {job}"
+    assert (job / PIPELINE_FILE).read_text() == PIPELINE
+    last = (tmp_path / "jarvis.log").read_text().splitlines()[-1]
+    assert last.endswith(f"ppl run yaml {job}/{PIPELINE_FILE} +json")
+
+
+def test_the_site_script_runs_only_the_reviewed_bytes(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    env = _env(tmp_path, tmp_path / "bin")
     archive = job / ".relay-package" / f"{digest}.tar.gz"
     archive.write_bytes(archive.read_bytes() + b"\0")
-    done = _runner(job, env, digest, "demo.hello", "jarvis", "")
-    assert done.returncode == 65
+    done = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE)
+    assert done.returncode == EXIT_DIGEST
     assert "not the reviewed" in done.stderr
     assert not (tmp_path / "jarvis.log").exists()
-    missing = _runner(job, env, "e" * 64, "demo.hello", "jarvis", "")
-    assert missing.returncode == 66
+    missing = _site(job, env, "e" * 64, "demo.hello", "jarvis", "", PIPELINE)
+    assert missing.returncode == EXIT_MISSING
 
 
-def test_the_runner_checks_the_name_and_the_layout(tmp_path: Path) -> None:
+def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
-    bin_dir = tmp_path / "bin"
-    _program(bin_dir, "jarvis", FAKE_JARVIS)
-    env = _env(tmp_path, bin_dir)
+    _jarvis(tmp_path)
+    env = _env(tmp_path, tmp_path / "bin")
     for bad in ("hello", "demo.hello.x", "demo.he-llo", "demo/x.hello"):
-        done = _runner(job, env, digest, bad, "jarvis", "")
-        assert done.returncode == 64, bad
+        done = _site(job, env, digest, bad, "jarvis", "", PIPELINE)
+        assert done.returncode == EXIT_USAGE, bad
         assert "is not <repo>.<package>" in done.stderr
-    wrong_repo = _runner(job, env, digest, "other.hello", "jarvis", "")
-    assert wrong_repo.returncode == 66
+    mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
+    assert mode.returncode == EXIT_USAGE
+    assert "mode up is not submit or run" in mode.stderr
+    unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
+    assert unnamed.returncode == EXIT_USAGE
+    assert "needs an execution id" in unnamed.stderr
+    wrong_repo = _site(job, env, digest, "other.hello", "jarvis", "", PIPELINE)
+    assert wrong_repo.returncode == EXIT_MISSING
     assert "no other/other directory" in wrong_repo.stderr
     assert not (tmp_path / "jarvis.log").exists()
 
 
-def test_the_runner_says_when_jarvis_is_missing(tmp_path: Path) -> None:
+def test_the_site_script_says_when_jarvis_is_missing(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
-    done = _runner(
-        job, _env(tmp_path, tmp_path / "bin"), digest, "demo.hello", "no-such-jarvis", ""
-    )
-    assert done.returncode == 69
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "no-such-jarvis", "op_x", PIPELINE, mode="submit")
+    assert done.returncode == EXIT_NO_JARVIS
     assert "no-such-jarvis is not on PATH" in done.stderr
+    written = json.loads((job / REFUSAL_FILE).read_text())
+    assert written == {
+        "missing": "jarvis",
+        "reason": "adapter_unavailable",
+        "tried": "no-such-jarvis",
+    }
+    refusal = missing_jarvis(done.stderr, site="lab")
+    assert refusal.reason == RefusalReason.ADAPTER_UNAVAILABLE
+    assert refusal.data == {"missing": "jarvis", "tried": "no-such-jarvis"}
 
 
-def test_the_runner_refuses_an_unknown_mode(tmp_path: Path) -> None:
-    job, digest = _job_dir(tmp_path)
-    bin_dir = tmp_path / "bin"
-    _program(bin_dir, "jarvis", FAKE_JARVIS)
-    done = _runner(job, _env(tmp_path, bin_dir), digest, "demo.hello", "jarvis", "", mode="up")
-    assert done.returncode == 64
-    assert "mode up is not run or service" in done.stderr
-    assert not (tmp_path / "jarvis.log").exists()
-
-
-def _service(tmp_path: Path, **extra: str) -> tuple[subprocess.Popen[str], Path]:
-    job, digest = _job_dir(tmp_path)
-    bin_dir = tmp_path / "bin"
-    _program(bin_dir, "jarvis", FAKE_JARVIS)
-    runner = subprocess.Popen(
-        ["/bin/bash", "-c", RUNNER, "clio-relay-package"]
-        + [digest, "demo.hello", "jarvis", "", "service", "port=1"],
-        cwd=job,
-        env=_env(tmp_path, bin_dir, **extra),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    return runner, tmp_path / "jarvis.log"
-
-
-def _wait_for(runner: subprocess.Popen[str], ready: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 60
-    while not ready():
-        assert runner.poll() is None, runner.communicate()
-        assert time.monotonic() < deadline, "the runner never got there"
-        time.sleep(0.1)
-
-
-def _commands(log: Path) -> list[str]:
-    return [line.split(" ", 1)[1] for line in log.read_text().splitlines()]
-
-
-def _finish(runner: subprocess.Popen[str]) -> str:
-    try:
-        _, err = runner.communicate(timeout=60)
-    finally:
-        if runner.poll() is None:
-            runner.kill()
-            runner.communicate()
-    return err
-
-
-def _sleeping_child(runner: subprocess.Popen[str]) -> int | None:
-    found = subprocess.run(
-        ["pgrep", "-x", "-P", str(runner.pid), "sleep"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    pids = found.stdout.split()
-    return int(pids[0]) if pids else None
-
-
-def test_a_service_package_starts_then_stops_when_told(tmp_path: Path) -> None:
-    runner, log = _service(tmp_path)
-    _wait_for(runner, lambda: _sleeping_child(runner) is not None)
-    time.sleep(0.5)
-    assert runner.poll() is None, "a service stays up after ppl start"
-    runner.send_signal(signal.SIGTERM)
-    err = _finish(runner)
-    assert runner.returncode == 0, err
-    commands = _commands(log)
-    assert commands[-3:] == ["ppl append demo.hello pkg port=1", "ppl start", "ppl stop"]
-    assert "ppl run" not in commands
-
-
-def test_a_service_stops_when_its_wait_is_killed(tmp_path: Path) -> None:
-    # A Tapis FORK cancel is `pkill -9 -P <launcher>`: it kills only the sleep.
-    runner, log = _service(tmp_path)
-    _wait_for(runner, lambda: _sleeping_child(runner) is not None)
-    sleeper = _sleeping_child(runner)
-    assert sleeper is not None
-    os.kill(sleeper, signal.SIGKILL)
-    err = _finish(runner)
-    assert runner.returncode == 0, err
-    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
-
-
-def test_a_failed_start_stops_and_keeps_its_code(tmp_path: Path) -> None:
-    runner, log = _service(tmp_path, JARVIS_START_RC="3")
-    err = _finish(runner)
-    assert runner.returncode == 3, err
-    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
-
-
-def test_a_stop_before_the_first_wait_still_stops(tmp_path: Path) -> None:
-    runner, log = _service(tmp_path, JARVIS_START_SLEEP="2")
-    _wait_for(runner, lambda: log.exists() and "ppl start" in log.read_text())
-    runner.send_signal(signal.SIGTERM)
-    err = _finish(runner)
-    assert runner.returncode == 0, err
-    assert "unbound" not in err
-    assert _commands(log)[-2:] == ["ppl start", "ppl stop"]
-
-
-def test_the_runner_expands_a_home_jarvis_path(tmp_path: Path) -> None:
+def test_the_site_script_expands_a_home_jarvis_path(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
     home = tmp_path / "home"
     _program(home / "jv" / "bin", "jarvis", FAKE_JARVIS)
     env = _env(tmp_path, tmp_path / "bin", HOME=str(home))
-    done = _runner(job, env, digest, "demo.hello", "~/jv/bin/jarvis", "")
+    done = _site(job, env, digest, "demo.hello", "~/jv/bin/jarvis", "", PIPELINE)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == f"ran in {job}"
 

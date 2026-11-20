@@ -85,16 +85,21 @@ Relay pins the newest staged version and its SHA-256 before anything is
 checked, so the review below is still of one exact archive. The agent can
 give `version`, or `version` and `sha256`, to pick another.
 
-Relay copies the archive to the site by its hash. A small runner script
+Relay copies the archive to the site by its hash. A small site script
 checks the hash again, unpacks the archive into the job directory, makes a
-private JARVIS environment for that job only, adds the package's repository,
-appends the package with the parameters, and runs the pipeline. Your own
-JARVIS configuration on the site is not touched.
+private JARVIS environment for that job only and adds the package's
+repository. Relay writes the pipeline, the package with its parameters, and
+on a batch site a `scheduler:` key with the job's nodes, processes per node,
+walltime, partition and account. JARVIS then submits it with
+`jarvis ppl submit`, so the batch job, its execution record and its hostfile
+are JARVIS's own. On a host with no scheduler the script runs the pipeline
+with `jarvis ppl run`. Your own JARVIS configuration on the site is not
+touched.
 
-A package started as a service (such as pvserver) does not end when it is
-ready. The runner starts the pipeline, keeps the job running, and stops the
-pipeline when relay stops the service. An application package runs the
-pipeline once, from start to stop.
+JARVIS 1.8.1 has no command to cancel or stop a submitted execution, so a
+running package job cannot be cancelled through relay yet, and a package
+started as a service (such as pvserver) is refused. Each refusal names the
+JARVIS command it needs.
 
 While a package job runs, and after it ends, `describe(job=...)` shows the
 latest step the package reported (`result.progress`) and its outputs, each
@@ -102,7 +107,7 @@ with its path on the site and, when the package declares one, its view
 descriptor. Relay reads them from the job's JARVIS records with the site's
 `files` verb, so this works the same on every adapter that has `files`.
 
-The runner exits with a clear code when something is wrong: 64 for a package
+The site script exits with a clear code when something is wrong: 64 for a package
 name that is not `<repository>.<package>`, 65 when the archive's hash does not
 match the reviewed one, 66 when the archive is missing or has no
 `<repository>/<repository>` directory, and 69 when `jarvis` is not on the

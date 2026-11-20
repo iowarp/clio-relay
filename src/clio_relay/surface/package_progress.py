@@ -1,7 +1,8 @@
 """A package job's live step and outputs, from its JARVIS execution records (RL40, RL43).
 
-Relay's package runner gives each job a private JARVIS root at
-``<job dir>/.relay-jarvis``, and JARVIS keeps each execution's records under
+Relay gives each package job a private JARVIS root at
+``<job dir>/.relay-jarvis`` (see :mod:`clio_relay.jarvis_submit`), and JARVIS
+keeps each execution's records under
 ``shared/<pipeline>/executions/<execution id>/``: ``progress/*.jsonl``, one
 ``jarvis.progress.v1`` line per step, and ``artifacts/*.jsonl``, one
 ``jarvis.artifact.v1`` line per change to an output. A package that follows the
@@ -22,6 +23,7 @@ import logging
 import posixpath
 from typing import Any, cast
 
+from clio_relay import jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.jobs.handles import (
     VIEW_METADATA,
@@ -165,36 +167,28 @@ def latest_step(lines: list[dict[str, Any]], execution: str) -> JobProgress | No
     )
 
 
-def artifact_outputs(lines: list[dict[str, Any]]) -> list[OutputRef]:
+def artifact_outputs(lines: list[dict[str, Any]], execution: str) -> list[OutputRef]:
     """Return each artifact's latest state as an output, with its view descriptor."""
     latest: dict[str, dict[str, Any]] = {}
     for line in lines:
         if line.get("schema_version") == ARTIFACT_SCHEMA and line.get("artifact_id"):
             latest[str(line["artifact_id"])] = line
-    outputs: list[OutputRef] = []
-    for item in latest.values():
-        path = _dict(item.get("location")).get("value")
-        if not isinstance(path, str) or not path:
-            continue
-        metadata: dict[str, Any] = {
-            key: item[key] for key in ("state", "format", "media_type") if item.get(key)
-        }
-        view = _dict(_dict(item.get("metadata")).get("clio")).get("view")
-        if isinstance(view, dict):
-            metadata[VIEW_METADATA] = view
-        outputs.append(
-            OutputRef(
-                name=str(item.get("logical_name") or item["artifact_id"]),
-                path=path,
-                size=_int(item.get("size_bytes")),
-                metadata=metadata,
-            )
-        )
+    outputs = [
+        output
+        for output in (jarvis_submit.artifact_output(item, execution) for item in latest.values())
+        if output is not None
+    ]
     return sorted(outputs, key=lambda output: output.name)
 
 
 def _known_execution(record: OperationRecord) -> str | None:
     found = _dict(_dict(_dict(record.result).get("progress")).get("data")).get(EXECUTION)
+    return found if isinstance(found, str) and found else None
+
+
+def _handle_execution(handle: JobHandle) -> str | None:
+    """The execution directory an adapter that submitted through JARVIS keeps in the handle."""
+    found = handle.data.get("execution_dir")
     return found if isinstance(found, str) and found else None
 
 
@@ -217,7 +211,11 @@ async def with_package_progress(
         return status
     try:
         files = await adapter.files()
-        execution = _known_execution(record) or await _execution(files, directory)
+        execution = (
+            _known_execution(record)
+            or _handle_execution(record.handle)
+            or await _execution(files, directory)
+        )
         if execution is None:
             return status
         steps, artifacts = await asyncio.gather(
@@ -228,7 +226,9 @@ async def with_package_progress(
         logger.debug("reading the package records of %s: %s", record.operation_id, exc)
         return status
     taken = {output.name for output in status.outputs}
-    added = [output for output in artifact_outputs(artifacts) if output.name not in taken]
+    added = [
+        output for output in artifact_outputs(artifacts, execution) if output.name not in taken
+    ]
     update: dict[str, Any] = {"outputs": [*status.outputs, *added]}
     progress = latest_step(steps, execution)
     if progress is not None:

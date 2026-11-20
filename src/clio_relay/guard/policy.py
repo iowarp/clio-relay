@@ -31,7 +31,8 @@ from clio_relay.guard import execlist
 from clio_relay.guard.config import SiteGuard, load_config
 from clio_relay.guard.reviews import REVIEW_KIND, Review, ReviewStore
 from clio_relay.guard.warm import WARM_EXECUTABLE, holder_job, is_warm
-from clio_relay.jarvis_site import ArchiveInfo, package_job, read_archive
+from clio_relay.jarvis_site import ArchiveInfo, read_archive
+from clio_relay.jarvis_submit import direct_job
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -318,4 +319,4 @@ class Guard:
                 package = package.model_copy(update={"service": True})
                 return spec.model_copy(update={"package": package})
             return spec
-        return package_job(spec, jarvis=settings.jarvis, service=service)
+        return direct_job(spec, jarvis=settings.jarvis)
