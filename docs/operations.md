@@ -1,7 +1,7 @@
 # Operations
 
 Most people never need this page. An agent reaches a cluster through relay's
-five tools, and a `worker` site places and signs in its own worker the first
+tools, and a `worker` site places and signs in its own worker the first
 time it is used (see [the worker adapter](adapters/worker.md)). There are no
 commands to install, start or stop the worker by hand.
 
@@ -113,3 +113,29 @@ rebuilding ParaView takes hours. Pass `--remove-spack` to delete it too, and
 `--yes` to approve on the command line. It refuses while a job of the site
 still runs. The next call signs in and deploys everything again. Every live
 proof starts with it, so deployment is tested each time.
+
+## Stage and remove packages
+
+`run` takes only packages relay has staged, so a package is staged before its
+first run. The catalog and the archives live on the relay host, under relay's
+state directory, not on any site: `site clean` leaves them alone, and staging
+deploys nothing. The `packages` tool does it over MCP:
+
+```json
+{"op": "stage", "package": "clio_jarvis.xcompact3d"}
+{"op": "stage", "package": "demo.hello", "git": "https://example.org/demo", "commit": "4f2a9c1"}
+{"op": "stage", "package": "demo.hello", "dir": "/home/me/src/demo"}
+{"op": "list"}
+{"op": "remove", "package": "clio_jarvis.xcompact3d"}
+```
+
+With only a package name, relay stages it from its pinned clio-jarvis commit
+(the result's `default_source`). A git source is fetched on the relay host at
+exactly that commit, never a branch, with no prompt for credentials. A `dir`
+is a directory on the relay host. Each call returns `relay.packages.v1`: what
+it staged or removed, and the catalog after it. Removing takes every version
+of the package out of the catalog unless `version` or `sha256` narrows it, and
+drops each archive from the content store unless an unfinished operation still
+needs it (`archive_kept`). `python -m clio_relay.packages stage` and `list` do
+the same from a shell. See [guarded sites](guarded-sites.md#running-a-package)
+for how a guarded site reviews a staged package.

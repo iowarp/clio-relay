@@ -24,15 +24,15 @@ from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
 
-from .a2ui_host import VERBS, Host, a2ui_client, basic_client, said
+from .a2ui_host import TOOLS, Host, a2ui_client, basic_client, said
 from .conftest import add_site
 
 
-def test_plain_clients_see_the_five_verbs_and_no_tab(relay_paths: RelayPaths) -> None:
+def test_plain_clients_see_the_tools_and_no_tab(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
         for mode in ("auto", "legacy"):
             async with Client(create_server(relay_paths), mode=mode) as client:
-                assert {tool.name for tool in await client.list_tools()} == VERBS
+                assert {tool.name for tool in await client.list_tools()} == TOOLS
                 uris = {str(item.uri) for item in await client.list_resources()}
                 assert TAB_URI not in uris
                 contents = await client.read_resource(TAB_URI)
@@ -51,10 +51,10 @@ def test_a2ui_clients_see_app_only_tools_that_refuse_without_a_token(
     async def scenario() -> None:
         async with basic_client(relay_paths) as client:
             tools = {tool.name: tool for tool in await client.list_tools()}
-            assert set(tools) == VERBS | set(ACTIONS)
+            assert set(tools) == TOOLS | set(ACTIONS)
             for name in ACTIONS:
                 assert (tools[name].meta or {}).get("ui", {}).get("visibility") == ["app"]
-            for name in VERBS:
+            for name in TOOLS:
                 assert "visibility" not in (tools[name].meta or {}).get("ui", {})
             uris = {str(item.uri) for item in await client.list_resources()}
             assert TAB_URI in uris

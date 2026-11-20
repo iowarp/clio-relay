@@ -2,8 +2,9 @@
 
 This folder is relay's plugin for CLIO. Installing it gives CLIO:
 
-- relay's MCP server, launched from `mcp.json`, with the five tools `describe`,
-  `run`, `exec`, `files` and `serve`;
+- relay's MCP server, launched from `mcp.json`, with the five verbs `describe`,
+  `run`, `exec`, `files` and `serve`, plus `packages` (stage the packages `run`
+  takes) and `shutdown`;
 - the Compute page in CLIO's left bar, where a person adds, probes, edits and
   removes compute endpoints (relay's sites) and picks each one's protocol,
   security and spending (ask before every job, above N node-hours, or always

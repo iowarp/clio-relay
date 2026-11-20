@@ -46,14 +46,29 @@ anywhere else the site lets relay write, does not ask.
 
 A package is one JARVIS package from a JARVIS repository, such as
 `clio_jarvis.gray_scott` from clio-jarvis, or one the agent writes with the
-JARVIS package skill. Whoever runs relay stages it once, on the relay machine:
+JARVIS package skill. It is staged once, on the relay machine. An agent stages
+it with relay's `packages` tool:
+
+- `packages(op="stage", package="clio_jarvis.gray_scott")` fetches relay's
+  pinned clio-jarvis commit and stages the package from it;
+- `git` and `commit` (and `path`, when the JARVIS repository sits deeper in
+  the checkout) stage from another git repository at one fixed commit;
+- `dir` stages from a directory on the relay machine, such as the person's
+  workspace;
+- `op="list"` shows what is staged, and `op="remove"` takes a package out of
+  the catalog (every version, unless `version` or `sha256` narrows it). Its
+  archive leaves the content store too, unless an unfinished operation still
+  needs it.
+
+Staging runs nothing and touches no site, so it asks nobody; the review below
+is where a guarded site's person decides. From a shell, the same is:
 
 ```powershell
 python -m clio_relay.packages stage ~/src/clio-jarvis/clio_jarvis clio_jarvis.gray_scott
 ```
 
-That builds the package's archive, puts it in relay's content store and adds
-it to relay's package catalog. It prints the name, the version, the archive's
+Either way relay builds the package's archive, puts it in relay's content store and adds
+it to relay's package catalog. It reports the name, the version, the archive's
 SHA-256 and where it came from (repository, tag, commit, and whether the
 checkout had uncommitted changes). The archive holds the package's own
 directory, the repository's shared Python modules, and the `schemas/`

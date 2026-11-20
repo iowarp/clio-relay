@@ -28,7 +28,9 @@ GENERAL = (
     "Relay runs work on the sites in its sites file. Call describe first. "
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
     "exec runs one short command; files lists, reads, writes and stages files; "
-    "serve starts a service. Refusals carry a typed reason in structuredContent.refusal. "
+    "serve starts a service; packages lists the JARVIS packages relay can run and stages "
+    "one (from git at a commit, or a directory on the relay host) before its first run. "
+    "Refusals carry a typed reason in structuredContent.refusal. "
     "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
     "it is also the resource relay://sites/<site>/skill, which files cannot read."
 )

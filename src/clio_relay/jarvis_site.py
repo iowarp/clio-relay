@@ -263,9 +263,9 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
         raise Refusal(
             RefusalReason.INPUT_MISSING,
             f"the archive of {name} ({digest}) is not in relay's content store, so nobody can "
-            "review what would run. Stage it with `python -m clio_relay.packages stage "
-            "<repository dir> <package>`, or stage the file with the files "
-            "verb on a local site, then run again",
+            "review what would run. Stage it with the packages tool: "
+            'packages(op="stage", package="<repo.package>"), from git at a commit or from a '
+            "directory on the relay host (dir), then run again",
             digest=digest,
             package=name,
         )

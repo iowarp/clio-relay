@@ -73,6 +73,8 @@ from clio_relay.surface.progress import latest_note, observation_line
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.skills import SkillResources
+from clio_relay.surface.staging import PackagesArgs
+from clio_relay.surface.staging import packages as packages_op
 from clio_relay.wording import with_article
 
 PROTOCOL_VERSION = "2026-07-28"
@@ -732,6 +734,65 @@ class RelayServer:
                     recursive=recursive,
                     digest=digest,
                 ),
+            )
+
+        @server.tool(
+            name="packages",
+            title="List, stage and remove the packages relay can run",
+            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+        )
+        async def packages(  # pyright: ignore[reportUnusedFunction]
+            op: Literal["list", "stage", "remove"],
+            package: Annotated[
+                str | None, Field(description="<repository>.<package>, for stage and remove")
+            ] = None,
+            git: Annotated[
+                str | None,
+                Field(description="Stage from this git repository; give commit with it"),
+            ] = None,
+            commit: Annotated[
+                str | None, Field(description="The commit to stage from git, 7 to 40 hex digits")
+            ] = None,
+            path: Annotated[
+                str | None,
+                Field(description="Where the JARVIS repository sits in the git checkout"),
+            ] = None,
+            dir: Annotated[  # noqa: A002 - the source is a directory
+                str | None,
+                Field(description="Stage from this absolute directory on the relay host"),
+            ] = None,
+            version: Annotated[
+                str | None,
+                Field(
+                    description="stage: when the package has no contract version or tag. "
+                    "remove: only this version"
+                ),
+            ] = None,
+            sha256: Annotated[str | None, Field(description="remove: only this archive")] = None,
+        ) -> ToolResult:
+            """run needs a staged package: stage one before its first run. stage builds the
+            package's archive from git at one commit (git, commit; with neither, relay's
+            pinned clio-jarvis) or from dir, a directory on the relay host, and adds it to
+            relay's catalog. list shows what is staged; remove takes a package out (version
+            or sha256 narrow it). Staging runs nothing: a guarded site reviews the archive
+            by its SHA-256 before its first run there."""
+            arguments = PackagesArgs(
+                op=op,
+                package=package,
+                git=git,
+                commit=commit,
+                path=path,
+                dir=dir,
+                version=version,
+                sha256=sha256,
+            )
+            try:
+                result = await packages_op(relay.service, arguments)
+            except Refusal as refusal:
+                return refusal_result(refusal)
+            return ToolResult(
+                content=[mcp_types.TextContent(type="text", text=_text(result))],
+                structured_content=result,
             )
 
         async def serve(

@@ -1,6 +1,7 @@
 # Architecture
 
-Relay is an MCP server with five tools, a command line, and a set of adapters
+Relay is an MCP server with seven tools (the five verbs, `packages` and
+`shutdown`), a command line, and a set of adapters
 that each know one way into a site. This page follows a call from the agent to
 the site and back.
 
@@ -8,7 +9,7 @@ the site and back.
 flowchart LR
     agent[Agent or person] -->|MCP or CLI| surface
     subgraph relay[clio-relay]
-        surface[surface: five tools and the Compute tab] --> service[RelayService]
+        surface[surface: tools and the Compute tab] --> service[RelayService]
         service --> guard[guard hook]
         service --> asks[asks hook]
         service --> serve[serve hook]
@@ -21,8 +22,10 @@ flowchart LR
 
 ## A call, top to bottom
 
-1. **Surface.** `surface/server.py` serves the tools `describe`, `run`,
-   `exec`, `files` and `serve` over stdio or Streamable HTTP. `run` and `serve`
+1. **Surface.** `surface/server.py` serves the verbs `describe`, `run`,
+   `exec`, `files` and `serve` over stdio or Streamable HTTP, with `packages`
+   (list, stage and remove the packages `run` takes, `surface/staging.py`) and
+   `shutdown` beside them. `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the

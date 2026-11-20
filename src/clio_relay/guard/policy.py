@@ -61,7 +61,8 @@ PROCEED = (
     "it lists them: ask the person which one and give its version or sha256. For a "
     "package relay does "
     "not have yet (a new one written with the JARVIS package skill), stage it first with "
-    "`python -m clio_relay.packages stage <repository dir> <repo.package>`. The person "
+    'the packages tool: packages(op="stage", package="<repo.package>"), from git at a '
+    "commit or from a directory on the relay host (dir). The person "
     "reviews each package once, by its hash, before it runs."
 )
 

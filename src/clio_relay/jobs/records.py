@@ -147,6 +147,14 @@ class RecordStore[RecordT: BaseModel]:
             Path(tmp).unlink(missing_ok=True)
             raise
 
+    def delete(self, record_id: str) -> bool:
+        """Remove the record. Return whether it was there."""
+        try:
+            self._path(record_id).unlink()
+        except (FileNotFoundError, ValueError):
+            return False
+        return True
+
     def ids(self) -> list[str]:
         """Return every stored id, oldest file first."""
         if not self.root.is_dir():

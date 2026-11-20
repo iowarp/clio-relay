@@ -51,7 +51,7 @@ async def test_a_free_form_run_on_a_guarded_site_is_refused_with_the_way_on(guar
     assert decision.data["next_step"] == "package_review"
     assert "reviewed JARVIS packages" in (decision.message or "")
     assert "describe(site=...)" in decision.data["how"]
-    assert "clio_relay.packages stage" in decision.data["how"]
+    assert 'packages(op="stage"' in decision.data["how"]
     with pytest.raises(Refusal) as raised:
         decision.raise_if_refused()
     assert raised.value.reason == RefusalReason.POLICY_REFUSED
@@ -62,7 +62,7 @@ async def test_a_package_relay_has_not_got_cannot_be_reviewed(guard: Guard) -> N
     with pytest.raises(Refusal) as raised:
         await guard.check_run(site(), package_spec("a" * 64))
     assert raised.value.reason == RefusalReason.INPUT_MISSING
-    assert "clio_relay.packages stage" in raised.value.message
+    assert 'packages(op="stage"' in raised.value.message
 
 
 @pytest.mark.asyncio

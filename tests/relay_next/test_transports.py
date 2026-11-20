@@ -144,7 +144,15 @@ def test_stdio_task(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
         async with FastMCPClient(transport, mode="auto") as client:
             tools = {tool.name for tool in await client.list_tools()}
-            assert tools == {"describe", "run", "exec", "files", "serve"}
+            assert tools == {
+                "describe",
+                "run",
+                "exec",
+                "files",
+                "serve",
+                "packages",
+                "shutdown",
+            }
             task = await call_tool_task(client, "run", {"site": "fx", "spec": ECHO})
             result = await task.result()
             assert result.structured_content is not None
@@ -237,6 +245,8 @@ def test_plain_mcp_client_over_stdio(relay_paths: RelayPaths, mode: str) -> None
                 "exec",
                 "files",
                 "serve",
+                "packages",
+                "shutdown",
             }
             for site in ("open", "spend", "sso"):
                 ran = await client.call_tool("run", {"site": site, "spec": ECHO, "wait_s": 60})
