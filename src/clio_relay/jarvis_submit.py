@@ -67,7 +67,7 @@ SCRIPT_FILE = "relay-jarvis.sh"
 SUBMISSION_FILE = "relay.submission.json"
 """The ``jarvis.execution.handle.v1`` line ``ppl submit`` printed."""
 REFUSAL_FILE = "relay.refusal.json"
-"""Written when the site has no JARVIS: ``{"reason", "missing", "tried"}``."""
+"""Written when the site has no JARVIS, or no Spack for it: ``{"reason", "missing", "tried"}``."""
 EXITCODE_FILE = "relay.exitcode"
 JARVIS_FILE = "relay.jarvis"
 """The JARVIS program the site script found, for the ``execution`` commands later."""
@@ -314,6 +314,11 @@ def steps_digest(spec: JobSpec) -> str:
     """Return the sha256 of the sorted package archive digests: the pipeline's software."""
     digests = sorted({step.pinned()[1] for step in steps_of(spec)})
     return hashlib.sha256(",".join(digests).encode()).hexdigest()
+
+
+def package_names(steps: list[PackageRef]) -> dict[str, str]:
+    """Map each step's ``pkg_name`` (:func:`step_names`) to its package's name."""
+    return dict(zip(step_names(steps), (step.name for step in steps), strict=True))
 
 
 def step_names(steps: list[PackageRef]) -> list[str]:
@@ -620,6 +625,7 @@ if [ "$mode" = install ]; then
   [ $# -ge 1 ] || fail 64 "an install needs the answers"
   printf '%s\n' "$1" > "$answers.tmp" && mv -f "$answers.tmp" "$answers"
   shift
+  [ $# -eq 0 ] || pipeline="$job/relay.install-pipeline.yaml"
 fi
 [ $# -eq 0 ] || printf '%s' "$1" > "$pipeline"
 [ -f "$pipeline" ] || fail 66 "the pipeline $pipeline is missing"
@@ -706,7 +712,23 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
     [ -d "$root/src/$repo/$repo" ] || fail 66 "the archive of $name has no $repo/$repo directory"
     case $repos in *" $repo "*) ;; *) repos="$repos$repo " ;; esac
   done
-  for repo in $repos; do "$found" repo add "$root/src/$repo" >/dev/null; done
+  for repo in $repos; do
+    requirements="$root/src/$repo/.clio-relay-requirements.txt"
+    # Relay installs a repository's Python requirements only into its own jarvis-cd,
+    # never into the environment of a JARVIS the site's setting names.
+    if [ -z "$jarvis" ] && [ -s "$requirements" ]; then
+      pip="${found%/*}/pip"
+      [ -x "$pip" ] || pip="${found%/*}/venv/bin/pip"
+      [ -x "$pip" ] || fail 69 "relay's jarvis-cd at ${found%/*} has no pip"
+      "$pip" install --disable-pip-version-check --no-input -r "$requirements" \
+        >>"$job/relay.requirements.log" 2>&1 || {
+        tail -n 20 "$job/relay.requirements.log" >&2
+        listed_now=$(tr '\n' ' ' < "$requirements")
+        fail 1 "installing the Python requirements of $repo failed: $listed_now"
+      }
+    fi
+    "$found" repo add "$root/src/$repo" >/dev/null
+  done
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi
 [ -f "$answers" ] && export JARVIS_INSTALL_ANSWERS="$answers"
@@ -739,6 +761,13 @@ else
 fi
 printf '%s\n' "$out"
 [ "$rc" -ne 3 ] || report
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'spack is not available'; then
+  tried=$(printf '%s' "$spack_root" | sed 's/[\\"]/\\&/g')
+  printf '{"missing":"spack","reason":"adapter_unavailable","tried":"%s"}\n' "$tried" \
+    > "$job/relay.refusal.json"
+  cat "$job/relay.refusal.json" >&2
+  exit 69
+fi
 [ "$rc" -eq 0 ] || exit "$rc"
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
@@ -761,19 +790,27 @@ become ``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR``
 ``JARVIS_SPACK_CONFIG`` (only when that directory is there). The script unsets
 ``JARVIS_ALLOW_LOCAL_BUILD``: relay never builds outside a job. It unpacks the
 archives into the job's private
-JARVIS root and registers each repository once, once per set of archives, and
+JARVIS root and registers each repository once, once per set of archives. Before
+it registers one whose archive lists Python requirements
+(:data:`~clio_relay.jarvis_site.REQUIREMENTS_FILE`), it installs them with relay's
+jarvis-cd ``pip`` (only for relay's own JARVIS, logged in
+``relay.requirements.log``), and fails with exit 1 when that install fails. Then it
 hands the pipeline to JARVIS:
 
 - ``submit`` runs ``ppl submit`` under ``JARVIS_INSTALL_ON_LOAD=check`` and keeps
   the handle line as ``relay.submission.json``;
 - ``install`` (the answers JSON comes first) keeps the answers as
   ``relay.answers.json``, runs ``ppl install ... +submit`` and keeps the handle
-  line as ``relay.install.json``;
+  line as ``relay.install.json``. A pipeline YAML given to ``install`` is the
+  install job's own (:func:`install_pipeline`), kept as
+  ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was;
 - ``run`` runs ``ppl run`` in place.
 
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
-and exits 3. Answers already given reach every check through
+and exits 3. When JARVIS stops because it finds no Spack to install with, the
+script writes ``relay.refusal.json`` with ``missing: spack`` and the CLIO Spack
+path it offered, and exits 69. Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
 allocation) passes through unchanged; relay reports it with
 :func:`build_refused` and never retries it. The exit code is also written to
@@ -835,12 +872,53 @@ def submit_command(
     return _site_command(spec, arguments, script=script, home=home)
 
 
+INSTALL_WALLTIME_S = 4 * 3600
+"""The default walltime of the job JARVIS builds a package's software in."""
+
+INSTALL_WALLTIME_HELP = (
+    "The walltime, in seconds, of the one-node job JARVIS builds a package's software in. "
+    "A build outlasts most runs, so it does not take the run's walltime, unless the run's "
+    "is longer. Keep it within the site's partition limit"
+)
+
+INSTALL_PIPELINE_FILE = "relay.install-pipeline.yaml"
+"""The pipeline the install job builds with, beside the run's :data:`PIPELINE_FILE`."""
+
+
+def install_walltime(spec: JobSpec, walltime_s: int) -> str:
+    """Return the install job's Slurm walltime: ``walltime_s``, or the run's when longer."""
+    walltime = timedelta(seconds=walltime_s)
+    duration = spec.attributes.duration
+    if duration is not None and duration > walltime:
+        walltime = duration
+    return slurm_time(walltime)
+
+
+def install_pipeline(document: Mapping[str, object], spec: JobSpec, *, walltime_s: int) -> str:
+    """Render the pipeline the install job builds with, from the run's ``document``.
+
+    JARVIS's install job keeps the pipeline's scheduler walltime, so the run's
+    (often minutes) would cut a build short. This one has
+    :func:`install_walltime` instead, and no ``pre_cmds``: the install job
+    serves nothing, so a package service's connector does not start in it.
+    """
+    found = document.get("scheduler")
+    if not isinstance(found, Mapping):
+        return render_pipeline(document)
+    scheduler = {
+        key: value for key, value in cast(Mapping[str, object], found).items() if key != "pre_cmds"
+    }
+    scheduler["time"] = install_walltime(spec, walltime_s)
+    return render_pipeline({**document, "scheduler": scheduler})
+
+
 def install_command(
     spec: JobSpec,
     *,
     operation_id: str,
     jarvis: str,
     answers: Mapping[str, Any],
+    pipeline: str | None = None,
     script: str = SCRIPT_FILE,
     home: str | None = None,
 ) -> str:
@@ -849,7 +927,9 @@ def install_command(
     It runs in the job directory after a submit exited 3, with the person's
     ``answers`` (:func:`answers_document`). The install job is
     ``install_execution_id(operation_id)`` in the operation's pipeline; ``home`` is
-    as in :func:`submit_command`.
+    as in :func:`submit_command`. ``pipeline`` is the YAML of
+    :func:`install_pipeline`, which the site script keeps as
+    :data:`INSTALL_PIPELINE_FILE`; without it the install builds with the run's.
     """
     arguments = site_arguments(
         spec,
@@ -857,12 +937,13 @@ def install_command(
         jarvis=jarvis,
         execution=install_execution_id(operation_id),
         answers=answers,
+        pipeline=pipeline,
     )
     return _site_command(spec, arguments, script=script, home=home)
 
 
 BOOTSTRAP_SCRIPT = r"""set -eu
-home=$1 pin=$2 source=$3
+home=$1 pin=$2 source=$3 want=${4:-}
 case $home in
   "~") home=$HOME ;;
   "~/"*) home="$HOME/${home#??}" ;;
@@ -873,14 +954,95 @@ dir="$home/jarvis-cd"
 mkdir -p "$dir"
 log="$dir/install.log"
 : > "$log"
-python=${CLIO_RELAY_PYTHON:-python3}
-command -v "$python" >/dev/null 2>&1 || { echo "no $python on this site" >&2; exit 69; }
-"$python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
-  || { echo "jarvis-cd needs Python 3.11 or newer; $python is older" >&2; exit 69; }
+
+# Find a Python 3.11 or newer that can build a venv with pip over https.
+check='import sys
+v = "%d.%d.%d" % sys.version_info[:3]
+if sys.version_info < (3, 11):
+    print(v)
+    sys.exit(1)
+try:
+    import ensurepip, ssl, venv
+except ImportError as e:
+    print(v + " without " + (e.name or "a module it needs"))
+    sys.exit(1)
+print(v)'
+tried="" python="" from="" libs=""
+note() { tried="${tried:+$tried; }$1"; }
+try_program() {
+  local name=$1 p v
+  case $name in "~/"*) name="$HOME/${name#??}" ;; esac
+  p=$(command -v "$name" 2>/dev/null) || { note "$1: not found"; return 1; }
+  if v=$("$p" -c "$check" 2>/dev/null); then python=$p from=$1; return 0; fi
+  note "$1: ${v:-does not run}"
+  return 1
+}
+# A site's modules are set up by its login profile, so they are asked in a login shell.
+login() { bash -lc "$1" clio-relay-python "${@:2}" </dev/null 2>/dev/null || true; }
+try_module() {
+  local out p lib v
+  out=$(login 'module load "$1" >/dev/null 2>&1 || exit 0
+p=$(command -v python3) || exit 0
+printf "@@py %s\n@@lib %s\n" "$p" "${LD_LIBRARY_PATH:-}"' "$1")
+  p=$(printf '%s\n' "$out" | sed -n 's/^@@py //p' | tail -n 1)
+  lib=$(printf '%s\n' "$out" | sed -n 's/^@@lib //p' | tail -n 1)
+  [ -n "$p" ] || { note "module $1: does not load a python3"; return 1; }
+  if v=$("$p" -c "$check" 2>/dev/null); then python=$p from="module $1"; return 0; fi
+  if v=$(env LD_LIBRARY_PATH="$lib" "$p" -c "$check" 2>/dev/null); then
+    python=$p from="module $1" libs=$lib
+    return 0
+  fi
+  note "module $1: ${v:-does not run}"
+  return 1
+}
+python_modules() {
+  login 'type module >/dev/null 2>&1 || exit 0; module -t avail 2>&1' \
+    | tr -d '\r' | sed -E 's/\(.*\)//; s/[[:space:]]+$//' \
+    | grep -E '(^|/)[Pp]ython[0-9.]*/[0-9][^/[:space:]]*$' \
+    | awk -F/ '{ print $NF, length($0), $0 }' \
+    | { sort -k1,1Vr -k2,2n 2>/dev/null || sort -r; } \
+    | awk '!seen[$1]++ { print $3 }' || true
+}
+find_python() {
+  local name m
+  try_program python3 && return 0
+  for name in $(compgen -c python3. | grep -E '^python3\.[0-9]+$' | sort -u -V -r); do
+    try_program "$name" && return 0
+  done
+  m=$(python_modules)
+  [ -n "$m" ] || { note "modules: none named python"; return 1; }
+  for name in $m; do try_module "$name" && return 0; done
+  return 1
+}
+how="Name one in the site's jarvis_python setting: a path, or module:<name>"
+need="jarvis-cd needs Python 3.11 or newer"
+case $want in
+  "")
+    find_python || {
+      echo "$need, and relay found none on this site. Tried $tried. $how" >&2
+      exit 69
+    } ;;
+  module:*)
+    try_module "${want#module:}" || {
+      echo "$need, and the site's jarvis_python setting ($want) gave none: $tried" >&2
+      exit 69
+    } ;;
+  *)
+    try_program "$want" || {
+      echo "$need, and the site's jarvis_python setting ($want) gave none: $tried" >&2
+      exit 69
+    } ;;
+esac
+[ -z "$libs" ] || export LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+echo "python: $python ($from)" >>"$log"
+
 # A fresh environment of relay's own each time: a new pin never keeps an old jarvis-cd,
 # and a failed install leaves no jarvis behind.
-rm -rf "$dir/venv" "$dir/pin" "$dir/jarvis"
+rm -rf "$dir/venv" "$dir/pin" "$dir/jarvis" "$dir/python" "$dir/pip"
 target="$dir/venv/bin/jarvis"
+# jarvis-cd takes its version from git (setuptools-scm), and an archive has no .git, so
+# the build is told one that names the pin.
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_JARVIS_CD="0+g${pin:0:12}"
 if ! { "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install --upgrade pip >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; } \
@@ -888,26 +1050,81 @@ if ! { "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
   tail -n 40 "$log" >&2
   exit 1
 fi
-ln -sfn "$target" "$dir/jarvis"
+if [ -n "$libs" ]; then
+  # The interpreter runs only with its module's libraries. JARVIS's jobs run that same
+  # interpreter (the venv's), and inherit them from the jarvis that submits them.
+  wrapper='#!/bin/sh\nexport LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\n'
+  printf "$wrapper"'exec %s "$@"\n' "$(printf '%q' "$libs")" "$(printf '%q' "$target")" \
+    > "$dir/jarvis"
+  printf "$wrapper"'exec %s -m pip "$@"\n' "$(printf '%q' "$libs")" \
+    "$(printf '%q' "$dir/venv/bin/python")" > "$dir/pip"
+  chmod +x "$dir/jarvis" "$dir/pip"
+else
+  ln -sfn "$target" "$dir/jarvis"
+  printf '#!/bin/sh\nexec %s -m pip "$@"\n' "$(printf '%q' "$dir/venv/bin/python")" > "$dir/pip"
+  chmod +x "$dir/pip"
+fi
+printf '%s\n' "$python" > "$dir/python"
 printf '%s\n' "$pin" > "$dir/pin"
-printf '{"jarvis":"%s","pin":"%s","log":"%s"}\n' "$dir/jarvis" "$pin" "$log"
+printf '{"jarvis":"%s","pin":"%s","log":"%s","python":"%s","from":"%s"}\n' \
+  "$dir/jarvis" "$pin" "$log" "$python" "$from"
 """
 """Install jarvis-cd under the CLIO site home. ``bash -c BOOTSTRAP_SCRIPT <$0> <home>
-<pin> <source>`` (:func:`bootstrap_arguments`).
+<pin> <source> [python]`` (:func:`bootstrap_arguments`).
 
-It makes a fresh virtual environment from the site's ``python3`` (3.11 or
-newer) and installs jarvis-cd at the pinned commit's source archive into it,
-never into the user's own site-packages. It links the program at
-``<home>/jarvis-cd/jarvis`` (:func:`bootstrap_path`), writes the pin beside it
-and prints ``{"jarvis", "pin", "log"}``, all by absolute path. A relative
-``home`` is from the home directory. The log is ``<home>/jarvis-cd/install.log``.
-It exits 69 when the site has no usable Python and 1 when the install fails.
+It finds a Python 3.11 or newer with ``ssl``, ``venv`` and ``ensurepip``. With
+the site's ``jarvis_python`` setting (``python``) it uses only what that names:
+a program (a path, ``~/...``, or a name on ``PATH``), or ``module:<name>``, an
+environment module to load. Otherwise it tries ``python3``, then each
+``python3.<minor>`` on ``PATH``, newest first, then the site's modules named
+``python``, newest first, loaded in a login shell because the site's profile
+sets modules up.
+
+It makes a fresh virtual environment from that interpreter and installs
+jarvis-cd at the pinned commit's source archive into it, never into the user's
+own site-packages. The archive has no git metadata, so the build gets the
+version ``0+g<pin>``. JARVIS's jobs run the venv's interpreter, so they use the
+same Python. A module's interpreter that runs only with the module's libraries
+gets ``<home>/jarvis-cd/jarvis`` as a wrapper that exports them; otherwise that
+is a link to the venv's ``jarvis`` (:func:`bootstrap_path`). Beside it,
+``<home>/jarvis-cd/pip`` runs the venv's pip the same way, for the packages'
+Python requirements. It writes the pin
+and the interpreter beside it and prints ``{"jarvis", "pin", "log", "python",
+"from"}``, by absolute path. A relative ``home`` is from the home directory.
+The log is ``<home>/jarvis-cd/install.log``. It exits 69, naming what it
+tried, when the site has no usable Python, and 1 when the install fails.
 """
 
+PYTHON_SETTING_HELP = (
+    "The Python 3.11 or newer relay builds its jarvis-cd from: a path, ~/..., a name on "
+    "PATH, or module:<name> for an environment module. Leave empty: relay tries python3, "
+    "then python3.<minor> on PATH, then the site's python modules, newest first"
+)
+"""The description of an adapter's ``jarvis_python`` setting (:func:`explicit_python`)."""
 
-def bootstrap_arguments(home: str) -> list[str]:
-    """Return :data:`BOOTSTRAP_SCRIPT`'s arguments after ``$0`` for the site home."""
-    return [home, JARVIS_PIN, JARVIS_SOURCE]
+_MODULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
+
+
+def explicit_python(value: str) -> str:
+    """Check an adapter's ``jarvis_python`` setting; empty means relay finds one."""
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("module:"):
+        if _MODULE.fullmatch(value.removeprefix("module:")) is None:
+            raise ValueError(f"jarvis_python {value!r} must name a module, as module:<name>")
+        return value
+    if value.startswith("-") or any(ch.isspace() for ch in value):
+        raise ValueError(f"jarvis_python {value!r} must be one program, or module:<name>")
+    return value
+
+
+def bootstrap_arguments(home: str, python: str = "") -> list[str]:
+    """Return :data:`BOOTSTRAP_SCRIPT`'s arguments after ``$0`` for the site home.
+
+    ``python`` is the site's ``jarvis_python`` setting (:func:`explicit_python`).
+    """
+    return [home, JARVIS_PIN, JARVIS_SOURCE, python]
 
 
 def direct_job(
@@ -1266,7 +1483,9 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
     """The refusal for a submit that exited 69: ``relay.refusal.json`` or stderr.
 
     Relay offers to install its pinned jarvis-cd when its own is missing or at
-    another pin; a path the site's setting names is the site's to fix.
+    another pin; a path the site's setting names is the site's to fix. A site
+    with no Spack for JARVIS to install with (``missing: spack``) is the site's
+    to fix too: relay offers no install.
     """
     written: dict[str, Any] = {}
     for line in reversed(text.splitlines()):
@@ -1278,6 +1497,16 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
             written = cast(dict[str, Any], found)
             break
     tried = str(written.get("tried") or "the site home")
+    if written.get("missing") == "spack":
+        return Refusal(
+            RefusalReason.ADAPTER_UNAVAILABLE,
+            f"{site} has no Spack for JARVIS to install the package with: relay looked for "
+            f"a Spack checkout at {tried} (its share/spack/setup-env.sh) and JARVIS found no "
+            "spack on the site's PATH. Prepare a Spack checkout there, or make spack "
+            "available on the site, then run again",
+            missing="spack",
+            tried=tried,
+        )
     if written.get("explicit"):
         return Refusal(
             RefusalReason.ADAPTER_UNAVAILABLE,
@@ -1313,10 +1542,13 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
     )
 
 
-def bootstrap_command(home: str) -> str:
-    """Return the shell command that runs :data:`BOOTSTRAP_SCRIPT` for the site home."""
+def bootstrap_command(home: str, python: str = "") -> str:
+    """Return the shell command that runs :data:`BOOTSTRAP_SCRIPT` for the site home.
+
+    ``python`` is the site's ``jarvis_python`` setting, as in :func:`bootstrap_arguments`.
+    """
     return shlex.join(
-        ["bash", "-c", BOOTSTRAP_SCRIPT, "clio-relay-jarvis", *bootstrap_arguments(home)]
+        ["bash", "-c", BOOTSTRAP_SCRIPT, "clio-relay-jarvis", *bootstrap_arguments(home, python)]
     )
 
 
@@ -1439,16 +1671,22 @@ def blocking_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     return blocking
 
 
-def install_summary(report: Mapping[str, Any]) -> dict[str, Any]:
+def install_summary(
+    report: Mapping[str, Any], names: Mapping[str, str] | None = None
+) -> dict[str, Any]:
     """Return what the install reuses and what it builds, per package.
 
     ``reuse`` names the packages the site already has; ``build`` lists the others,
-    with the spec and how many of its dependencies are missing.
+    with the spec and how many of its dependencies are missing. JARVIS reports a
+    package by its pipeline step (``pkg_name``); ``names`` (:func:`package_names`)
+    turns that back into the package.
     """
+    names = names or {}
     reuse: list[str] = []
     build: list[dict[str, Any]] = []
     for method, installer in _dict(report.get("installers")).items():
-        for name, package in _dict(_dict(installer).get("packages")).items():
+        for step, package in _dict(_dict(installer).get("packages")).items():
+            name = names.get(step, step)
             entry = _dict(package)
             if entry.get("status") == "satisfied":
                 reuse.append(name)
@@ -1467,9 +1705,19 @@ def install_summary(report: Mapping[str, Any]) -> dict[str, Any]:
     return {"reuse": sorted(reuse), "build": build, "issues": len(_issues(report))}
 
 
-def install_message(report: Mapping[str, Any], *, site: str, package: str) -> str:
-    """Return the approval question for installing the package's software on the site."""
-    summary = install_summary(report)
+def install_message(
+    report: Mapping[str, Any],
+    *,
+    site: str,
+    package: str,
+    names: Mapping[str, str] | None = None,
+    walltime: str | None = None,
+) -> str:
+    """Return the approval question for installing the package's software on the site.
+
+    ``walltime`` is the install job's, when the adapter reported it.
+    """
+    summary = install_summary(report, names)
     built: list[str] = []
     for item in summary["build"]:
         detail = item["spec"] or item["package"]
@@ -1489,7 +1737,8 @@ def install_message(report: Mapping[str, Any], *, site: str, package: str) -> st
         parts.append("Built: " + ", ".join(built) + ".")
     if summary["issues"]:
         parts.append(f"JARVIS has {summary['issues']} question(s) for you after this.")
-    parts.append("JARVIS installs it as a job on the site before the run. Install it?")
+    job = f"a one-node job of up to {walltime}" if walltime else "a job"
+    parts.append(f"JARVIS installs it as {job} on the site before the run. Install it?")
     return " ".join(parts)
 
 
@@ -1546,8 +1795,11 @@ def choice_message(issue: Mapping[str, Any]) -> str:
     return f"{text} Options: {'. '.join(lines)}." if lines else text
 
 
-def install_needed(report: Mapping[str, Any], *, site: str) -> Refusal:
-    """The refusal for a submit that exited 3: the software is missing or needs a choice."""
+def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None = None) -> Refusal:
+    """The refusal for a submit that exited 3: the software is missing or needs a choice.
+
+    ``walltime`` is the install job's (:func:`install_walltime`), for the ask.
+    """
     summary = install_summary(report)
     message = (
         f"the package's software is not installed on {site}: JARVIS builds "
@@ -1556,12 +1808,14 @@ def install_needed(report: Mapping[str, Any], *, site: str) -> Refusal:
     if not summary["build"] and choice_issues(report):
         kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})
         message = f"JARVIS needs a choice on {site} before the run ({', '.join(kinds)})"
+    extra: dict[str, Any] = {"install_walltime": walltime} if walltime else {}
     return Refusal(
         RefusalReason.NEEDS_APPROVAL,
         message,
         needs=NEEDS_INSTALL,
         install_report=dict(report),
         summary=summary,
+        **extra,
     )
 
 

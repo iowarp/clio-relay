@@ -20,13 +20,18 @@ def spack_keeps(home: str) -> list[str]:
 
 
 def prune_script(targets: list[str], keep: list[str]) -> str:
-    """Return the bash that removes ``targets`` on a site, sparing ``keep``.
+    """Return the shell command that removes ``targets`` on a site, sparing ``keep``.
 
     A path is absolute, ``~`` or ``~/...``, or relative to the home directory.
     ``keep`` entries may hold ``*`` globs. It never removes the home directory, ``/``
     or an ancestor of the home, and prints ``removed``, ``kept``, ``absent`` or
-    ``refused`` and a path on each line.
+    ``refused`` and a path on each line. The prune itself is bash, so the command
+    is ``bash -c <prune>``: it runs the same under ``sh`` (dash) or a login shell.
     """
+    return shlex.join(["bash", "-c", _prune_bash(targets, keep), "clio-relay-prune"])
+
+
+def _prune_bash(targets: list[str], keep: list[str]) -> str:
     quoted_targets = " ".join(shlex.quote(item) for item in targets)
     quoted_keep = " ".join(shlex.quote(item) for item in keep)
     return f"""set -u
@@ -66,6 +71,10 @@ prune() {{
     for child in "$1"/*; do prune "$child"; done
     return
   fi
+  if rm -rf -- "$1" 2>/dev/null; then printf 'removed\\t%s\\n' "$1"; return; fi
+  # Tools like JARVIS leave read-only directories; the person owns them, so
+  # make the tree writable and try once more.
+  [ -L "$1" ] || chmod -R u+w -- "$1" 2>/dev/null
   if rm -rf -- "$1"; then printf 'removed\\t%s\\n' "$1"; else printf 'refused\\t%s\\n' "$1"; fi
 }}
 for target in {quoted_targets}; do

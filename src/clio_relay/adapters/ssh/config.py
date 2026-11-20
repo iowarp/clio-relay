@@ -46,6 +46,12 @@ class SshConfig(BaseModel):
         ),
     )
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+    jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
+    install_walltime_s: int = Field(
+        default=jarvis_submit.INSTALL_WALLTIME_S,
+        ge=60,
+        description=jarvis_submit.INSTALL_WALLTIME_HELP,
+    )
     interactive_sign_in: bool = Field(
         default=False,
         description=(
@@ -82,3 +88,8 @@ class SshConfig(BaseModel):
     @classmethod
     def _jarvis_path(cls, value: str) -> str:
         return jarvis_submit.explicit_jarvis(value)
+
+    @field_validator("jarvis_python")
+    @classmethod
+    def _jarvis_python(cls, value: str) -> str:
+        return jarvis_submit.explicit_python(value)

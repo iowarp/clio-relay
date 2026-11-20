@@ -99,6 +99,11 @@ def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, arch
         lines.append(f"  {item.sha256[:12]}  {item.size:>8}  {item.path}{mode}")
     if len(info.files) > _MAX_LISTED_FILES:
         lines.append(f"  ... and {len(info.files) - _MAX_LISTED_FILES} more")
+    if info.requirements:
+        lines.append(
+            "Python requirements relay installs from PyPI into its jarvis-cd environment on "
+            f"the site: {', '.join(info.requirements)}"
+        )
     if package.parameters:
         shown = ", ".join(f"{key}={value}" for key, value in sorted(package.parameters.items()))
         lines.append(f"Parameters for this run: {shown}")

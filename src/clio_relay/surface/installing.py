@@ -133,14 +133,19 @@ async def ask_install(
                 OperationState.FAILED,
                 jarvis_submit.install_blocked(blocking, site=site.title),
             )
-        state["summary"] = jarvis_submit.install_summary(report)
+        names = jarvis_submit.package_names(job_of(record).steps())
+        state["summary"] = jarvis_submit.install_summary(report, names)
         state["report_digest"] = jarvis_submit.report_digest(report)
         asks.append(
             await provider.approve(
                 site=site,
                 operation_id=operation_id,
                 message=jarvis_submit.install_message(
-                    report, site=site.title, package=_what(job_of(record))
+                    report,
+                    site=site.title,
+                    package=_what(job_of(record)),
+                    names=names,
+                    walltime=cast(str | None, refusal.data.get("install_walltime")),
                 ),
                 binding={
                     **binding,
