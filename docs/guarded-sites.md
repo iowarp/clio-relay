@@ -81,9 +81,20 @@ instead of an executable, by name:
 }
 ```
 
-Relay pins the newest staged version and its SHA-256 before anything is
-checked, so the review below is still of one exact archive. The agent can
-give `version`, or `version` and `sha256`, to pick another.
+When only one version of that name is staged, relay pins it and its SHA-256
+before anything is checked, so the review below is still of one exact archive.
+When several are staged, relay does not guess: `run` refuses with the
+candidates (version, SHA-256, when each was staged), and the agent asks you
+which one and gives `version`, or `version` and `sha256`.
+
+Before anything is asked or submitted, relay checks the job's layout against
+what the site reports in `describe(site=...)` for its partition: the node
+count, ranks per node times threads per rank against the physical cores, the
+memory per node (up to 90% of a node's), and the walltime against the
+partition's limit. A job that does not fit is refused with the limits, so the
+agent can size it again. The agent can say why it chose the layout, with up
+to four alternatives, in the run's `sizing`; the spend question then shows a
+"Why" line and the alternatives.
 
 Relay copies the archive to the site by its hash. A small site script
 checks the hash again, unpacks the archive into the job directory, makes a
@@ -114,7 +125,9 @@ its `host_slice` parameter.
 
 When the site lacks software the packages need, or JARVIS is not on the site
 at all, relay asks you before it installs anything, and the install runs as
-its own job before the run. Nothing is submitted until you say yes.
+its own job before the run. Nothing is submitted until you say yes. Nothing
+is built on a site's login node: JARVIS refuses a build outside an allocation
+(exit 4), and relay reports that as a refusal and never retries it.
 
 While a package job runs, and after it ends, `describe(job=...)` shows the
 latest step the package reported (`result.progress`) and its outputs, each
@@ -122,7 +135,8 @@ with its path on the site and, when the package declares one, its view
 descriptor. Relay reads them from the job's JARVIS records with the site's
 `files` verb, so this works the same on every adapter that has `files`.
 
-The site script exits with a clear code when something is wrong: 64 for a package
+The site script exits with a clear code when something is wrong: 4 when JARVIS
+refused to build outside an allocation, 64 for a package
 name that is not `<repository>.<package>`, 65 when the archive's hash does not
 match the reviewed one, 66 when the archive is missing or has no
 `<repository>/<repository>` directory, and 69 when `jarvis` is not on the

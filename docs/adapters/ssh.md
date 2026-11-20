@@ -153,20 +153,41 @@ directories made before the submit, and the bound interpreter and
 A pipeline can have several packages, such as a ParaView server and the
 simulation it watches. They share one allocation, and each package's
 `host_slice` parameter (for example `"0:12"` and `"12:16"`) says which of its
-nodes the package gets. `start_mode` passes through the same way.
+nodes the package gets. `start_mode` passes through the same way. When a
+package is served, relay's connector (which publishes the port and releases
+an idle service) runs on the first node of that package's `host_slice`, where
+its rank 0 listens, through `srun --overlap` inside JARVIS's own allocation.
+The service can sit on any nodes of the allocation, not only the first ones.
 
 The submit first checks that the site has the software the packages need.
 When it does not, nothing is submitted. Relay asks you to approve the install
 (what JARVIS reuses and what it builds), then asks one question for each
 choice JARVIS cannot make alone, such as which of two compilers to build
 with. JARVIS then installs the software as its own job,
-`jarvis ppl install +submit`. `describe(job=...)` follows the install log and
+`jarvis ppl install +submit`, on compute nodes. Nothing is built on the login
+node: when JARVIS refuses a build outside an allocation (exit 4,
+`build_outside_allocation`), relay reports it as `policy_refused` and does not
+retry it. `describe(job=...)` follows the install log and
 its progress for as long as the install takes, then relay submits the run.
 Your answers and the Spack environment are kept under the CLIO site home, at
 `jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
 archives, so the next run of the same packages reuses them. Two installs into
 one environment take turns; the second shows `waiting_env_lock` until the
 first is done.
+
+When the CLIO Spack is on the site (`<home>/spack`, made by clio-kit's
+`spack_prepare_site`), relay tells JARVIS to use it with `JARVIS_SPACK_ROOT`,
+and with `JARVIS_SPACK_CONFIG` for its own configuration in
+`<home>/spack-config`. Each is set only when it is there.
+
+On Slurm, `describe(site=...)` also reports each partition, read live from
+`sinfo`: nodes, CPUs and physical cores per node, memory, the time limit, and
+how many nodes are idle or allocated. It reports the site's MPI facts as
+`mpi`: Slurm's MPI plugins and default, the `mpiexec` on the path with its
+version and prefix, and Open MPI's launcher components. Each read is short and
+times out after 20 seconds. On a guarded site, relay checks a job's layout
+against its partition before it asks anything (see
+[guarded sites](../guarded-sites.md)).
 
 The `jarvis` setting names the command on the site (default `jarvis`). When
 nothing is there, relay asks before it installs jarvis-cd at a pinned commit

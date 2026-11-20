@@ -113,8 +113,40 @@ Verb = Literal["describe", "run", "exec", "files", "serve"]
 VERBS: tuple[Verb, ...] = get_args(Verb)
 
 
+class PartitionInfo(BaseModel):
+    """One batch partition (queue) of a site, as its scheduler reports it live.
+
+    Per-node figures are what every node of the partition has: the smallest
+    when its nodes differ. ``max_time_s`` is None when the partition has no
+    limit or relay could not read it; ``max_time`` is the scheduler's own text.
+    """
+
+    name: str
+    default: bool = False
+    nodes: int = 0
+    cpus_per_node: int | None = None
+    sockets: int | None = None
+    cores_per_socket: int | None = None
+    threads_per_core: int | None = None
+    physical_cores: int | None = Field(default=None, description="sockets x cores per socket")
+    memory_mb: int | None = None
+    max_time: str | None = None
+    max_time_s: int | None = None
+    allocated: int = 0
+    idle: int = 0
+    other: int = Field(default=0, description="down, drained or otherwise not usable")
+    gres: list[str] = Field(default_factory=list[str])
+    features: list[str] = Field(default_factory=list[str])
+
+
 class SiteInfo(BaseModel):
-    """What an adapter reports about its site."""
+    """What an adapter reports about its site.
+
+    ``partitions`` are the batch partitions with their limits and live node
+    counts, empty when the adapter cannot read them. ``mpi`` is what the site
+    offers for MPI (the scheduler's MPI plugins, the ``mpiexec`` on the PATH),
+    for the person and the agent sizing a run.
+    """
 
     adapter: str
     address: str | None = None
@@ -122,6 +154,8 @@ class SiteInfo(BaseModel):
     queues: list[str] = Field(default_factory=list[str])
     accounts: list[str] = Field(default_factory=list[str])
     limits: dict[str, Any] = Field(default_factory=dict[str, Any])
+    partitions: list[PartitionInfo] = Field(default_factory=list[PartitionInfo])
+    mpi: dict[str, Any] = Field(default_factory=dict[str, Any])
     facts: dict[str, Any] = Field(default_factory=dict[str, Any])
     verbs: list[Verb] = Field(default_factory=list[Verb])
 

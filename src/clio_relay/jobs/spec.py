@@ -149,7 +149,10 @@ class PackageRef(_Spec):
     version: str | None = Field(
         default=None,
         min_length=1,
-        description="Leave out to use the newest version relay has (describe(site=) lists them)",
+        description=(
+            "Leave out when relay has one archive of the package; with several, relay "
+            "refuses and lists them, so pin one (describe(site=) lists them)"
+        ),
     )
     sha256: str | None = Field(
         default=None,
@@ -181,6 +184,33 @@ class PackageRef(_Spec):
         return self.version, self.sha256
 
 
+class Layout(_Spec):
+    """A way to lay a job out on the allocation: what the agent chose, or an alternative."""
+
+    nodes: int = Field(ge=1)
+    ranks_per_node: int | None = Field(default=None, ge=1)
+    threads_per_rank: int | None = Field(default=None, ge=1)
+    walltime_s: float | None = Field(default=None, gt=0)
+    memory_mb: int | None = Field(default=None, ge=1, description="Per node")
+    queue: str | None = None
+    note: str | None = Field(default=None, description="Why not this one, in a few words")
+
+
+class Sizing(_Spec):
+    """Why a job asks for its layout, and what else was weighed. The spend ask shows it."""
+
+    rationale: str = Field(
+        min_length=1,
+        max_length=600,
+        description="Why these nodes, ranks and walltime, e.g. the grid and the partition",
+    )
+    alternatives: list[Layout] = Field(
+        default_factory=list[Layout],
+        max_length=4,
+        description="Other layouts that would work, each with a note",
+    )
+
+
 class JobSpec(_Spec):
     """A job, in PSI/J terms, plus relay's inputs and package reference."""
 
@@ -207,6 +237,13 @@ class JobSpec(_Spec):
             "allocation. Give each its nodes with the host_slice parameter, e.g. '0:12'"
         ),
     )
+    sizing: Sizing | None = Field(
+        default=None,
+        description=(
+            "Why the job asks for its nodes, ranks per node and walltime, and the "
+            "alternatives. The person sees them in the spend ask"
+        ),
+    )
 
     @model_validator(mode="after")
     def _one_entry_point(self) -> Self:
@@ -229,10 +266,13 @@ class JobSpec(_Spec):
         return self.model_copy(update={"package": None, "packages": steps})
 
     def dump(self) -> dict[str, Any]:
-        """Return the JSON form. ``packages`` is left out when empty, so older digests hold."""
+        """Return the JSON form. Empty ``packages`` and ``sizing`` are left out, so older
+        digests hold."""
         data = self.model_dump(mode="json")
         if not data.get("packages"):
             data.pop("packages", None)
+        if data.get("sizing") is None:
+            data.pop("sizing", None)
         return data
 
     def digest(self) -> str:

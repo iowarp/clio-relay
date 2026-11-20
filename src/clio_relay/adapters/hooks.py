@@ -8,7 +8,7 @@ the name ``asks``, ``guard`` or ``serve``. A factory takes a
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.metadata import EntryPoint, entry_points
@@ -22,7 +22,7 @@ from clio_relay.adapters.base import BaseAdapter, SignInNeed
 from clio_relay.jobs.handles import Endpoint, JobStatus, utc_now
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
+from clio_relay.jobs.spec import JobSpec, Layout, PackageRef, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
 
 if TYPE_CHECKING:
@@ -150,8 +150,39 @@ class MountsPages(Protocol):
         ...
 
 
+class ChargeStep(BaseModel):
+    """The allocation's nodes one step of a pipeline gets."""
+
+    package: str
+    host_slice: str | None = Field(default=None, description="None: all the nodes")
+    nodes: int | None = Field(default=None, description="None when the slice depends on the size")
+
+
+def charge_steps(steps: Sequence[PackageRef], allocation: int) -> list[ChargeStep]:
+    """Return the nodes each step of a pipeline gets, of an ``allocation``-node job."""
+    from clio_relay.packages import node_range
+
+    shares: list[ChargeStep] = []
+    for step in steps:
+        host_slice = step.nodes()
+        found = node_range(step)
+        if host_slice is None:
+            nodes: int | None = allocation
+        else:
+            nodes = None if found is None else found[1] - found[0]
+        shares.append(ChargeStep(package=step.name, host_slice=host_slice, nodes=nodes))
+    return shares
+
+
 class Charge(BaseModel):
-    """What a job may cost, as the spend gate shows it (RL25)."""
+    """What a job may cost and how it is laid out, as the spend gate shows it (RL25).
+
+    The layout (nodes, ranks per node, threads, memory, walltime, each step's
+    nodes) is what the job asks the scheduler for. ``rationale`` and
+    ``alternatives`` are the job's ``sizing``: why that layout, and what else
+    would work. The approval binds the whole charge, so the person approves this
+    layout and no other.
+    """
 
     site: str
     queue: str | None = None
@@ -159,10 +190,31 @@ class Charge(BaseModel):
     nodes: int
     ranks_per_node: int | None = Field(default=None, description="None when the job leaves it out")
     ranks: int | None = Field(default=None, description="All processes, None when left out")
+    threads_per_rank: int | None = Field(default=None, description="None when left out")
+    memory_mb: int | None = Field(default=None, description="Per node, None when left out")
     walltime_s: float | None = Field(default=None, description="None when no walltime is set")
     node_hours: float | None = Field(default=None, description="None when unknown")
     amount: float | None = None
     unit: str = "node-hours"
+    steps: list[ChargeStep] = Field(default_factory=list[ChargeStep])
+    rationale: str | None = None
+    alternatives: list[Layout] = Field(default_factory=list[Layout])
+
+    def with_layout(self, spec: JobSpec) -> Charge:
+        """Return a copy with ``spec``'s threads, memory, steps and sizing filled in."""
+        resources = spec.resources
+        steps = spec.steps()
+        sizing = spec.sizing
+        return self.model_copy(
+            update={
+                "threads_per_rank": self.threads_per_rank or resources.cpu_cores_per_process,
+                "memory_mb": self.memory_mb
+                or (None if resources.memory is None else -(-resources.memory // 2**20)),
+                "steps": self.steps or (charge_steps(steps, self.nodes) if len(steps) > 1 else []),
+                "rationale": self.rationale or (sizing.rationale if sizing else None),
+                "alternatives": self.alternatives or (sizing.alternatives if sizing else []),
+            }
+        )
 
 
 class GuardDecision(BaseModel):

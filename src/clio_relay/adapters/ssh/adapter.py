@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from pydantic import BaseModel
 
 from clio_relay import jarvis_submit
+from clio_relay.adapters import slurm_facts
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.hooks import Charge
 from clio_relay.adapters.ssh import pricing, scripts, signals, slurm_paths, store
@@ -177,11 +178,15 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
         cpus = first("cpus")
         queues = sorted({line.strip() for line in sections.get("queues", []) if line.strip()})
+        partitions = slurm_facts.partitions(sections.get("partitions", []))
+        scheduler = first("scheduler") or "none"
         return SiteInfo(
             adapter=self.name,
             address=self.config.ssh_profile,
-            scheduler=first("scheduler") or "none",
-            queues=queues,
+            scheduler=scheduler,
+            queues=queues or [partition.name for partition in partitions],
+            partitions=partitions,
+            mpi=slurm_facts.mpi(sections) if scheduler == "slurm" else {},
             facts={
                 "host": first("host"),
                 "os": first("os"),
@@ -307,6 +312,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 raise jarvis_submit.missing_jarvis(error, site=self.config.ssh_profile)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_DECISION):
                 raise self._install_needed(output)
+            if jarvis_mode and rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
+                raise jarvis_submit.build_refused(
+                    output + "\n" + error, site=self.config.ssh_profile
+                )
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
                 f"{self.config.ssh_profile} refused the job: {error or 'no output'}",
@@ -812,6 +821,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             raise jarvis_submit.missing_jarvis(output, site=self.config.ssh_profile)
         if rc == str(jarvis_submit.EXIT_DECISION):
             raise self._install_needed(output)
+        if rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
+            raise jarvis_submit.build_refused(output, site=self.config.ssh_profile)
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
         if rc != "0" or handle is None:
             raise Refusal(

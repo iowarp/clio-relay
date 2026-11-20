@@ -310,7 +310,7 @@ class RelayService:
             raise not_run_here(adapter_name)
         decision = await self.guard.check_run(site, job)
         decision.raise_if_refused()
-        charge = await self.guard.price(site, job)
+        charge = (await self.guard.price(site, job)).with_layout(job)
         operation_id = new_id("op")
         result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
         if skipped:

@@ -23,14 +23,16 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import AdapterContext, BaseAdapter
+from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo
 from clio_relay.adapters.hooks import Charge, GuardDecision, HookContext
-from clio_relay.guard import execlist
+from clio_relay.guard import execlist, limits
 from clio_relay.guard.config import SiteGuard, load_config
 from clio_relay.guard.reviews import REVIEW_KIND, Review, ReviewStore
 from clio_relay.guard.warm import WARM_EXECUTABLE, holder_job, is_warm
@@ -45,11 +47,19 @@ from clio_relay.sites.routing import route
 
 _MAX_LISTED_FILES = 40
 _PRICE: str = "price"  # an optional adapter method (sky); not on BaseAdapter
+_log = logging.getLogger(__name__)
+
+DESCRIBE_TTL_S = 600.0
+"""How long the guard keeps a site's partitions before it reads them again."""
+DESCRIBE_TIMEOUT_S = 60.0
+"""How long the guard waits for a site's ``describe`` before it skips the layout check."""
 
 PROCEED = (
     "Pick a JARVIS package for the work: describe(site=...) lists the packages relay has, "
     "with their parameters. Call run with `package: {name, parameters}` instead of an "
-    "executable; relay pins the newest version and its SHA-256. For a package relay does "
+    "executable; relay pins the one archive it has of that name. When it has several, "
+    "it lists them: ask the person which one and give its version or sha256. For a "
+    "package relay does "
     "not have yet (a new one written with the JARVIS package skill), stage it first with "
     "`python -m clio_relay.packages stage <repository dir> <repo.package>`. The person "
     "reviews each package once, by its hash, before it runs."
@@ -120,6 +130,7 @@ class Guard:
         self.operations: RecordStore[OperationRecord] = RecordStore(
             context.state_dir / "operations", OperationRecord
         )
+        self._described: dict[str, tuple[float, SiteInfo | None]] = {}
 
     def settings(self, site: SiteEntry) -> SiteGuard:
         """Return the site's guard settings from ``guard.yaml``."""
@@ -139,6 +150,36 @@ class Guard:
     # check_run
 
     async def check_run(self, site: SiteEntry, spec: JobSpec) -> GuardDecision:
+        info = await self.site_info(site)
+        unfit = None if info is None else limits.check(spec, info)
+        if unfit is not None:
+            reason, message, data = unfit
+            return GuardDecision(
+                allowed=False, reason=reason, message=message, data={"site": site.id, **data}
+            )
+        return await self._check_run(site, spec)
+
+    async def site_info(self, site: SiteEntry) -> SiteInfo | None:
+        """Return the site's ``describe``, read again after :data:`DESCRIBE_TTL_S`.
+
+        None when the adapter cannot describe the site now: the job's layout is
+        then not checked, and the scheduler has the last word.
+        """
+        now = time.monotonic()
+        cached = self._described.get(site.id)
+        if cached is not None and now - cached[0] < DESCRIBE_TTL_S:
+            return cached[1]
+        found: SiteInfo | None = None
+        try:
+            adapter = self._adapter(site)
+            if adapter is not None and "describe" in adapter.implements:
+                found = await asyncio.wait_for(adapter.describe(), DESCRIBE_TIMEOUT_S)
+        except Exception as error:  # noqa: BLE001 - any failure only skips the check
+            _log.info("not checking the layout on %s: %s", site.id, error)
+        self._described[site.id] = (now, found)
+        return found
+
+    async def _check_run(self, site: SiteEntry, spec: JobSpec) -> GuardDecision:
         if is_warm(spec):
             if spec.arguments:
                 return GuardDecision(
@@ -271,23 +312,33 @@ class Guard:
     async def _adapter_price(self, site: SiteEntry, spec: JobSpec) -> Charge | None:
         """Ask the adapter that would run ``spec`` for its price, when it has one (sky)."""
         try:
-            name, config, _skipped = route(site, "run")
-            cls = registry.load(name)
+            adapter = self._adapter(site)
         except Refusal:
             return None
-        if not callable(getattr(cls, _PRICE, None)):
+        if adapter is None or not callable(getattr(adapter, _PRICE, None)):
+            return None
+        price = cast(Callable[[JobSpec], object], getattr(adapter, _PRICE))
+        result: object = price(spec)
+        if inspect.isawaitable(result):
+            result = await result
+        return result if isinstance(result, Charge) else None
+
+    def _adapter(self, site: SiteEntry) -> BaseAdapter[Any] | None:
+        """Build the adapter that would run a job on ``site``, or None when none loads."""
+        try:
+            name, config, _skipped = route(site, "run")
+            registry.load(name)
+        except Refusal:
             return None
         context = AdapterContext(
             site_id=site.id,
             state_dir=self.context.state_dir / "sites" / site.id / name,
             content=self.content,
         )
-        adapter = registry.build(name, config, context)
-        price = cast(Callable[[JobSpec], object], getattr(adapter, _PRICE))
-        result: object = price(spec)
-        if inspect.isawaitable(result):
-            result = await result
-        return result if isinstance(result, Charge) else None
+        try:
+            return registry.build(name, config, context)
+        except (Refusal, ValueError):
+            return None
 
     # prepare
 
@@ -327,7 +378,9 @@ class Guard:
         if not adapter.runs_packages:
             # A package never becomes relay's own job: JARVIS submits it.
             raise not_run_here(adapter.name)
-        if service and not all(step.service for step in steps):
+        if service and not any(step.service for step in steps):
             # The whole pipeline is the service: relay keeps it up until it is stopped.
+            # Steps the request marked keep their marks: the connector runs on the
+            # first node of their host_slice, where their rank 0 serves the ports.
             return spec.with_steps([step.model_copy(update={"service": True}) for step in steps])
         return spec

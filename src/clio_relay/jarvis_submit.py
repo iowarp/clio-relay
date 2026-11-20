@@ -95,7 +95,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "811dde8072dc2267080dc013e69110a9670c1baa"
+JARVIS_PIN = "96283b3f7ff1a5f5ee0a825f74f62ba1978b924e"
 """The jarvis-cd commit relay installs on a site that has none."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -109,9 +109,20 @@ DECISIONS_ENV = "CLIO_RELAY_JARVIS_DECISIONS"
 """The file the site script exports as ``JARVIS_SPACK_DECISIONS``."""
 SPACK_ENV_ENV = "CLIO_RELAY_JARVIS_SPACK_ENV"
 """The directory the site script exports as ``JARVIS_SPACK_ENV_DIR``."""
+SPACK_DIR = "spack"
+"""The CLIO Spack checkout, relative to the CLIO site home (clio-kit's ``spack_prepare_site``)."""
+SPACK_CONFIG_DIR = "spack-config"
+"""The CLIO Spack's own user configuration, relative to the CLIO site home."""
+SPACK_ROOT_ENV = "CLIO_RELAY_SPACK_ROOT"
+"""The Spack the site script exports as ``JARVIS_SPACK_ROOT`` when it is there."""
+SPACK_CONFIG_ENV = "CLIO_RELAY_SPACK_CONFIG"
+"""The directory the site script exports as ``JARVIS_SPACK_CONFIG`` when it is there."""
 
 EXIT_DECISION = 3
 """JARVIS needs to install software, or a decision, before the job can run."""
+EXIT_BUILD_REFUSED = 4
+"""JARVIS refused to build outside an allocation (``refused.kind: build_outside_allocation``).
+Relay builds only through ``ppl install +submit``, so this is a refusal, never a retry."""
 EXIT_USAGE = 64
 """A bad mode, package name or execution id."""
 EXIT_DIGEST = 65
@@ -197,6 +208,12 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     archives (:func:`steps_digest`): the job's JARVIS root and pipeline are per
     operation, so JARVIS's own per-pipeline ``decisions.yaml`` and ``spack.lock``
     would be forgotten, and a repeat run would concretize again.
+
+    The CLIO Spack, ``<home>/spack`` with its configuration in
+    ``<home>/spack-config``, is offered too. The site script exports it as
+    ``JARVIS_SPACK_ROOT`` (and ``JARVIS_SPACK_CONFIG``) only when the checkout
+    has ``share/spack/setup-env.sh``, so a site without one keeps JARVIS's own
+    lookup (``SPACK_ROOT``).
     """
     if not home:
         return {}
@@ -205,6 +222,8 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
         FALLBACK_ENV: bootstrap_path(home),
         DECISIONS_ENV: posixpath.join(kept, "decisions.yaml"),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
+        SPACK_ROOT_ENV: posixpath.join(home, SPACK_DIR),
+        SPACK_CONFIG_ENV: posixpath.join(home, SPACK_CONFIG_DIR),
     }
 
 
@@ -383,14 +402,65 @@ def is_service(spec: JobSpec) -> bool:
     return any(step.service for step in spec.steps())
 
 
+def slice_start(step: PackageRef) -> int:
+    """Return the first allocation host of a step's ``host_slice``, as JARVIS indexes it.
+
+    No slice is the whole allocation, so 0. A negative start counts from the
+    end, as in Python. JARVIS refuses a malformed slice when it loads the
+    pipeline, so one here is taken as 0.
+    """
+    value = step.nodes()
+    match = re.fullmatch(r"\s*(-?\d*):(-?\d*)\s*", value) if value is not None else None
+    if match is None or not match.group(1):
+        return 0
+    return int(match.group(1))
+
+
+def service_step(spec: JobSpec) -> PackageRef:
+    """Return the step whose first host serves the ports: the service steps' first.
+
+    Rank 0 of that step listens on the ports, on the first host of its
+    ``host_slice``, wherever the slice sits in the allocation. Service steps
+    that start on different hosts are refused: relay could not tell which one
+    serves the ports.
+    """
+    steps = [step for step in steps_of(spec) if step.service]
+    if not steps:
+        raise ValueError("not a package service")
+    starts = sorted({slice_start(step) for step in steps})
+    if len(starts) > 1:
+        raise Refusal(
+            RefusalReason.INVALID_SPEC,
+            "the pipeline's service steps start on different nodes "
+            f"({', '.join(f'{step.name} at {slice_start(step)}' for step in steps)}); "
+            "set service: true on the one step that serves the ports",
+            field="packages",
+        )
+    return steps[0]
+
+
+_SLICE_HOST = (
+    'h=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk -v s={start} '
+    "'{{ h[NR - 1] = $0 }} END {{ if (s < 0) s += NR; if (s >= 0 && s < NR) print h[s] }}'); "
+    'if [ -z "$h" ]; then echo "no host {start} in the allocation $SLURM_JOB_NODELIST"; '
+    "exit 1; fi; "
+)
+
+
 def connector_command(spec: JobSpec, *, job_dir: str) -> str:
-    """Return the ``pre_cmds`` line that starts the connector beside the batch shell.
+    """Return the ``pre_cmds`` line that starts the connector on the service's first host.
 
     The connector reads ``serve/ports`` and ``serve/secrets.env``, runs frpc
-    with restarts, writes ``serve/ready.json`` once the ports listen on the
-    batch host, writes ``serve/idle`` after the idle release and ends with the
-    batch shell. Its settings are arguments, so they do not depend on the
-    environment JARVIS gives the batch shell.
+    with restarts, writes ``serve/ready.json`` once the ports listen on its
+    host, writes ``serve/idle`` after the idle release and ends with the job.
+    Its settings are arguments, so they do not depend on the environment JARVIS
+    gives the batch shell.
+
+    It runs where the service step's rank 0 listens: the first host of its
+    ``host_slice`` (:func:`service_step`). When that is the allocation's first
+    host it runs beside the batch shell. Otherwise it is a one-task step of the
+    job, ``srun --overlap`` on that host, which Slurm ends with the job. Either
+    way it runs on a compute node, inside the allocation JARVIS submitted.
     """
     env = spec.environment
     job = shlex.quote(job_dir)
@@ -402,7 +472,12 @@ def connector_command(spec: JobSpec, *, job_dir: str) -> str:
         ]
     )
     log = shlex.quote(posixpath.join(job_dir, "serve", "connect.log"))
-    return f"(cd {job} && exec sh {CONNECTOR} {arguments}) </dev/null >>{log} 2>&1 &"
+    inner = f"cd {job} && exec sh {CONNECTOR} {arguments}"
+    start = slice_start(service_step(spec))
+    if start == 0:
+        return f"({inner}) </dev/null >>{log} 2>&1 &"
+    step = f'exec srun --overlap --nodes=1 --ntasks=1 --nodelist="$h" sh -c {shlex.quote(inner)}'
+    return f"({_SLICE_HOST.format(start=start)}{step}) </dev/null >>{log} 2>&1 &"
 
 
 def _parameter(key: str, value: CustomValue) -> CustomValue:
@@ -529,8 +604,20 @@ home() { case $1 in "~/"*) printf '%s' "$HOME/${1#??}" ;; *) printf '%s' "$1" ;;
 fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
+spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
+spack_config=$(home "${CLIO_RELAY_SPACK_CONFIG:-}")
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_DECISIONS CLIO_RELAY_JARVIS_SPACK_ENV
+unset CLIO_RELAY_SPACK_ROOT CLIO_RELAY_SPACK_CONFIG
+# Builds run only in a job JARVIS submits (ppl install +submit), never on this host.
+unset JARVIS_ALLOW_LOCAL_BUILD
 jarvis=$(home "$jarvis")
+# The CLIO Spack, when the site has one: JARVIS installs and loads through it.
+if [ -n "$spack_root" ] && [ -f "$spack_root/share/spack/setup-env.sh" ]; then
+  export JARVIS_SPACK_ROOT="$spack_root"
+  if [ -n "$spack_config" ] && [ -d "$spack_config" ]; then
+    export JARVIS_SPACK_CONFIG="$spack_config"
+  fi
+fi
 if [ -n "$decisions" ]; then
   mkdir -p "$(dirname "$decisions")"
   export JARVIS_SPACK_DECISIONS="$decisions"
@@ -611,7 +698,12 @@ site's setting, then ``$CLIO_RELAY_JARVIS_FALLBACK`` (where relay installs
 jarvis-cd), writing ``relay.refusal.json`` and exiting 69 when neither is
 there. ``$CLIO_RELAY_JARVIS_DECISIONS`` and ``$CLIO_RELAY_JARVIS_SPACK_ENV``
 become ``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR``
-(:func:`site_environment`). It unpacks the archives into the job's private
+(:func:`site_environment`). When the CLIO Spack is on the site,
+``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
+``share/spack/setup-env.sh`` is there) and ``$CLIO_RELAY_SPACK_CONFIG`` becomes
+``JARVIS_SPACK_CONFIG`` (only when that directory is there). The script unsets
+``JARVIS_ALLOW_LOCAL_BUILD``: relay never builds outside a job. It unpacks the
+archives into the job's private
 JARVIS root and registers each repository once, once per set of archives, and
 hands the pipeline to JARVIS:
 
@@ -625,7 +717,10 @@ hands the pipeline to JARVIS:
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
 and exits 3. Answers already given reach every check through
-``JARVIS_INSTALL_ANSWERS``. The exit code is also written to ``relay.exitcode``.
+``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
+allocation) passes through unchanged; relay reports it with
+:func:`build_refused` and never retries it. The exit code is also written to
+``relay.exitcode``.
 """
 
 SiteMode = Literal["submit", "run", "install"]
@@ -938,6 +1033,8 @@ def _control_message(control: Mapping[str, Any] | None, state: JobState) -> str 
 
 WAITING_ENV_LOCK = "waiting_env_lock"
 """The install phase while another install holds the shared Spack environment's lock."""
+BUILD_REFUSED_PHASE = "refused"
+"""The install phase when JARVIS refused to build outside an allocation (exit 4)."""
 
 
 def install_progress(record: Mapping[str, Any]) -> JobProgress | None:
@@ -955,13 +1052,15 @@ def install_progress(record: Mapping[str, Any]) -> JobProgress | None:
             "waiting for another install into the same Spack environment; "
             "it then reuses that install"
         )
+    elif phase == BUILD_REFUSED_PHASE:
+        message = "refused: JARVIS would not build outside an allocation; relay does not retry"
     elif isinstance(current, str) and current:
         message = f"{phase}: {current}"
     else:
         message = phase
     data = {
         key: install[key]
-        for key in ("phase", "missing", "issue_count", "error", "log")
+        for key in ("phase", "missing", "issue_count", "error", "log", "refused")
         if install.get(key) is not None
     }
     return JobProgress(
@@ -1065,6 +1164,40 @@ def artifact_outputs(snapshot: Mapping[str, Any], *, execution: str) -> list[Out
 
 
 # Refusals
+
+
+def build_refused(text: str, *, site: str) -> Refusal:
+    """The refusal for a JARVIS command that exited 4: it would have built on the login host.
+
+    ``text`` is the command's output; its install report's ``refused`` says what
+    and which packages. Relay builds only through ``ppl install +submit``, in a
+    job, and never opts in to a local build, so this is final, not a retry.
+    """
+    refused: dict[str, Any] = {}
+    for line in reversed(text.splitlines()):
+        try:
+            found: object = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(found, dict):
+            value = cast(dict[str, Any], found).get("refused")
+            if isinstance(value, dict):
+                refused = cast(dict[str, Any], value)
+                break
+    what = refused.get("what") if isinstance(refused.get("what"), str) else "build"
+    packages = [str(item) for item in cast(list[Any], refused.get("packages") or [])]
+    named = f" ({', '.join(packages)})" if packages else ""
+    return Refusal(
+        RefusalReason.POLICY_REFUSED,
+        f"JARVIS on {site} refused to {what}{named} outside an allocation: the login "
+        "node takes only light work. Relay builds only in a job JARVIS submits "
+        "(ppl install +submit), so it does not retry this",
+        kind=refused.get("kind") or "build_outside_allocation",
+        what=what,
+        packages=packages,
+        exit_code=EXIT_BUILD_REFUSED,
+        retry=False,
+    )
 
 
 def missing_jarvis(text: str, *, site: str) -> Refusal:

@@ -247,9 +247,18 @@ Relay calls these when the adapter defines them:
 | `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`) |
 
 A batch adapter that runs packages refuses with `jarvis_submit.install_needed`
-when the submit exits 3, and with `jarvis_submit.missing_jarvis` when JARVIS is
+when the submit exits 3, with `jarvis_submit.build_refused` when it exits 4
+(JARVIS will not build outside an allocation; never retry it), and with
+`jarvis_submit.missing_jarvis` when JARVIS is
 missing. Relay turns those into the install questions and calls `install` or
 `install_jarvis` itself.
+
+A Slurm adapter's `describe()` fills `SiteInfo.partitions` (a `PartitionInfo`
+per partition: nodes, CPUs and physical cores per node, memory, max time and
+idle or allocated counts) and `SiteInfo.mpi` (the site's MPI facts), with
+`clio_relay.adapters.slurm_facts`. The guard sizes jobs against them, and a
+site that reports none is not checked. `Charge.with_layout(spec)` adds the
+layout (threads, memory, each step's nodes, the job's `sizing`) to a price.
 
 ### Register it
 

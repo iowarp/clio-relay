@@ -386,9 +386,11 @@ class PackageCatalog:
     def resolve(self, package: PackageRef) -> PackageRef:
         """Fill ``package``'s version and SHA-256 from the catalog.
 
-        A package that gives both is returned as it is. Otherwise the newest
-        staged archive of that name matching what it gives is used, and none
-        refuses with ``invalid_spec``.
+        A package that gives both is returned as it is. Otherwise the one
+        staged archive of that name matching what it gives is pinned. None
+        refuses with ``invalid_spec``, and so do several: relay never picks one
+        for the person. The refusal lists the candidates, so the caller asks
+        which one and pins its ``version`` or ``sha256``.
         """
         if package.version is not None and package.sha256 is not None:
             return package
@@ -399,11 +401,9 @@ class PackageCatalog:
             and package.version in (None, entry.version)
             and package.sha256 in (None, entry.sha256)
         ]
+        wanted = " ".join(part for part in (package.name, package.version, package.sha256) if part)
         if not found:
             known = sorted({entry.name for entry in self.all()})
-            wanted = " ".join(
-                part for part in (package.name, package.version, package.sha256) if part
-            )
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
                 f"relay has no package {wanted}. It has: {', '.join(known) or 'none'}. "
@@ -411,7 +411,30 @@ class PackageCatalog:
                 package=package.name,
                 known=known,
             )
-        chosen = found[-1]
+        if len(found) > 1:
+            candidates = [
+                {
+                    "version": entry.version,
+                    "sha256": entry.sha256,
+                    "staged_at": entry.staged_at.isoformat(),
+                }
+                for entry in reversed(found)
+            ]
+            listed = "; ".join(
+                f"{item['version'] or 'no version'} sha256 {item['sha256'][:12]} "
+                f"staged {item['staged_at']}"
+                for item in candidates
+            )
+            raise Refusal(
+                RefusalReason.INVALID_SPEC,
+                f"relay has {len(found)} archives of {wanted}: {listed}. Ask the person "
+                "which one, then pin its version or sha256",
+                field="package",
+                package=package.name,
+                candidates=candidates,
+                next_step="pin_package",
+            )
+        chosen = found[0]
         return package.model_copy(update={"version": chosen.version, "sha256": chosen.sha256})
 
     def entry(self, package: PackageRef, content: ContentStore) -> PackageEntry | None:

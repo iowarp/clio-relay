@@ -31,6 +31,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
 from clio_relay import jarvis_submit
+from clio_relay.adapters import slurm_facts
 from clio_relay.adapters.ssh import store
 
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
@@ -470,7 +471,7 @@ def find_script(remote_dir: str, operation_id: str) -> str:
 
 
 def describe_script(scheduler: str) -> str:
-    """Report the host."""
+    """Report the host, and on Slurm its partitions and MPI facts (short reads only)."""
     return (
         'echo "@@host $(hostname 2>/dev/null)"\n'
         'echo "@@os $(uname -s 2>/dev/null)"\n'
@@ -479,7 +480,9 @@ def describe_script(scheduler: str) -> str:
         'echo "@@home $HOME"\n'
         + _detect(scheduler)
         + 'case "$S" in\n'
-        + 'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null ;;\n'
+        + 'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null\n'
+        + slurm_facts.SCRIPT
+        + ";;\n"
         + "pbs) echo \"@@queues\"; qstat -Q 2>/dev/null | awk 'NR>2 {print $1}' ;;\n"
         + "esac\n"
     )
