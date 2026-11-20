@@ -46,6 +46,7 @@ from clio_relay.surface.a2ui.surfaces import (
     protocol_name,
     protocol_order,
     settings_rows,
+    sign_in_text,
     spend_options,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
@@ -127,7 +128,7 @@ def _caption(view: SiteView) -> str | None:
     parts: list[str] = []
     state = str(view.status.get("state", ""))
     if state == "needs_sign_in" and view.status.get("provider"):
-        parts.append(f"Needs a {view.status['provider']} sign-in")
+        parts.append(sign_in_text(str(view.status["provider"])))
     elif state != "ready" and view.status.get("detail"):
         parts.append(str(view.status["detail"]))
     if view.probe:

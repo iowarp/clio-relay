@@ -174,12 +174,17 @@ class SiteStore:
     def add_from_catalog(self, catalog: CatalogEntry, site_id: str | None = None) -> SiteEntry:
         """Copy a catalog entry into ``sites.yaml``, where the person edits it.
 
-        An entry that sets no spend setting takes the person's default for new sites.
+        An entry that sets no security or spend setting takes the person's default
+        for new sites (Secure, and always ask, unless they changed them).
         """
         site = catalog.to_site(site_id)
+        defaults = self.defaults()
+        changes: dict[str, Any] = {}
+        if "policy" not in catalog.model_fields_set:
+            changes["policy"] = defaults.policy
         if "spend" not in catalog.model_fields_set:
-            site = site.model_copy(update={"spend": SpendPolicy(ask=self.defaults().spend)})
-        return self.add(site)
+            changes["spend"] = SpendPolicy(ask=defaults.spend)
+        return self.add(site.model_copy(update=changes) if changes else site)
 
     def edit(self, site_id: str, changes: dict[str, Any]) -> SiteEntry:
         """Apply top-level field changes to a site and validate the result."""
