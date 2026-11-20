@@ -217,10 +217,29 @@ def _member(name: str, size: int, mode: int) -> tarfile.TarInfo:
     return info
 
 
+def _portable(data: bytes) -> tuple[bytes, int]:
+    """Return a file's archive bytes and mode, the same from any checkout of it.
+
+    A text file (UTF-8, no NUL byte) has its CRLF line ends made LF, as git keeps
+    them, so a Windows checkout with ``core.autocrlf`` packs what a POSIX one packs.
+    The mode is 0755 for a file that starts with ``#!`` and 0644 otherwise: a host's
+    permission bits are not part of the package (Windows has none to give).
+    """
+    if b"\0" not in data:
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            data = data.replace(b"\r\n", b"\n")
+    return data, 0o755 if data.startswith(b"#!") else 0o644
+
+
 def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None = None) -> bytes:
     """Return the deterministic archive of package ``name`` from ``repo_dir``.
 
-    The same files give the same bytes, so the same SHA-256, on any machine.
+    The same files give the same bytes, so the same SHA-256, on any machine and
+    from any checkout of them (:func:`_portable`).
     """
     raw = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
@@ -228,7 +247,7 @@ def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None 
             data = (json.dumps(source, sort_keys=True, indent=2) + "\n").encode("utf-8")
             tar.addfile(_member(SOURCE_FILE, len(data), 0o644), io.BytesIO(data))
         members = [
-            (arcname, path.read_bytes(), 0o755 if path.stat().st_mode & 0o111 else 0o644)
+            (arcname, *_portable(path.read_bytes()))
             for arcname, path in package_files(repo_dir, name)
         ]
         requirements = repository_requirements(repo_dir)

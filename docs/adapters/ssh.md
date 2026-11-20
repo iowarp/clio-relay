@@ -194,8 +194,23 @@ and with `JARVIS_SPACK_CONFIG` for its own configuration in
 `<home>/spack-config`. Each is set only when it is there. When neither that
 Spack nor a `spack` on the site's `PATH` is there, the run is refused with
 `adapter_unavailable` and `missing: spack`, naming where relay looked. Relay
-does not make the CLIO Spack itself; prepare it first (clio-kit's
-`spack_prepare_site` does, through `exec`).
+does not make the CLIO Spack itself, and never builds into the site's own
+Spack. The refusal's `remedy` says what to do instead, for any agent:
+
+- `action`: `prepare_spack`;
+- `root`, `setup_env` and `config`: where relay looks for the Spack checkout
+  and its configuration;
+- `site_spacks`: the Spacks the site's login profile sets up (`SPACK_ROOT`, a
+  `spack` on `PATH`, Spack module trees on `MODULEPATH`), each with its
+  version, whether it is writable, `used: false` and why not. The new checkout
+  reuses one as an upstream;
+- `steps`, `where` and `then`: clone a Spack release at `root`, point its
+  upstreams at the site's install tree and find compilers and externals, on the
+  login node through `exec`. That is light work: JARVIS builds what is missing
+  in its install job. Then run again.
+
+clio-kit's `spack_prepare_site` does those steps; pass it the site's
+`site_spacks[0].root` as `site_spack`.
 
 A package archive carries what the package needs on the site: the Spack
 repositories its repository's `contract.yaml` lists under `install.repos`,
