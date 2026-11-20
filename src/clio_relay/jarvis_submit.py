@@ -762,9 +762,35 @@ fi
 printf '%s\n' "$out"
 [ "$rc" -ne 3 ] || report
 if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'spack is not available'; then
-  tried=$(printf '%s' "$spack_root" | sed 's/[\\"]/\\&/g')
-  printf '{"missing":"spack","reason":"adapter_unavailable","tried":"%s"}\n' "$tried" \
-    > "$job/relay.refusal.json"
+  quote() { printf '%s' "$1" | tr -d '\r\n' | sed 's/[\\"]/\\&/g'; }
+  # The site's own Spacks, as its login profile sets them up: SPACK_ROOT, a spack
+  # on PATH, and the Spack module trees on MODULEPATH. They are reported, not used.
+  found_spacks=$(bash -lc 'printf "SPACK_ROOT %s\n" "${SPACK_ROOT:-}"
+p=$(command -v spack 2>/dev/null) && case $p in /*) echo "PATH ${p%/bin/spack}" ;; esac
+printf "%s\n" "${MODULEPATH:-}" | tr ":" "\n" |
+  sed -n "s:^\(/.*\)/share/spack/.*:MODULEPATH \1:p"' \
+    </dev/null 2>/dev/null | tr -d '\r' || true)
+  site_spacks="" seen=" "
+  while read -r how where; do
+    [ -n "$where" ] || continue
+    where=${where%/}
+    case $seen in *" $where "*) continue ;; esac
+    seen="$seen$where "
+    [ "$where" != "${spack_root%/}" ] || continue
+    [ -x "$where/bin/spack" ] && [ -f "$where/share/spack/setup-env.sh" ] || continue
+    version=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' \
+      "$where/lib/spack/spack/__init__.py" 2>/dev/null | head -n 1)
+    writable=false
+    [ -w "$where" ] && writable=true
+    site_spacks="${site_spacks:+$site_spacks,}{\"root\":\"$(quote "$where")\""
+    site_spacks="$site_spacks,\"found_by\":\"$how\",\"version\":\"$(quote "$version")\""
+    site_spacks="$site_spacks,\"writable\":$writable}"
+  done <<EOF
+$found_spacks
+EOF
+  printf '{"missing":"spack","reason":"adapter_unavailable","tried":"%s","config":"%s",' \
+    "$(quote "$spack_root")" "$(quote "$spack_config")" > "$job/relay.refusal.json"
+  printf '"site_spacks":[%s]}\n' "$site_spacks" >> "$job/relay.refusal.json"
   cat "$job/relay.refusal.json" >&2
   exit 69
 fi
@@ -809,8 +835,11 @@ hands the pipeline to JARVIS:
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
 and exits 3. When JARVIS stops because it finds no Spack to install with, the
-script writes ``relay.refusal.json`` with ``missing: spack`` and the CLIO Spack
-path it offered, and exits 69. Answers already given reach every check through
+script writes ``relay.refusal.json`` with ``missing: spack``, the CLIO Spack
+path it offered (``tried``) and its config directory, and ``site_spacks``: the
+Spacks the site's login profile sets up (``SPACK_ROOT``, a ``spack`` on PATH, and
+Spack module trees on ``MODULEPATH``), each with its version and whether it is
+writable. Then it exits 69. Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
 allocation) passes through unchanged; relay reports it with
 :func:`build_refused` and never retries it. The exit code is also written to
@@ -1479,13 +1508,86 @@ def build_refused(text: str, *, site: str) -> Refusal:
     )
 
 
+def missing_spack(written: dict[str, Any], *, tried: str, site: str) -> Refusal:
+    """The refusal for a site with no Spack for JARVIS to install with.
+
+    Its ``remedy`` says what a generic agent does about it: prepare a Spack
+    checkout at ``root`` that reuses the site's own Spack (``site_spacks``, the
+    ones the site's login profile sets up) as an upstream. Relay never installs
+    into a site's Spack: it is shared, usually not writable, and JARVIS writes
+    its environments and install records into the Spack it uses.
+    """
+    raw_spacks: object = written.get("site_spacks")
+    listed = cast(list[object], raw_spacks) if isinstance(raw_spacks, list) else []
+    site_spacks: list[dict[str, Any]] = [
+        {
+            "root": str(item.get("root")),
+            "found_by": str(item.get("found_by") or ""),
+            "version": str(item.get("version") or "") or None,
+            "writable": bool(item.get("writable")),
+            "used": False,
+        }
+        for item in (cast(dict[str, Any], raw) for raw in listed if isinstance(raw, dict))
+        if item.get("root")
+    ]
+    why = (
+        "JARVIS installs only through a Spack of its own, which chains to the site's Spack as "
+        "an upstream; relay never builds into a site's Spack"
+    )
+    for item in site_spacks:
+        item["why_not_used"] = why + ("" if item["writable"] else ", and this one is not writable")
+    config = str(written.get("config") or "") or None
+    if site_spacks:
+        first = site_spacks[0]
+        found = (
+            f" The site has its own Spack at {first['root']}"
+            f"{' ' + first['version'] if first['version'] else ''} (from {first['found_by']}); "
+            "relay does not build into it, so the new checkout reuses it as an upstream."
+        )
+        how = (
+            f"Clone Spack {first['version'] or 'at the release of the site Spack'} into {tried}, "
+            f"point its upstreams.yaml at the install tree of {first['root']}, turn on "
+            "concretizer reuse, and run spack compiler find and spack external find"
+        )
+    else:
+        found = " The site's login profile sets up no Spack of its own."
+        how = (
+            f"Clone a Spack release into {tried}, and run spack compiler find and spack "
+            "external find"
+        )
+    remedy: dict[str, Any] = {
+        "action": "prepare_spack",
+        "root": tried,
+        "setup_env": f"{tried.rstrip('/')}/share/spack/setup-env.sh",
+        "config": config,
+        "site_spacks": site_spacks,
+        "steps": how,
+        "where": (
+            "the site's login node, through exec: a clone and configuration only, which is "
+            "light. Install nothing there; JARVIS builds what is missing in its install job"
+        ),
+        "then": "call run again with the same spec",
+    }
+    return Refusal(
+        RefusalReason.ADAPTER_UNAVAILABLE,
+        f"{site} has no Spack for JARVIS to install the package with: relay looked for a "
+        f"Spack checkout at {tried} (its share/spack/setup-env.sh) and JARVIS found no spack "
+        f"on the site's PATH.{found} Prepare a Spack checkout at {tried} (remedy: "
+        f"{remedy['action']}): {how}. That is light login-node work; then run again",
+        missing="spack",
+        tried=tried,
+        remedy=remedy,
+    )
+
+
 def missing_jarvis(text: str, *, site: str) -> Refusal:
     """The refusal for a submit that exited 69: ``relay.refusal.json`` or stderr.
 
     Relay offers to install its pinned jarvis-cd when its own is missing or at
     another pin; a path the site's setting names is the site's to fix. A site
     with no Spack for JARVIS to install with (``missing: spack``) is the site's
-    to fix too: relay offers no install.
+    to fix too: relay offers no install, and its refusal carries the remedy
+    (:func:`missing_spack`).
     """
     written: dict[str, Any] = {}
     for line in reversed(text.splitlines()):
@@ -1498,15 +1600,7 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
             break
     tried = str(written.get("tried") or "the site home")
     if written.get("missing") == "spack":
-        return Refusal(
-            RefusalReason.ADAPTER_UNAVAILABLE,
-            f"{site} has no Spack for JARVIS to install the package with: relay looked for "
-            f"a Spack checkout at {tried} (its share/spack/setup-env.sh) and JARVIS found no "
-            "spack on the site's PATH. Prepare a Spack checkout there, or make spack "
-            "available on the site, then run again",
-            missing="spack",
-            tried=tried,
-        )
+        return missing_spack(written, tried=tried, site=site)
     if written.get("explicit"):
         return Refusal(
             RefusalReason.ADAPTER_UNAVAILABLE,
