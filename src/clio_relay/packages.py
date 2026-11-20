@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import io
 import json
 import os
@@ -28,15 +29,18 @@ import re
 import subprocess
 import sys
 import tarfile
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, Field
 
 from clio_relay import programs
+from clio_relay.identity.grants import GrantFiles
 from clio_relay.jarvis_site import (
     CLIO_JARVIS_COMMIT,
     CLIO_JARVIS_URL,
@@ -51,6 +55,7 @@ from clio_relay.jobs.records import RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.scratch import ScratchDir
+from clio_relay.scratch import remove as remove_tree
 
 STAGE_COMMAND = (
     'the packages tool: packages(op="stage", package="<repository>.<package>"), from a git '
@@ -61,6 +66,16 @@ STAGE_COMMAND = (
 GIT_TIMEOUT_S = 300.0
 _GIT_URL = re.compile(r"(?:https?|ssh|git|file)://[^\s]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s]+")
 _COMMIT = re.compile(r"[0-9a-fA-F]{7,40}")
+GIT_GRANT_HOSTS: dict[str, str] = {"github": "github.com"}
+"""Grant file providers (HS4a) whose token relay hands to git for https fetches from a host."""
+_AUTH_MARKS = (
+    "could not read username",
+    "could not read password",
+    "unable to get password",
+    "authentication failed",
+    "terminal prompts disabled",
+    "credential-",
+)
 _MENU_TYPES = {"int": "integer", "float": "number", "str": "string", "bool": "boolean"}
 _OUTPUT_KEYS = ("name", "path", "path_kind", "format", "reader")
 
@@ -581,9 +596,67 @@ def stage_dir(
     return _archive_and_stage(state_dir, repository_dir(root.resolve(), name), name, version)
 
 
-def _git(args: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+def _grant_provider(url: str) -> str | None:
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        return None
+    host = parts.hostname.lower()
+    return next((name for name, known in GIT_GRANT_HOSTS.items() if known == host), None)
+
+
+def _grant_config(url: str, env: Mapping[str, str], grants: GrantFiles | None) -> dict[str, str]:
+    """Hand a grant's token to git for ``url``, as an HTTP header set in git's environment.
+
+    Through ``GIT_CONFIG_COUNT``, not ``-c``, so the token is never in an argument list,
+    and not through a credential helper: a sandbox may stop the shell git runs a helper in
+    (msys ``sh`` cannot make its named objects in a Windows AppContainer).
+    """
+    provider = _grant_provider(url)
+    if provider is None:
+        return {}
+    files = grants if grants is not None else GrantFiles.from_settings({}, env)
+    token = files.token(provider)
+    if token is None:
+        return {}
+    pair = f"x-access-token:{token.access_token.get_secret_value()}".encode()
+    try:
+        index = int(env.get("GIT_CONFIG_COUNT") or "0")
+    except ValueError:
+        index = 0
+    return {
+        "GIT_CONFIG_COUNT": str(index + 1),
+        f"GIT_CONFIG_KEY_{index}": f"http.https://{GIT_GRANT_HOSTS[provider]}/.extraheader",
+        f"GIT_CONFIG_VALUE_{index}": f"Authorization: Basic {base64.b64encode(pair).decode()}",
+    }
+
+
+def _no_credential_hint(url: str, done: subprocess.CompletedProcess[str]) -> str:
+    text = f"{done.stderr}\n{done.stdout}".lower()
+    if not any(mark in text for mark in _AUTH_MARKS):
+        return ""
+    provider = _grant_provider(url)
+    grant = (
+        f"a grant file for {provider} (CLIO_RELAY_GRANT_FILE_{provider.upper()}) or "
+        if provider
+        else ""
+    )
+    return (
+        f". The repository needs a credential relay can use without a prompt: {grant}"
+        "a git credential helper that runs on the relay host"
+    )
+
+
+def _git(
+    args: Sequence[str],
+    cwd: Path,
+    *,
+    url: str | None = None,
+    grants: GrantFiles | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    if url is not None:
+        env.update(_grant_config(url, env, grants))
     git = programs.find("git", env)
     if git is None:
         raise Refusal(RefusalReason.INVALID_CONFIG, programs.missing("git"), command="git")
@@ -612,23 +685,29 @@ def _tail(done: subprocess.CompletedProcess[str]) -> str:
     return " ".join(lines[-3:]) or f"exit {done.returncode}"
 
 
-def fetch_commit(url: str, commit: str, checkout: Path) -> str:
-    """Check out ``commit`` of the git repository ``url`` in ``checkout``; return it in full."""
+def fetch_commit(url: str, commit: str, checkout: Path, grants: GrantFiles | None = None) -> str:
+    """Check out ``commit`` of the git repository ``url`` in ``checkout``; return it in full.
+
+    An https fetch from a host in :data:`GIT_GRANT_HOSTS` carries the live token of that
+    provider's grant file, when relay has one (``grants``, else its environment).
+    """
     checkout.mkdir(parents=True)
     for step in (["init", "-q"], ["remote", "add", "origin", url]):
         done = _git(step, checkout)
         if done.returncode != 0:
             raise Refusal(RefusalReason.INPUT_MISSING, f"git {step[0]} failed: {_tail(done)}")
     ref = "FETCH_HEAD"
-    fetched = _git(["fetch", "-q", "--depth", "1", "origin", commit], checkout)
+    fetched = _git(
+        ["fetch", "-q", "--depth", "1", "origin", commit], checkout, url=url, grants=grants
+    )
     if fetched.returncode != 0:
         # A short commit, or a server that serves no commit by hash: fetch all of it.
         ref = commit
-        fetched = _git(["fetch", "-q", "--tags", "origin"], checkout)
+        fetched = _git(["fetch", "-q", "--tags", "origin"], checkout, url=url, grants=grants)
         if fetched.returncode != 0:
             raise Refusal(
                 RefusalReason.INPUT_MISSING,
-                f"relay could not fetch {url}: {_tail(fetched)}",
+                f"relay could not fetch {url}: {_tail(fetched)}{_no_credential_hint(url, fetched)}",
                 url=url,
             )
     done = _git(["checkout", "-q", "--detach", ref], checkout)
@@ -643,6 +722,32 @@ def fetch_commit(url: str, commit: str, checkout: Path) -> str:
     return head
 
 
+STAGE_PREFIX = "clio-relay-stage-"
+#: A stage checkout older than this is a leftover (a killed relay), never one in progress.
+STAGE_STALE_S = 6 * 3600.0
+
+
+def stage_scratch_dir(state_dir: Path) -> Path:
+    """Return where git checkouts are made for staging, under relay's state directory.
+
+    Not the system temp folder: a sandbox may let a process create files there but not
+    rename them (CLIO's MXC fence on Windows denies every rename in the container's
+    ``AC\\Temp``), and git commits each file it writes by renaming a ``.lock`` file. Relay
+    already needs its state directory writable, so a sandbox that runs relay grants it.
+    Leftovers of killed stages are removed here.
+    """
+    scratch = state_dir / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for old in scratch.glob(f"{STAGE_PREFIX}*"):
+        try:
+            if now - old.stat().st_mtime > STAGE_STALE_S:
+                remove_tree(old, ignore_errors=True)
+        except OSError:
+            continue
+    return scratch
+
+
 def stage_git(
     state_dir: Path,
     name: str,
@@ -651,12 +756,13 @@ def stage_git(
     commit: str | None = None,
     path: str | None = None,
     version: str | None = None,
+    grants: GrantFiles | None = None,
 ) -> tuple[PackageEntry, int]:
     """Stage package ``name`` from a git repository at one commit; return it and its size.
 
     With neither ``url`` nor ``commit`` it is relay's pinned clio-jarvis. ``path``
     is where the JARVIS repository sits in the checkout, when it is neither the
-    top nor ``<repo>`` there.
+    top nor ``<repo>`` there. ``grants`` are the grant files the fetch may use.
     """
     if url is None and commit is None:
         url, commit = CLIO_JARVIS_URL, CLIO_JARVIS_COMMIT
@@ -687,9 +793,11 @@ def stage_git(
             path=path,
         )
     repo, _package = split_name(name)
-    with ScratchDir("clio-relay-stage-", ignore_cleanup_errors=True) as scratch:
+    with ScratchDir(
+        STAGE_PREFIX, stage_scratch_dir(state_dir), ignore_cleanup_errors=True
+    ) as scratch:
         checkout = Path(scratch) / repo
-        fetch_commit(url, commit, checkout)
+        fetch_commit(url, commit, checkout, grants)
         root = checkout.joinpath(*relative.parts) if relative is not None else checkout
         return _archive_and_stage(state_dir, repository_dir(root, name), name, version)
 

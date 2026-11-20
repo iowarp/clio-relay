@@ -131,7 +131,15 @@ deploys nothing. The `packages` tool does it over MCP:
 
 With only a package name, relay stages it from its pinned clio-jarvis commit
 (the result's `default_source`). A git source is fetched on the relay host at
-exactly that commit, never a branch, with no prompt for credentials. A `dir`
+exactly that commit, never a branch, with no prompt for credentials. The
+checkout is made under relay's state directory (`<state>/scratch`) and removed
+after, so a sandbox that lets relay write its state lets git work too. The
+fetch uses relay's environment, its proxy variables included. A private
+repository needs a credential relay can use without a prompt: for
+`https://github.com/...` that is a `github` grant file
+(`CLIO_RELAY_GRANT_FILE_GITHUB` or `--grant-file github=<path>`), whose token
+relay hands to git in git's environment, never on a command line; otherwise a
+git credential helper that runs on the relay host. A `dir`
 is a directory on the relay host. Each call returns `relay.packages.v1`: what
 it staged or removed, and the catalog after it. Removing takes every version
 of the package out of the catalog unless `version` or `sha256` narrows it, and
