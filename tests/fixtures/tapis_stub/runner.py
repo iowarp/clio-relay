@@ -1,7 +1,8 @@
 """How the Tapis stub runs a job: the ZIP runtime's launch and cancel, on its own machine.
 
 FORK starts the launcher in the background and cancels with `pkill -9 -P <pid>`,
-then `kill -9 <pid>` only if that fails. BATCH runs the launcher in the
+then `kill -9 <pid>` only if that fails. Its exit code is the app's own
+`tapisjob.exitcode`, 0 when the app wrote none, as Tapis reads it. BATCH runs the launcher in the
 foreground of a batch script, after the job's cmdPrefix, and cancels as Slurm
 does: TERM to the step's processes, then KILL once the batch process is gone or
 after KillWait. With ``StubState.slurm`` set, a BATCH job goes to the machine's
@@ -37,6 +38,18 @@ QUEUED_STATES = (
 FINAL_STATES = ("FINISHED", "CANCELLED", "FAILED")
 # Slurm's KillWait on Ares: the time between a cancel's TERM and its KILL.
 KILL_WAIT_S = 30
+
+
+def _fork_exit_code(out_dir: Path) -> int:
+    """Tapis's FORK exit code: the app's tapisjob.exitcode, 0 when missing or not a number.
+
+    The ZIP runtime's FORK wrapper never writes the file (tapis-jobs ZipRunCmd), and its
+    monitor takes the app's file as written (AbstractJobMonitor.readExitCodeFile).
+    """
+    try:
+        return int((out_dir / "tapisjob.exitcode").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
 
 
 @dataclass
@@ -121,9 +134,13 @@ class JobRunner:
             command = f"./tapisjob_app.sh {' '.join(args)}"
             if request.get("jobType") == "BATCH" and state.slurm:
                 code = self._sbatch(job, state.systems[system_id], exec_dir, out_dir, env, command)
-            else:
+                (out_dir / "tapisjob.exitcode").write_text(f"{code}\n", encoding="utf-8")
+            elif request.get("jobType") == "BATCH":
                 code = self._local(job, exec_dir, out_dir, env, command)
-            (out_dir / "tapisjob.exitcode").write_text(f"{code}\n", encoding="utf-8")
+                (out_dir / "tapisjob.exitcode").write_text(f"{code}\n", encoding="utf-8")
+            else:
+                self._local(job, exec_dir, out_dir, env, command)
+                code = _fork_exit_code(out_dir)
             with state.lock:
                 if job.status == "CANCELLED":
                     return
