@@ -48,6 +48,7 @@ from clio_relay.login_load import light_argv
 from clio_relay.packages import (
     PackageCatalog,
     pipeline_conflict,
+    stage_current,
     with_contract_resources,
     with_site_cores,
 )
@@ -249,6 +250,9 @@ class RelayService:
         pipeline whose steps cannot share one JARVIS tree is refused.
         """
         if spec.steps():
+            for step in spec.steps():
+                if step.sha256 is None:
+                    stage_current(self.paths.state_dir, self.paths.package_sources, step.name)
             steps = [self.packages.resolve(step) for step in spec.steps()]
             spec = spec.with_steps(steps)
             entries = [self.packages.entry(step, self.content) for step in steps]

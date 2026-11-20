@@ -765,7 +765,9 @@ class RelayServer:
             package, from relay's package sources (directories its host installed, listed
             in sources); with dir, from that directory on the relay host, such as a package
             the person wrote. Staging fetches nothing and runs no git. list shows what is
-            staged; remove takes a package out (version or sha256 narrow it). Staging runs
+            staged; remove takes a package out (version or sha256 narrow it). When the
+            package sources change, a stage or run by name uses their new archive and lists
+            the old one with superseded_by; pin its sha256 to run it. Staging runs
             nothing: a guarded site reviews the archive by its SHA-256 before its first run
             there, and the archive reaches the site through relay's own transfer."""
             arguments = PackagesArgs(

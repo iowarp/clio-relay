@@ -9,6 +9,12 @@ nothing. Nothing runs and no site is touched, so staging asks nobody:
 on a guarded site the person reviews the archive, by its SHA-256, before its
 first run there. Removing takes entries out of the catalog, and their archives
 out of the content store unless an unfinished operation still needs one.
+
+What relay's package sources give for a name is what a bare name runs. When
+they change (a plugin update), the next stage or run of that name stages the
+new archive and marks the old one ``superseded_by`` it; a bare name never
+resolves to a superseded archive, so its review is asked again. An archive
+staged from a directory (``dir``) is the person's own and is never superseded.
 """
 
 from __future__ import annotations
@@ -21,13 +27,23 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.packages import PackageEntry, stage_dir, stage_source
+from clio_relay.packages import PackageEntry, refresh_from_sources, stage_dir, stage_source
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
 
 SCHEMA = "relay.packages.v1"
-_FIELDS = {"name", "version", "sha256", "kind", "summary", "source", "staged_at"}
+_FIELDS = {
+    "name",
+    "version",
+    "sha256",
+    "kind",
+    "summary",
+    "source",
+    "origin",
+    "superseded_by",
+    "staged_at",
+}
 
 
 class PackagesArgs(BaseModel):
@@ -91,6 +107,8 @@ def _apply(service: RelayService, args: PackagesArgs) -> dict[str, Any]:
             )
         change = _stage if args.op == "stage" else _remove
         result.update(change(service, args, args.package))
+    else:
+        refresh_from_sources(service.paths.state_dir, service.paths.package_sources)
     result["packages"] = [_view(entry) for entry in service.packages.all()]
     result["sources"] = [str(source) for source in service.paths.package_sources]
     return result

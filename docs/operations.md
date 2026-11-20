@@ -148,3 +148,13 @@ drops each archive from the content store unless an unfinished operation still
 needs it (`archive_kept`). `python -m clio_relay.packages stage` and `list` do
 the same from a shell. See [guarded sites](guarded-sites.md#running-a-package)
 for how a guarded site reviews a staged package.
+
+When the package sources change, for example after a plugin update ships a
+newer clio-jarvis, a name follows them. A stage or run by name, `list` and
+`describe` build the name's archive from the current sources. If its SHA-256
+is new, relay stages it and marks the older archives of that name with
+`superseded_by`. A name then never resolves to a superseded archive, so a run
+pins the new one and a guarded site asks its review again. A superseded archive
+stays in the catalog: an operation that pinned it keeps working, and a run that
+gives its `sha256` still uses it. An archive staged from a `dir` is never
+superseded, and `site clean` leaves the catalog alone.

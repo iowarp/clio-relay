@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import io
 import json
 import re
@@ -31,7 +32,7 @@ import tarfile
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import yaml
 from pydantic import BaseModel, Field
@@ -71,6 +72,13 @@ class PackageEntry(BaseModel):
     progress: dict[str, Any] | None = None
     resources: dict[str, Any] | None = None
     source: dict[str, Any] | None = None
+    origin: Literal["sources", "dir"] | None = None
+    """``sources`` when staged by name from relay's package sources, ``dir`` when the
+    person named a directory. An entry staged before relay recorded it counts as
+    ``sources``."""
+    superseded_by: str | None = None
+    """The SHA-256 relay's package sources now give for this name, when they changed
+    after this archive was staged from them. A bare name no longer resolves to it."""
     staged_at: datetime = Field(default_factory=utc_now)
 
 
@@ -439,11 +447,35 @@ class PackageCatalog:
         return sorted(self.records.all(), key=lambda entry: (entry.name, entry.staged_at))
 
     def newest(self) -> list[PackageEntry]:
-        """Return the newest entry of each package name, by when it was staged."""
+        """Return the newest entry of each package name, by when it was staged.
+
+        A superseded entry is left out: a bare name no longer resolves to it.
+        """
         latest: dict[str, PackageEntry] = {}
         for entry in self.all():
-            latest[entry.name] = entry
+            if entry.superseded_by is None:
+                latest[entry.name] = entry
         return list(latest.values())
+
+    def supersede(self, current: PackageEntry) -> list[PackageEntry]:
+        """Mark the other archives of ``current``'s name staged from the sources as superseded.
+
+        ``current`` is what relay's package sources give now. An archive the
+        person staged from a directory is kept as it is.
+        """
+        marked: list[PackageEntry] = []
+        for entry in self.all():
+            if (
+                entry.name != current.name
+                or entry.sha256 == current.sha256
+                or entry.origin == "dir"
+                or entry.superseded_by == current.sha256
+            ):
+                continue
+            updated = entry.model_copy(update={"superseded_by": current.sha256})
+            self.put(updated)
+            marked.append(updated)
+        return marked
 
     def resolve(self, package: PackageRef) -> PackageRef:
         """Fill ``package``'s version and SHA-256 from the catalog.
@@ -452,7 +484,9 @@ class PackageCatalog:
         staged archive of that name matching what it gives is pinned. None
         refuses with ``invalid_spec``, and so do several: relay never picks one
         for the person. The refusal lists the candidates, so the caller asks
-        which one and pins its ``version`` or ``sha256``.
+        which one and pins its ``version`` or ``sha256``. A superseded archive
+        is pinned only by its ``sha256``; call :func:`stage_current` first, so
+        a change in relay's package sources supersedes what they gave before.
         """
         if package.version is not None and package.sha256 is not None:
             return package
@@ -462,6 +496,7 @@ class PackageCatalog:
             if entry.name == package.name
             and package.version in (None, entry.version)
             and package.sha256 in (None, entry.sha256)
+            and (entry.superseded_by is None or package.sha256 is not None)
         ]
         wanted = " ".join(part for part in (package.name, package.version, package.sha256) if part)
         if not found:
@@ -517,11 +552,25 @@ class PackageCatalog:
         return updated
 
 
-def stage(state_dir: Path, data: bytes, name: str, *, version: str | None = None) -> PackageEntry:
-    """Put an archive in relay's content store and record it in the catalog."""
-    entry = describe_archive(data, name, version=version)
+def stage(
+    state_dir: Path,
+    data: bytes,
+    name: str,
+    *,
+    version: str | None = None,
+    origin: Literal["sources", "dir"] = "dir",
+) -> PackageEntry:
+    """Put an archive in relay's content store and record it in the catalog.
+
+    An archive from relay's package sources supersedes what they gave before
+    under that name (:meth:`PackageCatalog.supersede`).
+    """
+    entry = describe_archive(data, name, version=version).model_copy(update={"origin": origin})
     ContentStore(state_dir / "content").put(data)
-    PackageCatalog(state_dir / "packages").put(entry)
+    catalog = PackageCatalog(state_dir / "packages")
+    catalog.put(entry)
+    if origin == "sources":
+        catalog.supersede(entry)
     return entry
 
 
@@ -564,10 +613,14 @@ def package_source(repo_dir: Path) -> dict[str, Any] | None:
 
 
 def _archive_and_stage(
-    state_dir: Path, repo_dir: Path, name: str, version: str | None
+    state_dir: Path,
+    repo_dir: Path,
+    name: str,
+    version: str | None,
+    origin: Literal["sources", "dir"],
 ) -> tuple[PackageEntry, int]:
     data = archive_package(repo_dir, name, source=package_source(repo_dir))
-    return stage(state_dir, data, name, version=version), len(data)
+    return stage(state_dir, data, name, version=version, origin=origin), len(data)
 
 
 def stage_dir(
@@ -590,7 +643,7 @@ def stage_dir(
             f"{root} is not a directory on the relay host",
             path=str(root),
         )
-    return _archive_and_stage(state_dir, repository_dir(root.resolve(), name), name, version)
+    return _archive_and_stage(state_dir, repository_dir(root.resolve(), name), name, version, "dir")
 
 
 PACKAGE_SOURCES_ENV = "CLIO_RELAY_PACKAGE_SOURCES"
@@ -641,7 +694,51 @@ def stage_source(
     state_dir: Path, sources: Sequence[Path], name: str, *, version: str | None = None
 ) -> tuple[PackageEntry, int]:
     """Stage package ``name`` from relay's package sources; return it and its size."""
-    return _archive_and_stage(state_dir, find_repository(sources, name), name, version)
+    return _archive_and_stage(state_dir, find_repository(sources, name), name, version, "sources")
+
+
+def stage_current(state_dir: Path, sources: Sequence[Path], name: str) -> PackageEntry | None:
+    """Stage what relay's package sources give for ``name`` now, if they hold it.
+
+    ``run`` calls it before it resolves a bare name, so after a host updates its
+    package sources (a plugin update), the archive they give now is staged and
+    the one they gave before is superseded: the run pins the new archive and its
+    review is asked, never an old archive quietly. The archive is deterministic,
+    so an unchanged source stages the same entry and changes nothing. Returns
+    ``None`` when no source holds ``name``.
+    """
+    try:
+        repo_dir = find_repository(sources, name)
+    except Refusal:
+        return None
+    data = archive_package(repo_dir, name, source=package_source(repo_dir))
+    catalog = PackageCatalog(state_dir / "packages")
+    digest = hashlib.sha256(data).hexdigest()
+    known = catalog.records.get(digest)
+    if known is not None and known.superseded_by is None and known.origin is not None:
+        catalog.supersede(known)
+        return known
+    return stage(state_dir, data, name, origin="sources")
+
+
+def refresh_from_sources(state_dir: Path, sources: Sequence[Path]) -> None:
+    """Run :func:`stage_current` for each staged name relay's package sources hold.
+
+    ``packages list`` and ``describe`` call it, so what they show as a name's
+    archive is what a run by that name would pin.
+    """
+    if not sources:
+        return
+    names = {
+        entry.name
+        for entry in PackageCatalog(state_dir / "packages").all()
+        if entry.origin != "dir"
+    }
+    for name in sorted(names):
+        try:
+            stage_current(state_dir, sources, name)
+        except Refusal:
+            continue
 
 
 # Command line
