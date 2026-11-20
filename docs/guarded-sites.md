@@ -51,7 +51,10 @@ it with relay's `packages` tool:
 
 - `packages(op="stage", package="clio_jarvis.gray_scott")` stages the package
   from relay's package sources, the copies its host installed with it (the
-  CLIO plugin ships clio-jarvis at its pinned commit). It fetches nothing;
+  CLIO plugin ships clio-jarvis at its pinned commit). It fetches nothing.
+  When those copies change, the name follows them: the new archive is staged,
+  the old one is marked `superseded_by`, and the new SHA-256 needs its own
+  review;
 - `dir` stages from a directory on the relay machine, such as the person's
   workspace. It is never pushed to any repository: the archive reaches the
   site as a job input, through the site adapter's transfer;

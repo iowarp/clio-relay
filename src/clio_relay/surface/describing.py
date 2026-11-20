@@ -9,6 +9,7 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
+from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.skills import skill_link, skills
 
@@ -57,9 +58,14 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
 
 
 def package_listing(service: RelayService, site: SiteEntry) -> list[dict[str, Any]]:
-    """List the newest staged version of each package, and whether this site reviewed it."""
+    """List the newest staged version of each package, and whether this site reviewed it.
+
+    A change in relay's package sources is staged first, so a name shows the
+    archive a run by that name pins.
+    """
+    refresh_from_sources(service.paths.state_dir, service.paths.package_sources)
     reviewed = getattr(service.guard, "reviewed", None)
-    entries = service.packages.all()
+    entries = [entry for entry in service.packages.all() if entry.superseded_by is None]
     listed: list[dict[str, Any]] = []
     for entry in service.packages.newest():
         item = entry.model_dump(mode="json", exclude={"staged_at"})
