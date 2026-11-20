@@ -173,8 +173,10 @@ The submit first checks that the site has the software the packages need.
 When it does not, nothing is submitted. Relay asks you to approve the install
 (what JARVIS reuses and what it builds), then asks one question for each
 choice JARVIS cannot make alone, such as which of two compilers to build
-with. JARVIS then installs the software as its own one-node job,
-`jarvis ppl install +submit`, on a compute node. That job gets
+with. JARVIS then installs the software as its own job,
+`jarvis ppl install +submit`, on a compute node. The job is one task on a
+whole node (`exclusive`), whatever the run asks for, so Spack builds with all
+of that node's CPUs (its `build_jobs` setting is capped by them). It gets
 `install_walltime_s` (4 hours by default, or the run's walltime when longer),
 not the run's walltime, since a build often takes longer than the run, and the
 approval says how long it may take. Nothing is built on the login
@@ -182,6 +184,9 @@ node: when JARVIS refuses a build outside an allocation (exit 4,
 `build_outside_allocation`), relay reports it as `policy_refused` and does not
 retry it. `describe(job=...)` follows the install log and
 its progress for as long as the install takes, then relay submits the run.
+When the install job fails, the run fails `submit_failed` with the end of the
+log in its message, `install_log` (the whole log on the site, for `files`) and
+`install_job` (the scheduler's job id).
 Your answers and the Spack environment are kept under the CLIO site home, at
 `jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
 archives, so the next run of the same packages reuses them. Two installs into

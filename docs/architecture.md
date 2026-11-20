@@ -30,7 +30,11 @@ flowchart LR
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
    configured sites and the staged packages (`surface/instructions.py`), so an
-   agent knows what relay can run before it calls a tool.
+   agent knows what relay can run before it calls a tool. The tool annotations
+   say `describe` only reads and the rest change things, all in a closed world:
+   relay touches only the sites you registered, and the guard below asks for
+   what their policy names. So a client that accepts bounded changes without a
+   question can run relay calls unattended, and relay's own asks still reach you.
 2. **Service.** `surface/service.py` holds `RelayService`, which the MCP
    server, the CLI and the tests all drive. It loads the site from
    `sites.yaml`, picks the adapter for the verb, and keeps a durable record of
