@@ -13,13 +13,17 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import hmac
 import json
 import os
+import secrets
 import signal
+import ssl
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from clio_relay.adapters.base import ShutsDown
 from clio_relay.config import RelaySettings
@@ -36,6 +40,8 @@ MAX_TIMEOUT_S = 120.0
 LOCAL = "local"
 _JOB_KINDS = ("run", "serve")
 _SELF_EXIT_DELAY_S = 1.0
+_HTTP_STOP_TIMEOUT_S = 5.0
+STOP_ROUTE = "/relay/stop"
 _QUERY_LIMITED_INFORMATION = 0x1000
 _ERROR_INVALID_PARAMETER = 87
 _STILL_ACTIVE = 259
@@ -48,17 +54,55 @@ def servers_dir(paths: RelayPaths) -> Path:
     return paths.state_dir / "servers"
 
 
-def register_server(paths: RelayPaths, url: str) -> Path:
-    """Record this process as a relay HTTP server until it exits."""
+def register_server(
+    paths: RelayPaths, server: Any, url: str, origin: str, *, tls_cert: Path | None = None
+) -> Path:
+    """Record this process as a relay HTTP server until it exits, and mount its stop route.
+
+    The record is private (0600) and holds a stop secret made for this process
+    alone, separate from the MCP bearer token. A host that cannot see the process
+    (another identity, or a sandbox) can still ask it to exit: ``POST``
+    :data:`STOP_ROUTE` with that secret as a bearer token. Any other request there
+    gets 401, so the route never stops a server without the secret.
+    """
+    from starlette.requests import Request
+    from starlette.responses import Response
+
     directory = servers_dir(paths)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{os.getpid()}.json"
-    path.write_text(json.dumps({"pid": os.getpid(), "url": url}), encoding="utf-8")
+    secret = secrets.token_urlsafe(32)
+    record: dict[str, Any] = {
+        "pid": os.getpid(),
+        "url": url,
+        "origin": origin,
+        "stop_token": secret,
+    }
+    if tls_cert is not None:
+        record["tls_cert"] = str(tls_cert.resolve())
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
 
     def forget() -> None:
         with contextlib.suppress(OSError):
             path.unlink()
 
+    async def stop(request: Request) -> Response:
+        scheme, _, given = (request.headers.get("authorization") or "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+            given.strip().encode(), secret.encode()
+        ):
+            return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        forget()
+        asyncio.get_running_loop().call_later(_SELF_EXIT_DELAY_S, _exit_self)
+        return Response(status_code=202)
+
+    server.custom_route(STOP_ROUTE, methods=["POST"], name="relay-stop", include_in_schema=False)(
+        stop
+    )
     atexit.register(forget)
     return path
 
@@ -162,19 +206,48 @@ def _terminate(pid: int) -> str | None:
     return None
 
 
-def _stop_record(
+async def _http_stop(record: dict[str, Any]) -> str | None:
+    """Ask a recorded server to exit through its stop route; return why that failed, or None."""
+    origin = record.get("origin")
+    token = record.get("stop_token")
+    if not isinstance(origin, str) or not isinstance(token, str):
+        return "its record has no stop route (a relay server from before the route existed)"
+    import httpx
+
+    cert = record.get("tls_cert")
+    verify: ssl.SSLContext | bool = (
+        ssl.create_default_context(cafile=cert) if isinstance(cert, str) else True
+    )
+    try:
+        async with httpx.AsyncClient(
+            timeout=_HTTP_STOP_TIMEOUT_S, verify=verify, trust_env=False
+        ) as client:
+            response = await client.post(
+                f"{origin}{STOP_ROUTE}", headers={"Authorization": f"Bearer {token}"}
+            )
+    except (httpx.HTTPError, OSError) as exc:
+        return f"its stop route at {origin} did not answer: {exc}"
+    if response.status_code not in (200, 202):
+        return f"its stop route at {origin} answered HTTP {response.status_code}"
+    return None
+
+
+async def _stop_record(
     record: Path,
     pid: int | None,
     word: str,
     stop: dict[str, Any],
     failures: list[dict[str, Any]],
+    remote: Callable[[], Awaitable[str | None]] | None = None,
 ) -> dict[str, Any] | None:
     """Stop the process ``record`` names; return ``stop`` with its pid once it is stopped.
 
     The record is dropped only when its process is stopped, has exited, or is another
-    program that took the pid. A process relay cannot confirm or stop keeps its
-    record and is reported in ``failures`` with the reason; it is never dropped
-    silently. ``stop`` holds the entry's site, kind and detail.
+    program that took the pid. ``remote`` is tried only when the process can be
+    neither confirmed nor ruled out, for example one under another identity. A
+    process relay cannot confirm or stop keeps its record and is reported in
+    ``failures`` with the reason; it is never dropped silently. ``stop`` holds the
+    entry's site, kind and detail.
     """
 
     def keep(reason: str) -> None:
@@ -192,8 +265,13 @@ def _stop_record(
         return None
     state, reason = _probe(pid, word)
     if state == "unknown":
-        keep(reason)
-        return None
+        failed = None if remote is None else await remote()
+        if remote is None or failed is not None:
+            keep(reason if failed is None else f"{reason}; {failed}")
+            return None
+        with contextlib.suppress(OSError):
+            record.unlink()
+        return {**stop, "pid": pid, "detail": f"{stop['detail']}, stopped through its stop route"}
     if state == "relay":
         failed = _terminate(pid)
         if failed is not None:
@@ -217,7 +295,7 @@ def _read_pid(path: Path) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def _stop_connectors(
+async def _stop_connectors(
     paths: RelayPaths, operations: dict[str, str], site: str | None, failures: list[Any]
 ) -> list[Any]:
     """Stop ``clio-relay connect`` holders: all of them, or those of ``site``'s operations."""
@@ -237,17 +315,35 @@ def _stop_connectors(
             "kind": "connector",
             "detail": f"clio-relay connect for service {operation}",
         }
-        found = _stop_record(pidfile, pid, "connect", stop, failures)
+        found = await _stop_record(pidfile, pid, "connect", stop, failures)
         if found is not None:
             stopped.append(found)
     return stopped
 
 
-def _stop_servers(paths: RelayPaths, failures: list[Any]) -> list[dict[str, Any]]:
+async def _stop_servers(paths: RelayPaths, failures: list[Any]) -> list[dict[str, Any]]:
     """Stop recorded ``serve --http`` processes; this one exits after it answers."""
     stopped: list[dict[str, Any]] = []
     for record in sorted(servers_dir(paths).glob("*.json")):
-        pid = _read_pid(record)
+        stop = {
+            "site": LOCAL,
+            "kind": "local_server",
+            "detail": "a detached clio-relay serve --http",
+        }
+        try:
+            data: Any = json.loads(record.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            failures.append(
+                {
+                    "site": LOCAL,
+                    "error": RefusalReason.UNREACHABLE.value,
+                    "detail": f"{stop['detail']} was not stopped ({record}): "
+                    f"its record cannot be read: {exc}",
+                }
+            )
+            continue
+        fields: dict[str, Any] = cast("dict[str, Any]", data) if isinstance(data, dict) else {}
+        pid = fields.get("pid") if isinstance(fields.get("pid"), int) else None
         if pid == os.getpid():
             stopped.append(
                 {
@@ -260,12 +356,11 @@ def _stop_servers(paths: RelayPaths, failures: list[Any]) -> list[dict[str, Any]
             with contextlib.suppress(RuntimeError):
                 asyncio.get_running_loop().call_later(_SELF_EXIT_DELAY_S, _exit_self)
             continue
-        stop = {
-            "site": LOCAL,
-            "kind": "local_server",
-            "detail": "a detached clio-relay serve --http",
-        }
-        found = _stop_record(record, pid, "serve", stop, failures)
+
+        async def remote(fields: dict[str, Any] = fields) -> str | None:
+            return await _http_stop(fields)
+
+        found = await _stop_record(record, pid, "serve", stop, failures, remote)
         if found is not None:
             stopped.append(found)
     return stopped
@@ -414,7 +509,7 @@ async def shutdown(
 
     await asyncio.gather(*(one(entry) for entry in entries))
     operations = {record.operation_id: record.site for record in service.operations.all()}
-    stopped.extend(_stop_connectors(service.paths, operations, site, failures))
+    stopped.extend(await _stop_connectors(service.paths, operations, site, failures))
     if site is None:
         try:
             stopped.extend(_reap_visitors())
@@ -422,7 +517,7 @@ async def shutdown(
             failures.append(
                 {"site": LOCAL, "error": RefusalReason.UNREACHABLE.value, "detail": str(exc)}
             )
-        stopped.extend(_stop_servers(service.paths, failures))
+        stopped.extend(await _stop_servers(service.paths, failures))
     hop_stopped = {item["site"] for item in stopped if item["kind"] == "hop_proxy"}
     return {
         "schema": SCHEMA,
