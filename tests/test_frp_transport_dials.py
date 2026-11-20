@@ -17,7 +17,6 @@ from __future__ import annotations
 import io
 import json
 import subprocess
-import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import Any, cast
@@ -39,6 +38,7 @@ from clio_relay.frp_transport import (
     UdpRendezvousTransport,
 )
 from clio_relay.frp_visitor_reconciliation import ReconciliationResult
+from clio_relay.scratch import ScratchDir
 from clio_relay.session_api import SESSION_IDENTITY_SCHEMA, session_identity_document
 
 NONCE = "1" * 64
@@ -475,11 +475,11 @@ def test_close_keeps_a_residual_config_cleanup_error(
     transport = _transport()
     transport.establish(nonce=NONCE)
 
-    def raising_cleanup(self: tempfile.TemporaryDirectory[str]) -> None:
+    def raising_cleanup(self: ScratchDir) -> None:
         del self
         raise OSError("simulated: the config file is still held open")
 
-    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", raising_cleanup)
+    monkeypatch.setattr(ScratchDir, "cleanup", raising_cleanup)
 
     transport.close()
 

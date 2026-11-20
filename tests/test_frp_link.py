@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
-import tempfile
 import threading
 from contextlib import suppress
 from io import BytesIO
@@ -30,6 +29,7 @@ from clio_relay.frp_link import (
     require_frp_server_addr,
 )
 from clio_relay.relay_host import FrpTransportProtocol
+from clio_relay.scratch import ScratchDir
 
 
 def _link_config(**overrides: Any) -> FrpLinkConfig:
@@ -502,11 +502,11 @@ def test_close_reports_residual_config_file_when_cleanup_fails(monkeypatch: Monk
     assert config_path is not None
     assert visitor.config_cleanup_error is None
 
-    def raising_cleanup(self: tempfile.TemporaryDirectory[str]) -> None:
+    def raising_cleanup(self: ScratchDir) -> None:
         del self
         raise OSError("simulated: the config file is still held open")
 
-    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", raising_cleanup)
+    monkeypatch.setattr(ScratchDir, "cleanup", raising_cleanup)
 
     visitor.close()
 
