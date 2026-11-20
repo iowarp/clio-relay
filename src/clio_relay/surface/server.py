@@ -88,6 +88,18 @@ _NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
 
+# Relay acts only on the sites the person registered, each under its own policy, and it
+# asks itself for the decisions that policy names (spend, installs, reviews). So its
+# world is closed in the MCP sense, and a client that accepts bounded changes without a
+# question can run relay calls unattended while relay's own asks still reach the person.
+_READ = mcp_types.ToolAnnotations(read_only_hint=True, open_world_hint=False)
+_CHANGE = mcp_types.ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, open_world_hint=False
+)
+_START = mcp_types.ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, open_world_hint=False
+)
+
 
 def _text(value: dict[str, Any]) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=str)
@@ -609,7 +621,7 @@ class RelayServer:
         @server.tool(
             name="describe",
             title="Describe relay, a site, or an operation",
-            annotations=mcp_types.ToolAnnotations(read_only_hint=True, open_world_hint=True),
+            annotations=_READ,
         )
         async def describe(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str | None, Field(description="A site id")] = None,
@@ -662,7 +674,7 @@ class RelayServer:
         @server.tool(
             name="exec",
             title="Run one short command on a site",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+            annotations=_CHANGE,
         )
         async def exec_(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
@@ -691,7 +703,7 @@ class RelayServer:
         @server.tool(
             name="files",
             title="List, read, write, delete and stage files on a site",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+            annotations=_CHANGE,
         )
         async def files(  # pyright: ignore[reportUnusedFunction]
             ctx: Context,
@@ -740,7 +752,7 @@ class RelayServer:
         @server.tool(
             name="packages",
             title="List, stage and remove the packages relay can run",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+            annotations=_CHANGE,
         )
         async def packages(  # pyright: ignore[reportUnusedFunction]
             op: Literal["list", "stage", "remove"],
@@ -813,7 +825,7 @@ class RelayServer:
         @server.tool(
             name="shutdown",
             title="Stop relay's long-lived processes",
-            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+            annotations=_CHANGE,
         )
         async def shutdown(  # pyright: ignore[reportUnusedFunction]
             all: Annotated[  # noqa: A002 - the contract names it all
@@ -871,7 +883,7 @@ def _task_optional(fn: Any, name: str, title: str) -> FunctionTool:
         fn,
         name=name,
         title=title,
-        annotations=mcp_types.ToolAnnotations(destructive_hint=False, open_world_hint=True),
+        annotations=_START,
         task=TaskConfig(
             mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
         ),

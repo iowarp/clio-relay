@@ -315,7 +315,7 @@ async def refresh_install(
         _update(service, operation_id, stage="done", log_offset=offset, log_tail=tail)
         return await _resubmit(service, operation_id, "the install finished; submitting the run")
     if status.state.final:
-        return _ended(service, operation_id, status, tail or state.get("log_tail"))
+        return _ended(service, operation_id, status, handle, tail or state.get("log_tail"))
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)
         if record.state.final:
@@ -340,7 +340,7 @@ async def refresh_install(
 
 
 def _ended(
-    service: RelayService, operation_id: str, status: JobStatus, tail: object
+    service: RelayService, operation_id: str, status: JobStatus, handle: JobHandle, tail: object
 ) -> OperationRecord:
     if status.state == JobState.CANCELLED:
         return service.finish(operation_id, OperationState.CANCELLED, None)
@@ -356,5 +356,7 @@ def _ended(
             message,
             needs=jarvis_submit.NEEDS_INSTALL,
             exit_code=status.exit_code,
+            install_log=_log_path(handle),
+            install_job=handle.native_id,
         ),
     )

@@ -98,7 +98,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "c95fa922a1b46aae8a2e3abcc335b0142a54d393"
+JARVIS_PIN = "af290aef6a3592a102b99df38545a2345e3dc28b"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -910,6 +910,11 @@ INSTALL_WALLTIME_HELP = (
     "is longer. Keep it within the site's partition limit"
 )
 
+_INSTALL_DROPPED_KEYS = frozenset(
+    {"pre_cmds", "ntasks", "cpus_per_task", "gpus_per_node", "mem", "hostfile"}
+)
+"""The run's scheduler keys the install job does not take: it is one task on a whole node."""
+
 INSTALL_PIPELINE_FILE = "relay.install-pipeline.yaml"
 """The pipeline the install job builds with, beside the run's :data:`PIPELINE_FILE`."""
 
@@ -930,13 +935,23 @@ def install_pipeline(document: Mapping[str, object], spec: JobSpec, *, walltime_
     (often minutes) would cut a build short. This one has
     :func:`install_walltime` instead, and no ``pre_cmds``: the install job
     serves nothing, so a package service's connector does not start in it.
+
+    A build is one process using every CPU it is given, not the run's ranks, so
+    the job is one task on a whole node (``exclusive``). Spack's ``build_jobs``
+    is capped by the CPUs the job can use, so it then builds with the whole
+    node instead of the run's few cores.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
         return render_pipeline(document)
     scheduler = {
-        key: value for key, value in cast(Mapping[str, object], found).items() if key != "pre_cmds"
+        key: value
+        for key, value in cast(Mapping[str, object], found).items()
+        if key not in _INSTALL_DROPPED_KEYS
     }
+    scheduler["nodes"] = 1
+    scheduler["ntasks_per_node"] = 1
+    scheduler["exclusive"] = True
     scheduler["time"] = install_walltime(spec, walltime_s)
     return render_pipeline({**document, "scheduler": scheduler})
 
@@ -1831,7 +1846,7 @@ def install_message(
         parts.append("Built: " + ", ".join(built) + ".")
     if summary["issues"]:
         parts.append(f"JARVIS has {summary['issues']} question(s) for you after this.")
-    job = f"a one-node job of up to {walltime}" if walltime else "a job"
+    job = f"a job on one whole node of up to {walltime}" if walltime else "a job"
     parts.append(f"JARVIS installs it as {job} on the site before the run. Install it?")
     return " ".join(parts)
 
