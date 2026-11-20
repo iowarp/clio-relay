@@ -36,10 +36,11 @@ import shutil
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from clio_relay import jarvis_submit
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.worker.files import WorkerFileAccess
@@ -126,6 +127,14 @@ class WorkerConfig(BaseModel):
     )
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
+    jarvis: str = Field(
+        default="jarvis",
+        min_length=1,
+        description=(
+            "The jarvis command on the site, which runs package jobs. A leading ~/ "
+            "means the home directory"
+        ),
+    )
 
     @field_validator("remote_dir")
     @classmethod
@@ -225,6 +234,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     name: ClassVar[str] = "worker"
     Config: ClassVar[type[BaseModel]] = WorkerConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
+    # The site's local adapter hands a package job to jarvis ppl submit.
+    runs_packages: ClassVar[bool] = True
 
     # --- link state -----------------------------------------------------
 
@@ -560,6 +571,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         config: dict[str, Any] = {
             "scheduler": self.config.scheduler,
             "submit_timeout_s": self.config.submit_timeout_s,
+            "jarvis": self.config.jarvis,
         }
         if self.config.work_dir is not None:
             config["work_dir"] = self.config.work_dir
@@ -640,7 +652,18 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             )
         return remote  # pyright: ignore[reportUnknownVariableType]
 
+    def job_dir(self, handle: JobHandle) -> str | None:
+        """The job's directory on the site, from the site's own handle."""
+        remote = handle.data.get("remote")
+        if not isinstance(remote, dict):
+            return None
+        data = cast(dict[str, Any], remote).get("data")
+        found = cast(dict[str, Any], data).get("job_dir") if isinstance(data, dict) else None
+        return found if isinstance(found, str) and found else None
+
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
+        if spec.package is not None:
+            spec = jarvis_submit.with_archive(spec)  # stage the reviewed archive too
         for item in spec.inputs:
             if not await self.call("/files/has", {"digest": item.sha256}, timeout_s=120):
                 if not self.context.content.has(item.sha256):
@@ -739,6 +762,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
+        if spec.job.package is not None:
+            raise jarvis_submit.stop_refusal()
         try:
             runtime: Any = importlib.import_module("clio_relay.serve")
         except ModuleNotFoundError as exc:

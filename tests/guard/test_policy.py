@@ -10,7 +10,6 @@ from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.hooks import Charge, GuardHook
 from clio_relay.guard import WARM_EXECUTABLE, Guard
-from clio_relay.jarvis_site import ARCHIVE_DIR
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
@@ -174,7 +173,9 @@ async def test_package_jobs_take_settings_only_as_parameters(guard: Guard, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Path) -> None:
+async def test_prepare_hands_only_a_reviewed_package_to_an_adapter_that_runs_it(
+    guard: Guard, tmp_path: Path
+) -> None:
     digest = stage(guard, make_repo(tmp_path), "demo.hello")
     hpc = site()
     adapter = fixture(guard)
@@ -184,40 +185,21 @@ async def test_prepare_lowers_only_a_reviewed_package(guard: Guard, tmp_path: Pa
     review = (await guard.check_run(hpc, package_spec(digest))).data["asks"][0]
     answer(guard, "ask-1", hpc.id, review["message"], {**review["binding"], "site": hpc.id})
 
-    lowered = await guard.prepare(hpc, package_spec(digest), adapter=adapter)
-    assert lowered.package is None
-    assert lowered.executable == "/bin/bash"
-    assert lowered.arguments[2:8] == [
-        "clio-relay-jarvis",
-        "run",
-        digest,
-        "demo.hello",
-        "jarvis",
-        "",
-    ]
-    assert lowered.arguments[8].splitlines()[-2:] == ["  out: result.txt", "  steps: 3"]
-    assert [(item.name, item.sha256) for item in lowered.inputs] == [
-        (f"{ARCHIVE_DIR}/{digest}.tar.gz", digest)
-    ]
-    served = await guard.prepare(hpc, package_spec(digest), adapter=adapter, service=True)
-    assert served.arguments == lowered.arguments, "JARVIS's run holds while a service is up"
+    class CommandsOnly(FixtureAdapter):
+        runs_packages: ClassVar[bool] = False
 
-    class Runs(FixtureAdapter):
-        runs_packages: ClassVar[bool] = True
+    commands_only = CommandsOnly(FixtureConfig(), _context(guard))
+    for service in (False, True):
+        with pytest.raises(Refusal) as raised:
+            await guard.prepare(hpc, package_spec(digest), adapter=commands_only, service=service)
+        assert raised.value.reason == RefusalReason.ADAPTER_UNAVAILABLE
+        assert raised.value.data["needs"] == "jarvis ppl submit through the fixture adapter"
+        assert "inside an allocation" in raised.value.message
 
-    kept = await guard.prepare(
-        hpc,
-        package_spec(digest),
-        adapter=Runs(FixtureConfig(), _context(guard)),
-    )
+    kept = await guard.prepare(hpc, package_spec(digest), adapter=adapter)
     assert kept.package is not None
     assert kept.package.service is False
-    served_copy = await guard.prepare(
-        hpc,
-        package_spec(digest),
-        adapter=Runs(FixtureConfig(), _context(guard)),
-        service=True,
-    )
+    served_copy = await guard.prepare(hpc, package_spec(digest), adapter=adapter, service=True)
     assert served_copy.package is not None
     assert served_copy.package.service is True
     assert served_copy.package.sha256 == digest

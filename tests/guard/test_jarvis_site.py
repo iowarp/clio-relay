@@ -15,7 +15,13 @@ from clio_relay.jarvis_site import (
     package_files,
     read_archive,
 )
-from clio_relay.jarvis_submit import SITE_SCRIPT, direct_job
+from clio_relay.jarvis_submit import (
+    ARCHIVE_DIR,
+    SITE_SCRIPT,
+    direct_job,
+    input_paths,
+    pipeline_document,
+)
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
@@ -156,3 +162,38 @@ def test_direct_job_keeps_resources_and_inputs() -> None:
     with pytest.raises(Refusal) as raised:
         direct_job(spec.model_copy(update={"directory": "/scratch/run"}))
     assert raised.value.reason == RefusalReason.INVALID_SPEC
+
+
+def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
+    spec = JobSpec.model_validate(
+        {
+            "package": {
+                "name": "demo.hello",
+                "version": "1",
+                "sha256": "b" * 64,
+                "parameters": {"stl": "body.stl", "label": "body", "count": 2},
+            },
+            "inputs": [
+                {"name": "body.stl", "sha256": "c" * 64},
+                {"name": f"{ARCHIVE_DIR}/{'b' * 64}.tar.gz", "sha256": "b" * 64},
+            ],
+        }
+    )
+    archive = f"{ARCHIVE_DIR}/{'b' * 64}.tar.gz"
+    assert input_paths(spec, "/scratch/job") == {"body.stl": "/scratch/job/body.stl"}
+    entry = pipeline_document(spec, pipeline="p", job_dir="/scratch/job")["pkgs"]
+    assert entry == [
+        {
+            "pkg_type": "demo.hello",
+            "pkg_name": "pkg",
+            "count": 2,
+            "label": "body",
+            "stl": "/scratch/job/body.stl",
+        }
+    ]
+    kept = pipeline_document(spec, pipeline="p")["pkgs"]
+    assert isinstance(kept, list)
+    assert kept[0]["stl"] == "body.stl"
+    assert archive not in str(entry)
+    job = direct_job(spec, job_dir="/scratch/job")
+    assert "stl: /scratch/job/body.stl" in job.arguments[8].splitlines()

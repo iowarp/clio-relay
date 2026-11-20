@@ -160,8 +160,14 @@ working around JARVIS:
 - Package jobs need Slurm. On PBS, LSF or Cobalt, `run` is refused with
   `adapter_unavailable`, naming the JARVIS scheduler it needs.
 - A package job's `directory` and `stdin_path` are refused. Its inputs are in
-  the job directory, so give packages absolute paths.
+  the job directory, and a package parameter whose value is an input's name
+  becomes that input's absolute path there, so nobody spells out the job
+  directory.
 - JARVIS has no cleanup command, so the execution directory stays on the site.
+
+The local and worker adapters run package jobs the same way, with the same
+refusals: `jarvis ppl submit` when the site's scheduler is Slurm, and
+JARVIS's direct run under the supervisor when it has none.
 
 ## Sites that ask for a code
 

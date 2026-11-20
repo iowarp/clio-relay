@@ -33,7 +33,8 @@ from clio_relay.session_api import (
     session_identity_document,
 )
 
-WORKER_PROTOCOL: Final = 2
+WORKER_PROTOCOL: Final = 3
+"""3: the site's local adapter hands package jobs to ``jarvis ppl submit``."""
 MAX_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 _IDLE_STREAMS: Final = 4
 # The site keeps an idle stream open for 300 s; relay drops its own sooner.

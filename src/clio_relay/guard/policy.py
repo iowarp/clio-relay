@@ -11,9 +11,10 @@ It implements the guard hook (RL24 to RL26):
 - ``price``: the most a job may use, in node-hours, or the adapter's own price
   when it has one (sky, in US dollars). No walltime means an unknown charge,
   which always asks unless the site never asks.
-- ``prepare``: what the adapter submits. A package becomes the package runner,
-  unless the adapter runs packages itself, and a warm allocation request
-  becomes its holder. A package that is still not reviewed is refused here too.
+- ``prepare``: what the adapter submits. A package goes, unchanged, only to an
+  adapter that runs packages (through ``jarvis ppl submit``); any other adapter
+  refuses it. A warm allocation request becomes its holder. A package that is
+  still not reviewed is refused here too.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from clio_relay.guard.config import SiteGuard, load_config
 from clio_relay.guard.reviews import REVIEW_KIND, Review, ReviewStore
 from clio_relay.guard.warm import WARM_EXECUTABLE, holder_job, is_warm
 from clio_relay.jarvis_site import ArchiveInfo, read_archive
-from clio_relay.jarvis_submit import direct_job
+from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -314,9 +315,10 @@ class Guard:
                     site=site.id,
                     next_step="package_review",
                 )
-        if adapter.runs_packages:
-            if service and not package.service:
-                package = package.model_copy(update={"service": True})
-                return spec.model_copy(update={"package": package})
-            return spec
-        return direct_job(spec, jarvis=settings.jarvis)
+        if not adapter.runs_packages:
+            # A package never becomes relay's own job: JARVIS submits it.
+            raise not_run_here(adapter.name)
+        if service and not package.service:
+            package = package.model_copy(update={"service": True})
+            return spec.model_copy(update={"package": package})
+        return spec

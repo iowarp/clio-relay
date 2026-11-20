@@ -236,17 +236,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
         jarvis_mode = False
         if spec.package is not None:
             if scheduler is None:
-                spec = jarvis_submit.direct_job(spec, jarvis=self.config.jarvis)
+                spec = jarvis_submit.direct_job(
+                    spec, jarvis=self.config.jarvis, job_dir=str(job_dir)
+                )
             elif scheduler == "slurm":
                 jarvis_mode = True
             else:
-                raise Refusal(
-                    RefusalReason.ADAPTER_UNAVAILABLE,
-                    f"a package job on {self.config.ssh_profile} goes through jarvis ppl "
-                    f"submit, and JARVIS submits to Slurm only, not {scheduler}",
-                    scheduler=scheduler,
-                    needs=f"a JARVIS {scheduler} scheduler",
-                )
+                raise jarvis_submit.scheduler_refusal(scheduler, site=self.config.ssh_profile)
         have = set(check.get("have", []))
         missing = sorted(digests - have)
         blobs: list[Path] = []
@@ -369,14 +365,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{submit_output.strip()[-500:] or 'no output'}",
                 scheduler="jarvis",
             )
-        execution_id = str(found["execution_id"])
-        native = found.get("scheduler_native_id")
-        data["mode"] = "jarvis"
-        data["scheduler"] = str(found.get("scheduler_provider") or "slurm")
-        data["execution_id"] = execution_id
-        data["pipeline_id"] = str(found["pipeline_id"])
-        data["execution_dir"] = jarvis_submit.execution_dir(str(data["job_dir"]), execution_id)
-        return JobHandle(adapter=self.name, native_id=str(native) if native else None, data=data)
+        native, jarvis_data = jarvis_submit.handle_data(found, job_dir=str(data["job_dir"]))
+        return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
 
     def _render_jarvis(
         self, spec: JobSpec, operation_id: str, job_dir: PurePosixPath, name: str
@@ -390,7 +380,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
             stderr=str(stderr) if stderr is not None else None,
         )
         document = jarvis_submit.pipeline_document(
-            spec, pipeline=jarvis_submit.pipeline_id(operation_id), scheduler=block
+            spec,
+            pipeline=jarvis_submit.pipeline_id(operation_id),
+            scheduler=block,
+            job_dir=str(job_dir),
         )
         rendered = _Rendered()
         rendered.files[jarvis_submit.PIPELINE_FILE] = jarvis_submit.render_pipeline(document)

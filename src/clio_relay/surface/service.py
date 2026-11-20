@@ -24,6 +24,7 @@ from clio_relay.adapters.hooks import (
     Transport,
     hook_factory,
 )
+from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
 from clio_relay.jobs.records import (
@@ -269,6 +270,8 @@ class RelayService:
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
+        if job.package is not None and not adapter.runs_packages:
+            raise not_run_here(adapter_name)
         decision = await self.guard.check_run(site, job)
         decision.raise_if_refused()
         charge = await self.guard.price(site, job)

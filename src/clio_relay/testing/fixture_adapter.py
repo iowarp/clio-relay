@@ -49,6 +49,8 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
     name: ClassVar[str] = "fixture"
     Config: ClassVar[type[BaseModel]] = FixtureConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
+    # A package job is simulated like any other, as if JARVIS had accepted it.
+    runs_packages: ClassVar[bool] = True
     listed: ClassVar[bool] = False
 
     def __init__(self, config: FixtureConfig, context: AdapterContext) -> None:
@@ -89,8 +91,8 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
         await self._require_sign_in()
-        if spec.executable is None:
-            raise Refusal(RefusalReason.INVALID_SPEC, "the fixture runs an executable")
+        if spec.executable is None and spec.package is None:
+            raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
         job_dir = self.jobs_root / operation_id
         job_dir.mkdir(parents=True, exist_ok=True)
         for item in spec.inputs:
@@ -104,6 +106,7 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
         record = {
             "operation_id": operation_id,
             "executable": spec.executable,
+            "package": spec.package.name if spec.package is not None else None,
             "arguments": spec.arguments,
             "submitted_at": time.time(),
             "queue_s": self.config.queue_s,
@@ -138,7 +141,7 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
         return loaded
 
     def _result(self, job: dict[str, Any], job_dir: Path) -> tuple[int, str]:
-        executable = str(job["executable"])
+        executable = str(job["executable"] or f"package {job.get('package')}")
         arguments = [str(item) for item in job["arguments"]]
         if executable == "false":
             return 1, ""

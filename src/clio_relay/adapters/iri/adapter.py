@@ -87,7 +87,7 @@ def iri_job_spec(spec: JobSpec, *, job_dir: str | None) -> dict[str, Any]:
     if spec.executable is None:
         raise Refusal(
             RefusalReason.INVALID_SPEC,
-            "the iri adapter runs an executable; a package job needs the package runner",
+            "the iri adapter runs an executable; it does not run JARVIS packages",
         )
 
     def in_job(path: str | None, default: str | None) -> str | None:

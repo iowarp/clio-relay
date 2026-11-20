@@ -43,11 +43,12 @@ is ``needs_sign_in``, a facility that does not answer is ``unreachable``, a bad
 setting is ``invalid_config``, and a missing path is ``path_not_found``.
 
 Policy: a site is open or guarded. The guard sits in front of every adapter,
-so an adapter does not enforce it. On a guarded site the guard turns a reviewed
-JARVIS package into a plain command job that runs it with JARVIS's direct run
-(:func:`clio_relay.jarvis_submit.direct_job`), unless the adapter sets
-``runs_packages`` and runs :attr:`JobSpec.package` itself, which a batch
-adapter does by handing it to ``jarvis ppl submit``.
+so an adapter does not enforce it. A JARVIS package job (:attr:`JobSpec.package`)
+goes only to an adapter that sets ``runs_packages``, which hands it to
+``jarvis ppl submit`` on a batch site (:mod:`clio_relay.jarvis_submit`), or to
+JARVIS's direct run on a machine with no scheduler. Relay never turns a package
+into its own command job inside an allocation; any other adapter refuses it
+(:func:`clio_relay.jarvis_submit.not_run_here`).
 
 Optional hooks, found by name when an adapter defines them:
 

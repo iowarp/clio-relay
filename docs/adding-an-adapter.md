@@ -220,15 +220,16 @@ returns the first bytes of each stream, and stops it.
 ### Policy
 
 Each site is `open` or `guarded`. Relay's guard sits in front of every adapter
-and enforces the policy, so an adapter does not check it. On a guarded site the
-guard turns a reviewed JARVIS package into a plain command job that runs
-`jarvis ppl run` (`jarvis_submit.direct_job`). If your facility runs packages
-itself, set `runs_packages = True` and read `spec.package`. A batch adapter
-should hand the job to JARVIS rather than its own scheduler call:
-`clio_relay.jarvis_submit` renders the pipeline with its `scheduler:` key, the
-site script that runs `jarvis ppl submit`, and the parsers that turn JARVIS's
-execution record into a `JobStatus` and outputs. The ssh and tapis adapters
-both use it.
+and enforces the policy, so an adapter does not check it. A JARVIS package job
+goes only to an adapter with `runs_packages = True`, which reads `spec.package`;
+relay refuses a package for any other adapter before it asks anything
+(`jarvis_submit.not_run_here`). Relay never turns a package into its own command
+job inside an allocation. A batch adapter hands the job to JARVIS rather than
+its own scheduler call: `clio_relay.jarvis_submit` renders the pipeline with its
+`scheduler:` key, the site script that runs `jarvis ppl submit`, and the parsers
+that turn JARVIS's execution record into a `JobStatus` and outputs. With no
+scheduler, `jarvis_submit.direct_job` runs JARVIS's direct run on the machine
+itself. The local, worker, ssh and tapis adapters all use it.
 
 ### Optional hooks
 

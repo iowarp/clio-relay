@@ -243,13 +243,40 @@ def _parameter(key: str, value: CustomValue) -> CustomValue:
     return value
 
 
+def input_paths(spec: JobSpec, job_dir: str) -> dict[str, str]:
+    """Return each run input's absolute path on the site, by the input's name.
+
+    The archive is left out: it is relay's, not the package's.
+    """
+    return {
+        item.name: posixpath.join(job_dir, item.name)
+        for item in spec.inputs
+        if not item.name.startswith(f"{ARCHIVE_DIR}/")
+    }
+
+
+def _resolved(value: CustomValue, paths: Mapping[str, str]) -> CustomValue:
+    if isinstance(value, str):
+        return paths.get(value, value)
+    return value
+
+
 def pipeline_document(
-    spec: JobSpec, *, pipeline: str, scheduler: Mapping[str, object] | None = None
+    spec: JobSpec,
+    *,
+    pipeline: str,
+    scheduler: Mapping[str, object] | None = None,
+    job_dir: str | None = None,
 ) -> dict[str, object]:
     """Return the JARVIS pipeline for ``spec``'s package, with typed parameters.
 
     The pipeline names no ``env``, so JARVIS captures the environment it is
     loaded in, which is where the site script exports the job's environment.
+
+    With ``job_dir``, a parameter whose value is a run input's name becomes that
+    input's absolute path in the job directory, so the person or agent never
+    spells out where relay puts the job. JARVIS runs the package in its own
+    execution directory, where a relative name would not resolve.
     """
     package = spec.package
     if package is None:
@@ -263,8 +290,14 @@ def pipeline_document(
             "leave directory and stdin_path out and set the package's own parameters",
             package=package.name,
         )
+    paths = input_paths(spec, job_dir) if job_dir is not None else {}
     entry: dict[str, object] = {"pkg_type": package.name, "pkg_name": "pkg"}
-    entry.update({key: _parameter(key, value) for key, value in sorted(package.parameters.items())})
+    entry.update(
+        {
+            key: _resolved(_parameter(key, value), paths)
+            for key, value in sorted(package.parameters.items())
+        }
+    )
     document: dict[str, object] = {"name": pipeline}
     if scheduler is not None:
         document["scheduler"] = dict(scheduler)
@@ -381,19 +414,22 @@ def submit_command(
     return shlex.join([*prefix, "bash", script, *arguments])
 
 
-def direct_job(spec: JobSpec, *, jarvis: str = "jarvis") -> JobSpec:
+def direct_job(spec: JobSpec, *, jarvis: str = "jarvis", job_dir: str | None = None) -> JobSpec:
     """Lower a package job to the bash job that runs it with JARVIS's direct run.
 
-    For an adapter that starts the job itself rather than through a batch
-    scheduler. The archive becomes an input, so the adapter stages it by
-    digest; the pipeline YAML travels as an argument. A service package runs
-    the same way: JARVIS's run holds while the service is up.
+    Only for a site with no batch scheduler, where the adapter starts the job
+    on the machine itself: a package never runs this way inside an allocation,
+    because there ``jarvis ppl submit`` owns the job. The archive becomes an
+    input, so the adapter stages it by digest; the pipeline YAML travels as an
+    argument. ``job_dir`` resolves input names as in :func:`pipeline_document`.
     """
     package = spec.package
     if package is None:
         return spec
     digest = package.pinned()[1]
-    pipeline = render_pipeline(pipeline_document(spec, pipeline=f"relay_{digest[:12]}"))
+    pipeline = render_pipeline(
+        pipeline_document(spec, pipeline=f"relay_{digest[:12]}", job_dir=job_dir)
+    )
     staged = with_archive(spec)
     data = staged.model_dump(mode="json", exclude={"package", "executable", "arguments"})
     data["executable"] = "/bin/bash"
@@ -463,6 +499,25 @@ def parse_document(text: str, schema: str) -> dict[str, Any] | None:
 def parse_handle(text: str) -> dict[str, Any] | None:
     """Return the ``jarvis.execution.handle.v1`` that ``ppl submit +json`` printed."""
     return parse_document(text, HANDLE_SCHEMA)
+
+
+def handle_data(found: Mapping[str, Any], *, job_dir: str) -> tuple[str | None, dict[str, Any]]:
+    """Return the native id and the job handle's data for a job ``ppl submit`` accepted.
+
+    The data has ``mode: jarvis``, ``scheduler``, ``job_dir``, ``execution_id``,
+    ``pipeline_id`` and ``execution_dir``; the adapter adds its own keys.
+    """
+    execution_id = str(found["execution_id"])
+    native = found.get("scheduler_native_id")
+    data: dict[str, Any] = {
+        "mode": "jarvis",
+        "scheduler": str(found.get("scheduler_provider") or "slurm"),
+        "job_dir": job_dir,
+        "execution_id": execution_id,
+        "pipeline_id": str(found["pipeline_id"]),
+        "execution_dir": execution_dir(job_dir, execution_id),
+    }
+    return (str(native) if native else None), data
 
 
 _STATES = {
@@ -576,6 +631,28 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
         "jarvis-cd there, or set the site's jarvis setting to its path",
         missing="jarvis",
         tried=tried,
+    )
+
+
+def scheduler_refusal(scheduler: str, *, site: str) -> Refusal:
+    """A package job on a site whose batch scheduler JARVIS cannot submit to."""
+    return Refusal(
+        RefusalReason.ADAPTER_UNAVAILABLE,
+        f"a package job on {site} goes through jarvis ppl submit, and JARVIS submits to "
+        f"Slurm only, not {scheduler}",
+        scheduler=scheduler,
+        needs=f"a JARVIS {scheduler} scheduler",
+    )
+
+
+def not_run_here(adapter: str) -> Refusal:
+    """A package job sent to an adapter that cannot hand it to ``jarvis ppl submit``."""
+    return Refusal(
+        RefusalReason.ADAPTER_UNAVAILABLE,
+        f"the {adapter} adapter does not run JARVIS packages: a package job goes through "
+        "jarvis ppl submit, and relay does not run a package inside an allocation itself",
+        adapter=adapter,
+        needs=f"jarvis ppl submit through the {adapter} adapter",
     )
 
 

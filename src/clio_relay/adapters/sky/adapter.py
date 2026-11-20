@@ -148,7 +148,7 @@ def run_command(spec: JobSpec) -> str:
     if spec.executable is None:
         raise Refusal(
             RefusalReason.INVALID_SPEC,
-            "the sky adapter runs an executable; a package job needs the package runner",
+            "the sky adapter runs an executable; it does not run JARVIS packages",
         )
     argv = [spec.executable, *spec.arguments]
     if spec.launcher:

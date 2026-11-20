@@ -210,7 +210,7 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
         if spec.executable is None:
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
-                "the globus adapter runs an executable; a package job needs the package runner",
+                "the globus adapter runs an executable; it does not run JARVIS packages",
             )
         argv = [spec.executable, *spec.arguments]
         launcher = spec.launcher

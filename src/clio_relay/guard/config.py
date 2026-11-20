@@ -29,7 +29,13 @@ class SiteGuard(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    jarvis: str = Field(default="jarvis", description="The jarvis command on the site")
+    jarvis: str = Field(
+        default="jarvis",
+        description=(
+            "The jarvis command on the site, whose read-only commands exec allows. The "
+            "adapter's own jarvis setting is the one that submits package jobs"
+        ),
+    )
     read_only: list[str] = Field(
         default_factory=list[str],
         description="Programs added to the site's read-only exec list, by exact argv[0]",

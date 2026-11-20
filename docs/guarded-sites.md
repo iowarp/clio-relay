@@ -94,7 +94,14 @@ walltime, partition and account. JARVIS then submits it with
 `jarvis ppl submit`, so the batch job, its execution record and its hostfile
 are JARVIS's own. On a host with no scheduler the script runs the pipeline
 with `jarvis ppl run`. Your own JARVIS configuration on the site is not
-touched.
+touched. This is the same on the local, worker, ssh and tapis adapters; the
+globus, iri and sky adapters do not run packages, and relay says so before it
+asks anything.
+
+A package parameter whose value is the name of one of the run's inputs becomes
+that input's absolute path on the site, so `{"stl": "body.stl"}` with an input
+named `body.stl` reaches the package as `<job directory>/body.stl`. Neither you
+nor the agent spell out where relay puts the job.
 
 JARVIS 1.8.1 has no command to cancel or stop a submitted execution, so a
 running package job cannot be cancelled through relay yet, and a package
