@@ -70,6 +70,7 @@ from typing import IO, Any, Final, Literal, Protocol, cast
 
 import httpx
 
+from clio_relay import programs
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.relay_host import (
@@ -570,8 +571,12 @@ fake factory rather than monkeypatching :mod:`subprocess` directly.
 
 
 def spawn_frp_process(*args: Any, **kwargs: Any) -> FrpProcess:
-    """Spawn one real ``frpc`` process (the production dial)."""
-    return cast(FrpProcess, subprocess.Popen(*args, **kwargs))
+    """Spawn one real ``frpc`` process (the production dial), its program found on the PATH."""
+    argv = list(args[0]) if args else list(kwargs.pop("args"))
+    program = programs.resolved(argv, kwargs.get("env"))
+    if program is None:
+        raise FileNotFoundError(programs.missing(argv[0] if argv else "frpc"))
+    return cast(FrpProcess, subprocess.Popen(program, *args[1:], **kwargs))
 
 
 class HeldFrpVisitor:

@@ -10,6 +10,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+from clio_relay import programs
 from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
 
 POSIX = os.name == "posix"
@@ -79,9 +80,18 @@ async def run_bounded(
     started = time.monotonic()
     stdout = _Sink(max_output_bytes)
     stderr = _Sink(max_output_bytes)
+    program = programs.resolved(argv, env)
+    if program is None:
+        return ExecResult(
+            argv=argv,
+            exit_code=127,
+            stdout="",
+            stderr=f"{argv[0] if argv else ''}: command not found",
+            duration_s=time.monotonic() - started,
+        )
     try:
         process = await asyncio.create_subprocess_exec(
-            *argv,
+            *program,
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

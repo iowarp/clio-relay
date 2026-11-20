@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from clio_relay import programs
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.client import TapisCallError
 from clio_relay.adapters.tapis.files import WORK_DIR_NAME
@@ -85,7 +86,15 @@ class SshHost:
         return argv
 
     def _run(self, argv: list[str], what: str) -> str:
-        done = subprocess.run(argv, capture_output=True, text=True, check=False)
+        program = programs.resolved(argv)
+        if program is None:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                programs.missing(argv[0]),
+                profile=self.ssh_profile,
+                command=argv[0],
+            )
+        done = subprocess.run(program, capture_output=True, text=True, check=False)
         if done.returncode != 0:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
@@ -185,7 +194,11 @@ def make_key_pair(comment: str) -> KeyPair:
         "ssh-keygen", "-q", "-t", "rsa", "-b", str(KEY_BITS), "-m", "PEM",
         "-N", "", "-C", comment, "-f", str(path),
     ]  # fmt: skip
-    done = subprocess.run(argv, capture_output=True, text=True, check=False)
+    program = programs.resolved(argv)
+    if program is None:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise Refusal(RefusalReason.ADAPTER_UNAVAILABLE, programs.missing(argv[0]), command=argv[0])
+    done = subprocess.run(program, capture_output=True, text=True, check=False)
     if done.returncode != 0:
         shutil.rmtree(directory, ignore_errors=True)
         raise Refusal(
