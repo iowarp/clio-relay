@@ -819,7 +819,19 @@ class RelayService:
         return record
 
     async def cancel(self, operation_id: str) -> OperationRecord:
-        """Cancel an operation wherever it is."""
+        """Cancel an operation wherever it is.
+
+        Once it ends, any ask still pending on it is withdrawn, so no page or
+        ``asks list`` keeps offering a question about a cancelled operation.
+        """
+        record = await self._cancel(operation_id)
+        if record.state.final:
+            for ask in self.operation_asks(record):
+                if ask.state == "pending":
+                    self.answer(ask.ask_id, "cancel", by="cancel")
+        return record
+
+    async def _cancel(self, operation_id: str) -> OperationRecord:
         record = self.operation(operation_id)
         if record.state.final:
             return record

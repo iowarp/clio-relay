@@ -244,14 +244,17 @@ Relay calls these when the adapter defines them:
 | `price(spec)` | What a job would cost, for the spend question on guarded sites |
 | `system_id()` | The facility's own id for the site, shown in the Compute tab |
 | `stop(handle)` | Stop a package service so its package's own stop runs (`jarvis execution stop`) |
-| `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle |
-| `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`) |
+| `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle. Pass the build its own walltime: `jarvis_submit.install_pipeline` of the run's pipeline as `install_command(pipeline=...)` |
+| `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`, with the site's `jarvis_python` setting) |
 
 A batch adapter that runs packages refuses with `jarvis_submit.install_needed`
-when the submit exits 3, with `jarvis_submit.build_refused` when it exits 4
+when the submit exits 3 (with `walltime=jarvis_submit.install_walltime(...)`,
+so the approval says how long the build may take), with
+`jarvis_submit.build_refused` when it exits 4
 (JARVIS will not build outside an allocation; never retry it), and with
-`jarvis_submit.missing_jarvis` when JARVIS is
-missing. Relay turns those into the install questions and calls `install` or
+`jarvis_submit.missing_jarvis` when the site script exits 69: JARVIS is
+missing, or JARVIS found no Spack (`missing: spack`, with no install offer).
+Relay turns those into the install questions and calls `install` or
 `install_jarvis` itself.
 
 A Slurm adapter's `describe()` fills `SiteInfo.partitions` (a `PartitionInfo`

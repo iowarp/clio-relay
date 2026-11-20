@@ -7,7 +7,10 @@ registers the repository under its own name and ``<repo>.<package>`` resolves.
 Shared modules of the repository (``<repo>/<repo>/_*``), the repository's
 top-level files, and a ``schemas/`` directory next to the repository ride
 along, because packages import or read them (clio-jarvis's contract reads
-``<repo dir>/../schemas``).
+``<repo dir>/../schemas``), and so do the Spack repositories a package's
+``contract.yaml`` installs from (:func:`contract_repos`). The repository's Python
+requirements ride along as ``<repo>/.clio-relay-requirements.txt``
+(:func:`repository_requirements`).
 
 JARVIS runs the package: :mod:`clio_relay.jarvis_submit` renders the
 pipeline and the site script that checks the archive's SHA-256 against the
@@ -28,10 +31,13 @@ import json
 import re
 import subprocess
 import tarfile
+import tomllib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
+
+import yaml
 
 from clio_relay import programs
 from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
@@ -43,6 +49,18 @@ SOURCE_FILE = ".clio-relay-source.json"
 
 SHARED_SIBLINGS = ("schemas",)
 """Directories next to the repository directory that its packages read."""
+
+REQUIREMENTS_FILE = ".clio-relay-requirements.txt"
+"""The archive member ``<repo>/<this>``: the repository's Python requirements, one a line.
+
+They are the ``[project] dependencies`` of the repository's ``pyproject.toml``, or of
+the checkout's beside it, without jarvis-cd, which relay pins itself. The site
+script installs them into relay's jarvis-cd environment before JARVIS loads the
+package.
+"""
+
+_PINNED_BY_RELAY = frozenset({"jarvis-cd"})
+_REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 _SKIP_DIRS = frozenset({"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
 _SKIP_SUFFIXES = (".pyc", ".pyo")
@@ -107,14 +125,86 @@ def package_files(repo_dir: Path, name: str) -> list[tuple[str, Path]]:
         for path in chosen
         if path.name not in _SKIP_DIRS and not path.name.endswith(_SKIP_SUFFIXES)
     ]
-    for sibling in SHARED_SIBLINGS:
+    for sibling in (*SHARED_SIBLINGS, *contract_repos(repo_dir, inner / package)):
         shared = repo_dir.parent / sibling
         if shared.is_dir() and not shared.is_symlink():
             entries += [
                 (str(PurePosixPath(sibling, *path.relative_to(shared).parts)), path)
                 for path in _files(shared)
             ]
-    return sorted(entries)
+    return sorted(set(entries))
+
+
+def contract_repos(repo_dir: Path, package_dir: Path) -> list[str]:
+    """Return the Spack repositories the package's ``contract.yaml`` installs from.
+
+    ``install.repos`` names directories of the checkout, beside ``repo_dir`` as
+    ``schemas/`` is, so they ride along in the archive. One that is not there is
+    refused here, on the relay host, rather than on the site.
+    """
+    contract = package_dir / "contract.yaml"
+    if not contract.is_file():
+        return []
+    try:
+        loaded: object = yaml.safe_load(contract.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return []
+    install = cast(dict[str, object], loaded).get("install") if isinstance(loaded, dict) else None
+    listed = cast(dict[str, object], install).get("repos") if isinstance(install, dict) else None
+    repos: list[str] = []
+    for item in cast(list[object], listed) if isinstance(listed, list) else []:
+        relative = PurePosixPath(str(item))
+        where = repo_dir.parent / str(item)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise Refusal(
+                RefusalReason.INVALID_SPEC,
+                f"{contract} installs from {item!r}, which is not a directory of the checkout",
+            )
+        if not (where / "repo.yaml").is_file():
+            raise Refusal(
+                RefusalReason.INVALID_SPEC,
+                f"{contract} installs from the Spack repository {item!r}, and {where} is not "
+                "one: copy it beside the repository, as in the package's checkout",
+                path=str(where),
+            )
+        repos.append(relative.as_posix())
+    return repos
+
+
+def repository_requirements(repo_dir: Path) -> list[str]:
+    """Return the Python requirements of the JARVIS repository at ``repo_dir``.
+
+    They come from ``repo_dir/pyproject.toml``, else from the checkout's
+    ``repo_dir/../pyproject.toml``, without jarvis-cd (:data:`REQUIREMENTS_FILE`).
+    """
+    for pyproject in (repo_dir / "pyproject.toml", repo_dir.parent / "pyproject.toml"):
+        if not pyproject.is_file():
+            continue
+        try:
+            loaded = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise Refusal(
+                RefusalReason.INVALID_SPEC, f"{pyproject} is not a readable pyproject.toml: {exc}"
+            ) from exc
+        project: object = loaded.get("project")
+        listed: object = (
+            cast(dict[str, object], project).get("dependencies")
+            if isinstance(project, dict)
+            else None
+        )
+        requirements: list[str] = []
+        for item in cast(list[object], listed) if isinstance(listed, list) else []:
+            text = str(item).strip()
+            match = _REQUIREMENT_NAME.match(text)
+            if not match or "\n" in text:
+                raise Refusal(
+                    RefusalReason.INVALID_SPEC,
+                    f"{pyproject} lists {text!r}, which is not a Python requirement",
+                )
+            if re.sub(r"[-_.]+", "-", match.group(1)).lower() not in _PINNED_BY_RELAY:
+                requirements.append(text)
+        return requirements
+    return []
 
 
 def _member(name: str, size: int, mode: int) -> tarfile.TarInfo:
@@ -137,9 +227,15 @@ def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None 
         if source is not None:
             data = (json.dumps(source, sort_keys=True, indent=2) + "\n").encode("utf-8")
             tar.addfile(_member(SOURCE_FILE, len(data), 0o644), io.BytesIO(data))
-        for arcname, path in package_files(repo_dir, name):
-            data = path.read_bytes()
-            mode = 0o755 if path.stat().st_mode & 0o111 else 0o644
+        members = [
+            (arcname, path.read_bytes(), 0o755 if path.stat().st_mode & 0o111 else 0o644)
+            for arcname, path in package_files(repo_dir, name)
+        ]
+        requirements = repository_requirements(repo_dir)
+        if requirements:
+            listed = "".join(f"{line}\n" for line in requirements).encode("utf-8")
+            members.append((f"{split_name(name)[0]}/{REQUIREMENTS_FILE}", listed, 0o644))
+        for arcname, data, mode in sorted(members):
             tar.addfile(_member(arcname, len(data), mode), io.BytesIO(data))
     packed = io.BytesIO()
     with gzip.GzipFile(filename="", mode="wb", fileobj=packed, mtime=0) as handle:
@@ -200,6 +296,7 @@ class ArchiveInfo:
     size: int
     files: list[ArchiveFile] = field(default_factory=list[ArchiveFile])
     source: dict[str, Any] | None = None
+    requirements: list[str] = field(default_factory=list[str])
 
 
 def inspect_archive(data: bytes, name: str) -> ArchiveInfo:
@@ -237,6 +334,12 @@ def inspect_archive(data: bytes, name: str) -> ArchiveInfo:
                         loaded = None
                     info.source = loaded if isinstance(loaded, dict) else None
                     continue
+                if member.name == f"{repo}/{REQUIREMENTS_FILE}":
+                    info.requirements = [
+                        line.strip()
+                        for line in body.decode("utf-8", errors="replace").splitlines()
+                        if line.strip()
+                    ]
                 info.files.append(
                     ArchiveFile(
                         path=member.name,

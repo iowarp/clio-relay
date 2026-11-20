@@ -180,11 +180,22 @@ class LocalConfig(BaseModel):
     )
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+    jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
+    install_walltime_s: int = Field(
+        default=jarvis_submit.INSTALL_WALLTIME_S,
+        ge=60,
+        description=jarvis_submit.INSTALL_WALLTIME_HELP,
+    )
 
     @field_validator("jarvis")
     @classmethod
     def _jarvis_path(cls, value: str) -> str:
         return jarvis_submit.explicit_jarvis(value)
+
+    @field_validator("jarvis_python")
+    @classmethod
+    def _jarvis_python(cls, value: str) -> str:
+        return jarvis_submit.explicit_python(value)
 
 
 _PSIJ_STATES = {
@@ -298,8 +309,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     def _home(self) -> str:
         return self.work_dir.as_posix()
 
-    async def _submit_jarvis(self, spec: JobSpec, job_dir: Path, operation_id: str) -> JobHandle:
-        """Hand a package job to ``jarvis ppl submit``, which writes and submits the batch job."""
+    def _jarvis_document(
+        self, spec: JobSpec, job_dir: Path, operation_id: str
+    ) -> dict[str, object]:
         directory = job_dir.as_posix()
         block = jarvis_submit.scheduler_block(
             spec,
@@ -308,12 +320,16 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             stderr=_in_job(job_dir, spec.stderr_path),
             job_dir=directory,
         )
-        document = jarvis_submit.pipeline_document(
+        return jarvis_submit.pipeline_document(
             spec,
             pipeline=jarvis_submit.pipeline_id(operation_id),
             scheduler=block,
             job_dir=directory,
         )
+
+    async def _submit_jarvis(self, spec: JobSpec, job_dir: Path, operation_id: str) -> JobHandle:
+        """Hand a package job to ``jarvis ppl submit``, which writes and submits the batch job."""
+        document = self._jarvis_document(spec, job_dir, operation_id)
 
         def _write() -> None:
             pipeline = jarvis_submit.render_pipeline(document)
@@ -332,7 +348,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             max_output_bytes=1 << 20,
             cwd=job_dir,
         )
-        self._refuse_jarvis_exit(result)
+        self._refuse_jarvis_exit(result, spec)
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
@@ -351,7 +367,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             )
         return self._jarvis_handle(found, job_dir, operation_id)
 
-    def _refuse_jarvis_exit(self, result: ExecResult) -> None:
+    def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
         """Raise the refusal for the site script's no-JARVIS (69), decision (3) and
         build-refused (4) exits."""
         site = self.context.site_id
@@ -368,7 +384,11 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                     f"report: {(result.stderr.strip() or result.stdout.strip())[-500:]}",
                     needs=jarvis_submit.NEEDS_INSTALL,
                 )
-            raise jarvis_submit.install_needed(report, site=site)
+            raise jarvis_submit.install_needed(
+                report,
+                site=site,
+                walltime=jarvis_submit.install_walltime(spec, self.config.install_walltime_s),
+            )
 
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
@@ -380,19 +400,24 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 RefusalReason.INPUT_MISSING,
                 f"the job directory {job_dir} has no pipeline; run the job again",
             )
+        spec = jarvis_submit.with_archive(spec)
+        document = self._jarvis_document(spec, job_dir, operation_id)
         argv = shlex.split(
             jarvis_submit.install_command(
                 spec,
                 operation_id=operation_id,
                 jarvis=self.config.jarvis,
                 answers=answers,
+                pipeline=jarvis_submit.install_pipeline(
+                    document, spec, walltime_s=self.config.install_walltime_s
+                ),
                 home=self._home(),
             )
         )
         result = await run_bounded(
             argv, timeout_s=self.config.submit_timeout_s, max_output_bytes=1 << 20, cwd=job_dir
         )
-        self._refuse_jarvis_exit(result)
+        self._refuse_jarvis_exit(result, spec)
         found = jarvis_submit.parse_handle(result.stdout)
         if result.exit_code != 0 or found is None:
             raise Refusal(
@@ -409,7 +434,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def install_jarvis(self) -> str:
         await asyncio.to_thread(self.work_dir.mkdir, parents=True, exist_ok=True)
         result = await run_bounded(
-            shlex.split(jarvis_submit.bootstrap_command(self._home())),
+            shlex.split(jarvis_submit.bootstrap_command(self._home(), self.config.jarvis_python)),
             timeout_s=None,
             max_output_bytes=1 << 20,
             cwd=self.work_dir,

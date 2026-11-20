@@ -181,8 +181,21 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return [self.config.remote_dir], spack_keeps(self.config.remote_dir)
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
-        """Prune over this adapter's own ``ssh``."""
-        return parse_report(await self._ssh(prune_script(targets, keep), "cleaning the site"))
+        """Prune over this adapter's own ``ssh``; a prune that fails is refused, never empty."""
+        result = await self.transport.ssh(
+            prune_script(targets, keep),
+            timeout_s=self.config.command_timeout_s,
+            what="cleaning the site",
+        )
+        if result.exit_code != 0:
+            raise Refusal(
+                RefusalReason.ADAPTER_UNAVAILABLE,
+                f"cleaning {self.config.ssh_profile} failed (exit {result.exit_code}): "
+                f"{result.error_text()[-1000:] or 'no output'}",
+                site=self.context.site_id,
+                exit_code=result.exit_code,
+            )
+        return parse_report(result.text())
 
     def ssh_argv(self) -> list[str]:
         """Return the base ``ssh`` argv (program, options, host) for ``serve``."""
@@ -356,7 +369,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             if jarvis_mode and rc == str(jarvis_submit.EXIT_NO_JARVIS):
                 raise jarvis_submit.missing_jarvis(error, site=self.config.ssh_profile)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_DECISION):
-                raise self._install_needed(output)
+                raise self._install_needed(output, spec)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
                 raise jarvis_submit.build_refused(
                     output + "\n" + error, site=self.config.ssh_profile
@@ -428,9 +441,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
         native, jarvis_data = jarvis_submit.handle_data(found, job_dir=str(data["job_dir"]))
         return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
 
-    def _render_jarvis(
+    def _jarvis_document(
         self, spec: JobSpec, operation_id: str, job_dir: PurePosixPath, name: str
-    ) -> _Rendered:
+    ) -> dict[str, object]:
         stdout = _remote_path(job_dir, spec.stdout_path)
         stderr = _remote_path(job_dir, spec.stderr_path)
         block = jarvis_submit.scheduler_block(
@@ -440,12 +453,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
             stderr=str(stderr) if stderr is not None else None,
             job_dir=str(job_dir),
         )
-        document = jarvis_submit.pipeline_document(
+        return jarvis_submit.pipeline_document(
             spec,
             pipeline=jarvis_submit.pipeline_id(operation_id),
             scheduler=block,
             job_dir=str(job_dir),
         )
+
+    def _render_jarvis(
+        self, spec: JobSpec, operation_id: str, job_dir: PurePosixPath, name: str
+    ) -> _Rendered:
+        document = self._jarvis_document(spec, operation_id, job_dir, name)
         rendered = _Rendered()
         rendered.files[jarvis_submit.PIPELINE_FILE] = jarvis_submit.render_pipeline(document)
         rendered.files[jarvis_submit.SCRIPT_FILE] = jarvis_submit.SITE_SCRIPT
@@ -454,7 +472,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         )
         return rendered
 
-    def _install_needed(self, output: str) -> Refusal:
+    def _install_needed(self, output: str, spec: JobSpec) -> Refusal:
         report = jarvis_submit.parse_install_report(output)
         if report is None:
             return Refusal(
@@ -463,7 +481,11 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"report: {output[-500:] or 'no output'}",
                 needs=jarvis_submit.NEEDS_INSTALL,
             )
-        return jarvis_submit.install_needed(report, site=self.config.ssh_profile)
+        return jarvis_submit.install_needed(
+            report,
+            site=self.config.ssh_profile,
+            walltime=jarvis_submit.install_walltime(spec, self.config.install_walltime_s),
+        )
 
     def _render(
         self,
@@ -841,11 +863,16 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{self.config.ssh_profile} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
+        spec = jarvis_submit.with_archive(spec)
+        document = self._jarvis_document(spec, operation_id, job_dir, job_name(operation_id))
         command = jarvis_submit.install_command(
             spec,
             operation_id=operation_id,
             jarvis=self.config.jarvis,
             answers=answers,
+            pipeline=jarvis_submit.install_pipeline(
+                document, spec, walltime_s=self.config.install_walltime_s
+            ),
             home=self.config.remote_dir,
         )
         result = await self.transport.ssh(
@@ -865,7 +892,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if rc == str(jarvis_submit.EXIT_NO_JARVIS):
             raise jarvis_submit.missing_jarvis(output, site=self.config.ssh_profile)
         if rc == str(jarvis_submit.EXIT_DECISION):
-            raise self._install_needed(output)
+            raise self._install_needed(output, spec)
         if rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
             raise jarvis_submit.build_refused(output, site=self.config.ssh_profile)
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
@@ -883,7 +910,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
     async def install_jarvis(self) -> str:
         result = await self.transport.ssh(
-            jarvis_submit.bootstrap_command(self.config.remote_dir),
+            jarvis_submit.bootstrap_command(self.config.remote_dir, self.config.jarvis_python),
             timeout_s=None,
             what="installing jarvis-cd",
             check_timeout=False,

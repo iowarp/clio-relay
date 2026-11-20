@@ -144,6 +144,12 @@ class WorkerConfig(BaseModel):
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+    jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
+    install_walltime_s: int = Field(
+        default=jarvis_submit.INSTALL_WALLTIME_S,
+        ge=60,
+        description=jarvis_submit.INSTALL_WALLTIME_HELP,
+    )
     idle_exit_s: int = Field(
         default=IDLE_EXIT_S,
         ge=0,
@@ -183,6 +189,11 @@ class WorkerConfig(BaseModel):
     @classmethod
     def _jarvis_path(cls, value: str) -> str:
         return jarvis_submit.explicit_jarvis(value)
+
+    @field_validator("jarvis_python")
+    @classmethod
+    def _jarvis_python(cls, value: str) -> str:
+        return jarvis_submit.explicit_python(value)
 
 
 class WorkerLink(BaseModel):
@@ -809,6 +820,10 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             "submit_timeout_s": self.config.submit_timeout_s,
             "jarvis": self.config.jarvis,
         }
+        if self.config.jarvis_python:
+            config["jarvis_python"] = self.config.jarvis_python
+        if self.config.install_walltime_s != jarvis_submit.INSTALL_WALLTIME_S:
+            config["install_walltime_s"] = self.config.install_walltime_s
         if self.config.work_dir is not None:
             config["work_dir"] = self.config.work_dir
         return config

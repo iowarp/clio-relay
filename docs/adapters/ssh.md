@@ -39,6 +39,8 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `remote_dir` | `.clio-relay` | Relay's directory on the site, under your home unless absolute |
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
+| `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
+| `install_walltime_s` | 14400 | The walltime of the job that builds a package's software. The run's walltime is used when it is longer |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
 | `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run. A bare name is looked up on the PATH relay hands the child, with PATHEXT on Windows, so an `ssh.cmd` early on the PATH wins. A path is used as given |
@@ -171,8 +173,11 @@ The submit first checks that the site has the software the packages need.
 When it does not, nothing is submitted. Relay asks you to approve the install
 (what JARVIS reuses and what it builds), then asks one question for each
 choice JARVIS cannot make alone, such as which of two compilers to build
-with. JARVIS then installs the software as its own job,
-`jarvis ppl install +submit`, on compute nodes. Nothing is built on the login
+with. JARVIS then installs the software as its own one-node job,
+`jarvis ppl install +submit`, on a compute node. That job gets
+`install_walltime_s` (4 hours by default, or the run's walltime when longer),
+not the run's walltime, since a build often takes longer than the run, and the
+approval says how long it may take. Nothing is built on the login
 node: when JARVIS refuses a build outside an allocation (exit 4,
 `build_outside_allocation`), relay reports it as `policy_refused` and does not
 retry it. `describe(job=...)` follows the install log and
@@ -186,7 +191,17 @@ first is done.
 When the CLIO Spack is on the site (`<home>/spack`, made by clio-kit's
 `spack_prepare_site`), relay tells JARVIS to use it with `JARVIS_SPACK_ROOT`,
 and with `JARVIS_SPACK_CONFIG` for its own configuration in
-`<home>/spack-config`. Each is set only when it is there.
+`<home>/spack-config`. Each is set only when it is there. When neither that
+Spack nor a `spack` on the site's `PATH` is there, the run is refused with
+`adapter_unavailable` and `missing: spack`, naming where relay looked. Relay
+does not make the CLIO Spack itself; prepare it first (clio-kit's
+`spack_prepare_site` does, through `exec`).
+
+A package archive carries what the package needs on the site: the Spack
+repositories its repository's `contract.yaml` lists under `install.repos`,
+and the Python requirements its `pyproject.toml` names. Relay installs those
+requirements into its own jarvis-cd before it registers the repository, and
+the review lists them.
 
 On Slurm, `describe(site=...)` also reports each partition, read live from
 `sinfo`: nodes, CPUs and physical cores per node, memory, the time limit, and
@@ -202,8 +217,12 @@ site home, by absolute path for submit, install, check, execution and stop. It
 never runs a `jarvis` found on the site's `PATH`: an older one rejects the
 service reports and builds on the login node. When relay's is missing or at
 another pin, relay asks before it installs the pinned commit there, in a fresh
-virtual environment made from the site's `python3` 3.11 or newer. That needs
-the site to reach github.com. Later runs on the site use it. A site that really
+virtual environment made with a Python 3.11 or newer. Relay looks for one
+itself: `python3`, then any `python3.N` on the site's `PATH`, newest first, then
+a `python` environment module (`module avail`, newest first). Name
+another in `jarvis_python`. When none is new enough, the refusal lists what
+relay tried. Package jobs run jarvis-cd with that same Python. The install
+needs the site to reach github.com. Later runs on the site use it. A site that really
 needs another jarvis names its path in the `jarvis` setting, absolute or from
 `~/`; a bare name is refused.
 
