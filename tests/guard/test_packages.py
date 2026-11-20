@@ -91,7 +91,7 @@ def test_the_catalog_pins_a_package_named_alone(tmp_path: Path) -> None:
         catalog.resolve(PackageRef(name="demo.nothing"))
     assert raised.value.reason == RefusalReason.INVALID_SPEC
     assert "It has: demo.hello" in raised.value.message
-    assert "clio_relay.packages stage" in raised.value.message
+    assert 'packages(op="stage"' in raised.value.message
     with pytest.raises(Refusal):
         catalog.resolve(PackageRef(name="demo.hello", version="7"))
     with pytest.raises(ValueError, match="version and SHA-256"):

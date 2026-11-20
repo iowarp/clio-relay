@@ -16,7 +16,7 @@ from clio_relay.surface.a2ui.protocol import MIME_TYPE
 from clio_relay.surface.server import create_server
 from clio_relay.surface.settings import RelayPaths
 
-VERBS = {"describe", "run", "exec", "files", "serve"}
+TOOLS = {"describe", "run", "exec", "files", "serve", "packages", "shutdown"}
 # A client that renders relay's catalog gets the endpoint table.
 AD = {
     "versions": ["v0.9.1"],

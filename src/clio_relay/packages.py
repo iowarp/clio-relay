@@ -1,7 +1,10 @@
 """The packages relay can run: its catalog of staged package archives (RL24, RL42).
 
 Staging a package puts its archive in relay's content store and records it in
-the catalog, one entry per archive at ``<state>/packages/<sha256>.json``. The
+the catalog, one entry per archive at ``<state>/packages/<sha256>.json``. An
+agent stages one with the ``packages`` tool (:mod:`clio_relay.surface.staging`),
+from a git repository at one commit or from a directory on the relay host;
+``python -m clio_relay.packages`` does the same from a shell. The
 entry says what the archive holds, read from the archive itself and never by
 running it: the parameters of ``_configure_menu`` in ``pkg.py``, and the
 summary, version, outputs, progress and resources of a ``contract.yaml``
@@ -20,25 +23,43 @@ import argparse
 import ast
 import io
 import json
+import os
 import re
+import subprocess
 import sys
 import tarfile
+import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
 import yaml
 from pydantic import BaseModel, Field
 
-from clio_relay.jarvis_site import archive_package, git_source, inspect_archive, split_name
+from clio_relay.jarvis_site import (
+    CLIO_JARVIS_COMMIT,
+    CLIO_JARVIS_URL,
+    archive_package,
+    git_source,
+    inspect_archive,
+    split_name,
+)
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
 
-STAGE_COMMAND = "python -m clio_relay.packages stage <repository dir> <repo.package>"
+STAGE_COMMAND = (
+    'the packages tool: packages(op="stage", package="<repository>.<package>"), from a git '
+    "repository at a commit (git, commit; by default relay's pinned clio-jarvis) or from a "
+    "directory on the relay host (dir)"
+)
+"""How an agent stages a package. Refusals that find none name it."""
+GIT_TIMEOUT_S = 300.0
+_GIT_URL = re.compile(r"(?:https?|ssh|git|file)://[^\s]+|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s]+")
+_COMMIT = re.compile(r"[0-9a-fA-F]{7,40}")
 _MENU_TYPES = {"int": "integer", "float": "number", "str": "string", "bool": "boolean"}
 _OUTPUT_KEYS = ("name", "path", "path_kind", "format", "reader")
 
@@ -405,6 +426,20 @@ class PackageCatalog:
         """Record ``entry``, replacing an earlier entry of the same archive."""
         self.records.put(entry.sha256, entry)
 
+    def remove(
+        self, name: str, *, version: str | None = None, sha256: str | None = None
+    ) -> list[PackageEntry]:
+        """Remove every entry of ``name`` matching ``version`` and ``sha256``; return them."""
+        removed: list[PackageEntry] = []
+        for entry in self.all():
+            if entry.name != name or version not in (None, entry.version):
+                continue
+            if sha256 is not None and entry.sha256 != sha256.lower():
+                continue
+            if self.records.delete(entry.sha256):
+                removed.append(entry)
+        return removed
+
     def all(self) -> list[PackageEntry]:
         """Return every entry, newest version of each name last."""
         return sorted(self.records.all(), key=lambda entry: (entry.name, entry.staged_at))
@@ -440,7 +475,7 @@ class PackageCatalog:
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
                 f"relay has no package {wanted}. It has: {', '.join(known) or 'none'}. "
-                f"Stage one with `{STAGE_COMMAND}`",
+                f"Stage one with {STAGE_COMMAND}",
                 package=package.name,
                 known=known,
             )
@@ -494,6 +529,167 @@ def stage(state_dir: Path, data: bytes, name: str, *, version: str | None = None
     ContentStore(state_dir / "content").put(data)
     PackageCatalog(state_dir / "packages").put(entry)
     return entry
+
+
+def repository_dir(root: Path, name: str) -> Path:
+    """Return the JARVIS repository of package ``name`` at ``root`` or just below it.
+
+    That is a directory named like the repository, holding a Python package of
+    the same name with ``<package>/pkg.py``: ``root`` itself, or ``root/<repo>``
+    as in clio-jarvis, whose checkout holds ``clio_jarvis/clio_jarvis/...``.
+    """
+    repo, package = split_name(name)
+    for candidate in (root, root / repo):
+        if candidate.name == repo and (candidate / repo / package / "pkg.py").is_file():
+            return candidate
+    raise Refusal(
+        RefusalReason.INVALID_ARGUMENTS,
+        f"{root} holds no JARVIS repository with {name}: relay looks for a directory "
+        f"named {repo} holding {repo}/{package}/pkg.py, at {root} or {root / repo}",
+        package=name,
+    )
+
+
+def _archive_and_stage(
+    state_dir: Path, repo_dir: Path, name: str, version: str | None
+) -> tuple[PackageEntry, int]:
+    data = archive_package(repo_dir, name, source=git_source(repo_dir))
+    return stage(state_dir, data, name, version=version), len(data)
+
+
+def stage_dir(
+    state_dir: Path, directory: Path, name: str, *, version: str | None = None
+) -> tuple[PackageEntry, int]:
+    """Stage package ``name`` from a directory on the relay host; return it and its size.
+
+    ``directory`` is the JARVIS repository or the checkout that holds it.
+    """
+    root = directory.expanduser()
+    if not root.is_absolute():
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            f"{directory} is relative; give the directory's absolute path on the relay host",
+            path=str(directory),
+        )
+    if not root.is_dir():
+        raise Refusal(
+            RefusalReason.PATH_NOT_FOUND,
+            f"{root} is not a directory on the relay host",
+            path=str(root),
+        )
+    return _archive_and_stage(state_dir, repository_dir(root.resolve(), name), name, version)
+
+
+def _git(args: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    try:
+        return subprocess.run(
+            ["git", "-c", "protocol.ext.allow=never", *args],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise Refusal(RefusalReason.INVALID_CONFIG, "git is not on the relay host's PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal(
+            RefusalReason.TIMEOUT,
+            f"git {args[0]} took longer than {GIT_TIMEOUT_S:.0f} s",
+        ) from exc
+
+
+def _tail(done: subprocess.CompletedProcess[str]) -> str:
+    lines = (done.stderr or done.stdout or "").strip().splitlines()
+    return " ".join(lines[-3:]) or f"exit {done.returncode}"
+
+
+def fetch_commit(url: str, commit: str, checkout: Path) -> str:
+    """Check out ``commit`` of the git repository ``url`` in ``checkout``; return it in full."""
+    checkout.mkdir(parents=True)
+    for step in (["init", "-q"], ["remote", "add", "origin", url]):
+        done = _git(step, checkout)
+        if done.returncode != 0:
+            raise Refusal(RefusalReason.INPUT_MISSING, f"git {step[0]} failed: {_tail(done)}")
+    ref = "FETCH_HEAD"
+    fetched = _git(["fetch", "-q", "--depth", "1", "origin", commit], checkout)
+    if fetched.returncode != 0:
+        # A short commit, or a server that serves no commit by hash: fetch all of it.
+        ref = commit
+        fetched = _git(["fetch", "-q", "--tags", "origin"], checkout)
+        if fetched.returncode != 0:
+            raise Refusal(
+                RefusalReason.INPUT_MISSING,
+                f"relay could not fetch {url}: {_tail(fetched)}",
+                url=url,
+            )
+    done = _git(["checkout", "-q", "--detach", ref], checkout)
+    head = _git(["rev-parse", "HEAD"], checkout).stdout.strip()
+    if done.returncode != 0 or not head.lower().startswith(commit.lower()):
+        raise Refusal(
+            RefusalReason.INPUT_MISSING,
+            f"{url} has no commit {commit}",
+            url=url,
+            commit=commit,
+        )
+    return head
+
+
+def stage_git(
+    state_dir: Path,
+    name: str,
+    *,
+    url: str | None = None,
+    commit: str | None = None,
+    path: str | None = None,
+    version: str | None = None,
+) -> tuple[PackageEntry, int]:
+    """Stage package ``name`` from a git repository at one commit; return it and its size.
+
+    With neither ``url`` nor ``commit`` it is relay's pinned clio-jarvis. ``path``
+    is where the JARVIS repository sits in the checkout, when it is neither the
+    top nor ``<repo>`` there.
+    """
+    if url is None and commit is None:
+        url, commit = CLIO_JARVIS_URL, CLIO_JARVIS_COMMIT
+    if url is None or commit is None:
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            "give git and commit together, or neither for relay's pinned clio-jarvis",
+        )
+    if not _GIT_URL.fullmatch(url):
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            f"{url!r} is not a git URL relay fetches: use https://, ssh://, git://, file:// "
+            "or user@host:path",
+            url=url,
+        )
+    if not _COMMIT.fullmatch(commit):
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            f"{commit!r} is not a commit: relay stages one fixed commit, 7 to 40 hex digits, "
+            "not a branch or a tag",
+            commit=commit,
+        )
+    relative = PurePosixPath(path) if path else None
+    if relative is not None and (relative.is_absolute() or ".." in relative.parts):
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS,
+            f"path {path!r} must stay inside the checkout",
+            path=path,
+        )
+    repo, _package = split_name(name)
+    with tempfile.TemporaryDirectory(
+        prefix="clio-relay-stage-", ignore_cleanup_errors=True
+    ) as scratch:
+        checkout = Path(scratch) / repo
+        fetch_commit(url, commit, checkout)
+        root = checkout.joinpath(*relative.parts) if relative is not None else checkout
+        return _archive_and_stage(state_dir, repository_dir(root, name), name, version)
 
 
 # Command line
