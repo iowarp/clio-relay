@@ -2,9 +2,10 @@
 
 ``run`` takes a package by name and pins the one archive staged under it, so a
 package must be staged before it runs. Staging builds the package's archive on
-the relay host, from a git repository at one commit (relay's pinned clio-jarvis
-when the call names only the package) or from a directory there, and records it
-in relay's catalog. Nothing runs and no site is touched, so staging asks nobody:
+the relay host, from relay's package sources when the call names only the package
+(directories a host installed, such as a plugin's copy of clio-jarvis) or from a
+directory there, and records it in relay's catalog. It runs no git and fetches
+nothing. Nothing runs and no site is touched, so staging asks nobody:
 on a guarded site the person reviews the archive, by its SHA-256, before its
 first run there. Removing takes entries out of the catalog, and their archives
 out of the content store unless an unfinished operation still needs one.
@@ -19,10 +20,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
-from clio_relay.identity.grants import GrantFiles
-from clio_relay.jarvis_site import CLIO_JARVIS_COMMIT, CLIO_JARVIS_URL
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.packages import PackageEntry, stage_dir, stage_git
+from clio_relay.packages import PackageEntry, stage_dir, stage_source
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -36,9 +35,6 @@ class PackagesArgs(BaseModel):
 
     op: Literal["list", "stage", "remove"]
     package: str | None = None
-    git: str | None = None
-    commit: str | None = None
-    path: str | None = None
     dir: str | None = None
     version: str | None = None
     sha256: str | None = None
@@ -57,24 +53,12 @@ def _in_use(service: RelayService, digest: str) -> bool:
 
 
 def _stage(service: RelayService, args: PackagesArgs, package: str) -> dict[str, Any]:
-    if args.dir is not None and (args.git or args.commit or args.path):
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            "give one source: dir, or git and commit (path optional)",
-        )
     state = service.paths.state_dir
     if args.dir is not None:
         entry, size = stage_dir(state, Path(args.dir), package, version=args.version)
     else:
-        entry, size = stage_git(
-            state,
-            package,
-            url=args.git,
-            commit=args.commit,
-            path=args.path,
-            version=args.version,
-            grants=GrantFiles.from_settings({"grant_files": dict(service.paths.grant_files)}),
-        )
+        sources = service.paths.package_sources
+        entry, size = stage_source(state, sources, package, version=args.version)
     return {"staged": {**_view(entry), "size": size}}
 
 
@@ -108,10 +92,10 @@ def _apply(service: RelayService, args: PackagesArgs) -> dict[str, Any]:
         change = _stage if args.op == "stage" else _remove
         result.update(change(service, args, args.package))
     result["packages"] = [_view(entry) for entry in service.packages.all()]
-    result["default_source"] = {"git": CLIO_JARVIS_URL, "commit": CLIO_JARVIS_COMMIT}
+    result["sources"] = [str(source) for source in service.paths.package_sources]
     return result
 
 
 async def packages(service: RelayService, args: PackagesArgs) -> dict[str, Any]:
-    """Run one ``packages`` call; the git fetch runs off the event loop."""
+    """Run one ``packages`` call; building an archive runs off the event loop."""
     return await asyncio.to_thread(_apply, service, args)

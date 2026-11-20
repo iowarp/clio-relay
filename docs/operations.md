@@ -123,24 +123,25 @@ deploys nothing. The `packages` tool does it over MCP:
 
 ```json
 {"op": "stage", "package": "clio_jarvis.xcompact3d"}
-{"op": "stage", "package": "demo.hello", "git": "https://example.org/demo", "commit": "4f2a9c1"}
 {"op": "stage", "package": "demo.hello", "dir": "/home/me/src/demo"}
 {"op": "list"}
 {"op": "remove", "package": "clio_jarvis.xcompact3d"}
 ```
 
-With only a package name, relay stages it from its pinned clio-jarvis commit
-(the result's `default_source`). A git source is fetched on the relay host at
-exactly that commit, never a branch, with no prompt for credentials. The
-checkout is made under relay's state directory (`<state>/scratch`) and removed
-after, so a sandbox that lets relay write its state lets git work too. The
-fetch uses relay's environment, its proxy variables included. A private
-repository needs a credential relay can use without a prompt: for
-`https://github.com/...` that is a `github` grant file
-(`CLIO_RELAY_GRANT_FILE_GITHUB` or `--grant-file github=<path>`), whose token
-relay hands to git in git's environment, never on a command line; otherwise a
-git credential helper that runs on the relay host. A `dir`
-is a directory on the relay host. Each call returns `relay.packages.v1`: what
+With only a package name, relay stages it from its package sources: the
+directories `CLIO_RELAY_PACKAGE_SOURCES` names (`os.pathsep` apart), listed in
+the result's `sources`. Each is a JARVIS repository, a checkout that holds one,
+or a folder of such checkouts. The host fills them when it installs relay, so
+staging fetches nothing and runs no git, and it works for anyone, with no
+account and no write access to any repository. The CLIO plugin ships a copy of
+clio-jarvis at its pinned commit and points `CLIO_RELAY_PACKAGE_SOURCES` at it.
+A copy says where it came from in a `.clio-relay-source.json`, which goes into
+the archive; a git checkout says it through git, read only. With no source that
+holds the package, the refusal names the repository and the directories relay
+looked in. A `dir` is a directory on the relay host, such as a package the
+person wrote: it is never pushed anywhere, and its archive reaches a site as a
+job input through the site adapter's transfer (scp for ssh). Each call returns
+`relay.packages.v1`: what
 it staged or removed, and the catalog after it. Removing takes every version
 of the package out of the catalog unless `version` or `sha256` narrows it, and
 drops each archive from the content store unless an unfinished operation still
