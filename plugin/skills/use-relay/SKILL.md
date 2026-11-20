@@ -44,7 +44,8 @@ use `describe` instead.
   output.
 - `files` lists, reads, writes and stages small files. `stage` returns the
   SHA-256 a JobSpec input names.
-- `serve` starts a job with ports and returns how to reach it.
+- `serve` starts a job with ports and returns how to reach it. Each port in
+  the endpoint has an `address` (`host:port`): hand that to the client.
 
 A refusal carries a typed reason in `structuredContent.refusal`. Read it and
 act on it: a site that needs sign-in, a missing account or an unreachable host

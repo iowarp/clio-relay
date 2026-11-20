@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from clio_relay.jobs.spec import PortProtocol
 
@@ -132,6 +132,13 @@ class EndpointPort(BaseModel):
     host: str
     port: int
     url: str | None = None
+
+    @computed_field
+    @property
+    def address(self) -> str:
+        """``host:port`` as one string, the form to hand to a client (IPv6 in brackets)."""
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
 
 
 class Endpoint(BaseModel):

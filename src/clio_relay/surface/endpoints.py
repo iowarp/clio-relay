@@ -17,6 +17,15 @@ def public_endpoint(endpoint: Endpoint) -> dict[str, Any]:
     return endpoint.model_dump(mode="json", exclude={"ports": {"__all__": {"url"}}})
 
 
+def address(port: dict[str, Any]) -> str:
+    """Return a recorded port's `address`; a record older than the field has host and port."""
+    found = port.get("address")
+    if isinstance(found, str) and found:
+        return found
+    host = str(port["host"])
+    return f"[{host}]:{port['port']}" if ":" in host else f"{host}:{port['port']}"
+
+
 def service_ready(record: OperationRecord) -> bool:
     """Return whether a service operation is running and has an endpoint."""
     return (
@@ -32,7 +41,7 @@ def endpoint_summary(record: OperationRecord) -> str | None:
     ports: list[dict[str, Any]] = endpoint.get("ports") or []
     if not ports:
         return None
-    return ", ".join(f"{port['name']} {port['host']}:{port['port']}" for port in ports)
+    return ", ".join(f"{port['name']} {address(port)}" for port in ports)
 
 
 def service_message(record: OperationRecord) -> str | None:
