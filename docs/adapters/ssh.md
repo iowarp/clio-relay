@@ -249,15 +249,19 @@ node, say), ranks on different nodes reach their own node and the job dies at
 startup (`received unexpected process identifier`). Relay names the network
 for every package run: the login node's network that holds all of Slurm's node
 addresses, which is how the scheduler reaches the nodes. It is found once and
-kept at `jarvis-cd/mpi-network` in the CLIO site home (write `none` there to
-turn it off). The site script exports `OMPI_MCA_btl_tcp_if_include`,
-`OMPI_MCA_oob_tcp_if_include` and `PRTE_MCA_oob_tcp_if_include`, JARVIS seals
-them into the pipeline and passes them to `mpiexec` and every rank, and the job
-directory's `relay.mpi-network` says what the run used. A run whose own
-environment sets any of them, or an `_if_exclude`, keeps its own: that is how
-you name another fabric. `describe(site=...)` shows the network as
+kept at `jarvis-cd/mpi-network` in the CLIO site home, one line
+`<network> <who>`. The site script exports `OMPI_MCA_btl_tcp_if_include`,
+`OMPI_MCA_oob_tcp_if_include` and `PRTE_MCA_oob_tcp_if_include` before it
+hands the pipeline to JARVIS; `sbatch` passes them on with the rest of the
+submit environment and Open MPI forwards them to every rank. The job
+directory's `relay.mpi-network` says what the run used and who named it. To
+name another fabric for every job, write it there (a CIDR, interface names
+joined by commas, or `none` to name nothing) with `files`; a guarded site asks
+you first. `site clean` drops it and relay finds the network again. A run whose
+own environment sets any of the variables, or an `_if_exclude`, keeps its own,
+on sites that take a job environment. `describe(site=...)` shows the network as
 `mpi.network`. A failed run whose output looks like this carries
-`mpi_network_hint`, saying what to set.
+`mpi_network_hint`, naming the record to change.
 
 Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
 site home, by absolute path for submit, install, check, execution and stop. It

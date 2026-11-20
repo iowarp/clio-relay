@@ -305,7 +305,7 @@ class RelayService:
     ) -> OperationRecord:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
-        spec = await self.site_cores(site, self.apply_defaults(site, spec), "run")
+        spec = await self.prepared_run(site, spec)
         what = spec.executable or _steps_label(spec) or "a job"
         return await self._open(
             site,
@@ -317,9 +317,18 @@ class RelayService:
             task=task,
         )
 
+    async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
+        """Return the run's job as relay records and digests it."""
+        return await self.site_cores(site, self.apply_defaults(site, spec), "run")
+
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Fill the service job's site defaults."""
         return spec.model_copy(update={"job": self.apply_defaults(site, spec.job)})
+
+    async def prepared_serve(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
+        """Return the service as relay records and digests it."""
+        spec = self.prepare_service(site, spec)
+        return spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
 
     async def start_serve(
         self, site_id: str, spec: ServiceSpec, *, task: bool = False
@@ -334,8 +343,7 @@ class RelayService:
                 verb="serve",
                 site=site.id,
             )
-        spec = self.prepare_service(site, spec)
-        spec = spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
+        spec = await self.prepared_serve(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
         what = spec.job.executable or _steps_label(spec.job) or "a service"
         return await self._open(
@@ -464,21 +472,25 @@ class RelayService:
             self.asks.put(ask_id, ask)
         return ask
 
-    def same_request(
+    async def same_request(
         self, record: OperationRecord, site: str | None, spec: JobSpec | ServiceSpec | None
     ) -> None:
-        """Refuse a retry or resume whose site or spec differs from what was approved."""
+        """Refuse a retry or resume whose site or spec differs from what was approved.
+
+        The spec is prepared as start_run or start_serve prepared it, site cores
+        included, so the same request digests the same; the form without site
+        cores also matches, for a site described differently since.
+        """
         if site is None and spec is None:
             return
         changed = site is not None and site != record.site
         if spec is not None and not changed:
             entry = self.site(record.site)
-            current = (
-                self.prepare_service(entry, spec)
-                if isinstance(spec, ServiceSpec)
-                else self.apply_defaults(entry, spec)
-            )
-            changed = current.digest() != record.spec_digest
+            if isinstance(spec, ServiceSpec):
+                forms = [self.prepare_service(entry, spec), await self.prepared_serve(entry, spec)]
+            else:
+                forms = [self.apply_defaults(entry, spec), await self.prepared_run(entry, spec)]
+            changed = all(form.digest() != record.spec_digest for form in forms)
         if changed:
             raise Refusal(
                 RefusalReason.APPROVAL_MISMATCH,
@@ -831,8 +843,11 @@ class RelayService:
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
             if status.state is JobState.FAILED:
+                handle_data = record.handle.data if record.handle is not None else {}
+                root = handle_data.get("root")
                 hint = mpi_network.failure_hint(
-                    "\n".join(text for text in (status.message, tail, errors) if text)
+                    "\n".join(text for text in (status.message, tail, errors) if text),
+                    root=root if isinstance(root, str) else None,
                 )
                 if hint is not None:
                     result["mpi_network_hint"] = hint

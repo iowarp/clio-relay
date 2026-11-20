@@ -706,8 +706,9 @@ printf '%s\n' "$found" > "$job/relay.jarvis"
     + mpi_network.SHELL
     + r"""
 # The network MPI's TCP channels use: the job's own setting, else the site's, which is
-# found once from Slurm's node addresses and kept in the CLIO site home. JARVIS seals
-# it into the pipeline's environment and passes it to mpiexec and every rank.
+# found once from Slurm's node addresses and kept in the CLIO site home. sbatch exports
+# it with the rest of this environment, and Open MPI forwards OMPI_MCA_* to every rank.
+# The record's first word is the network (or none); the second says who named it.
 net_file=$(home "${CLIO_RELAY_MPI_NETWORK:-}")
 unset CLIO_RELAY_MPI_NETWORK
 if [ "$mode" != install ]; then
@@ -722,12 +723,17 @@ if [ "$mode" != install ]; then
     printf '%s job\n' "$own" > "$job/relay.mpi-network"
   else
     net=
-    [ -z "$net_file" ] || net=$(head -n 1 "$net_file" 2>/dev/null | cut -d' ' -f1)
+    src=site
+    if [ -n "$net_file" ] && [ -s "$net_file" ]; then
+      read -r net src < "$net_file" || true
+      src=${src:-site}
+    fi
     if [ -z "$net" ]; then
       py="${found%/*}/python"
       [ -x "$py" ] || py="${found%/*}/venv/bin/python"
       [ -x "$py" ] || py=$(command -v python3 2>/dev/null) || py=
       [ -z "$py" ] || net=$(relay_mpi_network "$py" | cut -d' ' -f1) || net=
+      src=slurm-node-addresses
       if [ -n "$net" ] && [ -n "$net_file" ]; then
         mkdir -p "$(dirname "$net_file")"
         printf '%s slurm-node-addresses\n' "$net" > "$net_file"
@@ -736,7 +742,9 @@ if [ "$mode" != install ]; then
     if [ -n "$net" ] && [ "$net" != none ]; then
       export OMPI_MCA_btl_tcp_if_include="$net" OMPI_MCA_oob_tcp_if_include="$net"
       export PRTE_MCA_oob_tcp_if_include="$net"
-      printf 'OMPI_MCA_btl_tcp_if_include=%s site\n' "$net" > "$job/relay.mpi-network"
+      printf 'OMPI_MCA_btl_tcp_if_include=%s %s\n' "$net" "${src%% *}" > "$job/relay.mpi-network"
+    elif [ "$net" = none ]; then
+      printf 'none %s\n' "${src%% *}" > "$job/relay.mpi-network"
     fi
   fi
 fi

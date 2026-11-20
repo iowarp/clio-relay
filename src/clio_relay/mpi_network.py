@@ -14,10 +14,15 @@ which is how the scheduler and ``ssh`` reach the nodes, as the login node's own
 interfaces give its prefix. :data:`SHELL` discovers it on the login node with
 short reads. The site script (:data:`clio_relay.jarvis_submit.SITE_SCRIPT`)
 keeps the answer in the CLIO site home, so every job on the site uses the same
-one, and exports :func:`launch_env` for JARVIS to seal into the pipeline. JARVIS
-passes the pipeline's environment to ``mpiexec`` and to every rank (``-x``).
+one, and exports :func:`launch_env` before it hands the pipeline to JARVIS. The
+variables reach the ranks the way any submit-time environment does: Slurm's
+``sbatch`` exports the submitting environment (``--export=ALL``, its default),
+and Open MPI's launcher forwards every ``OMPI_MCA_*`` variable to each rank.
+JARVIS's own pipeline environment does not list them.
 A job whose own environment sets one of :data:`KEYS` (or an ``_if_exclude``)
-keeps its own, so the person can name another fabric.
+keeps its own. On a guarded site, where a package job takes no environment,
+the person names another fabric by changing the site's record
+(:func:`site_file`), which every later job reads.
 """
 
 from __future__ import annotations
@@ -27,6 +32,9 @@ from typing import Any
 
 FILE = "mpi-network"
 """The file under the CLIO site home's JARVIS directory that keeps the site's network."""
+
+SITE_DIR = "jarvis-cd"
+"""The CLIO site home's JARVIS directory (:data:`clio_relay.jarvis_submit.BOOTSTRAP_DIR`)."""
 
 JOB_FILE = "relay.mpi-network"
 """The job directory's copy: the network the job's launch used, and where it came from."""
@@ -112,10 +120,18 @@ _SIGNS = (
 )
 
 
-def failure_hint(text: str, used: Mapping[str, str] | None = None) -> dict[str, Any] | None:
+def site_file(root: str) -> str:
+    """Return the site's MPI network record under the CLIO site home ``root``."""
+    return f"{root.rstrip('/')}/{SITE_DIR}/{FILE}"
+
+
+def failure_hint(
+    text: str, used: Mapping[str, str] | None = None, root: str | None = None
+) -> dict[str, Any] | None:
     """Return what to try when a failed run's output looks like MPI used the wrong network.
 
-    ``used`` is the job's launch settings, when relay knows them.
+    ``used`` is the job's launch settings, when relay knows them. ``root`` is
+    the CLIO site home, so the hint names the site's record to change.
     """
     lowered = text.lower()
     seen = [sign for sign in _SIGNS if sign in lowered]
@@ -129,15 +145,23 @@ def failure_hint(text: str, used: Mapping[str, str] | None = None) -> dict[str, 
         said = "this run named no network for its ranks"
     else:
         said = f"the job directory's {JOB_FILE} says which network this run named"
-    return {
+    record = site_file(root) if root else f"<CLIO site home>/{SITE_DIR}/{FILE}"
+    hint: dict[str, Any] = {
         "kind": "mpi_network",
         "matched": seen,
         "launch_env": current,
+        "site_record": record,
         "message": (
             "The run's MPI ranks could not reach each other over TCP: Open MPI likely "
             f"picked an interface that is not a real link between the nodes; {said}. "
-            "Run again with the job environment naming the nodes' fabric, the same "
-            f"network (CIDR or interface) in {', '.join(KEYS)}. describe(site) shows the "
-            "network relay found for the site."
+            f"Every job on the site uses the network in {record} (first word: a CIDR, "
+            "interface names joined by commas, or none). describe(site) shows the network "
+            "relay found and the nodes' interfaces can be read with exec (ip -o -4 addr). "
+            "Write the nodes' fabric there with files (op write, overwrite true; a guarded "
+            "site asks the person first), as one line '<network> person', and run again. "
+            f"On a site that takes job environment variables, {', '.join(KEYS)} in the job's "
+            "environment name it for one job. site clean drops the record, and relay finds "
+            "the network again."
         ),
     }
+    return hint
