@@ -88,8 +88,11 @@ default). Relay stops, for each site in parallel and locally: the worker's
 site-serve, the login hop, serve connectors and tunnels, frpc, and a relay
 server you detached with `clio-relay serve --http`. It never cancels a JARVIS
 job. The JSON result (`relay.shutdown.v1`) lists what stopped, each job still
-running (`kind: job`), and each site relay could not reach as a failure. The
-next call to a site signs in and starts what it needs again.
+running (`kind: job`), and each site relay could not reach as a failure. A
+recorded relay process that relay cannot confirm or stop, for example one that
+runs as another user or outside the host's sandbox, is a failure with the
+reason, and its record stays so a later call can try again. The next call to a
+site signs in and starts what it needs again.
 
 ## Clean a site so the next use deploys again
 
