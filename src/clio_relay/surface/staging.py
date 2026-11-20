@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
+from clio_relay.identity.grants import GrantFiles
 from clio_relay.jarvis_site import CLIO_JARVIS_COMMIT, CLIO_JARVIS_URL
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.packages import PackageEntry, stage_dir, stage_git
@@ -72,6 +73,7 @@ def _stage(service: RelayService, args: PackagesArgs, package: str) -> dict[str,
             commit=args.commit,
             path=args.path,
             version=args.version,
+            grants=GrantFiles.from_settings({"grant_files": dict(service.paths.grant_files)}),
         )
     return {"staged": {**_view(entry), "size": size}}
 
