@@ -34,7 +34,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
-from clio_relay.serve.config import SiteServe
+from clio_relay.serve.config import Rendezvous, SiteServe, frp_unusable
 from clio_relay.serve.forward import CLOSED_MARKER, Forward, kill_recorded
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
@@ -419,7 +419,7 @@ class ServeRuntime:
         package = bool(spec.job.steps())
         if package and not getattr(adapter, "runs_packages", False):
             raise jarvis_submit.not_run_here(str(adapter.name))
-        mode = self._mode(adapter, site, loaded.rendezvous is not None)
+        mode = self._mode(adapter, site, loaded.rendezvous)
         ports = plan_ports(spec)
         if any(port.protocol == "mcp" for port in ports):
             self._refuse_a_second_mount(site_id, service_name(spec), operation_id)
@@ -490,22 +490,37 @@ class ServeRuntime:
                 operation_id=other.operation_id,
             )
 
-    def _mode(self, adapter: Any, site: SiteServe, has_rendezvous: bool) -> Any:
+    def _mode(self, adapter: Any, site: SiteServe, rendezvous: Rendezvous | None) -> Any:
+        """Pick frp or ssh. ``auto`` takes frp only when it can work, and else ssh."""
         has_ssh = callable(getattr(adapter, "ssh_argv", None))
-        if site.path == "frp" or (site.path == "auto" and has_rendezvous):
-            if not has_rendezvous:
+        site_id = str(adapter.context.site_id)
+        if site.path == "frp":
+            if rendezvous is None:
                 raise Refusal(
                     RefusalReason.INVALID_CONFIG,
                     "no rendezvous host is set; see docs/rendezvous-host.md",
                 )
             return "frp"
+        if site.path == "auto" and rendezvous is not None:
+            unusable = frp_unusable(site, rendezvous)
+            if unusable is None:
+                return "frp"
+            if not has_ssh:
+                raise Refusal(
+                    RefusalReason.INVALID_CONFIG,
+                    f"frp cannot carry a port from {site_id}: {unusable}, and its adapter "
+                    "has no ssh to forward one",
+                    site=site_id,
+                )
+            logger.info("serve on %s: ssh, because frp %s", site_id, unusable)
+            return "ssh"
         if has_ssh:
             return "ssh"
         raise Refusal(
             RefusalReason.INVALID_CONFIG,
-            f"site {adapter.context.site_id!r} has no way to carry a port: set a rendezvous host "
+            f"site {site_id!r} has no way to carry a port: set a rendezvous host "
             "(docs/rendezvous-host.md), or reach the site through an adapter that uses ssh",
-            site=str(adapter.context.site_id),
+            site=site_id,
         )
 
     async def _exec(

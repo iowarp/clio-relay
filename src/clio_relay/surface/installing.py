@@ -18,20 +18,30 @@ Either refusal turns the operation back into asks instead of a failure:
   in the site's CLIO home and submits the run again.
 
 The state lives in ``record.result["install"]``.
+
+A choice JARVIS scopes to the site (which MPI packages use) is asked once per
+site. Relay keeps the person's answer in its state for the site and answers the
+same question with it on a later install, of any package, for as long as it is
+still one of JARVIS's candidates. The install approval names the choice it
+carries; declining that approval forgets it, so the next run asks again.
+``site clean`` forgets it too.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import posixpath
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from clio_relay import jarvis_submit
+from clio_relay.adapters import slurm_facts
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
-from clio_relay.jobs.records import OperationRecord, OperationState
+from clio_relay.jobs.records import OperationRecord, OperationState, write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
@@ -53,6 +63,101 @@ START_GRACE = timedelta(hours=6)
 """How long installing jarvis-cd or submitting the install job may hold ``submitting``."""
 
 InstallKind = Literal["software", "jarvis"]
+
+CHOICES_FILE = "install-choices.json"
+"""The site's carried choices, ``{subject: {constraint, kind, ask_id, operation_id}}``."""
+
+
+def choices_path(service: RelayService, site_id: str) -> Path:
+    """Return the file that keeps the site-scope install choices relay carries."""
+    return service.paths.state_dir / "sites" / site_id / CHOICES_FILE
+
+
+def site_choices(service: RelayService, site_id: str) -> dict[str, dict[str, Any]]:
+    """Return the site-scope choices the person made for ``site_id``, by subject."""
+    try:
+        loaded: object = json.loads(choices_path(service, site_id).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {
+        str(subject): cast(dict[str, Any], entry)
+        for subject, entry in cast(dict[object, object], loaded).items()
+        if isinstance(entry, dict)
+        and isinstance(cast(dict[str, Any], entry).get("constraint"), str)
+    }
+
+
+def _save_choices(service: RelayService, site_id: str, choices: dict[str, Any]) -> None:
+    path = choices_path(service, site_id)
+    if not choices:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, choices)
+
+
+def _site_subject(issue: dict[str, Any]) -> str | None:
+    subject = issue.get("subject")
+    if issue.get("scope") == "site" and isinstance(subject, str) and subject:
+        return subject
+    return None
+
+
+def _carried(service: RelayService, site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the site's earlier answer to ``issue`` while it is still a candidate."""
+    subject = _site_subject(issue)
+    if subject is None:
+        return None
+    entry = site_choices(service, site_id).get(subject)
+    if entry is None or entry["constraint"] not in jarvis_submit.choice_options(issue):
+        return None
+    return entry
+
+
+def remember_choices(service: RelayService, record: OperationRecord) -> None:
+    """Keep the person's answers to site-scope issues for the site's later installs."""
+    state = state_of(record)
+    subjects = cast(dict[str, str], state.get("site_subjects") or {})
+    if not subjects:
+        return
+    kept = site_choices(service, record.site)
+    for ask_id, issue_id in cast(dict[str, str], state.get("choices") or {}).items():
+        subject = subjects.get(issue_id)
+        ask = service.asks.get(ask_id)
+        content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
+        value = content.get(CHOICE_FIELD)
+        if subject and isinstance(value, str) and value:
+            kept[subject] = {
+                "constraint": value,
+                "issue_id": issue_id,
+                "ask_id": ask_id,
+                "operation_id": record.operation_id,
+            }
+    _save_choices(service, record.site, kept)
+
+
+def forget_carried(service: RelayService, record: OperationRecord, ask: Ask) -> str | None:
+    """Forget the choices an install approval carried, when the person declined it.
+
+    Returns what was forgotten, for the refusal's message, or None.
+    """
+    state = state_of(record)
+    carried = cast(dict[str, dict[str, Any]], state.get("carried") or {})
+    if ask.state != "declined" or ask.binding.get("kind") != SOFTWARE_KIND or not carried:
+        return None
+    kept = site_choices(service, record.site)
+    forgotten: list[str] = []
+    for entry in carried.values():
+        subject = str(entry.get("subject"))
+        if kept.get(subject, {}).get("constraint") == entry.get("constraint"):
+            kept.pop(subject)
+            forgotten.append(f"{subject} {entry.get('constraint')}")
+    _save_choices(service, record.site, kept)
+    if not forgotten:
+        return None
+    return f"relay forgot the earlier choice ({', '.join(forgotten)}); the next run asks it again"
 
 
 def install_kind(refusal: Refusal) -> InstallKind | None:
@@ -136,6 +241,25 @@ async def ask_install(
         names = jarvis_submit.package_names(job_of(record).steps())
         state["summary"] = jarvis_submit.install_summary(report, names)
         state["report_digest"] = jarvis_submit.report_digest(report)
+        carried: dict[str, dict[str, Any]] = {}
+        to_ask: list[dict[str, Any]] = []
+        subjects: dict[str, str] = {}
+        for issue in jarvis_submit.choice_issues(report):
+            issue_id = str(issue.get("issue_id"))
+            subject = _site_subject(issue)
+            if subject is not None:
+                subjects[issue_id] = subject
+            earlier = _carried(service, site.id, issue)
+            if earlier is not None:
+                carried[issue_id] = {
+                    "subject": subject,
+                    "constraint": earlier["constraint"],
+                    "ask_id": earlier.get("ask_id") or "carried",
+                }
+            else:
+                to_ask.append(issue)
+        state["carried"] = carried
+        state["site_subjects"] = subjects
         asks.append(
             await provider.approve(
                 site=site,
@@ -146,16 +270,21 @@ async def ask_install(
                     package=_what(job_of(record)),
                     names=names,
                     walltime=cast(str | None, refusal.data.get("install_walltime")),
+                    carried={
+                        str(entry["subject"]): str(entry["constraint"])
+                        for entry in carried.values()
+                    },
                 ),
                 binding={
                     **binding,
                     "kind": SOFTWARE_KIND,
                     "report_digest": state["report_digest"],
+                    "carried": sorted(f"{k}={v['constraint']}" for k, v in carried.items()),
                 },
             )
         )
         choices: dict[str, str] = {}
-        for issue in jarvis_submit.choice_issues(report):
+        for issue in to_ask:
             ask = await provider.choose(
                 site=site,
                 operation_id=operation_id,
@@ -191,7 +320,10 @@ async def ask_install(
 
 
 def _answers(service: RelayService, state: dict[str, Any]) -> dict[str, Any]:
-    picked: dict[str, tuple[str, str]] = {}
+    picked: dict[str, tuple[str, str]] = {
+        issue_id: (str(entry["constraint"]), str(entry.get("ask_id") or "carried"))
+        for issue_id, entry in cast(dict[str, dict[str, Any]], state.get("carried") or {}).items()
+    }
     for ask_id, issue_id in cast(dict[str, str], state.get("choices") or {}).items():
         ask = service.asks.get(ask_id)
         content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
@@ -225,6 +357,7 @@ async def start_install(
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
+        remember_choices(service, record)
         handle = await adapter.install(
             job, operation_id=operation_id, answers=_answers(service, state)
         )
@@ -326,6 +459,11 @@ async def refresh_install(
             changes["log_tail"] = tail
         result[INSTALL_KEY] = {**state_of(record), **changes}
         message = status.progress.message if status.progress else status.message
+        if status.queue:
+            message = slurm_facts.queue_message(status.queue)
+            result["queue"] = status.queue
+        else:
+            result.pop("queue", None)
         result["message"] = f"installing: {message}" if message else "installing"
         if status.progress is not None:
             result["progress"] = status.progress.model_dump(mode="json")

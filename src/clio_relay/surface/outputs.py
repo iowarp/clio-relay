@@ -5,7 +5,8 @@ unless it brought its own. A view descriptor under ``metadata["view"]`` is
 checked against the shared schema; one that does not match is taken off the
 output, and the reasons go under ``metadata["view_problems"]`` so a client
 can tell why the output has no view. :func:`stdout_tail` is the end of a
-finished job's standard output, which relay keeps with the operation.
+finished job's standard output, which relay keeps with the operation, and
+:func:`stderr_tail` the end of its standard error.
 """
 
 from __future__ import annotations
@@ -80,12 +81,23 @@ def marked_status(record: OperationRecord, status: JobStatus) -> JobStatus:
 
 async def stdout_tail(adapter: BaseAdapter[Any], status: JobStatus) -> str | None:
     """Return the end of the job's standard output, if the adapter can read it."""
-    if "files" not in type(adapter).implements:
-        return None
     output = next((item for item in status.outputs if item.name.startswith("stdout")), None)
     if output is None:
         output = next((item for item in status.outputs if item.name.endswith(".out")), None)
-    if output is None:
+    return await _tail(adapter, output)
+
+
+async def stderr_tail(adapter: BaseAdapter[Any], status: JobStatus) -> str | None:
+    """Return the end of the job's standard error, if it has one the adapter can read."""
+    output = next(
+        (item for item in status.outputs if "stderr" in item.name or item.name.endswith(".err")),
+        None,
+    )
+    return await _tail(adapter, output)
+
+
+async def _tail(adapter: BaseAdapter[Any], output: OutputRef | None) -> str | None:
+    if "files" not in type(adapter).implements or output is None:
         return None
     try:
         files = await adapter.files()

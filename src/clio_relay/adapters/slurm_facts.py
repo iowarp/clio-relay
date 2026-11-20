@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
+from clio_relay import mpi_network
 from clio_relay.adapters.base import PartitionInfo
 
 SINFO_FORMAT = "%P|%D|%c|%X|%Y|%Z|%m|%l|%F|%G|%f"
@@ -49,8 +50,13 @@ SCRIPT = (
     '\'$1 == "mca" && ($2 == "plm" || $2 == "ras" || $2 == "pmix") '
     '{ print $2 ":" $3 }\' | sort -u\n'
     "fi\n"
+    + mpi_network.SHELL
+    + 'py=$(command -v python3 2>/dev/null) && { echo "@@mpi_network"; relay_mpi_network "$py"; }\n'
 )
-"""The shell text that reports the partitions and MPI facts, for a Slurm site."""
+"""The shell text that reports the partitions and MPI facts, for a Slurm site.
+
+``@@mpi_network`` is the network the site script names for MPI's TCP channels
+(:mod:`clio_relay.mpi_network`), found live."""
 
 
 def seconds(limit: str) -> int | None:
@@ -192,7 +198,102 @@ def mpi(sections: Mapping[str, Sequence[str]]) -> dict[str, Any]:
     ompi = [line.strip() for line in sections.get("ompi", []) if line.strip()]
     if ompi:
         facts["ompi_components"] = ompi
+    network = mpi_network.facts(list(sections.get("mpi_network", [])))
+    if network:
+        facts["network"] = network
     return facts
+
+
+QUEUE_FORMAT = "%P|%r|%S|%D|%l"
+"""A pending job's partition, reason, estimated start, nodes and time limit."""
+
+IDLE_FORMAT = "%P|%a|%F|%l"
+"""Partition, availability, allocated/idle/other/total nodes, time limit."""
+
+
+def queue_script(native_id: str) -> str:
+    """Return the shell text that reports a pending Slurm job's place in the queue.
+
+    It prints ``@@queue`` (``squeue`` for the job, only while it is pending)
+    and then ``@@idle`` (``sinfo`` per partition). Both are short reads, and
+    nothing prints for a job that is running, gone, or not Slurm's.
+    """
+    if not native_id.isdigit():
+        return ""
+    return (
+        "if command -v squeue >/dev/null 2>&1; then\n"
+        '  T=""; command -v timeout >/dev/null 2>&1 && T="timeout 15"\n'
+        f"  qline=$($T squeue -h -j {native_id} -t PD -o '{QUEUE_FORMAT}' 2>/dev/null)\n"
+        '  if [ -n "$qline" ]; then\n'
+        '    echo "@@queue"; printf "%s\\n" "$qline"\n'
+        f"    echo \"@@idle\"; $T sinfo -h -o '{IDLE_FORMAT}' 2>/dev/null\n"
+        "  fi\n"
+        "fi\n"
+    )
+
+
+def queue(sections: Mapping[str, Sequence[str]]) -> dict[str, Any] | None:
+    """Return where a pending job stands, from :func:`queue_script`'s sections.
+
+    The result has the job's ``partition``, Slurm's ``reason`` and
+    ``estimated_start`` (None while Slurm has no estimate), and
+    ``idle_partitions``: the other partitions that are up with idle nodes, each
+    with ``idle`` nodes, its ``max_time`` and whether the job ``fits`` (enough
+    idle nodes and a long enough time limit). None when the job is not pending.
+    """
+    rows = [line.strip() for line in sections.get("queue", []) if line.strip()]
+    if not rows:
+        return None
+    fields = (rows[0].split("|") + [""] * 5)[:5]
+    partition, reason, start, nodes_text, limit = (field.strip() for field in fields)
+    nodes = _number(nodes_text) or 1
+    needed = seconds(limit)
+    idle: dict[str, dict[str, Any]] = {}
+    for line in sections.get("idle", []):
+        parts = line.strip().split("|")
+        if len(parts) < 4 or not parts[0]:
+            continue
+        name = parts[0].rstrip("*")
+        if name == partition or parts[1].strip().lower() != "up":
+            continue
+        counts = [_number(part) or 0 for part in parts[2].split("/")]
+        free = (counts + [0, 0])[1]
+        entry = idle.setdefault(name, {"partition": name, "idle": 0, "max_time": parts[3].strip()})
+        entry["idle"] += free
+    found: list[dict[str, Any]] = []
+    for entry in idle.values():
+        if entry["idle"] <= 0:
+            continue
+        most = seconds(str(entry["max_time"]))
+        long_enough = needed is None or most is None or most >= needed
+        found.append({**entry, "fits": entry["idle"] >= nodes and long_enough})
+    found.sort(key=lambda item: (not item["fits"], -item["idle"]))
+    return {
+        "partition": partition or None,
+        "reason": reason or None,
+        "estimated_start": start if start and start.upper() not in {"N/A", "NONE"} else None,
+        "nodes": nodes,
+        "time_limit": limit or None,
+        "idle_partitions": found,
+    }
+
+
+def queue_message(facts: Mapping[str, Any]) -> str:
+    """Say in one line where a pending job stands, for an operation's message."""
+    partition = facts.get("partition") or "its partition"
+    text = f"waiting in the {partition} queue"
+    if facts.get("reason"):
+        text += f" ({facts['reason']})"
+    start = facts.get("estimated_start")
+    text += (
+        f"; Slurm estimates the start at {start}" if start else "; Slurm has no start estimate yet"
+    )
+    idle = cast(list[dict[str, Any]], facts.get("idle_partitions") or [])
+    fitting = [item for item in idle if item.get("fits")]
+    if fitting:
+        names = ", ".join(f"{item['partition']} ({item['idle']} idle nodes)" for item in fitting)
+        text += f"; partitions with room for it now: {names}"
+    return text
 
 
 def _plugins(lines: Sequence[str]) -> list[str]:

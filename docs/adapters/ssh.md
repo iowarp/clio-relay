@@ -192,6 +192,17 @@ Your answers and the Spack environment are kept under the CLIO site home, at
 archives, so the next run of the same packages reuses them. Two installs into
 one environment take turns; the second shows `waiting_env_lock` until the
 first is done.
+A choice about the site rather than the packages, such as which MPI to build
+against, is asked once per site: relay keeps the answer in its own state
+(`sites/<site>/install-choices.json`) and gives it to the next install that asks the
+same question, saying so in its approval. Declining the approval forgets the
+carried answers, so the next install asks again. `site clean` removes them.
+
+While the install job or the run waits in Slurm's queue, the operation's
+`result.queue` and its message say why it waits, Slurm's estimated start, and
+the partitions with idle nodes that fit the job (`idle_partitions`, each with
+`fits`). Relay never moves a job to another partition itself: cancel it and run
+again with `queue=` once you agree.
 
 When the CLIO Spack is on the site (`<home>/spack`, made by clio-kit's
 `spack_prepare_site`), relay tells JARVIS to use it with `JARVIS_SPACK_ROOT`,
@@ -231,6 +242,26 @@ version and prefix, and Open MPI's launcher components. Each read is short and
 times out after 20 seconds. On a guarded site, relay checks a job's layout
 against its partition before it asks anything (see
 [guarded sites](../guarded-sites.md)).
+
+Open MPI's TCP channels use every interface they find, so on nodes that share
+an address that is not a link between them (`docker0` at `172.17.0.1` on every
+node, say), ranks on different nodes reach their own node and the job dies at
+startup (`received unexpected process identifier`). Relay names the network
+for every package run: the login node's network that holds all of Slurm's node
+addresses, which is how the scheduler reaches the nodes. It is found once and
+kept at `jarvis-cd/mpi-network` in the CLIO site home, one line
+`<network> <who>`. The site script exports `OMPI_MCA_btl_tcp_if_include`,
+`OMPI_MCA_oob_tcp_if_include` and `PRTE_MCA_oob_tcp_if_include` before it
+hands the pipeline to JARVIS; `sbatch` passes them on with the rest of the
+submit environment and Open MPI forwards them to every rank. The job
+directory's `relay.mpi-network` says what the run used and who named it. To
+name another fabric for every job, write it there (a CIDR, interface names
+joined by commas, or `none` to name nothing) with `files`; a guarded site asks
+you first. `site clean` drops it and relay finds the network again. A run whose
+own environment sets any of the variables, or an `_if_exclude`, keeps its own,
+on sites that take a job environment. `describe(site=...)` shows the network as
+`mpi.network`. A failed run whose output looks like this carries
+`mpi_network_hint`, naming the record to change.
 
 Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
 site home, by absolute path for submit, install, check, execution and stop. It

@@ -13,7 +13,8 @@ import logging
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay.adapters import registry
+from clio_relay import mpi_network
+from clio_relay.adapters import registry, slurm_facts
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
@@ -60,7 +61,7 @@ from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
 from clio_relay.surface.guarding import approval_message, review_asks
-from clio_relay.surface.outputs import marked_status, run_provenance, stdout_tail
+from clio_relay.surface.outputs import marked_status, run_provenance, stderr_tail, stdout_tail
 from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
@@ -304,7 +305,7 @@ class RelayService:
     ) -> OperationRecord:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
-        spec = await self.site_cores(site, self.apply_defaults(site, spec), "run")
+        spec = await self.prepared_run(site, spec)
         what = spec.executable or _steps_label(spec) or "a job"
         return await self._open(
             site,
@@ -316,9 +317,18 @@ class RelayService:
             task=task,
         )
 
+    async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
+        """Return the run's job as relay records and digests it."""
+        return await self.site_cores(site, self.apply_defaults(site, spec), "run")
+
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Fill the service job's site defaults."""
         return spec.model_copy(update={"job": self.apply_defaults(site, spec.job)})
+
+    async def prepared_serve(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
+        """Return the service as relay records and digests it."""
+        spec = self.prepare_service(site, spec)
+        return spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
 
     async def start_serve(
         self, site_id: str, spec: ServiceSpec, *, task: bool = False
@@ -333,8 +343,7 @@ class RelayService:
                 verb="serve",
                 site=site.id,
             )
-        spec = self.prepare_service(site, spec)
-        spec = spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
+        spec = await self.prepared_serve(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
         what = spec.job.executable or _steps_label(spec.job) or "a service"
         return await self._open(
@@ -463,21 +472,25 @@ class RelayService:
             self.asks.put(ask_id, ask)
         return ask
 
-    def same_request(
+    async def same_request(
         self, record: OperationRecord, site: str | None, spec: JobSpec | ServiceSpec | None
     ) -> None:
-        """Refuse a retry or resume whose site or spec differs from what was approved."""
+        """Refuse a retry or resume whose site or spec differs from what was approved.
+
+        The spec is prepared as start_run or start_serve prepared it, site cores
+        included, so the same request digests the same; the form without site
+        cores also matches, for a site described differently since.
+        """
         if site is None and spec is None:
             return
         changed = site is not None and site != record.site
         if spec is not None and not changed:
             entry = self.site(record.site)
-            current = (
-                self.prepare_service(entry, spec)
-                if isinstance(spec, ServiceSpec)
-                else self.apply_defaults(entry, spec)
-            )
-            changed = current.digest() != record.spec_digest
+            if isinstance(spec, ServiceSpec):
+                forms = [self.prepare_service(entry, spec), await self.prepared_serve(entry, spec)]
+            else:
+                forms = [self.apply_defaults(entry, spec), await self.prepared_run(entry, spec)]
+            changed = all(form.digest() != record.spec_digest for form in forms)
         if changed:
             raise Refusal(
                 RefusalReason.APPROVAL_MISMATCH,
@@ -522,10 +535,14 @@ class RelayService:
         waiting = False
         for ask in self.operation_asks(record):
             if ask.state in ("declined", "cancelled"):
+                message = f"the person declined: {ask.message}"
+                forgotten = installing.forget_carried(self, record, ask)
+                if forgotten:
+                    message = f"{message}. {forgotten}"
                 return self.finish(
                     operation_id,
                     OperationState.CANCELLED,
-                    Refusal(RefusalReason.DECLINED, f"the person declined: {ask.message}"),
+                    Refusal(RefusalReason.DECLINED, message),
                 )
             if ask.state == "pending":
                 if ask.kind == "url" and await self._signed_in_elsewhere(ask, record):
@@ -791,8 +808,11 @@ class RelayService:
         endpoint: Endpoint | None = None,
     ) -> OperationRecord:
         tail: str | None = None
+        errors: str | None = None
         if status.state.final:
             tail = await stdout_tail(adapter, status)
+            if status.state is JobState.FAILED:
+                errors = await stderr_tail(adapter, status)
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if record.state.final:
@@ -809,6 +829,11 @@ class RelayService:
                 result["progress"] = status.progress.model_dump(mode="json")
             if status.control is not None:
                 result["control"] = status.control
+            if status.queue:
+                result["queue"] = status.queue
+                status.message = status.message or slurm_facts.queue_message(status.queue)
+            else:
+                result.pop("queue", None)
             if status.message is not None:
                 result["message"] = status.message
             elif record.kind != "serve":
@@ -817,6 +842,15 @@ class RelayService:
                 result["endpoint"] = public_endpoint(endpoint)
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
+            if status.state is JobState.FAILED:
+                handle_data = record.handle.data if record.handle is not None else {}
+                root = handle_data.get("root")
+                hint = mpi_network.failure_hint(
+                    "\n".join(text for text in (status.message, tail, errors) if text),
+                    root=root if isinstance(root, str) else None,
+                )
+                if hint is not None:
+                    result["mpi_network_hint"] = hint
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)

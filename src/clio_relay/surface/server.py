@@ -397,10 +397,15 @@ class RelayServer:
                     "page": self.service.ask_provider.page_address(ask),
                 }
             )
+        again = (
+            "call serve with service set to the operation id"
+            if record.kind == "serve"
+            else "call run with resume set to the operation id"
+        )
         refusal = Refusal(
             RefusalReason.NEEDS_SIGN_IN if url_only else RefusalReason.NEEDS_APPROVAL,
             "relay needs the person before it can go on. Open the page, or run "
-            "`clio-relay asks answer`, then call run with resume set to the operation id",
+            f"`clio-relay asks answer`, then {again}",
             operation_id=record.operation_id,
             asks=shown,
         )
@@ -444,7 +449,7 @@ class RelayServer:
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
-                self.service.same_request(self.service.operation(resume), site, spec)
+                await self.service.same_request(self.service.operation(resume), site, spec)
                 record = await self.service.advance(resume)
                 return await self._deliver(ctx, record, wait_s)
             if site is None or spec is None:
@@ -511,7 +516,7 @@ class RelayServer:
     ) -> ToolResult | InputRequiredToolResult:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
-        self.service.same_request(record, site, spec)
+        await self.service.same_request(record, site, spec)
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
                 action, content = response_parts(response)

@@ -36,9 +36,17 @@ def progress_message(record: OperationRecord) -> str | None:
 
 
 def latest_note(record: OperationRecord) -> str | None:
-    """Return the latest step, else the latest thing the site or relay said of the job."""
-    found: object = (record.result or {}).get("message")
-    return progress_message(record) or (found if isinstance(found, str) and found else None)
+    """Return the latest step, else the latest thing the site or relay said of the job.
+
+    A job still waiting in the queue says where it stands instead: that is the
+    news while it waits.
+    """
+    result = record.result or {}
+    found: object = result.get("message")
+    message = found if isinstance(found, str) and found else None
+    if result.get("queue") and message:
+        return message
+    return progress_message(record) or message
 
 
 def observation_line(view: dict[str, Any]) -> str | None:

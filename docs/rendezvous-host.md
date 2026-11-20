@@ -106,7 +106,7 @@ host:
 | `hop_advertise` | The login node's address as compute nodes see it, when its host name doesn't resolve there. |
 | `hop_dir` | Where the login hop keeps its lock, leases and password on the site, one directory per site. `~/.clio-relay/hop` by default. |
 | `login_limits` | What the login hop may use: `cpu_quota_percent`, `memory_mb`, `address_space_mb` and `cpu_s`. |
-| `path` | `auto` (the default) uses frp when a rendezvous host is set, and `ssh -L` otherwise. `frp` or `ssh` forces one. |
+| `path` | `auto` (the default) uses frp when a rendezvous host is set and frp can work: the site has an `frpc` or `frpc_binary`, this machine has its `frpc`, and the token reads. Otherwise it uses `ssh -L`. `frp` or `ssh` forces one. |
 | `stun_server` | The STUN server for this site's frp client, when the site can't reach the rendezvous one. |
 | `stop_grace_s` | Seconds a service gets to write its final files after a stop. 30 by default. |
 

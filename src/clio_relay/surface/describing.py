@@ -11,6 +11,7 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface import installing
 from clio_relay.surface.skills import skill_link, skills
 
 if TYPE_CHECKING:
@@ -84,6 +85,8 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
 
     ``packages`` are the JARVIS packages relay can run there. ``run`` takes one
     as ``package: {name, parameters}`` and pins its version and SHA-256.
+    ``install_choices`` are the site-scope choices (which MPI) the person made,
+    which later installs on the site carry.
     """
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
@@ -92,6 +95,10 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
             skill_link, site, service.paths.config_dir, with_text=True
         ),
         "packages": await asyncio.to_thread(package_listing, service, site),
+        "install_choices": {
+            subject: entry["constraint"]
+            for subject, entry in installing.site_choices(service, site.id).items()
+        },
     }
     try:
         adapter = service.adapter_for(site, "describe")
