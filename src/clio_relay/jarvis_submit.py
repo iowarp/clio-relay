@@ -52,6 +52,7 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from clio_relay import mpi_network
 from clio_relay.jobs.handles import VIEW_METADATA, JobProgress, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
@@ -129,6 +130,8 @@ SPACK_ROOT_ENV = "CLIO_RELAY_SPACK_ROOT"
 """The Spack the site script exports as ``JARVIS_SPACK_ROOT`` when it is there."""
 SPACK_CONFIG_ENV = "CLIO_RELAY_SPACK_CONFIG"
 """The directory the site script exports as ``JARVIS_SPACK_CONFIG`` when it is there."""
+MPI_NETWORK_ENV = "CLIO_RELAY_MPI_NETWORK"
+"""The file that keeps the site's MPI network (:mod:`clio_relay.mpi_network`)."""
 
 EXIT_DECISION = 3
 """JARVIS needs to install software, or a decision, before the job can run."""
@@ -246,7 +249,8 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     ``<home>/spack-config``, is offered too. The site script exports it as
     ``JARVIS_SPACK_ROOT`` (and ``JARVIS_SPACK_CONFIG``) only when the checkout
     has ``share/spack/setup-env.sh``, so a site without one keeps JARVIS's own
-    lookup (``SPACK_ROOT``).
+    lookup (``SPACK_ROOT``). The site's MPI network is kept at
+    ``<home>/jarvis-cd/mpi-network`` (:mod:`clio_relay.mpi_network`).
     """
     if not home:
         return {}
@@ -258,6 +262,7 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
         SPACK_ROOT_ENV: posixpath.join(home, SPACK_DIR),
         SPACK_CONFIG_ENV: posixpath.join(home, SPACK_CONFIG_DIR),
+        MPI_NETWORK_ENV: posixpath.join(home, BOOTSTRAP_DIR, mpi_network.FILE),
     }
 
 
@@ -602,7 +607,8 @@ def render_pipeline(document: Mapping[str, object]) -> str:
 
 # The site script
 
-SITE_SCRIPT = r"""set -eu
+SITE_SCRIPT = (
+    r"""set -eu
 mode=$1 jarvis=$2 execution=$3 steps=$4
 shift 4
 job=$PWD
@@ -696,6 +702,44 @@ else
     || refuse "$found" ",\"pin\":\"$got\"" "relay's jarvis-cd is at ${got:-no pin}, not $pin"
 fi
 printf '%s\n' "$found" > "$job/relay.jarvis"
+"""
+    + mpi_network.SHELL
+    + r"""
+# The network MPI's TCP channels use: the job's own setting, else the site's, which is
+# found once from Slurm's node addresses and kept in the CLIO site home. JARVIS seals
+# it into the pipeline's environment and passes it to mpiexec and every rank.
+net_file=$(home "${CLIO_RELAY_MPI_NETWORK:-}")
+unset CLIO_RELAY_MPI_NETWORK
+if [ "$mode" != install ]; then
+  own=
+  for key in OMPI_MCA_btl_tcp_if_include OMPI_MCA_btl_tcp_if_exclude \
+    OMPI_MCA_oob_tcp_if_include OMPI_MCA_oob_tcp_if_exclude \
+    PRTE_MCA_oob_tcp_if_include PRTE_MCA_oob_tcp_if_exclude; do
+    eval "value=\${$key:-}"
+    [ -z "$value" ] || own="$own$key=$value "
+  done
+  if [ -n "$own" ]; then
+    printf '%s job\n' "$own" > "$job/relay.mpi-network"
+  else
+    net=
+    [ -z "$net_file" ] || net=$(head -n 1 "$net_file" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$net" ]; then
+      py="${found%/*}/python"
+      [ -x "$py" ] || py="${found%/*}/venv/bin/python"
+      [ -x "$py" ] || py=$(command -v python3 2>/dev/null) || py=
+      [ -z "$py" ] || net=$(relay_mpi_network "$py" | cut -d' ' -f1) || net=
+      if [ -n "$net" ] && [ -n "$net_file" ]; then
+        mkdir -p "$(dirname "$net_file")"
+        printf '%s slurm-node-addresses\n' "$net" > "$net_file"
+      fi
+    fi
+    if [ -n "$net" ] && [ "$net" != none ]; then
+      export OMPI_MCA_btl_tcp_if_include="$net" OMPI_MCA_oob_tcp_if_include="$net"
+      export PRTE_MCA_oob_tcp_if_include="$net"
+      printf 'OMPI_MCA_btl_tcp_if_include=%s site\n' "$net" > "$job/relay.mpi-network"
+    fi
+  fi
+fi
 root="$job/.relay-jarvis"
 export JARVIS_ROOT="$root"
 # Set up once per set of archives: the root keeps the install records and executions.
@@ -798,6 +842,7 @@ fi
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
 """
+)
 """The site script. ``bash -c SITE_SCRIPT <$0> <mode> <jarvis> <execution> <steps>
 [<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
 ``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
@@ -820,7 +865,12 @@ JARVIS root and registers each repository once, once per set of archives. Before
 it registers one whose archive lists Python requirements
 (:data:`~clio_relay.jarvis_site.REQUIREMENTS_FILE`), it installs them with relay's
 jarvis-cd ``pip`` (only for relay's own JARVIS, logged in
-``relay.requirements.log``), and fails with exit 1 when that install fails. Then it
+``relay.requirements.log``), and fails with exit 1 when that install fails. For a
+``submit`` or ``run``, it names the network MPI's TCP channels use
+(:mod:`clio_relay.mpi_network`): unless the job's environment names one, it
+exports the site's, kept in ``$CLIO_RELAY_MPI_NETWORK`` (found from Slurm's
+node addresses the first time; a first line of ``none`` turns it off), and
+writes what the job used to ``relay.mpi-network``. Then it
 hands the pipeline to JARVIS:
 
 - ``submit`` runs ``ppl submit`` under ``JARVIS_INSTALL_ON_LOAD=check`` and keeps
@@ -1821,31 +1871,50 @@ def install_message(
     package: str,
     names: Mapping[str, str] | None = None,
     walltime: str | None = None,
+    carried: Mapping[str, str] | None = None,
 ) -> str:
     """Return the approval question for installing the package's software on the site.
 
-    ``walltime`` is the install job's, when the adapter reported it.
+    ``walltime`` is the install job's, when the adapter reported it. ``carried``
+    names the site choices the person made before, ``{subject: constraint}``,
+    which the install applies without asking them again.
     """
     summary = install_summary(report, names)
+    carried = dict(carried or {})
+    asked = len(choice_issues(report)) - len(carried)
     built: list[str] = []
     for item in summary["build"]:
         detail = item["spec"] or item["package"]
         if item["missing"]:
             detail = f"{detail} ({item['missing']} missing)"
         built.append(detail)
+    reuse = ""
+    if carried:
+        reuse = (
+            " It uses the "
+            + ", ".join(f"{subject} {value}" for subject, value in sorted(carried.items()))
+            + f" chosen for {site} before; decline to choose again."
+        )
     if not built and choice_issues(report):
+        if asked <= 0:
+            return (
+                f"JARVIS applies the earlier choice(s) for {site} in a short job before "
+                f"{package} runs; nothing has to be built.{reuse} Go ahead?"
+            )
         return (
-            f"JARVIS needs {len(choice_issues(report))} choice(s) from you before {package} "
+            f"JARVIS needs {asked} choice(s) from you before {package} "
             f"runs on {site}; nothing has to be built. It applies your answers in a short "
-            "job on the site, then the run goes ahead. Go ahead?"
+            f"job on the site, then the run goes ahead.{reuse} Go ahead?"
         )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
     if built:
         parts.append("Built: " + ", ".join(built) + ".")
-    if summary["issues"]:
-        parts.append(f"JARVIS has {summary['issues']} question(s) for you after this.")
+    if asked > 0:
+        parts.append(f"JARVIS has {asked} question(s) for you after this.")
+    if reuse:
+        parts.append(reuse.strip())
     job = f"a job on one whole node of up to {walltime}" if walltime else "a job"
     parts.append(f"JARVIS installs it as {job} on the site before the run. Install it?")
     return " ".join(parts)
@@ -1900,7 +1969,7 @@ def choice_message(issue: Mapping[str, Any]) -> str:
         if (line := _candidate_line(_dict(candidate)))
     ]
     if issue.get("kind") == "ambiguous_provider" and issue.get("scope") == "site":
-        text = f"{text} JARVIS keeps the answer for every later run on the site."
+        text = f"{text} Relay keeps the answer for every later install on the site."
     return f"{text} Options: {'. '.join(lines)}." if lines else text
 
 

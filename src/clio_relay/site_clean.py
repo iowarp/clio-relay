@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from clio_relay.adapters.base import CleansSite, ShutsDown
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.shutdown import shutdown
+from clio_relay.surface import installing
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -136,6 +137,10 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
         if directory.exists():
             shutil.rmtree(directory, ignore_errors=True)
             local.append(str(directory))
+    choices = installing.choices_path(service, site_id)
+    if choices.exists():
+        choices.unlink(missing_ok=True)
+        local.append(str(choices))
     return {
         "schema": SCHEMA,
         "site": site_id,

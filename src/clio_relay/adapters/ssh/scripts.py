@@ -301,11 +301,13 @@ def status_script(
     status_command: str | None,
     native_id: str | None,
     accounting_command: str | None = None,
+    queue: bool = False,
 ) -> str:
     """One poll: the record, then the scheduler or the supervisor (RL17).
 
     ``accounting_command`` runs only when the queue no longer lists the job and
-    the job wrote no exit code, as the last evidence of how it ended.
+    the job wrote no exit code, as the last evidence of how it ended. ``queue``
+    adds :func:`slurm_facts.queue_script`, which reports a pending job's place.
     """
     body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
@@ -334,16 +336,25 @@ def status_script(
             '[ -s child_pid ] && echo "@@started"\n'
         )
     body += '[ -e cancel ] && echo "@@cancel"\n'
+    if queue and native_id is not None:
+        body += slurm_facts.queue_script(native_id)
     body += "exit 0\n"
     return body
 
 
-def jarvis_status_script(job_dir: str, execution_id: str, pipeline: str | None = None) -> str:
+def jarvis_status_script(
+    job_dir: str,
+    execution_id: str,
+    pipeline: str | None = None,
+    native_id: str | None = None,
+) -> str:
     """One poll of a job JARVIS submitted: ``jarvis execution get``, and its artifacts.
 
     ``execution get`` reconciles the record with the scheduler and commits it,
     so relay keeps no state of its own. The artifacts are read once the record
     is terminal. ``pipeline`` is as in :func:`jarvis_submit.execution_argv`.
+    With the scheduler's ``native_id``, a pending job's place in the queue is
+    read too (:func:`slurm_facts.queue_script`).
     """
     get = jarvis_submit.execution_shell("get", execution_id, job_dir=job_dir, pipeline=pipeline)
     artifacts = jarvis_submit.execution_shell(
@@ -363,6 +374,7 @@ def jarvis_status_script(job_dir: str, execution_id: str, pipeline: str | None =
         + "'\"terminal\":true'; then\n"
         + f'  echo "@@artifacts"; {artifacts} 2>/dev/null </dev/null; echo\n'
         + "fi\n"
+        + (slurm_facts.queue_script(native_id) if native_id else "")
         + "exit 0\n"
     )
 

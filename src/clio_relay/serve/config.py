@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,8 +100,9 @@ class SiteServe(BaseModel):
     path: Literal["auto", "frp", "ssh"] = Field(
         default="auto",
         description=(
-            "auto: frp when a rendezvous host is set, otherwise an ssh -L forward "
-            "on an adapter that gives ssh_argv()"
+            "auto: frp when a rendezvous host is set and frp can work (a client on the "
+            "site and here, and the token), otherwise an ssh -L forward on an adapter "
+            "that gives ssh_argv()"
         ),
     )
     address: str | None = Field(
@@ -153,6 +155,27 @@ class ServeSettings(BaseModel):
 
     rendezvous: Rendezvous | None = None
     sites: dict[str, SiteServe] = Field(default_factory=dict[str, SiteServe])
+
+
+def frp_unusable(site: SiteServe, rendezvous: Rendezvous) -> str | None:
+    """Say why frp cannot carry a port for ``site`` now, or None when it can.
+
+    ``auto`` falls back to ssh then. It reads only local state: the site's frpc
+    setting, the local frpc, and the token.
+    """
+    if not site.frpc:
+        if not site.frpc_binary:
+            return "has no client on the site (set its serve frpc or frpc_binary)"
+        if not Path(os.path.expanduser(site.frpc_binary)).is_file():
+            return f"has no client for the site: frpc_binary {site.frpc_binary} is missing"
+    local = os.path.expanduser(rendezvous.frpc)
+    if shutil.which(local) is None:
+        return f"has no client on this machine: {rendezvous.frpc} is not found"
+    try:
+        rendezvous.token()
+    except Refusal as refusal:
+        return f"has no token: {refusal.message}"
+    return None
 
 
 def settings_path(state_dir: Path, settings: dict[str, Any] | None = None) -> Path:

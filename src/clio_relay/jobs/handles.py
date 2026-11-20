@@ -100,6 +100,13 @@ class JobStatus(BaseModel):
             "job, the execution record's cancel_request, stop_request and termination"
         ),
     )
+    queue: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Where a pending job stands, when the scheduler says: its partition, the reason "
+            "it waits, the estimated start, and the other partitions with idle nodes"
+        ),
+    )
 
 
 class ExecResult(BaseModel):

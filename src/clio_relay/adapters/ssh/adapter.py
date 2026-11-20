@@ -593,6 +593,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 status_command=status_command,
                 native_id=handle.native_id,
                 accounting_command=accounting_command,
+                queue=mode == "scheduler" and handle.data.get("scheduler") == "slurm",
             ),
             "status",
         )
@@ -613,6 +614,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             status = self._scheduler_status(executor, handle, sections, recorded)
         else:
             status = _detached_status(sections)
+        if not status.state.final:
+            status.queue = slurm_facts.queue(sections)
         if status.state.final:
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
@@ -646,7 +649,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
         job_dir = str(handle.data["job_dir"])
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         sections = parse_sections(
-            await self._ssh(scripts.jarvis_status_script(job_dir, execution_id, pipeline), "status")
+            await self._ssh(
+                scripts.jarvis_status_script(
+                    job_dir, execution_id, pipeline, native_id=handle.native_id
+                ),
+                "status",
+            )
         )
         if "nodir" in sections:
             return JobStatus(
@@ -669,6 +677,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{answer.strip()[-500:] or 'no output'}",
             )
         status = jarvis_submit.record_status(record)
+        if not status.state.final:
+            status.queue = slurm_facts.queue(sections)
         if not status.state.final or handle.data.get("install"):
             return status
         snapshot = jarvis_submit.parse_document(
