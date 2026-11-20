@@ -35,7 +35,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clio_relay import jarvis_submit
 from clio_relay.adapters._files import LocalFileAccess
@@ -177,14 +177,12 @@ class LocalConfig(BaseModel):
         description="Where job directories go. Defaults to relay's state directory",
     )
     submit_timeout_s: float = Field(default=60, gt=0)
-    jarvis: str = Field(
-        default="jarvis",
-        min_length=1,
-        description=(
-            "The jarvis command on this machine, which runs package jobs. A leading ~/ "
-            "means the home directory"
-        ),
-    )
+    jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+
+    @field_validator("jarvis")
+    @classmethod
+    def _jarvis_path(cls, value: str) -> str:
+        return jarvis_submit.explicit_jarvis(value)
 
 
 _PSIJ_STATES = {

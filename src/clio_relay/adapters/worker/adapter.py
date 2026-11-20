@@ -143,14 +143,7 @@ class WorkerConfig(BaseModel):
     )
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
-    jarvis: str = Field(
-        default="jarvis",
-        min_length=1,
-        description=(
-            "The jarvis command on the site, which runs package jobs. A leading ~/ "
-            "means the home directory"
-        ),
-    )
+    jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     idle_exit_s: int = Field(
         default=IDLE_EXIT_S,
         ge=0,
@@ -185,6 +178,11 @@ class WorkerConfig(BaseModel):
         if value.startswith("-") or any(ch.isspace() for ch in value):
             raise ValueError("ssh_profile must be one ssh_config Host")
         return value
+
+    @field_validator("jarvis")
+    @classmethod
+    def _jarvis_path(cls, value: str) -> str:
+        return jarvis_submit.explicit_jarvis(value)
 
 
 class WorkerLink(BaseModel):
