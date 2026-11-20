@@ -28,7 +28,6 @@ import re
 import subprocess
 import sys
 import tarfile
-import tempfile
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -51,6 +50,7 @@ from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
+from clio_relay.scratch import ScratchDir
 
 STAGE_COMMAND = (
     'the packages tool: packages(op="stage", package="<repository>.<package>"), from a git '
@@ -687,9 +687,7 @@ def stage_git(
             path=path,
         )
     repo, _package = split_name(name)
-    with tempfile.TemporaryDirectory(
-        prefix="clio-relay-stage-", ignore_cleanup_errors=True
-    ) as scratch:
+    with ScratchDir("clio-relay-stage-", ignore_cleanup_errors=True) as scratch:
         checkout = Path(scratch) / repo
         fetch_commit(url, commit, checkout)
         root = checkout.joinpath(*relative.parts) if relative is not None else checkout

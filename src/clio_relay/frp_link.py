@@ -58,7 +58,6 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
@@ -80,6 +79,7 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frpc_visitor_config,
 )
+from clio_relay.scratch import ScratchDir
 
 # Deliberately the same value as control_channel.py's
 # MAX_CHANNEL_EVENT_DETAIL_CHARS -- a different concern (this bounds a
@@ -621,7 +621,7 @@ class HeldFrpVisitor:
         self._stdout_thread: threading.Thread | None = None
         self._stderr_buffer: BoundedStderrBuffer | None = None
         self._stderr_thread: threading.Thread | None = None
-        self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._temp_dir: ScratchDir | None = None
         self._config_path: Path | None = None
         self._config_cleanup_error: str | None = None
         self._established = False
@@ -640,7 +640,7 @@ class HeldFrpVisitor:
         """Write the visitor TOML to a 0600 temp file and spawn ``frpc -c <toml>``."""
         if self._established:
             raise RelayError("frp visitor was already established")
-        temp_dir = tempfile.TemporaryDirectory(prefix=VISITOR_CONFIG_DIR_PREFIX)
+        temp_dir = ScratchDir(VISITOR_CONFIG_DIR_PREFIX)
         try:
             config_path = Path(temp_dir.name) / "frpc-visitor.toml"
             rendered = render_visitor_config(

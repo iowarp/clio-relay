@@ -24,12 +24,11 @@ import asyncio
 import shlex
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from clio_relay import programs
+from clio_relay import programs, scratch
 from clio_relay.adapters.tapis.adapter import TapisAdapter
 from clio_relay.adapters.tapis.client import TapisCallError
 from clio_relay.adapters.tapis.files import WORK_DIR_NAME
@@ -188,7 +187,7 @@ class KeyPair:
 
 def make_key_pair(comment: str) -> KeyPair:
     """Make an RSA key in PEM form, with no passphrase, in a fresh 0700 directory."""
-    directory = Path(tempfile.mkdtemp(prefix="clio-relay-tapis-key-"))
+    directory = Path(scratch.make_dir("clio-relay-tapis-key-"))
     path = directory / "id"
     argv = [
         "ssh-keygen", "-q", "-t", "rsa", "-b", str(KEY_BITS), "-m", "PEM",
