@@ -12,19 +12,32 @@ script hands it to JARVIS:
   FORK job.
 - ``run`` runs ``jarvis ppl run yaml <pipeline> +json``, JARVIS's direct run,
   for an adapter that starts the job itself (no batch scheduler).
+- ``install`` runs ``jarvis ppl install yaml <pipeline> --answers <file>
+  +submit --execution-id <op>-install +json``: JARVIS installs what the
+  pipeline's packages need, as a job of its own.
+
+A submit loads the pipeline with ``JARVIS_INSTALL_ON_LOAD=check``. When a
+package's software is missing or needs a decision, JARVIS exits 3 before it
+calls ``sbatch``; the script then writes JARVIS's ``jarvis.install-report.v1``
+to ``relay.install-report.json`` and exits 3 too. Relay asks the person to
+approve the install and to answer each ambiguous question
+(:func:`install_needed`), runs ``install`` with the answers, follows the
+install job's log and progress, and then submits the run again.
 
 Either way the job's JARVIS root is ``<job dir>/.relay-jarvis``, private to the
-job, so the person's own pipelines are never read or changed. Status, outputs
-and services come from JARVIS's ``execution`` commands and its record, never
-from relay's own tracking of the batch job.
+job, so the person's own pipelines are never read or changed. Status, outputs,
+services, cancel and stop all go through JARVIS's ``execution`` commands and its
+record, never through relay's own tracking of the batch job or the scheduler.
 
-JARVIS 1.8.1 has no ``execution cancel`` or ``execution stop``, so relay
-refuses both after a submit (:func:`cancel_refusal`, :func:`stop_refusal`)
-rather than calling the scheduler itself.
+A site with no JARVIS where its setting says can have one installed by relay,
+after the person approves it: :data:`BOOTSTRAP_SCRIPT` puts jarvis-cd at
+:data:`JARVIS_PIN` under the CLIO site home, and the site script falls back to
+it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import posixpath
@@ -36,9 +49,9 @@ from typing import Any, Literal, cast
 
 import yaml
 
-from clio_relay.jobs.handles import VIEW_METADATA, JobState, JobStatus, OutputRef
+from clio_relay.jobs.handles import VIEW_METADATA, JobProgress, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec
+from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
 
 ARCHIVE_DIR = ".relay-package"
 """Where the site script finds the package archive, relative to the job directory."""
@@ -55,16 +68,50 @@ REFUSAL_FILE = "relay.refusal.json"
 EXITCODE_FILE = "relay.exitcode"
 JARVIS_FILE = "relay.jarvis"
 """The JARVIS program the site script found, for the ``execution`` commands later."""
+INSTALL_REPORT_FILE = "relay.install-report.json"
+"""The ``jarvis.install-report.v1`` of a submit that exited 3."""
+ANSWERS_FILE = "relay.answers.json"
+"""The person's answers to JARVIS's install questions, ``{issue_id: {constraint, ...}}``."""
+INSTALL_FILE = "relay.install.json"
+"""The ``jarvis.execution.handle.v1`` line ``ppl install +submit`` printed."""
 
-SITE_FILES = (PIPELINE_FILE, SCRIPT_FILE, SUBMISSION_FILE, REFUSAL_FILE, EXITCODE_FILE, JARVIS_FILE)
+SITE_FILES = (
+    PIPELINE_FILE,
+    SCRIPT_FILE,
+    SUBMISSION_FILE,
+    REFUSAL_FILE,
+    EXITCODE_FILE,
+    JARVIS_FILE,
+    INSTALL_REPORT_FILE,
+    ANSWERS_FILE,
+    INSTALL_FILE,
+)
 """Files the site script keeps in the job directory. They are not outputs."""
 
 HANDLE_SCHEMA = "jarvis.execution.handle.v1"
 RECORD_SCHEMA = "jarvis.execution.record.v1"
 ARTIFACTS_SCHEMA = "jarvis.execution.artifacts.v1"
 SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
+INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
+JARVIS_PIN = "811dde8072dc2267080dc013e69110a9670c1baa"
+"""The jarvis-cd commit relay installs on a site that has none."""
+JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
+BOOTSTRAP_DIR = "jarvis-cd"
+"""Where relay installs jarvis-cd, relative to the CLIO site home."""
+FALLBACK_ENV = "CLIO_RELAY_JARVIS_FALLBACK"
+"""The JARVIS the site script uses when the site's setting points to nothing."""
+PIPELINES_DIR = "pipelines"
+"""Where the install answers and Spack env of each set of archives are kept, under
+:data:`BOOTSTRAP_DIR`."""
+DECISIONS_ENV = "CLIO_RELAY_JARVIS_DECISIONS"
+"""The file the site script exports as ``JARVIS_SPACK_DECISIONS``."""
+SPACK_ENV_ENV = "CLIO_RELAY_JARVIS_SPACK_ENV"
+"""The directory the site script exports as ``JARVIS_SPACK_ENV_DIR``."""
+
+EXIT_DECISION = 3
+"""JARVIS needs to install software, or a decision, before the job can run."""
 EXIT_USAGE = 64
 """A bad mode, package name or execution id."""
 EXIT_DIGEST = 65
@@ -74,11 +121,17 @@ EXIT_MISSING = 66
 EXIT_NO_JARVIS = 69
 """The site has no JARVIS where the site's setting says."""
 
-ExecutionVerb = Literal["get", "progress", "artifacts", "service-runtimes"]
-EXECUTION_VERBS: tuple[ExecutionVerb, ...] = ("get", "progress", "artifacts", "service-runtimes")
+ExecutionVerb = Literal["get", "progress", "artifacts", "service-runtimes", "cancel", "stop"]
+EXECUTION_VERBS: tuple[ExecutionVerb, ...] = (
+    "get",
+    "progress",
+    "artifacts",
+    "service-runtimes",
+    "cancel",
+    "stop",
+)
 
-NEEDS_CANCEL = "jarvis execution cancel"
-NEEDS_STOP = "jarvis execution stop"
+NEEDS_INSTALL = "jarvis ppl install"
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _TOKEN = re.compile(r"[^\s#]+")
@@ -122,37 +175,111 @@ def pipeline_id(operation_id: str) -> str:
     return f"relay_{operation_id}"
 
 
+def install_execution_id(operation_id: str) -> str:
+    """Return the execution id of the job that installs an operation's software.
+
+    It lives in the operation's pipeline, ``pipeline_id(operation_id)``.
+    """
+    return f"{operation_id}-install"
+
+
+def bootstrap_path(home: str) -> str:
+    """Return where :data:`BOOTSTRAP_SCRIPT` links the JARVIS it installs under ``home``."""
+    return posixpath.join(home, BOOTSTRAP_DIR, "jarvis")
+
+
+def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
+    """Return the site script's settings for ``spec`` and the CLIO site home ``home``.
+
+    The JARVIS relay installs there (:func:`bootstrap_path`) is the fallback.
+    The person's install answers and the pipeline's Spack environment are kept
+    at ``<home>/jarvis-cd/pipelines/<steps digest>/``, keyed by the set of
+    archives (:func:`steps_digest`): the job's JARVIS root and pipeline are per
+    operation, so JARVIS's own per-pipeline ``decisions.yaml`` and ``spack.lock``
+    would be forgotten, and a repeat run would concretize again.
+    """
+    if not home:
+        return {}
+    kept = posixpath.join(home, BOOTSTRAP_DIR, PIPELINES_DIR, steps_digest(spec))
+    return {
+        FALLBACK_ENV: bootstrap_path(home),
+        DECISIONS_ENV: posixpath.join(kept, "decisions.yaml"),
+        SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
+    }
+
+
 def jarvis_root(job_dir: str) -> str:
     """Return the job's private JARVIS root."""
     return posixpath.join(job_dir, JARVIS_DIR)
 
 
-def execution_dir(job_dir: str, operation_id: str) -> str:
-    """Return the execution directory JARVIS seals for the operation."""
+def execution_dir(job_dir: str, execution_id: str, *, pipeline: str | None = None) -> str:
+    """Return the execution directory JARVIS seals for an execution.
+
+    ``pipeline`` defaults to the operation's, ``pipeline_id(execution_id)``.
+    """
     return posixpath.join(
-        jarvis_root(job_dir), "shared", pipeline_id(operation_id), "executions", operation_id
+        jarvis_root(job_dir),
+        "shared",
+        pipeline or pipeline_id(execution_id),
+        "executions",
+        execution_id,
     )
 
 
-def record_path(job_dir: str, operation_id: str) -> str:
+def record_path(job_dir: str, execution_id: str, *, pipeline: str | None = None) -> str:
     """Return the path of the execution's ``jarvis.execution.record.v1`` file."""
-    return posixpath.join(execution_dir(job_dir, operation_id), RECORD_FILE)
+    return posixpath.join(execution_dir(job_dir, execution_id, pipeline=pipeline), RECORD_FILE)
 
 
-def archive_input(spec: JobSpec) -> InputRef:
-    """Return the input that stages the reviewed package archive by its digest."""
-    package = spec.package
-    if package is None:
+def steps_of(spec: JobSpec) -> list[PackageRef]:
+    """Return the pipeline's packages, refusing a job that has none."""
+    steps = spec.steps()
+    if not steps:
         raise ValueError("not a package job")
-    digest = package.pinned()[1]
-    return InputRef(name=f"{ARCHIVE_DIR}/{digest}.tar.gz", sha256=digest)
+    return steps
+
+
+def archive_inputs(spec: JobSpec) -> list[InputRef]:
+    """Return the inputs that stage each reviewed package archive by its digest, once each."""
+    found: dict[str, InputRef] = {}
+    for step in steps_of(spec):
+        digest = step.pinned()[1]
+        found.setdefault(digest, InputRef(name=f"{ARCHIVE_DIR}/{digest}.tar.gz", sha256=digest))
+    return list(found.values())
 
 
 def with_archive(spec: JobSpec) -> JobSpec:
-    """Return ``spec`` with the package archive among its inputs, once."""
-    archive = archive_input(spec)
-    inputs = [item for item in spec.inputs if item.name != archive.name]
-    return spec.model_copy(update={"inputs": [*inputs, archive]})
+    """Return ``spec`` with every package archive among its inputs, once."""
+    archives = archive_inputs(spec)
+    names = {item.name for item in archives}
+    inputs = [item for item in spec.inputs if item.name not in names]
+    return spec.model_copy(update={"inputs": [*inputs, *archives]})
+
+
+def steps_digest(spec: JobSpec) -> str:
+    """Return the sha256 of the sorted package archive digests: the pipeline's software."""
+    digests = sorted({step.pinned()[1] for step in steps_of(spec)})
+    return hashlib.sha256(",".join(digests).encode()).hexdigest()
+
+
+def step_names(steps: list[PackageRef]) -> list[str]:
+    """Return each step's ``pkg_name`` in the pipeline.
+
+    One step is ``pkg``. Several are named by their package, with ``_2``, ``_3``
+    for a package that appears again.
+    """
+    if len(steps) == 1:
+        return ["pkg"]
+    names: list[str] = []
+    for step in steps:
+        base = step.name.partition(".")[2] or step.name
+        name, count = base, 1
+        while name in names:
+            count += 1
+            name = f"{base}_{count}"
+        names.append(name)
+    return names
 
 
 # The pipeline
@@ -180,7 +307,12 @@ def _token(key: str, value: object) -> object:
 
 
 def scheduler_block(
-    spec: JobSpec, *, job_name: str, stdout: str | None = None, stderr: str | None = None
+    spec: JobSpec,
+    *,
+    job_name: str,
+    stdout: str | None = None,
+    stderr: str | None = None,
+    job_dir: str | None = None,
 ) -> dict[str, object]:
     """Return the pipeline's ``scheduler:`` block for ``spec`` on Slurm.
 
@@ -190,6 +322,10 @@ def scheduler_block(
     scheduler's default applies. With no ``stdout`` or ``stderr``, JARVIS
     writes the logs in its execution directory and registers them as the
     ``stdout`` and ``stderr`` artifacts.
+
+    For a package service (:func:`is_service`) ``job_dir`` is required: the
+    block's ``pre_cmds`` start relay's connector, ``serve/connect.sh``, beside
+    the batch shell (:func:`connector_command`).
     """
     resources = spec.resources
     attributes = spec.attributes
@@ -230,7 +366,43 @@ def scheduler_block(
         block["output"] = stdout
     if stderr is not None:
         block["error"] = stderr
-    return {key: _token(key, value) for key, value in block.items()}
+    checked: dict[str, object] = {key: _token(key, value) for key, value in block.items()}
+    if is_service(spec):
+        if job_dir is None:
+            raise ValueError("a package service's scheduler block needs the job directory")
+        checked["pre_cmds"] = [connector_command(spec, job_dir=job_dir)]
+    return checked
+
+
+CONNECTOR = "serve/connect.sh"
+"""Relay's connector for a package service, relative to the job directory."""
+
+
+def is_service(spec: JobSpec) -> bool:
+    """Return whether ``spec`` is a package job run as a relay service."""
+    return any(step.service for step in spec.steps())
+
+
+def connector_command(spec: JobSpec, *, job_dir: str) -> str:
+    """Return the ``pre_cmds`` line that starts the connector beside the batch shell.
+
+    The connector reads ``serve/ports`` and ``serve/secrets.env``, runs frpc
+    with restarts, writes ``serve/ready.json`` once the ports listen on the
+    batch host, writes ``serve/idle`` after the idle release and ends with the
+    batch shell. Its settings are arguments, so they do not depend on the
+    environment JARVIS gives the batch shell.
+    """
+    env = spec.environment
+    job = shlex.quote(job_dir)
+    arguments = shlex.join(
+        [
+            env.get("CLIO_RELAY_OPERATION", ""),
+            env.get("CLIO_RELAY_IDLE_S", "0"),
+            env.get("CLIO_RELAY_FRPC", "") or "-",
+        ]
+    )
+    log = shlex.quote(posixpath.join(job_dir, "serve", "connect.log"))
+    return f"(cd {job} && exec sh {CONNECTOR} {arguments}) </dev/null >>{log} 2>&1 &"
 
 
 def _parameter(key: str, value: CustomValue) -> CustomValue:
@@ -268,19 +440,20 @@ def pipeline_document(
     scheduler: Mapping[str, object] | None = None,
     job_dir: str | None = None,
 ) -> dict[str, object]:
-    """Return the JARVIS pipeline for ``spec``'s package, with typed parameters.
+    """Return the JARVIS pipeline for ``spec``'s packages, with typed parameters.
 
-    The pipeline names no ``env``, so JARVIS captures the environment it is
-    loaded in, which is where the site script exports the job's environment.
+    Each package is one ``pkgs:`` entry, in order (:func:`step_names`), and all
+    share the one ``scheduler:`` block. ``host_slice``, ``start_mode`` and the
+    package's other parameters pass through as they are. The pipeline names no
+    ``env``, so JARVIS captures the environment it is loaded in, which is where
+    the site script exports the job's environment.
 
     With ``job_dir``, a parameter whose value is a run input's name becomes that
     input's absolute path in the job directory, so the person or agent never
     spells out where relay puts the job. JARVIS runs the package in its own
     execution directory, where a relative name would not resolve.
     """
-    package = spec.package
-    if package is None:
-        raise ValueError("not a package job")
+    steps = steps_of(spec)
     if not _ID.fullmatch(pipeline):
         raise Refusal(RefusalReason.INVALID_SPEC, f"{pipeline!r} is not a JARVIS pipeline id")
     if spec.directory is not None or spec.stdin_path is not None:
@@ -288,20 +461,23 @@ def pipeline_document(
             RefusalReason.INVALID_SPEC,
             "JARVIS runs a package in its own execution directory with no standard input; "
             "leave directory and stdin_path out and set the package's own parameters",
-            package=package.name,
+            package=steps[0].name,
         )
     paths = input_paths(spec, job_dir) if job_dir is not None else {}
-    entry: dict[str, object] = {"pkg_type": package.name, "pkg_name": "pkg"}
-    entry.update(
-        {
-            key: _resolved(_parameter(key, value), paths)
-            for key, value in sorted(package.parameters.items())
-        }
-    )
+    entries: list[dict[str, object]] = []
+    for step, name in zip(steps, step_names(steps), strict=True):
+        entry: dict[str, object] = {"pkg_type": step.name, "pkg_name": name}
+        entry.update(
+            {
+                key: _resolved(_parameter(key, value), paths)
+                for key, value in sorted(step.parameters.items())
+            }
+        )
+        entries.append(entry)
     document: dict[str, object] = {"name": pipeline}
     if scheduler is not None:
         document["scheduler"] = dict(scheduler)
-    document["pkgs"] = [entry]
+    document["pkgs"] = entries
     return document
 
 
@@ -313,30 +489,58 @@ def render_pipeline(document: Mapping[str, object]) -> str:
 # The site script
 
 SITE_SCRIPT = r"""set -eu
-mode=$1 digest=$2 name=$3 jarvis=$4 execution=$5
-shift 5
+mode=$1 jarvis=$2 execution=$3 steps=$4
+shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
-case $mode in submit|run) ;; *) fail 64 "mode $mode is not submit or run" ;; esac
-printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$' \
-  || fail 64 "package name $name is not <repo>.<package>"
+case $mode in submit|run|install) ;; *) fail 64 "mode $mode is not submit, run or install" ;; esac
+printf '%s\n' "$steps" | tr , '\n' \
+  | grep -Evq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+@[0-9a-f]{64}$' \
+  && fail 64 "the steps $steps are not <repo>.<package>@<sha256>,..."
+[ -n "$steps" ] || fail 64 "a pipeline needs a package"
 if [ -n "$execution" ]; then
   printf '%s\n' "$execution" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' \
     || fail 64 "execution id $execution is not a JARVIS id"
-elif [ "$mode" = submit ]; then
-  fail 64 "a submit needs an execution id"
+elif [ "$mode" != run ]; then
+  fail 64 "a $mode needs an execution id"
 fi
 pipeline="$job/relay.pipeline.yaml"
+answers="$job/relay.answers.json"
+if [ "$mode" = install ]; then
+  [ $# -ge 1 ] || fail 64 "an install needs the answers"
+  printf '%s\n' "$1" > "$answers.tmp" && mv -f "$answers.tmp" "$answers"
+  shift
+fi
 [ $# -eq 0 ] || printf '%s' "$1" > "$pipeline"
 [ -f "$pipeline" ] || fail 66 "the pipeline $pipeline is missing"
-archive="$job/.relay-package/$digest.tar.gz"
-[ -f "$archive" ] || fail 66 "the package archive $archive is missing"
-if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$archive" | cut -d' ' -f1)
-else got=$(shasum -a 256 "$archive" | cut -d' ' -f1); fi
-[ "$got" = "$digest" ] || fail 65 "the archive's SHA-256 is $got, not the reviewed $digest"
-case $jarvis in "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
+sha() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+for step in $(printf '%s' "$steps" | tr , ' '); do
+  digest=${step##*@}
+  archive="$job/.relay-package/$digest.tar.gz"
+  [ -f "$archive" ] || fail 66 "the package archive $archive is missing"
+  got=$(sha "$archive")
+  [ "$got" = "$digest" ] || fail 65 "the archive's SHA-256 is $got, not the reviewed $digest"
+done
+home() { case $1 in "~/"*) printf '%s' "$HOME/${1#??}" ;; *) printf '%s' "$1" ;; esac; }
+fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
+decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
+spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
+unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_DECISIONS CLIO_RELAY_JARVIS_SPACK_ENV
+jarvis=$(home "$jarvis")
+if [ -n "$decisions" ]; then
+  mkdir -p "$(dirname "$decisions")"
+  export JARVIS_SPACK_DECISIONS="$decisions"
+fi
+if [ -n "$spack_env" ]; then
+  mkdir -p "$spack_env"
+  export JARVIS_SPACK_ENV_DIR="$spack_env"
+fi
 found=$(command -v "$jarvis" 2>/dev/null) || found=
+if [ -z "$found" ] && [ -n "$fallback" ] && [ -x "$fallback" ]; then found=$fallback; fi
 if [ -z "$found" ]; then
   tried=$(printf '%s' "$jarvis" | sed 's/[\\"]/\\&/g')
   printf '{"missing":"jarvis","reason":"adapter_unavailable","tried":"%s"}\n' "$tried" \
@@ -346,14 +550,34 @@ if [ -z "$found" ]; then
 fi
 printf '%s\n' "$found" > "$job/relay.jarvis"
 root="$job/.relay-jarvis"
-repo=${name%%.*}
-rm -rf "$root"
-mkdir -p "$root/src"
-tar -xzf "$archive" -C "$root/src"
-[ -d "$root/src/$repo/$repo" ] || fail 66 "the archive has no $repo/$repo directory"
 export JARVIS_ROOT="$root"
-"$found" init "$root/config" "$root/private" "$root/shared" >/dev/null
-"$found" repo add "$root/src/$repo" >/dev/null
+# Set up once per set of archives: the root keeps the install records and executions.
+# Archives of one repository unpack into one tree, which JARVIS registers once.
+if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
+  rm -rf "$root"
+  mkdir -p "$root/src"
+  "$found" init "$root/config" "$root/private" "$root/shared" >/dev/null
+  repos=" "
+  for step in $(printf '%s' "$steps" | tr , ' '); do
+    name=${step%@*} digest=${step##*@}
+    repo=${name%%.*}
+    tar -xzf "$job/.relay-package/$digest.tar.gz" -C "$root/src"
+    [ -d "$root/src/$repo/$repo" ] || fail 66 "the archive of $name has no $repo/$repo directory"
+    case $repos in *" $repo "*) ;; *) repos="$repos$repo " ;; esac
+  done
+  for repo in $repos; do "$found" repo add "$root/src/$repo" >/dev/null; done
+  printf '%s\n' "$steps" > "$root/.relay-setup"
+fi
+[ -f "$answers" ] && export JARVIS_INSTALL_ANSWERS="$answers"
+report() {
+  rc=0
+  out=$("$found" ppl install yaml "$pipeline" +check +json) || rc=$?
+  printf '%s\n' "$out"
+  printf '%s\n' "$out" | tail -n 1 > "$job/relay.install-report.json.tmp"
+  mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+  exit 3
+}
 if [ "$mode" = run ]; then
   if [ -n "$execution" ]; then
     "$found" ppl run yaml "$pipeline" --execution-id "$execution" +json
@@ -363,75 +587,202 @@ if [ "$mode" = run ]; then
   exit 0
 fi
 rc=0
-out=$("$found" ppl submit "$pipeline" --execution-id "$execution" +json) || rc=$?
+if [ "$mode" = install ]; then
+  out=$("$found" ppl install yaml "$pipeline" --answers "$answers" \
+    +submit --execution-id "$execution" +json) || rc=$?
+  saved=relay.install.json
+else
+  out=$(JARVIS_INSTALL_ON_LOAD=check "$found" ppl submit "$pipeline" \
+    --execution-id "$execution" +json) || rc=$?
+  saved=relay.submission.json
+fi
 printf '%s\n' "$out"
+[ "$rc" -ne 3 ] || report
 [ "$rc" -eq 0 ] || exit "$rc"
-printf '%s\n' "$out" | tail -n 1 > "$job/relay.submission.json.tmp"
-mv -f "$job/relay.submission.json.tmp" "$job/relay.submission.json"
+printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
+mv -f "$job/$saved.tmp" "$job/$saved"
 """
-"""The site script. ``bash -c SITE_SCRIPT <$0> <mode> <digest> <name> <jarvis> <execution>
-[<pipeline YAML>]``, run in the job directory.
+"""The site script. ``bash -c SITE_SCRIPT <$0> <mode> <jarvis> <execution> <steps>
+[<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
+``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
 
-It checks the archive's SHA-256 against the reviewed one, finds JARVIS (writing
-``relay.refusal.json`` and exiting 69 when it is missing), unpacks the archive
-into the job's private JARVIS root, registers its repository and hands the
-pipeline to JARVIS. ``submit`` keeps the handle line as ``relay.submission.json``.
-The exit code is also written to ``relay.exitcode``.
+It checks each archive's SHA-256 against the reviewed one and finds JARVIS: the
+site's setting, then ``$CLIO_RELAY_JARVIS_FALLBACK`` (where relay installs
+jarvis-cd), writing ``relay.refusal.json`` and exiting 69 when neither is
+there. ``$CLIO_RELAY_JARVIS_DECISIONS`` and ``$CLIO_RELAY_JARVIS_SPACK_ENV``
+become ``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR``
+(:func:`site_environment`). It unpacks the archives into the job's private
+JARVIS root and registers each repository once, once per set of archives, and
+hands the pipeline to JARVIS:
+
+- ``submit`` runs ``ppl submit`` under ``JARVIS_INSTALL_ON_LOAD=check`` and keeps
+  the handle line as ``relay.submission.json``;
+- ``install`` (the answers JSON comes first) keeps the answers as
+  ``relay.answers.json``, runs ``ppl install ... +submit`` and keeps the handle
+  line as ``relay.install.json``;
+- ``run`` runs ``ppl run`` in place.
+
+When JARVIS exits 3 (software to install, or a question), the script writes
+the ``ppl install +check`` report to ``relay.install-report.json``, prints it
+and exits 3. Answers already given reach every check through
+``JARVIS_INSTALL_ANSWERS``. The exit code is also written to ``relay.exitcode``.
 """
+
+SiteMode = Literal["submit", "run", "install"]
+
+
+def steps_argument(spec: JobSpec) -> str:
+    """Return the site script's ``<repo>.<package>@<sha256>,...`` for the pipeline."""
+    return ",".join(f"{step.name}@{step.pinned()[1]}" for step in steps_of(spec))
 
 
 def site_arguments(
     spec: JobSpec,
     *,
-    mode: Literal["submit", "run"],
+    mode: SiteMode,
     jarvis: str,
     execution: str = "",
+    answers: Mapping[str, Any] | None = None,
     pipeline: str | None = None,
 ) -> list[str]:
     """Return the site script's arguments after ``$0``.
 
-    ``pipeline`` is the YAML text, for an adapter that cannot place
-    ``relay.pipeline.yaml`` in the job directory itself.
+    ``answers`` is for ``install`` only. ``pipeline`` is the YAML text, for an
+    adapter that cannot place ``relay.pipeline.yaml`` in the job directory
+    itself.
     """
-    package = spec.package
-    if package is None:
-        raise ValueError("not a package job")
-    arguments = [mode, package.pinned()[1], package.name, jarvis, execution]
+    arguments = [mode, jarvis, execution, steps_argument(spec)]
+    if mode == "install":
+        arguments.append(json.dumps(dict(answers or {}), sort_keys=True, separators=(",", ":")))
     return arguments if pipeline is None else [*arguments, pipeline]
 
 
-def submit_command(
-    spec: JobSpec, *, operation_id: str, jarvis: str, script: str = SCRIPT_FILE
-) -> str:
-    """Return the shell command that submits ``spec`` from its job directory.
-
-    The job's environment is exported first, so JARVIS captures it in the
-    pipeline it seals.
-    """
-    arguments = site_arguments(spec, mode="submit", jarvis=jarvis, execution=operation_id)
-    environment = [f"{key}={value}" for key, value in spec.environment.items()]
+def _site_command(spec: JobSpec, arguments: list[str], *, script: str, home: str | None) -> str:
+    settings = {**spec.environment, **site_environment(spec, home)}
+    environment = [f"{key}={value}" for key, value in settings.items()]
     prefix = ["env", *environment] if environment else []
     return shlex.join([*prefix, "bash", script, *arguments])
 
 
-def direct_job(spec: JobSpec, *, jarvis: str = "jarvis", job_dir: str | None = None) -> JobSpec:
+def submit_command(
+    spec: JobSpec,
+    *,
+    operation_id: str,
+    jarvis: str,
+    script: str = SCRIPT_FILE,
+    home: str | None = None,
+) -> str:
+    """Return the shell command that submits ``spec`` from its job directory.
+
+    The job's environment is exported first, so JARVIS captures it in the
+    pipeline it seals. ``home`` is the CLIO site home, for
+    :func:`site_environment`: the JARVIS relay installed there is used when
+    ``jarvis`` points to nothing, and the person's install answers are kept there.
+    """
+    arguments = site_arguments(spec, mode="submit", jarvis=jarvis, execution=operation_id)
+    return _site_command(spec, arguments, script=script, home=home)
+
+
+def install_command(
+    spec: JobSpec,
+    *,
+    operation_id: str,
+    jarvis: str,
+    answers: Mapping[str, Any],
+    script: str = SCRIPT_FILE,
+    home: str | None = None,
+) -> str:
+    """Return the shell command that submits the install job for ``spec``'s software.
+
+    It runs in the job directory after a submit exited 3, with the person's
+    ``answers`` (:func:`answers_document`). The install job is
+    ``install_execution_id(operation_id)`` in the operation's pipeline; ``home`` is
+    as in :func:`submit_command`.
+    """
+    arguments = site_arguments(
+        spec,
+        mode="install",
+        jarvis=jarvis,
+        execution=install_execution_id(operation_id),
+        answers=answers,
+    )
+    return _site_command(spec, arguments, script=script, home=home)
+
+
+BOOTSTRAP_SCRIPT = r"""set -eu
+home=$1 pin=$2 source=$3
+case $home in "~") home=$HOME ;; "~/"*) home="$HOME/${home#??}" ;; esac
+dir="$home/jarvis-cd"
+mkdir -p "$dir"
+log="$dir/install.log"
+: > "$log"
+python=${CLIO_RELAY_PYTHON:-python3}
+command -v "$python" >/dev/null 2>&1 || { echo "no $python on this site" >&2; exit 69; }
+"$python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
+  || { echo "jarvis-cd needs Python 3.11 or newer; $python is older" >&2; exit 69; }
+target=
+if "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
+  && "$dir/venv/bin/python" -m pip install --upgrade pip >>"$log" 2>&1 \
+  && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; then
+  target="$dir/venv/bin/jarvis"
+elif "$python" -m pip install --user "jarvis-cd @ $source" >>"$log" 2>&1; then
+  target="$("$python" -m site --user-base)/bin/jarvis"
+fi
+if [ -z "$target" ] || [ ! -x "$target" ]; then
+  tail -n 40 "$log" >&2
+  exit 1
+fi
+ln -sfn "$target" "$dir/jarvis"
+printf '%s\n' "$pin" > "$dir/pin"
+printf '{"jarvis":"%s","pin":"%s","log":"%s"}\n' "$dir/jarvis" "$pin" "$log"
+"""
+"""Install jarvis-cd under the CLIO site home. ``bash -c BOOTSTRAP_SCRIPT <$0> <home>
+<pin> <source>`` (:func:`bootstrap_arguments`).
+
+It makes a virtual environment from the site's ``python3`` (3.11 or newer) and
+installs jarvis-cd at the pinned commit's source archive, falling back to
+``pip install --user``. It links the program at ``<home>/jarvis-cd/jarvis``
+(:func:`bootstrap_path`) and prints ``{"jarvis", "pin", "log"}``. The log is
+``<home>/jarvis-cd/install.log``. It exits 69 when the site has no usable
+Python and 1 when the install fails.
+"""
+
+
+def bootstrap_arguments(home: str) -> list[str]:
+    """Return :data:`BOOTSTRAP_SCRIPT`'s arguments after ``$0`` for the site home."""
+    return [home, JARVIS_PIN, JARVIS_SOURCE]
+
+
+def direct_job(
+    spec: JobSpec,
+    *,
+    jarvis: str = "jarvis",
+    job_dir: str | None = None,
+    home: str | None = None,
+    site: str = "this site",
+) -> JobSpec:
     """Lower a package job to the bash job that runs it with JARVIS's direct run.
 
     Only for a site with no batch scheduler, where the adapter starts the job
     on the machine itself: a package never runs this way inside an allocation,
     because there ``jarvis ppl submit`` owns the job. The archive becomes an
     input, so the adapter stages it by digest; the pipeline YAML travels as an
-    argument. ``job_dir`` resolves input names as in :func:`pipeline_document`.
+    argument. ``job_dir`` resolves input names as in :func:`pipeline_document`,
+    and ``home`` is as in :func:`submit_command`. A package service is
+    refused: it needs ``jarvis execution stop``, which only a submitted job has.
     """
-    package = spec.package
-    if package is None:
+    steps = spec.steps()
+    if not steps:
         return spec
-    digest = package.pinned()[1]
+    if is_service(spec):
+        raise service_refusal(site=site)
     pipeline = render_pipeline(
-        pipeline_document(spec, pipeline=f"relay_{digest[:12]}", job_dir=job_dir)
+        pipeline_document(spec, pipeline=f"relay_{steps_digest(spec)[:12]}", job_dir=job_dir)
     )
     staged = with_archive(spec)
-    data = staged.model_dump(mode="json", exclude={"package", "executable", "arguments"})
+    data = staged.dump()
+    for key in ("package", "packages", "executable", "arguments"):
+        data.pop(key, None)
     data["executable"] = "/bin/bash"
     data["arguments"] = [
         "-c",
@@ -439,7 +790,10 @@ def direct_job(spec: JobSpec, *, jarvis: str = "jarvis", job_dir: str | None = N
         "clio-relay-jarvis",
         *site_arguments(spec, mode="run", jarvis=jarvis, pipeline=pipeline),
     ]
-    data["name"] = spec.name or package.name.replace(".", "-")
+    settings = site_environment(spec, home)
+    if settings:
+        data["environment"] = {**spec.environment, **settings}
+    data["name"] = spec.name or steps[0].name.replace(".", "-")
     return JobSpec.model_validate(data)
 
 
@@ -447,9 +801,19 @@ def direct_job(spec: JobSpec, *, jarvis: str = "jarvis", job_dir: str | None = N
 
 
 def execution_argv(
-    verb: ExecutionVerb, operation_id: str, *, job_dir: str, jarvis: str
+    verb: ExecutionVerb,
+    execution_id: str,
+    *,
+    job_dir: str,
+    jarvis: str,
+    pipeline: str | None = None,
 ) -> list[str]:
-    """Return the argv of ``jarvis execution <verb>`` for the operation, ``+json``."""
+    """Return the argv of ``jarvis execution <verb>`` for an execution, ``+json``.
+
+    ``pipeline`` defaults to the operation's, ``pipeline_id(execution_id)``; the
+    install job (:func:`install_execution_id`) names the operation's pipeline.
+    ``cancel`` and ``stop`` print the execution record as ``get`` does.
+    """
     if verb not in EXECUTION_VERBS:
         raise ValueError(f"unknown execution verb {verb!r}")
     return [
@@ -458,22 +822,30 @@ def execution_argv(
         jarvis,
         "execution",
         verb,
-        operation_id,
+        execution_id,
         "--pipeline-id",
-        pipeline_id(operation_id),
+        pipeline or pipeline_id(execution_id),
         "+json",
     ]
 
 
-def execution_shell(verb: ExecutionVerb, operation_id: str, *, job_dir: str) -> str:
+def execution_shell(
+    verb: ExecutionVerb, execution_id: str, *, job_dir: str, pipeline: str | None = None
+) -> str:
     """Return ``jarvis execution <verb>`` as shell, with JARVIS from ``relay.jarvis``.
 
     The command runs in the job directory, after ``jarvis=$(cat relay.jarvis)``.
     """
-    argv = execution_argv(verb, operation_id, job_dir=job_dir, jarvis="JARVIS")
+    argv = execution_argv(verb, execution_id, job_dir=job_dir, jarvis="JARVIS", pipeline=pipeline)
     parts = [shlex.quote(part) for part in argv]
     parts[2] = '"$jarvis"'
     return " ".join(parts)
+
+
+def handle_pipeline(data: Mapping[str, Any]) -> tuple[str, str]:
+    """Return ``(execution_id, pipeline_id)`` from a JARVIS job handle's data."""
+    execution_id = str(data["execution_id"])
+    return execution_id, str(data.get("pipeline_id") or pipeline_id(execution_id))
 
 
 # Reading JARVIS's documents
@@ -508,14 +880,15 @@ def handle_data(found: Mapping[str, Any], *, job_dir: str) -> tuple[str | None, 
     ``pipeline_id`` and ``execution_dir``; the adapter adds its own keys.
     """
     execution_id = str(found["execution_id"])
+    pipeline = str(found["pipeline_id"])
     native = found.get("scheduler_native_id")
     data: dict[str, Any] = {
         "mode": "jarvis",
         "scheduler": str(found.get("scheduler_provider") or "slurm"),
         "job_dir": job_dir,
         "execution_id": execution_id,
-        "pipeline_id": str(found["pipeline_id"]),
-        "execution_dir": execution_dir(job_dir, execution_id),
+        "pipeline_id": pipeline,
+        "execution_dir": execution_dir(job_dir, execution_id, pipeline=pipeline),
     }
     return (str(native) if native else None), data
 
@@ -532,29 +905,109 @@ _STATES = {
 }
 
 
+def control_of(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return a record's ``cancel_request``, ``stop_request`` and ``termination``, if any."""
+    metadata = _dict(record.get("metadata"))
+    control = {
+        key: metadata[key]
+        for key in ("cancel_request", "stop_request", "termination")
+        if isinstance(metadata.get(key), dict)
+    }
+    return control or None
+
+
+def _control_message(control: Mapping[str, Any] | None, state: JobState) -> str | None:
+    if not control:
+        return None
+    cancel = _dict(control.get("cancel_request"))
+    stop = _dict(control.get("stop_request"))
+    if cancel.get("status") == "failed":
+        return f"jarvis execution cancel failed: {cancel.get('error') or 'no reason given'}"
+    if stop.get("status") == "failed":
+        return f"jarvis execution stop failed: {stop.get('error') or 'no reason given'}"
+    if stop.get("status") == "fallback_cancel":
+        return "the job had not started, so jarvis execution stop cancelled it"
+    if state.final:
+        return None
+    if cancel:
+        return "cancelling: jarvis execution cancel asked the scheduler to end the job"
+    if stop:
+        return "stopping: jarvis execution stop sent TERM, and JARVIS runs ppl stop"
+    return None
+
+
+WAITING_ENV_LOCK = "waiting_env_lock"
+"""The install phase while another install holds the shared Spack environment's lock."""
+
+
+def install_progress(record: Mapping[str, Any]) -> JobProgress | None:
+    """Return an install job's ``metadata.install`` (``jarvis.install.progress.v1``) as progress."""
+    metadata = _dict(record.get("metadata"))
+    if metadata.get("action") != "install":
+        return None
+    install = _dict(metadata.get("install"))
+    if not install:
+        return JobProgress(message="installing: waiting for the install job to start")
+    phase = str(install.get("phase") or "installing")
+    current = install.get("current_package")
+    if phase == WAITING_ENV_LOCK:
+        message = (
+            "waiting for another install into the same Spack environment; "
+            "it then reuses that install"
+        )
+    elif isinstance(current, str) and current:
+        message = f"{phase}: {current}"
+    else:
+        message = phase
+    data = {
+        key: install[key]
+        for key in ("phase", "missing", "issue_count", "error", "log")
+        if install.get(key) is not None
+    }
+    return JobProgress(
+        step=_int(install.get("packages_done")),
+        total=_int(install.get("packages_total")),
+        message=message,
+        data=data,
+    )
+
+
 def record_status(record: Mapping[str, Any], *, last: JobState | None = None) -> JobStatus:
     """Map a ``jarvis.execution.record.v1`` onto relay's job states.
 
     ``unknown`` (JARVIS cannot see the scheduler's job right now) keeps ``last``,
-    the state relay knew before.
+    the state relay knew before. ``control`` carries the record's cancel and
+    stop requests and how the job was terminated; an install job's progress
+    comes from ``metadata.install``.
     """
     native = str(record.get("state") or "unknown")
     code = record.get("return_code")
     exit_code = code if isinstance(code, int) and not isinstance(code, bool) else None
     error = record.get("error")
-    message = error if isinstance(error, str) and error else None
+    control = control_of(record)
+    progress = install_progress(record)
     if native == "unknown" or native not in _STATES:
         return JobStatus(
             state=last if last is not None and not last.final else JobState.RUNNING,
             native_state=native,
             message="jarvis can't see the Slurm job right now",
+            control=control,
+            progress=progress,
         )
     state = _STATES[native]
+    message = _control_message(control, state) or (
+        error if isinstance(error, str) and error else None
+    )
     if state == JobState.COMPLETED and exit_code is None:
         exit_code = 0
-    if state.final:
-        return JobStatus(state=state, exit_code=exit_code, native_state=native, message=message)
-    return JobStatus(state=state, native_state=native, message=message)
+    return JobStatus(
+        state=state,
+        exit_code=exit_code if state.final else None,
+        native_state=native,
+        message=message,
+        control=control,
+        progress=progress,
+    )
 
 
 def _dict(value: object) -> dict[str, Any]:
@@ -627,10 +1080,45 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
             break
     return Refusal(
         RefusalReason.ADAPTER_UNAVAILABLE,
-        f"{site} has no JARVIS at {tried}, so relay cannot hand the package to it. Install "
-        "jarvis-cd there, or set the site's jarvis setting to its path",
+        f"{site} has no JARVIS at {tried}, so relay cannot hand the package to it. Relay "
+        f"can install jarvis-cd {JARVIS_PIN[:8]} in the site's CLIO home once you agree, "
+        "or set the site's jarvis setting to its path",
         missing="jarvis",
         tried=tried,
+        installable=JARVIS_PIN,
+    )
+
+
+def bootstrap_command(home: str) -> str:
+    """Return the shell command that runs :data:`BOOTSTRAP_SCRIPT` for the site home."""
+    return shlex.join(
+        ["bash", "-c", BOOTSTRAP_SCRIPT, "clio-relay-jarvis", *bootstrap_arguments(home)]
+    )
+
+
+def bootstrap_result(exit_code: int | None, output: str, *, site: str) -> str:
+    """Return the ``jarvis`` path :data:`BOOTSTRAP_SCRIPT` linked, or raise its refusal."""
+    if exit_code == 0:
+        for line in reversed(output.splitlines()):
+            try:
+                found: object = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(found, dict):
+                path = cast(dict[str, Any], found).get("jarvis")
+                if isinstance(path, str) and path:
+                    return path
+    tail = "\n".join(output.strip().splitlines()[-10:]) or "no output"
+    reason = (
+        RefusalReason.ADAPTER_UNAVAILABLE
+        if exit_code == EXIT_NO_JARVIS
+        else RefusalReason.SUBMIT_FAILED
+    )
+    raise Refusal(
+        reason,
+        f"relay could not install jarvis-cd {JARVIS_PIN[:8]} on {site}: {tail}",
+        missing="jarvis",
+        exit_code=exit_code,
     )
 
 
@@ -656,22 +1144,171 @@ def not_run_here(adapter: str) -> Refusal:
     )
 
 
-def cancel_refusal() -> Refusal:
-    """Cancelling a submitted package job needs a JARVIS command 1.8.1 lacks."""
-    return Refusal(
-        RefusalReason.NOT_CANCELLABLE,
-        "JARVIS owns this job, and cancelling it needs jarvis execution cancel, which this "
-        "JARVIS does not have. Relay does not call the scheduler behind JARVIS's back",
-        needs=NEEDS_CANCEL,
-    )
-
-
-def stop_refusal() -> Refusal:
-    """Stopping a submitted package service needs a JARVIS command 1.8.1 lacks."""
+def service_refusal(*, site: str) -> Refusal:
+    """A package service on a site with no batch scheduler for ``jarvis ppl submit``."""
     return Refusal(
         RefusalReason.ADAPTER_UNAVAILABLE,
-        "a package service on this site is started by jarvis ppl submit, and stopping it "
-        "needs jarvis execution stop, which this JARVIS does not have, nor a place for "
-        "relay's connector in the job JARVIS writes",
-        needs=NEEDS_STOP,
+        f"a package service on {site} needs jarvis ppl submit, so jarvis execution stop "
+        "can end it, and the site has no batch scheduler. Give the site a Slurm scheduler",
+        needs="jarvis ppl submit",
     )
+
+
+def execution_failed(verb: str, text: str) -> Refusal:
+    """``jarvis execution cancel|stop`` exited non-zero; ``text`` is its output."""
+    tail = "\n".join(text.strip().splitlines()[-5:]) or "no output"
+    return Refusal(
+        RefusalReason.NOT_CANCELLABLE,
+        f"jarvis execution {verb} did not end the job: {tail}",
+        needs=f"jarvis execution {verb}",
+    )
+
+
+# Installing the package's software
+
+
+def parse_install_report(text: str) -> dict[str, Any] | None:
+    """Return the last ``jarvis.install-report.v1`` line in ``text``."""
+    return parse_document(text, INSTALL_REPORT_SCHEMA)
+
+
+def report_digest(report: Mapping[str, Any]) -> str:
+    """Return the sha256 of an install report's installers and issues.
+
+    Paths and the mode are left out, so the digest binds what the person approves.
+    """
+    bound = {"installers": report.get("installers"), "issues": report.get("issues")}
+    text = json.dumps(bound, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    found = report.get("issues")
+    if not isinstance(found, list):
+        return []
+    return [_dict(item) for item in cast(list[object], found) if _dict(item)]
+
+
+def choice_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the issues the person answers by picking one of JARVIS's candidates."""
+    return [
+        issue
+        for issue in _issues(report)
+        if issue.get("answerable")
+        and isinstance(issue.get("candidates"), list)
+        and issue["candidates"]
+    ]
+
+
+def blocking_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the issues no answer fixes: no recipe, or answerable with no candidates.
+
+    ``not_installed`` is not blocking: the install itself fixes it.
+    """
+    blocking: list[dict[str, Any]] = []
+    for issue in _issues(report):
+        if issue.get("kind") == "not_installed":
+            continue
+        if issue in choice_issues(report):
+            continue
+        blocking.append(issue)
+    return blocking
+
+
+def install_summary(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Return what the install reuses and what it builds, per package.
+
+    ``reuse`` names the packages the site already has; ``build`` lists the others,
+    with the spec and how many of its dependencies are missing.
+    """
+    reuse: list[str] = []
+    build: list[dict[str, Any]] = []
+    for method, installer in _dict(report.get("installers")).items():
+        for name, package in _dict(_dict(installer).get("packages")).items():
+            entry = _dict(package)
+            if entry.get("status") == "satisfied":
+                reuse.append(name)
+                continue
+            missing = entry.get("missing")
+            count = len(cast(list[object], missing)) if isinstance(missing, list) else None
+            build.append(
+                {
+                    "package": name,
+                    "method": method,
+                    "status": entry.get("status"),
+                    "spec": entry.get("spec"),
+                    "missing": count,
+                }
+            )
+    return {"reuse": sorted(reuse), "build": build, "issues": len(_issues(report))}
+
+
+def install_message(report: Mapping[str, Any], *, site: str, package: str) -> str:
+    """Return the approval question for installing the package's software on the site."""
+    summary = install_summary(report)
+    built: list[str] = []
+    for item in summary["build"]:
+        detail = item["spec"] or item["package"]
+        if item["missing"]:
+            detail = f"{detail} ({item['missing']} missing)"
+        built.append(detail)
+    parts = [f"{package} needs software that {site} does not have yet."]
+    if summary["reuse"]:
+        parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
+    if built:
+        parts.append("Built: " + ", ".join(built) + ".")
+    if summary["issues"]:
+        parts.append(f"JARVIS has {summary['issues']} question(s) for you after this.")
+    parts.append("JARVIS installs it as a job on the site before the run. Install it?")
+    return " ".join(parts)
+
+
+def choice_options(issue: Mapping[str, Any]) -> list[str]:
+    """Return an issue's candidate constraints, in JARVIS's order."""
+    options: list[str] = []
+    for candidate in cast(list[object], issue.get("candidates") or []):
+        constraint = _dict(candidate).get("constraint")
+        if isinstance(constraint, str) and constraint and constraint not in options:
+            options.append(constraint)
+    return options
+
+
+def choice_message(issue: Mapping[str, Any]) -> str:
+    """Return the question to ask for one of JARVIS's answerable issues."""
+    question = issue.get("question")
+    subject = issue.get("package") or issue.get("subject") or "the package"
+    if isinstance(question, str) and question:
+        return question
+    return f"JARVIS needs a choice for {subject}: pick one"
+
+
+def install_needed(report: Mapping[str, Any], *, site: str) -> Refusal:
+    """The refusal for a submit that exited 3: the software is missing or needs a choice."""
+    summary = install_summary(report)
+    return Refusal(
+        RefusalReason.NEEDS_APPROVAL,
+        f"the package's software is not installed on {site}: JARVIS builds "
+        f"{len(summary['build'])} package(s) once you approve",
+        needs=NEEDS_INSTALL,
+        install_report=dict(report),
+        summary=summary,
+    )
+
+
+def install_blocked(issues: list[dict[str, Any]], *, site: str) -> Refusal:
+    """The refusal when JARVIS reports an install issue no answer can fix."""
+    first = issues[0]
+    detail = first.get("detail") or first.get("question") or first.get("kind")
+    hint = first.get("hint")
+    message = f"JARVIS cannot install the package's software on {site}: {detail}"
+    if isinstance(hint, str) and hint:
+        message = f"{message}. {hint}"
+    return Refusal(RefusalReason.SUBMIT_FAILED, message, issues=issues, needs=NEEDS_INSTALL)
+
+
+def answers_document(choices: Mapping[str, tuple[str, str]]) -> dict[str, Any]:
+    """Return JARVIS's answers file from ``{issue_id: (constraint, ask_id)}``."""
+    return {
+        issue_id: {"constraint": constraint, "answered_by": "person", "ask_id": ask_id}
+        for issue_id, (constraint, ask_id) in choices.items()
+    }

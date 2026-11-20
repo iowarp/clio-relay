@@ -43,12 +43,23 @@ is ``needs_sign_in``, a facility that does not answer is ``unreachable``, a bad
 setting is ``invalid_config``, and a missing path is ``path_not_found``.
 
 Policy: a site is open or guarded. The guard sits in front of every adapter,
-so an adapter does not enforce it. A JARVIS package job (:attr:`JobSpec.package`)
-goes only to an adapter that sets ``runs_packages``, which hands it to
-``jarvis ppl submit`` on a batch site (:mod:`clio_relay.jarvis_submit`), or to
-JARVIS's direct run on a machine with no scheduler. Relay never turns a package
-into its own command job inside an allocation; any other adapter refuses it
-(:func:`clio_relay.jarvis_submit.not_run_here`).
+so an adapter does not enforce it. A JARVIS pipeline job (:meth:`JobSpec.steps`:
+``package``, or the ordered ``packages``) goes only to an adapter that sets
+``runs_packages``, which hands it to ``jarvis ppl submit`` on a batch site
+(:mod:`clio_relay.jarvis_submit`), or to JARVIS's direct run on a machine with
+no scheduler. Relay never turns a package into its own command job inside an
+allocation; any other adapter refuses it
+(:func:`clio_relay.jarvis_submit.not_run_here`). Such an adapter also
+implements the JARVIS lifecycle:
+
+- ``cancel`` and :meth:`~BaseAdapter.stop` run ``jarvis execution cancel`` and
+  ``stop``; ``stop`` lets the pipeline run ``ppl stop`` and finish.
+- When ``run`` finds software to install, it raises
+  :func:`clio_relay.jarvis_submit.install_needed`; relay asks the person and calls
+  :meth:`~BaseAdapter.install` with the answers, then ``run`` again.
+- When the site has no JARVIS, ``run`` raises
+  :func:`clio_relay.jarvis_submit.missing_jarvis`; after the person agrees, relay
+  calls :meth:`~BaseAdapter.install_jarvis`.
 
 Optional hooks, found by name when an adapter defines them:
 
@@ -288,6 +299,27 @@ class BaseAdapter[ConfigT: BaseModel]:
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
         raise not_implemented(self.name, "serve")
+
+    async def stop(self, handle: JobHandle) -> JobStatus:
+        """Ask a running job to end cleanly (``jarvis execution stop``), and return its status."""
+        raise not_implemented(self.name, "stop")
+
+    async def install(
+        self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
+    ) -> JobHandle:
+        """Submit the job that installs ``spec``'s software with the person's ``answers``.
+
+        The handle is polled with :meth:`status` like any job; its progress is
+        the install's (``metadata.install``).
+        """
+        raise not_implemented(self.name, "install")
+
+    async def install_jarvis(self) -> str:
+        """Install jarvis-cd at :data:`clio_relay.jarvis_submit.JARVIS_PIN` in the site home.
+
+        Returns the path of the ``jarvis`` program it linked.
+        """
+        raise not_implemented(self.name, "install_jarvis")
 
     async def sign_in_needed(self) -> SignInNeed | None:
         return None

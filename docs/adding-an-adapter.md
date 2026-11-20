@@ -221,7 +221,8 @@ returns the first bytes of each stream, and stops it.
 
 Each site is `open` or `guarded`. Relay's guard sits in front of every adapter
 and enforces the policy, so an adapter does not check it. A JARVIS package job
-goes only to an adapter with `runs_packages = True`, which reads `spec.package`;
+goes only to an adapter with `runs_packages = True`, which reads `spec.steps()`
+(one entry for `package`, the ordered pipeline for `packages`);
 relay refuses a package for any other adapter before it asks anything
 (`jarvis_submit.not_run_here`). Relay never turns a package into its own command
 job inside an allocation. A batch adapter hands the job to JARVIS rather than
@@ -241,6 +242,14 @@ Relay calls these when the adapter defines them:
 | `job_name(operation_id)` | The facility's job name, which relay shows |
 | `price(spec)` | What a job would cost, for the spend question on guarded sites |
 | `system_id()` | The facility's own id for the site, shown in the Compute tab |
+| `stop(handle)` | Stop a package service so its package's own stop runs (`jarvis execution stop`) |
+| `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle |
+| `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`) |
+
+A batch adapter that runs packages refuses with `jarvis_submit.install_needed`
+when the submit exits 3, and with `jarvis_submit.missing_jarvis` when JARVIS is
+missing. Relay turns those into the install questions and calls `install` or
+`install_jarvis` itself.
 
 ### Register it
 

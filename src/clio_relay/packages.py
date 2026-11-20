@@ -20,6 +20,7 @@ import argparse
 import ast
 import io
 import json
+import re
 import sys
 import tarfile
 from collections.abc import Sequence
@@ -264,15 +265,31 @@ def contract_resources(entry: PackageEntry, parameters: dict[str, Any]) -> dict[
     return found
 
 
-def with_contract_resources(spec: JobSpec, entry: PackageEntry) -> JobSpec:
-    """Fill what ``entry``'s contract sets for ``spec``'s package where ``spec`` leaves it unset.
+def with_contract_resources(spec: JobSpec, entries: Sequence[PackageEntry | None]) -> JobSpec:
+    """Fill what the steps' contracts set for ``spec`` where ``spec`` leaves it unset.
 
-    The walltime and queue are filled one by one. The process layout (nodes,
-    processes, processes per node) is filled only when the job sets none of it.
+    ``entries`` are the catalog entries of ``spec.steps()``, in order, with None
+    for a step relay has no entry for. The walltime and queue are filled one by
+    one: a pipeline takes the longest walltime and the first queue its steps
+    set. A one-step job takes its contract's process layout (nodes, processes,
+    processes per node) when the job sets none of it. A pipeline's steps share
+    one allocation, so their layouts do not add up; a pipeline that sets no
+    node count gets the last node its steps' ``host_slice`` parameters name.
     """
-    if spec.package is None:
+    steps = spec.steps()
+    if not steps:
         return spec
-    found = contract_resources(entry, spec.package.parameters)
+    found: dict[str, Any] = {}
+    for step, entry in zip(steps, entries, strict=True):
+        if entry is None:
+            continue
+        own = contract_resources(entry, step.parameters)
+        if len(steps) == 1:
+            found = own
+        if "duration" in own and own["duration"] > found.get("duration", timedelta(0)):
+            found["duration"] = own["duration"]
+        if "queue_name" in own:
+            found.setdefault("queue_name", own["queue_name"])
     attributes = {
         key: found[key]
         for key in ("duration", "queue_name")
@@ -286,6 +303,9 @@ def with_contract_resources(spec: JobSpec, entry: PackageEntry) -> JobSpec:
         or (key == "exclusive_node_use" and key not in spec.resources.model_fields_set)
         if not (own_layout and key in _LAYOUT)
     }
+    last = slice_end(steps)
+    if len(steps) > 1 and not own_layout and last is not None:
+        resources["node_count"] = last
     if not attributes and not resources:
         return spec
     return spec.model_copy(
@@ -294,6 +314,52 @@ def with_contract_resources(spec: JobSpec, entry: PackageEntry) -> JobSpec:
             "resources": spec.resources.model_copy(update=resources),
         }
     )
+
+
+def node_range(step: PackageRef) -> tuple[int, int] | None:
+    """Return the ``[start, end)`` nodes a step's ``host_slice`` names.
+
+    JARVIS reads ``host_slice`` as a Python slice of the allocation's hosts. A
+    slice with no end, or a negative one, depends on the allocation's size, so
+    it gives None here.
+    """
+    value = step.nodes()
+    match = re.fullmatch(r"(\d*):(\d+)", value.strip()) if value is not None else None
+    if match is None:
+        return None
+    first = int(match.group(1) or 0)
+    last = int(match.group(2))
+    return (first, last) if first < last else None
+
+
+def slice_end(steps: Sequence[PackageRef]) -> int | None:
+    """Return how many nodes the steps' host slices reach, or None when none sets one."""
+    ends = [found[1] for found in map(node_range, steps) if found is not None]
+    return max(ends) if ends else None
+
+
+def pipeline_conflict(entries: Sequence[PackageEntry | None]) -> Refusal | None:
+    """Return why the steps cannot share one pipeline, or None when they can.
+
+    JARVIS loads every step's archive into one tree per repository, so two steps
+    from one repository must come from the same commit.
+    """
+    commits: dict[str, tuple[str, str]] = {}
+    for entry in entries:
+        commit = (entry.source or {}).get("commit") if entry is not None else None
+        if entry is None or not isinstance(commit, str) or not commit:
+            continue
+        repo, _package = split_name(entry.name)
+        seen = commits.setdefault(repo, (commit, entry.name))
+        if seen[0] != commit:
+            return Refusal(
+                RefusalReason.INVALID_SPEC,
+                f"{seen[1]} and {entry.name} come from different commits of the {repo} "
+                f"repository ({seen[0][:12]} and {commit[:12]}); a pipeline's steps from one "
+                "repository must be staged from the same commit",
+                repository=repo,
+            )
+    return None
 
 
 class PackageCatalog:

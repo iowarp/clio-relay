@@ -93,6 +93,13 @@ class JobStatus(BaseModel):
     observed_at: datetime = Field(default_factory=utc_now)
     outputs: list[OutputRef] = Field(default_factory=list[OutputRef])
     progress: JobProgress | None = None
+    control: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "How a cancel or stop went, as the adapter's scheduler reports it: for a JARVIS "
+            "job, the execution record's cancel_request, stop_request and termination"
+        ),
+    )
 
 
 class ExecResult(BaseModel):

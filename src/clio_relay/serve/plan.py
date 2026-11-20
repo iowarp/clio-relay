@@ -1,8 +1,11 @@
 """Turning a service spec into the job relay submits, and the record it keeps (RL19).
 
-The job relay submits is the person's job wrapped by ``serve/launch.sh``. The
-wrapper, its port list, the frpc configuration and the secrets reach the job
-directory as ordinary content-addressed inputs (RL16). Secrets travel only in
+The job relay submits is the person's job wrapped by ``serve/launch.sh``. A
+package service is a JARVIS pipeline instead: JARVIS starts the service, and
+relay's connector, ``serve/connect.sh``, runs beside the batch shell
+(:func:`package_service_job`). The wrapper or the connector, its port list,
+the frpc configuration and the secrets reach the job directory as ordinary
+content-addressed inputs (RL16). Secrets travel only in
 ``serve/secrets.env``, which the wrapper deletes once read, so they are in no
 argument list, environment block of a batch script, record or log. That input
 is marked transient, so relay and the site drop their stored copies when the
@@ -24,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from clio_relay.jobs.handles import Endpoint, EndpointPort, JobHandle, utc_now
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import InputRef, JobSpec, PortProtocol, ServiceSpec
+from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PortProtocol, ServiceSpec
 from clio_relay.serve import frp
 from clio_relay.serve.config import Rendezvous, SiteServe
 
@@ -120,6 +123,10 @@ class ServePlan(BaseModel):
     cancel_sent: bool = False
     forward_pid: int | None = None
     rebinds: int = 0
+    package: bool = Field(
+        default=False,
+        description="A JARVIS pipeline: jarvis execution stop ends it, and serve/idle asks to",
+    )
     final: dict[str, Any] | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
@@ -192,24 +199,28 @@ def plan_ports(spec: ServiceSpec) -> list[PortPlan]:
 def check_wrappable(spec: ServiceSpec) -> None:
     """Refuse a service relay cannot put its wrapper around."""
     job = spec.job
-    if job.package is not None:
-        raise Refusal(
-            RefusalReason.INVALID_SPEC,
-            "a package service is started by the adapter that runs packages; "
-            "this site's serve path takes an executable",
-        )
-    if job.launcher not in (None, "single"):
-        raise Refusal(
-            RefusalReason.INVALID_SPEC,
-            "a service runs one wrapper process; start parallel ranks from the program itself",
-            launcher=job.launcher,
-        )
     for item in job.inputs:
         if item.name == SERVE_DIR or item.name.startswith(f"{SERVE_DIR}/"):
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
                 f"input {item.name!r} is inside {SERVE_DIR}/, which relay uses",
             )
+    if job.steps():
+        for port in spec.ports:
+            if port.protection and port.protection.startswith(SECRET_ENV_PREFIX):
+                raise Refusal(
+                    RefusalReason.INVALID_SPEC,
+                    f"port {port.name!r}: a package service cannot take a secret, because "
+                    "secrets reach only relay's wrapper and JARVIS starts the package",
+                    field="protection",
+                )
+        return
+    if job.launcher not in (None, "single"):
+        raise Refusal(
+            RefusalReason.INVALID_SPEC,
+            "a service runs one wrapper process; start parallel ranks from the program itself",
+            launcher=job.launcher,
+        )
 
 
 def substitute(values: list[str], env: dict[str, str]) -> list[str]:
@@ -300,8 +311,9 @@ def ca_bytes(rendezvous: Rendezvous) -> bytes:
 
 def site_files(plan: ServePlan) -> dict[str, bytes]:
     """Return the files relay places in the job's ``serve/`` directory."""
+    wrapper = "connect.sh" if plan.package else "launch.sh"
     files: dict[str, bytes] = {
-        "launch.sh": site_file("launch.sh"),
+        wrapper: site_file(wrapper),
         "ports": ports_file(plan),
         SECRETS_FILE: secrets_file(site_secrets(plan)),
     }
@@ -362,6 +374,49 @@ def wrapped_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, str]) -> J
             "environment": env,
             "inputs": inputs,
             "launcher": None,
+            "name": job.name or f"relay-{plan.service}",
+        }
+    )
+
+
+def _filled(value: CustomValue, env: dict[str, str]) -> CustomValue:
+    if isinstance(value, str):
+        return substitute([value], env)[0]
+    return value
+
+
+def package_service_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, str]) -> JobSpec:
+    """Return the JARVIS pipeline relay submits for a package service.
+
+    Every step runs as a service. ``${CLIO_RELAY_...}`` in a step's parameters
+    is filled from the service's environment, so a package's port parameter can
+    name the port relay chose (``${CLIO_RELAY_PORT_<NAME>}``). The connector's
+    settings travel in the job's environment, where
+    :func:`clio_relay.jarvis_submit.connector_command` reads them.
+    """
+    job = spec.job
+    env = {**job.environment, **plan.service_env()}
+    env["CLIO_RELAY_IDLE_S"] = str(int(plan.idle_release_s or 0))
+    env["CLIO_RELAY_OPERATION"] = plan.operation_id
+    if plan.mode == "frp":
+        env["CLIO_RELAY_FRPC"] = plan.site_serve.frpc or f"{SERVE_DIR}/frpc"
+    steps = [
+        step.model_copy(
+            update={
+                "service": True,
+                "parameters": {key: _filled(value, env) for key, value in step.parameters.items()},
+            }
+        )
+        for step in job.steps()
+    ]
+    inputs = list(job.inputs) + [
+        InputRef(name=f"{SERVE_DIR}/{name}", sha256=digest, transient=name == SECRETS_FILE)
+        for name, digest in staged.items()
+    ]
+    return job.with_steps(steps).model_copy(
+        update={
+            "environment": env,
+            "inputs": inputs,
             "name": job.name or f"relay-{plan.service}",
         }
     )

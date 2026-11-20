@@ -371,6 +371,16 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             await files.stage(self.context.content.get(digest))
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
+        steps = spec.steps()
+        if len(steps) > 1:
+            raise Refusal(
+                RefusalReason.VERB_NOT_IMPLEMENTED,
+                "the Tapis adapter runs one package per job; a pipeline of several packages "
+                "runs through the ssh, local or worker adapter",
+                verb="run",
+            )
+        if steps and spec.package is None:
+            spec = spec.model_copy(update={"package": steps[0], "packages": []})
         guarded = self.config.launcher == "guarded"
         if guarded and spec.package is None:
             raise launcher.guarded_refusal()

@@ -103,10 +103,18 @@ that input's absolute path on the site, so `{"stl": "body.stl"}` with an input
 named `body.stl` reaches the package as `<job directory>/body.stl`. Neither you
 nor the agent spell out where relay puts the job.
 
-JARVIS 1.8.1 has no command to cancel or stop a submitted execution, so a
-running package job cannot be cancelled through relay yet, and a package
-started as a service (such as pvserver) is refused. Each refusal names the
-JARVIS command it needs.
+`cancel` asks JARVIS to cancel the execution (`jarvis execution cancel`), and a
+package started as a service (such as pvserver) is stopped with
+`jarvis execution stop`, so JARVIS runs the package's own stop first.
+
+A run can name several packages as one pipeline, in order, under `packages`
+instead of `package`. Each one is reviewed and pinned on its own, they share
+one allocation, and the spend question lists which nodes each one gets from
+its `host_slice` parameter.
+
+When the site lacks software the packages need, or JARVIS is not on the site
+at all, relay asks you before it installs anything, and the install runs as
+its own job before the run. Nothing is submitted until you say yes.
 
 While a package job runs, and after it ends, `describe(job=...)` shows the
 latest step the package reported (`result.progress`) and its outputs, each

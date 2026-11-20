@@ -64,7 +64,7 @@ done
 
 def is_warm(spec: JobSpec) -> bool:
     """Return whether ``spec`` asks for a warm allocation."""
-    return spec.executable == WARM_EXECUTABLE and spec.package is None
+    return spec.executable == WARM_EXECUTABLE and not spec.steps()
 
 
 def holder_job(spec: JobSpec, *, idle_s: int, poll_s: int = POLL_S) -> JobSpec:

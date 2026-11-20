@@ -37,10 +37,11 @@ from clio_relay.jobs.records import (
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
-from clio_relay.packages import PackageCatalog, with_contract_resources
+from clio_relay.packages import PackageCatalog, pipeline_conflict, with_contract_resources
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
+from clio_relay.surface import installing
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.guarding import approval_message, review_asks
@@ -69,6 +70,37 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
         return None
     name = namer(operation_id)
     return name if isinstance(name, str) else None
+
+
+def _steps_label(spec: JobSpec) -> str | None:
+    """Name a package job: its package, or its pipeline's steps in order."""
+    names = [step.name for step in spec.steps()]
+    if not names:
+        return None
+    if len(names) == 1:
+        return names[0]
+    return "the pipeline " + " then ".join(names)
+
+
+def _steps_view(record: OperationRecord) -> list[dict[str, Any]]:
+    """Return a package job's pipeline steps, in order, with the nodes each gets."""
+    raw = record.spec.get("job") if record.kind == "serve" else record.spec
+    if not isinstance(raw, dict):
+        return []
+    try:
+        steps = JobSpec.model_validate(raw).steps()
+    except ValueError:
+        return []
+    return [
+        {
+            "package": step.name,
+            "version": step.version,
+            "sha256": step.sha256,
+            "nodes": step.nodes(),
+            "service": step.service,
+        }
+        for step in steps
+    ]
 
 
 class RelayService:
@@ -186,17 +218,21 @@ class RelayService:
     # run
 
     def apply_defaults(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
-        """Pin the package, fill what its contract sets, then the site's defaults.
+        """Pin the packages, fill what their contracts set, then the site's defaults.
 
-        The package's contract (its walltime, queue and process layout, read
-        from its parameters) comes before the site's defaults, so the price, the
-        spend ask and the submitted job agree. What the job sets itself wins.
+        The packages' contracts (walltime, queue and process layout, read from
+        their parameters) come before the site's defaults, so the price, the
+        spend ask and the submitted job agree. What the job sets itself wins. A
+        pipeline whose steps cannot share one JARVIS tree is refused.
         """
-        if spec.package is not None:
-            package = self.packages.resolve(spec.package)
-            spec = spec.model_copy(update={"package": package})
-            entry = self.packages.entry(package, self.content)
-            spec = spec if entry is None else with_contract_resources(spec, entry)
+        if spec.steps():
+            steps = [self.packages.resolve(step) for step in spec.steps()]
+            spec = spec.with_steps(steps)
+            entries = [self.packages.entry(step, self.content) for step in steps]
+            conflict = pipeline_conflict(entries)
+            if conflict is not None:
+                raise conflict
+            spec = with_contract_resources(spec, entries)
         attributes = spec.attributes
         changes: dict[str, Any] = {}
         if attributes.queue_name is None and site.defaults.queue is not None:
@@ -215,7 +251,7 @@ class RelayService:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
         spec = self.apply_defaults(site, spec)
-        what = spec.executable or (spec.package.name if spec.package else "a job")
+        what = spec.executable or _steps_label(spec) or "a job"
         return await self._open(
             site,
             "run",
@@ -245,7 +281,7 @@ class RelayService:
             )
         spec = self.prepare_service(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
-        what = spec.job.executable or (spec.job.package.name if spec.job.package else "a service")
+        what = spec.job.executable or _steps_label(spec.job) or "a service"
         return await self._open(
             site,
             "serve",
@@ -270,7 +306,7 @@ class RelayService:
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
-        if job.package is not None and not adapter.runs_packages:
+        if job.steps() and not adapter.runs_packages:
             raise not_run_here(adapter_name)
         decision = await self.guard.check_run(site, job)
         decision.raise_if_refused()
@@ -309,7 +345,7 @@ class RelayService:
                 await self.ask_provider.approve(
                     site=site,
                     operation_id=operation_id,
-                    message=approval_message(action, site, charge),
+                    message=approval_message(action, site, charge, job.steps()),
                     binding=binding,
                 )
             )
@@ -431,7 +467,7 @@ class RelayService:
         waiting = False
         for ask in self.operation_asks(record):
             if ask.state in ("declined", "cancelled"):
-                return self._finish(
+                return self.finish(
                     operation_id,
                     OperationState.CANCELLED,
                     Refusal(RefusalReason.DECLINED, f"the person declined: {ask.message}"),
@@ -445,7 +481,7 @@ class RelayService:
                 ask.binding_digest != canonical_digest(ask.binding)
                 or ask.binding.get("spec_digest") != record.spec_digest
             ):
-                return self._finish(
+                return self.finish(
                     operation_id,
                     OperationState.FAILED,
                     Refusal(
@@ -457,9 +493,29 @@ class RelayService:
                 waiting = True
         if waiting:
             return record
+        if installing.pending(record):
+            return await self._install(operation_id)
         return await self.submit(operation_id)
 
-    def _finish(
+    async def _install(self, operation_id: str) -> OperationRecord:
+        """Start the install the answered asks approved, once, behind ``submitting``."""
+        record = self.operation(operation_id)
+        site = self.site(record.site)
+        try:
+            adapter = self.adapter_named(site, record.adapter)
+        except Refusal as refusal:
+            return self.finish(operation_id, OperationState.FAILED, refusal)
+        with self.operations.locked(operation_id):
+            record = self.operation(operation_id)
+            if record.state != OperationState.AWAITING_INPUT or not installing.pending(record):
+                return record
+            state = {**installing.state_of(record), "stage": "starting"}
+            record.result = {**(record.result or {}), installing.INSTALL_KEY: state}
+            record.move(OperationState.SUBMITTING, "starting the install")
+            self.operations.put(operation_id, record)
+        return await installing.start_install(self, operation_id, site, adapter)
+
+    def finish(
         self, operation_id: str, state: OperationState, refusal: Refusal | None
     ) -> OperationRecord:
         with self.operations.locked(operation_id):
@@ -485,7 +541,7 @@ class RelayService:
         try:
             adapter = self.adapter_named(site, record.adapter)
         except Refusal as refusal:
-            return self._finish(operation_id, OperationState.FAILED, refusal)
+            return self.finish(operation_id, OperationState.FAILED, refusal)
         job_name = _job_name(adapter, operation_id) if record.kind == "run" else None
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
@@ -506,10 +562,10 @@ class RelayService:
             )
             handle = await adapter.run(spec, operation_id=operation_id)
         except Refusal as refusal:
-            return self._finish(operation_id, OperationState.FAILED, refusal)
+            return await installing.ask_install(self, operation_id, site, refusal)
         except Exception as exc:
             logger.exception("submitting %s failed", operation_id)
-            return self._finish(
+            return self.finish(
                 operation_id,
                 OperationState.FAILED,
                 Refusal(RefusalReason.SUBMIT_FAILED, f"submission failed: {exc}"),
@@ -538,10 +594,10 @@ class RelayService:
                 site, adapter, service.model_copy(update={"job": job}), record
             )
         except Refusal as refusal:
-            return self._finish(operation_id, OperationState.FAILED, refusal)
+            return await installing.ask_install(self, operation_id, site, refusal)
         except Exception as exc:
             logger.exception("starting service %s failed", operation_id)
-            return self._finish(
+            return self.finish(
                 operation_id,
                 OperationState.FAILED,
                 Refusal(RefusalReason.SUBMIT_FAILED, f"starting the service failed: {exc}"),
@@ -572,6 +628,21 @@ class RelayService:
             return await self.advance(operation_id)
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
+        install = installing.install_handle(record)
+        if install is not None:
+            return await installing.refresh_install(self, operation_id, adapter, install)
+        if installing.state_of(record).get("stage") == "starting":
+            # Another call is installing JARVIS or submitting the install job right now.
+            if utc_now() - record.updated_at <= installing.START_GRACE:
+                return record
+            return self.finish(
+                operation_id,
+                OperationState.FAILED,
+                Refusal(
+                    RefusalReason.SUBMIT_FAILED,
+                    "the install was interrupted before its job started; run the job again",
+                ),
+            )
         if record.kind == "serve":
             return await self._refresh_service(operation_id, site, adapter, record)
         handle = record.handle
@@ -599,7 +670,7 @@ class RelayService:
             # One failed look is not the job's end; it stays open and says why.
             logger.warning("observing %s", operation_id, exc_info=True)
             reason = exc.message if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
-            return self._observation_failed(operation_id, reason, "job")
+            return self.observation_failed(operation_id, reason, "job")
         status = await with_package_progress(adapter, record, status)
         return await self._apply(operation_id, adapter, status)
 
@@ -617,16 +688,16 @@ class RelayService:
                 record.state == OperationState.SUBMITTING
                 and utc_now() - record.updated_at > SUBMIT_GRACE
             ):
-                return self._finish(operation_id, OperationState.FAILED, refusal)
+                return self.finish(operation_id, OperationState.FAILED, refusal)
             logger.warning("observing service %s: %s", operation_id, refusal.message)
-            return self._observation_failed(operation_id, refusal.message)
+            return self.observation_failed(operation_id, refusal.message)
         except Exception as exc:
             # One failed look is not the service's end; it stays open and says why.
             logger.warning("observing service %s", operation_id, exc_info=True)
-            return self._observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
+            return self.observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
         return await self._apply(operation_id, adapter, status, endpoint)
 
-    def _observation_failed(
+    def observation_failed(
         self, operation_id: str, error: str, what: str = "service"
     ) -> OperationRecord:
         with self.operations.locked(operation_id):
@@ -681,6 +752,8 @@ class RelayService:
             result.pop("observation_failed_at", None)
             if status.progress is not None:
                 result["progress"] = status.progress.model_dump(mode="json")
+            if status.control is not None:
+                result["control"] = status.control
             if status.message is not None:
                 result["message"] = status.message
             elif record.kind != "serve":
@@ -704,10 +777,17 @@ class RelayService:
             if record.kind == "serve"
             else record.handle is not None
         )
+        install = installing.install_handle(record)
+        if install is not None:
+            adapter = self.adapter_named(self.site(record.site), record.adapter)
+            status = await adapter.cancel(install)
+            if status.state.final:
+                return self.finish(operation_id, OperationState.CANCELLED, None)
+            return await installing.refresh_install(self, operation_id, adapter, install)
         if not started:
             for ask in self.outstanding(record):
                 self.answer(ask.ask_id, "cancel", by="cancel")
-            record = self._finish(operation_id, OperationState.CANCELLED, None)
+            record = self.finish(operation_id, OperationState.CANCELLED, None)
             return record
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
@@ -792,6 +872,7 @@ class RelayService:
             "exit_code": record.exit_code,
             "outputs": [item.model_dump(mode="json") for item in record.outputs],
             "asks": asks,
+            "steps": _steps_view(record),
             "result": record.result,
             "error": record.error,
             "spec_digest": record.spec_digest,

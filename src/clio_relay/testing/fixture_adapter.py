@@ -91,7 +91,7 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
         await self._require_sign_in()
-        if spec.executable is None and spec.package is None:
+        if spec.executable is None and not spec.steps():
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
         job_dir = self.jobs_root / operation_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -106,7 +106,7 @@ class FixtureAdapter(BaseAdapter[FixtureConfig]):
         record = {
             "operation_id": operation_id,
             "executable": spec.executable,
-            "package": spec.package.name if spec.package is not None else None,
+            "package": ",".join(step.name for step in spec.steps()) or None,
             "arguments": spec.arguments,
             "submitted_at": time.time(),
             "queue_s": self.config.queue_s,

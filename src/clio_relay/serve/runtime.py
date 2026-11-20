@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
+from clio_relay import jarvis_submit
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -40,6 +41,7 @@ from clio_relay.serve.plan import (
     ServePlan,
     check_wrappable,
     new_secret,
+    package_service_job,
     plan_ports,
     service_name,
     site_file,
@@ -186,6 +188,8 @@ class ServeRuntime:
                 return status.model_copy(update={"message": note}), None
             if status.state != JobState.RUNNING:
                 return status, None
+            if await self._idle(plan, adapter, handle):
+                return status.model_copy(update={"message": self.notes[plan.operation_id]}), None
             status, endpoint = await self._running(plan, adapter, status)
         if endpoint is None:
             self._follow(plan, adapter, handle, status)
@@ -313,6 +317,9 @@ class ServeRuntime:
         entry = self.sites.get(site_id)
         site = serve_settings.site_serve(loaded, site_id, getattr(entry, "serve", None))
         check_wrappable(spec)
+        package = bool(spec.job.steps())
+        if package and not getattr(adapter, "runs_packages", False):
+            raise jarvis_submit.not_run_here(str(adapter.name))
         mode = self._mode(adapter, site, loaded.rendezvous is not None)
         ports = plan_ports(spec)
         if any(port.protocol == "mcp" for port in ports):
@@ -331,6 +338,7 @@ class ServeRuntime:
             site_serve=site,
             bound_to=spec.lifetime.bound_to,
             idle_release_s=idle.total_seconds() if idle else None,
+            package=package,
         )
         if mode == "ssh":
             plan.ssh_argv = [str(part) for part in await _maybe(adapter.ssh_argv())]
@@ -341,8 +349,9 @@ class ServeRuntime:
         try:
             files: FileAccess = await adapter.files()
             staged = {name: await files.stage(data) for name, data in site_files(plan).items()}
+            build = package_service_job if package else wrapped_job
             handle: JobHandle = await adapter.run(
-                wrapped_job(spec, plan, staged), operation_id=operation_id
+                build(spec, plan, staged), operation_id=operation_id
             )
         except BaseException:
             await self._stop_hop(adapter, plan)
@@ -668,11 +677,31 @@ class ServeRuntime:
             await forward.close()
         await self.mounter.unmount(plan.operation_id)
 
+    async def _idle(self, plan: ServePlan, adapter: Any, handle: JobHandle) -> bool:
+        """For a package service: stop it once the connector wrote ``serve/idle``."""
+        if not plan.package or not plan.idle_release_s or plan.ready_at is None:
+            return False
+        if await self._read(plan, adapter, "idle") is None:
+            return False
+        plan.stop_requested_at = utc_now()
+        self.notes[plan.operation_id] = "stopping: released after its idle time"
+        self._save(plan)
+        await self._close_desktop(plan)
+        await self._request_stop(plan, adapter, handle)
+        return True
+
     async def _request_stop(self, plan: ServePlan, adapter: Any, handle: JobHandle) -> None:
         status = await adapter.status(handle)
         if status.state.final:
             return
-        if status.state == JobState.RUNNING and plan.job_dir:
+        if plan.package:
+            # JARVIS started the service: jarvis execution stop runs ppl stop and finalizes.
+            try:
+                await adapter.stop(handle)
+                return
+            except Refusal as refusal:
+                logger.info("service %s: stop refused (%s); cancelling", plan.operation_id, refusal)
+        elif status.state == JobState.RUNNING and plan.job_dir:
             try:
                 files: FileAccess = await adapter.files()
                 await files.write(job_path(plan, "stop"), b"stop\n", overwrite=True)

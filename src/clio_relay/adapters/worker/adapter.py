@@ -662,8 +662,17 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return found if isinstance(found, str) and found else None
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
-        if spec.package is not None:
-            spec = jarvis_submit.with_archive(spec)  # stage the reviewed archive too
+        if spec.steps():
+            spec = jarvis_submit.with_archive(spec)  # stage the reviewed archives too
+        await self._stage(spec)
+        reported = await self.call(
+            "/run",
+            {"spec": spec.model_dump(mode="json"), "operation_id": operation_id},
+            timeout_s=self.config.submit_timeout_s + 120,
+        )
+        return self._wrap(JobHandle.model_validate(reported))
+
+    async def _stage(self, spec: JobSpec) -> None:
         for item in spec.inputs:
             if not await self.call("/files/has", {"digest": item.sha256}, timeout_s=120):
                 if not self.context.content.has(item.sha256):
@@ -679,12 +688,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                     {"data": base64.b64encode(data).decode("ascii")},
                     timeout_s=600,
                 )
-        reported = await self.call(
-            "/run",
-            {"spec": spec.model_dump(mode="json"), "operation_id": operation_id},
-            timeout_s=self.config.submit_timeout_s + 120,
-        )
-        return self._wrap(JobHandle.model_validate(reported))
 
     async def status(self, handle: JobHandle) -> JobStatus:
         reported = await self.call("/status", {"handle": self._unwrap(handle)}, timeout_s=120)
@@ -697,6 +700,32 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             timeout_s=self.config.submit_timeout_s + 120,
         )
         return JobStatus.model_validate(reported)
+
+    async def stop(self, handle: JobHandle) -> JobStatus:
+        reported = await self.call(
+            "/stop",
+            {"handle": self._unwrap(handle)},
+            timeout_s=self.config.submit_timeout_s + 120,
+        )
+        return JobStatus.model_validate(reported)
+
+    async def install(
+        self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
+    ) -> JobHandle:
+        reported = await self.call(
+            "/install",
+            {
+                "spec": spec.model_dump(mode="json"),
+                "operation_id": operation_id,
+                "answers": answers,
+            },
+            timeout_s=self.config.submit_timeout_s + 120,
+        )
+        return self._wrap(JobHandle.model_validate(reported))
+
+    async def install_jarvis(self) -> str:
+        # Building a virtual environment and installing jarvis-cd takes minutes.
+        return str(await self.call("/install-jarvis", {}, timeout_s=3600))
 
     async def find(self, operation_id: str) -> JobHandle | None:
         if self.load_link() is None:
@@ -762,8 +791,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
-        if spec.job.package is not None:
-            raise jarvis_submit.stop_refusal()
         try:
             runtime: Any = importlib.import_module("clio_relay.serve")
         except ModuleNotFoundError as exc:

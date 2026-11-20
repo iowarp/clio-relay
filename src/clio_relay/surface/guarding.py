@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from clio_relay.adapters.hooks import Ask, AskProvider, Charge, GuardDecision
 from clio_relay.jobs.records import OperationRecord
+from clio_relay.jobs.spec import PackageRef
 from clio_relay.sites.models import SiteEntry
 
 
@@ -23,13 +25,29 @@ def _plural(count: int, word: str) -> str:
     return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
-def approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
+def _step_lines(steps: Sequence[PackageRef]) -> list[str]:
+    """Say which of the allocation's nodes each step of a pipeline gets."""
+    if len(steps) < 2:
+        return []
+    lines = ["- Pipeline, one allocation:"]
+    for number, step in enumerate(steps, start=1):
+        nodes = step.nodes()
+        where = f"nodes {nodes}" if nodes is not None else "all the nodes"
+        lines.append(f"  {number}. {step.name} on {where}")
+    return lines
+
+
+def approval_message(
+    action: str, site: SiteEntry, charge: Charge, steps: Sequence[PackageRef] = ()
+) -> str:
     """Say what the person approves when the price needs an approval.
 
     The first line is the question. Three short lines follow with what the job
     asks the scheduler for (nodes and ranks, walltime and node-hours, queue),
-    then why relay asks and where the person changes that. It is plain
-    Markdown, kept short so a client's question card shows it without scrolling.
+    then why relay asks and where the person changes that. A pipeline's steps
+    share the allocation; a list after the nodes line says which nodes
+    (``host_slice``) each gets. It is plain Markdown, kept short so a client's
+    question card shows it without scrolling.
     """
     known = charge.walltime_s is not None and charge.node_hours is not None
     if known:
@@ -65,7 +83,9 @@ def approval_message(action: str, site: SiteEntry, charge: Charge) -> str:
     else:
         why = f"Relay asks above {ask:g} node-hours here."
     change = "Change this under Spending on the Compute page."
-    return "\n".join([title, "", nodes, walltime, queue, "", f"{why} {change}"])
+    return "\n".join(
+        [title, "", nodes, *_step_lines(steps), walltime, queue, "", f"{why} {change}"]
+    )
 
 
 async def review_asks(

@@ -99,6 +99,8 @@ def final_message(plan: ServePlan, status: JobStatus, stopped: dict[str, Any]) -
         parts.append(f"the service exited with {stopped.get('exit_code')}")
     elif reason == "signal":
         parts.append("the job was signalled")
+    elif reason == "ended" and plan.stop_requested_at is not None:
+        parts.append("stopped: jarvis execution stop ended the pipeline")
     elif status.message:
         parts.append(redact(plan, status.message))
     else:

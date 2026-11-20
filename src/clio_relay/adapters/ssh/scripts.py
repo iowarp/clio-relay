@@ -336,16 +336,18 @@ def status_script(
     return body
 
 
-def jarvis_status_script(job_dir: str, operation_id: str) -> str:
+def jarvis_status_script(job_dir: str, execution_id: str, pipeline: str | None = None) -> str:
     """One poll of a job JARVIS submitted: ``jarvis execution get``, and its artifacts.
 
     ``execution get`` reconciles the record with the scheduler and commits it,
     so relay keeps no state of its own. The artifacts are read once the record
-    is terminal.
+    is terminal. ``pipeline`` is as in :func:`jarvis_submit.execution_argv`.
     """
-    get = jarvis_submit.execution_shell("get", operation_id, job_dir=job_dir)
-    artifacts = jarvis_submit.execution_shell("artifacts", operation_id, job_dir=job_dir)
-    execution = q(jarvis_submit.execution_dir(job_dir, operation_id))
+    get = jarvis_submit.execution_shell("get", execution_id, job_dir=job_dir, pipeline=pipeline)
+    artifacts = jarvis_submit.execution_shell(
+        "artifacts", execution_id, job_dir=job_dir, pipeline=pipeline
+    )
+    execution = q(jarvis_submit.execution_dir(job_dir, execution_id, pipeline=pipeline))
     return (
         f"J={q(job_dir)}\n"
         + _ENTER_JOB
@@ -359,6 +361,42 @@ def jarvis_status_script(job_dir: str, operation_id: str) -> str:
         + "'\"terminal\":true'; then\n"
         + f'  echo "@@artifacts"; {artifacts} 2>/dev/null </dev/null; echo\n'
         + "fi\n"
+        + "exit 0\n"
+    )
+
+
+def jarvis_execution_script(
+    job_dir: str, verb: jarvis_submit.ExecutionVerb, execution_id: str, pipeline: str
+) -> str:
+    """Run ``jarvis execution <verb>`` (cancel or stop) in the job directory.
+
+    Prints ``@@rc`` and the command's output under ``@@out``; the output's last
+    line is the execution record JARVIS committed.
+    """
+    command = jarvis_submit.execution_shell(verb, execution_id, job_dir=job_dir, pipeline=pipeline)
+    return (
+        f"J={q(job_dir)}\n"
+        + _ENTER_JOB
+        + f"jarvis=$(cat {jarvis_submit.JARVIS_FILE} 2>/dev/null)\n"
+        + '[ -n "$jarvis" ] || { echo "@@nojarvis"; exit 0; }\n'
+        + f"out=$({command} 2>&1 </dev/null); rc=$?\n"
+        + 'echo "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
+        + "exit 0\n"
+    )
+
+
+def jarvis_install_script(job_dir: str, install_command: str) -> str:
+    """Submit the install job from the job directory: the site script's ``install`` mode.
+
+    Prints ``@@rc`` and the output under ``@@out``; the handle line JARVIS printed
+    is kept as ``relay.install.json`` and printed under ``@@handle``.
+    """
+    return (
+        f"J={q(job_dir)}\n"
+        + _ENTER_JOB
+        + f"out=$({install_command} 2>&1 </dev/null); rc=$?\n"
+        + 'echo "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
+        + f'echo "@@handle"; cat {jarvis_submit.INSTALL_FILE} 2>/dev/null; echo\n'
         + "exit 0\n"
     )
 

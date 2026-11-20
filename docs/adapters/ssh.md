@@ -144,19 +144,38 @@ directories made before the submit, and the bound interpreter and
    It keeps JARVIS's handle in `relay.submission.json`.
 3. `status` reads `jarvis execution get`, and the outputs come from
    `jarvis execution artifacts` once the record is terminal.
+4. `cancel` runs `jarvis execution cancel`, and stopping a package service
+   runs `jarvis execution stop`, which lets the job run `jarvis ppl stop`
+   before it ends. A job still waiting in the queue is cancelled instead.
+   `status` shows what JARVIS recorded about either request. Relay never runs
+   `scancel` itself.
+
+A pipeline can have several packages, such as a ParaView server and the
+simulation it watches. They share one allocation, and each package's
+`host_slice` parameter (for example `"0:12"` and `"12:16"`) says which of its
+nodes the package gets. `start_mode` passes through the same way.
+
+The submit first checks that the site has the software the packages need.
+When it does not, nothing is submitted. Relay asks you to approve the install
+(what JARVIS reuses and what it builds), then asks one question for each
+choice JARVIS cannot make alone, such as which of two compilers to build
+with. JARVIS then installs the software as its own job,
+`jarvis ppl install +submit`. `describe(job=...)` follows the install log and
+its progress for as long as the install takes, then relay submits the run.
+Your answers and the Spack environment are kept under the CLIO site home, at
+`jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
+archives, so the next run of the same packages reuses them. Two installs into
+one environment take turns; the second shows `waiting_env_lock` until the
+first is done.
 
 The `jarvis` setting names the command on the site (default `jarvis`). When
-it is not there, `run` is refused with `adapter_unavailable` before anything
-is submitted.
+nothing is there, relay asks before it installs jarvis-cd at a pinned commit
+into the CLIO site home (`<home>/jarvis-cd/jarvis`), in a virtual environment
+made from the site's `python3` 3.11 or newer, or with `pip install --user`.
+That needs the site to reach github.com. Later runs on the site use it.
 
-Some things JARVIS 1.8.1 cannot do yet, so relay refuses them rather than
-working around JARVIS:
+Some things relay refuses rather than working around JARVIS:
 
-- `cancel` of a package job that is still running is refused with
-  `not_cancellable` ("needs jarvis execution cancel"). Relay does not run
-  `scancel` behind JARVIS's back.
-- A package started as a service (such as pvserver) is refused with
-  `adapter_unavailable` ("needs jarvis execution stop").
 - Package jobs need Slurm. On PBS, LSF or Cobalt, `run` is refused with
   `adapter_unavailable`, naming the JARVIS scheduler it needs.
 - A package job's `directory` and `stdin_path` are refused. Its inputs are in

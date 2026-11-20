@@ -1,8 +1,10 @@
 """The job and service specs.
 
 Field names follow `psij-python` 0.9.11 (RL15). Relay adds two things PSI/J
-does not have: content-addressed inputs (RL16) and a package reference that a
-guarded site takes in place of ``executable`` (RL24).
+does not have: content-addressed inputs (RL16) and the JARVIS packages a
+guarded site takes in place of ``executable`` (RL24). ``packages`` is a JARVIS
+pipeline's ordered steps, sharing one allocation; ``package`` is the one-step
+shorthand.
 """
 
 from __future__ import annotations
@@ -162,6 +164,11 @@ class PackageRef(_Spec):
         ),
     )
 
+    def nodes(self) -> str | None:
+        """Return the ``host_slice`` parameter, the allocation's nodes this step gets."""
+        value = self.parameters.get("host_slice")
+        return value if isinstance(value, str) and value.strip() else None
+
     @field_validator("sha256")
     @classmethod
     def _digest(cls, value: str | None) -> str | None:
@@ -190,17 +197,47 @@ class JobSpec(_Spec):
     resources: JobResources = Field(default_factory=JobResources)
     attributes: JobAttributes = Field(default_factory=JobAttributes)
     inputs: list[InputRef] = Field(default_factory=list[InputRef])
-    package: PackageRef | None = None
+    package: PackageRef | None = Field(
+        default=None, description="A one-step pipeline: the same as packages with one entry"
+    )
+    packages: list[PackageRef] = Field(
+        default_factory=list[PackageRef],
+        description=(
+            "A JARVIS pipeline's steps, in the order JARVIS starts them, sharing the job's "
+            "allocation. Give each its nodes with the host_slice parameter, e.g. '0:12'"
+        ),
+    )
 
     @model_validator(mode="after")
     def _one_entry_point(self) -> Self:
-        if (self.executable is None) == (self.package is None):
-            raise ValueError("give exactly one of executable or package")
+        if self.package is not None and self.packages:
+            raise ValueError("give package or packages, not both")
+        if (self.executable is None) == (not self.steps()):
+            raise ValueError("give exactly one of executable or package(s)")
         return self
+
+    def steps(self) -> list[PackageRef]:
+        """Return the JARVIS pipeline's packages, in order; empty for a command job."""
+        if self.package is not None:
+            return [self.package]
+        return list(self.packages)
+
+    def with_steps(self, steps: list[PackageRef]) -> JobSpec:
+        """Return a copy with ``steps`` in place of the packages, in the same shape."""
+        if self.package is not None and len(steps) == 1:
+            return self.model_copy(update={"package": steps[0]})
+        return self.model_copy(update={"package": None, "packages": steps})
+
+    def dump(self) -> dict[str, Any]:
+        """Return the JSON form. ``packages`` is left out when empty, so older digests hold."""
+        data = self.model_dump(mode="json")
+        if not data.get("packages"):
+            data.pop("packages", None)
+        return data
 
     def digest(self) -> str:
         """Return the SHA-256 of the canonical JSON form. Approvals bind to it."""
-        return canonical_digest(self.model_dump(mode="json"))
+        return canonical_digest(self.dump())
 
     def node_hours(self) -> float | None:
         """Return the most node-hours this job may consume, or None when no walltime is set."""
@@ -221,7 +258,7 @@ class JobSpec(_Spec):
         from psij import JobSpec as PsijJobSpec
 
         if self.executable is None:
-            raise ValueError("a package job is rendered by its package runner, not by PSI/J")
+            raise ValueError("a package job is rendered by JARVIS, not by PSI/J")
         environment: dict[str, str | int] | None = dict(self.environment) or None
         return PsijJobSpec(
             executable=self.executable,
@@ -278,9 +315,15 @@ class ServiceSpec(_Spec):
                 )
         return self
 
+    def dump(self) -> dict[str, Any]:
+        """Return the JSON form, with the job's as :meth:`JobSpec.dump`."""
+        data = self.model_dump(mode="json")
+        data["job"] = self.job.dump()
+        return data
+
     def digest(self) -> str:
         """Return the SHA-256 of the canonical JSON form."""
-        return canonical_digest(self.model_dump(mode="json"))
+        return canonical_digest(self.dump())
 
 
 def canonical_digest(value: Any) -> str:

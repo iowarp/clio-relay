@@ -8,8 +8,12 @@ writes its state to the job directory.
 
 A package job is JARVIS's (:mod:`clio_relay.jarvis_submit`). With Slurm, relay
 writes the pipeline with its ``scheduler:`` block and runs ``jarvis ppl submit``;
-status and outputs come from ``jarvis execution get`` and ``artifacts``. With no
-scheduler, the supervisor runs JARVIS's direct run on this machine.
+status and outputs come from ``jarvis execution get`` and ``artifacts``, and
+cancel and stop are ``jarvis execution cancel`` and ``stop``. A submit that
+finds software to install becomes the install ask, and ``install`` submits the
+install job. With no scheduler, the supervisor runs JARVIS's direct run on this
+machine. The CLIO site home, where relay installs jarvis-cd and keeps the
+install answers, is the work directory.
 """
 
 from __future__ import annotations
@@ -249,10 +253,14 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         job_dir = self._job_dir(operation_id)
         scheduler = self.scheduler()
         jarvis_mode = False
-        if spec.package is not None:
+        if spec.steps():
             if scheduler is None:
                 spec = jarvis_submit.direct_job(
-                    spec, jarvis=self.config.jarvis, job_dir=job_dir.as_posix()
+                    spec,
+                    jarvis=self.config.jarvis,
+                    job_dir=job_dir.as_posix(),
+                    home=self._home(),
+                    site=self.context.site_id,
                 )
             elif scheduler == "slurm":
                 spec = jarvis_submit.with_archive(spec)
@@ -279,6 +287,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             return await self._start_supervised(spec, job_dir)
         return await self._submit_batch(scheduler, spec, job_dir, operation_id)
 
+    def _home(self) -> str:
+        return self.work_dir.as_posix()
+
     async def _submit_jarvis(self, spec: JobSpec, job_dir: Path, operation_id: str) -> JobHandle:
         """Hand a package job to ``jarvis ppl submit``, which writes and submits the batch job."""
         directory = job_dir.as_posix()
@@ -287,6 +298,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             job_name=self.job_name(operation_id),
             stdout=_in_job(job_dir, spec.stdout_path),
             stderr=_in_job(job_dir, spec.stderr_path),
+            job_dir=directory,
         )
         document = jarvis_submit.pipeline_document(
             spec,
@@ -302,7 +314,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
         await asyncio.to_thread(_write)
         argv = shlex.split(
-            jarvis_submit.submit_command(spec, operation_id=operation_id, jarvis=self.config.jarvis)
+            jarvis_submit.submit_command(
+                spec, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home()
+            )
         )
         result = await run_bounded(
             argv,
@@ -310,8 +324,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             max_output_bytes=1 << 20,
             cwd=job_dir,
         )
-        if result.exit_code == jarvis_submit.EXIT_NO_JARVIS:
-            raise jarvis_submit.missing_jarvis(result.stderr, site=self.context.site_id)
+        self._refuse_jarvis_exit(result)
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
@@ -329,6 +342,70 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 scheduler="jarvis",
             )
         return self._jarvis_handle(found, job_dir, operation_id)
+
+    def _refuse_jarvis_exit(self, result: ExecResult) -> None:
+        """Raise the refusal for the site script's no-JARVIS (69) and decision (3) exits."""
+        site = self.context.site_id
+        if result.exit_code == jarvis_submit.EXIT_NO_JARVIS:
+            raise jarvis_submit.missing_jarvis(result.stderr, site=site)
+        if result.exit_code == jarvis_submit.EXIT_DECISION:
+            report = jarvis_submit.parse_install_report(result.stdout)
+            if report is None:
+                raise Refusal(
+                    RefusalReason.SUBMIT_FAILED,
+                    "JARVIS needs to install the package's software and printed no install "
+                    f"report: {(result.stderr.strip() or result.stdout.strip())[-500:]}",
+                    needs=jarvis_submit.NEEDS_INSTALL,
+                )
+            raise jarvis_submit.install_needed(report, site=site)
+
+    async def install(
+        self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
+    ) -> JobHandle:
+        """Submit ``ppl install +submit`` from the job directory the refused submit left."""
+        job_dir = self._job_dir(operation_id)
+        if not await asyncio.to_thread((job_dir / jarvis_submit.PIPELINE_FILE).is_file):
+            raise Refusal(
+                RefusalReason.INPUT_MISSING,
+                f"the job directory {job_dir} has no pipeline; run the job again",
+            )
+        argv = shlex.split(
+            jarvis_submit.install_command(
+                spec,
+                operation_id=operation_id,
+                jarvis=self.config.jarvis,
+                answers=answers,
+                home=self._home(),
+            )
+        )
+        result = await run_bounded(
+            argv, timeout_s=self.config.submit_timeout_s, max_output_bytes=1 << 20, cwd=job_dir
+        )
+        self._refuse_jarvis_exit(result)
+        found = jarvis_submit.parse_handle(result.stdout)
+        if result.exit_code != 0 or found is None:
+            raise Refusal(
+                RefusalReason.SUBMIT_FAILED,
+                "jarvis ppl install refused the install job: "
+                f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
+                scheduler="jarvis",
+                exit_code=result.exit_code,
+            )
+        handle = self._jarvis_handle(found, job_dir, operation_id)
+        handle.data["install"] = True
+        return handle
+
+    async def install_jarvis(self) -> str:
+        await asyncio.to_thread(self.work_dir.mkdir, parents=True, exist_ok=True)
+        result = await run_bounded(
+            shlex.split(jarvis_submit.bootstrap_command(self._home())),
+            timeout_s=None,
+            max_output_bytes=1 << 20,
+            cwd=self.work_dir,
+        )
+        return jarvis_submit.bootstrap_result(
+            result.exit_code, result.stdout + "\n" + result.stderr, site=self.context.site_id
+        )
 
     def _jarvis_handle(self, found: dict[str, Any], job_dir: Path, operation_id: str) -> JobHandle:
         native, data = jarvis_submit.handle_data(found, job_dir=job_dir.as_posix())
@@ -499,6 +576,18 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     async def _execution(self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb) -> str:
         """Run ``jarvis execution <verb>`` for the job, with the JARVIS that submitted it."""
+        result = await self._run_execution(handle, verb)
+        if result.exit_code != 0:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"jarvis execution {verb} did not answer: "
+                f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
+            )
+        return result.stdout
+
+    async def _run_execution(
+        self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb
+    ) -> ExecResult:
         job_dir = Path(handle.data["job_dir"])
         try:
             jarvis = (job_dir / jarvis_submit.JARVIS_FILE).read_text("utf-8").strip()
@@ -509,17 +598,12 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 RefusalReason.UNREACHABLE,
                 f"the job directory {job_dir} does not say which JARVIS submitted the job",
             )
+        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         argv = jarvis_submit.execution_argv(
-            verb, str(handle.data["execution_id"]), job_dir=job_dir.as_posix(), jarvis=jarvis
+            verb, execution_id, job_dir=job_dir.as_posix(), jarvis=jarvis, pipeline=pipeline
         )
-        result = await run_bounded(argv, timeout_s=30, max_output_bytes=1 << 20, cwd=job_dir)
-        if result.exit_code != 0:
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                f"jarvis execution {verb} did not answer: "
-                f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
-            )
-        return result.stdout
+        # stop waits for nothing here: JARVIS signals the job and returns its record.
+        return await run_bounded(argv, timeout_s=120, max_output_bytes=1 << 20, cwd=job_dir)
 
     async def _jarvis_status(self, handle: JobHandle) -> JobStatus:
         """Read the job from JARVIS's execution record; relay keeps no state of its own."""
@@ -538,14 +622,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 f"jarvis execution get printed no record: {answer.strip()[-500:] or 'no output'}",
             )
         status = jarvis_submit.record_status(record)
-        if not status.state.final:
+        if not status.state.final or handle.data.get("install"):
             return status
         snapshot = jarvis_submit.parse_document(
             await self._execution(handle, "artifacts"), jarvis_submit.ARTIFACTS_SCHEMA
         )
         if snapshot is not None:
+            execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
             execution = str(handle.data.get("execution_dir") or "") or (
-                jarvis_submit.execution_dir(job_dir.as_posix(), str(handle.data["execution_id"]))
+                jarvis_submit.execution_dir(job_dir.as_posix(), execution_id, pipeline=pipeline)
             )
             status.outputs = jarvis_submit.artifact_outputs(snapshot, execution=execution)
         await asyncio.to_thread(self._drop_transient, handle)
@@ -684,10 +769,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     async def cancel(self, handle: JobHandle) -> JobStatus:
         if handle.data.get("mode") == "jarvis":
-            current = await self.status(handle)
-            if current.state.final:
-                return current
-            raise jarvis_submit.cancel_refusal()
+            return await self._jarvis_control(handle, "cancel")
         job_dir = Path(handle.data["job_dir"])
         await asyncio.to_thread(job_dir.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread((job_dir / "cancel").write_text, "cancel", "utf-8")
@@ -717,6 +799,26 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             if current.state.final:
                 return current
             await asyncio.sleep(0.25)
+        return await self.status(handle)
+
+    async def stop(self, handle: JobHandle) -> JobStatus:
+        """``jarvis execution stop`` for a JARVIS job; any other job is cancelled."""
+        if handle.data.get("mode") == "jarvis":
+            return await self._jarvis_control(handle, "stop")
+        return await self.cancel(handle)
+
+    async def _jarvis_control(
+        self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb
+    ) -> JobStatus:
+        current = await self.status(handle)
+        if current.state.final:
+            return current
+        result = await self._run_execution(handle, verb)
+        if result.exit_code != 0:
+            current = await self.status(handle)
+            if current.state.final:
+                return current
+            raise jarvis_submit.execution_failed(verb, result.stderr + "\n" + result.stdout)
         return await self.status(handle)
 
     @staticmethod
@@ -755,10 +857,6 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return LocalFileAccess(self.work_dir, self.context.content)
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
-        if spec.job.package is not None:
-            # JARVIS starts a package service, and relay could neither stop it nor put
-            # its connector in the job JARVIS writes.
-            raise jarvis_submit.stop_refusal()
         try:
             runtime: Any = importlib.import_module("clio_relay.serve")
         except ModuleNotFoundError as exc:

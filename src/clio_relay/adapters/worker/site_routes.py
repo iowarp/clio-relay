@@ -215,6 +215,40 @@ def register_adapter_routes(
 
         return await _answer(action)
 
+    @app.post(f"{prefix}/stop", dependencies=[auth_dependency])
+    async def adapter_stop(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            status = await _site_adapter(ctx, body).stop(_handle(body))
+            return status.model_dump(mode="json")
+
+        return await _answer(action)
+
+    @app.post(f"{prefix}/install", dependencies=[auth_dependency])
+    async def adapter_install(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            try:
+                spec = JobSpec.model_validate(body.get("spec"))
+            except ValidationError as exc:
+                raise Refusal(RefusalReason.INVALID_SPEC, str(exc)) from exc
+            answers = body.get("answers")
+            if not isinstance(answers, dict):
+                raise Refusal(RefusalReason.INVALID_ARGUMENTS, "answers must be an object")
+            handle = await _site_adapter(ctx, body).install(
+                spec,
+                operation_id=_text(body, "operation_id"),
+                answers=cast(dict[str, Any], answers),
+            )
+            return handle.model_dump(mode="json")
+
+        return await _answer(action)
+
+    @app.post(f"{prefix}/install-jarvis", dependencies=[auth_dependency])
+    async def adapter_install_jarvis(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            return await _site_adapter(ctx, body).install_jarvis()
+
+        return await _answer(action)
+
     @app.post(f"{prefix}/find", dependencies=[auth_dependency])
     async def adapter_find(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:

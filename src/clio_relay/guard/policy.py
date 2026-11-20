@@ -3,9 +3,11 @@
 It implements the guard hook (RL24 to RL26):
 
 - ``check_run``: an open site runs anything. A guarded site runs only a JARVIS
-  package, named with its version and SHA-256. A package nobody has reviewed
-  on that site comes back allowed with a review question in ``data["asks"]``,
-  which relay asks before it submits. A free-form command is refused with
+  package, named with its version and SHA-256, or a pipeline of them. Each
+  package nobody has reviewed on that site comes back allowed with its own
+  review question in ``data["asks"]``, which relay asks before it submits.
+  ``data["review"]`` holds a one-package job's review, and ``data["reviews"]``
+  holds a pipeline's, one per step. A free-form command is refused with
   ``policy_refused`` and the way to proceed.
 - ``check_exec``: a guarded site's ``exec`` runs only the read-only list.
 - ``price``: the most a job may use, in node-hours, or the adapter's own price
@@ -148,8 +150,8 @@ class Guard:
             return GuardDecision(allowed=True, data={"warm": True})
         if site.policy == "open":
             return GuardDecision(allowed=True)
-        package = spec.package
-        if package is None:
+        steps = spec.steps()
+        if not steps:
             return GuardDecision(
                 allowed=False,
                 reason=RefusalReason.POLICY_REFUSED,
@@ -169,29 +171,34 @@ class Guard:
                 ),
                 data={"site": site.id, "next_step": "package_parameters"},
             )
-        review = await asyncio.to_thread(self.reviewed, site.id, package)
-        if review is not None:
-            return GuardDecision(allowed=True, data={"review": _review_data(review)})
-        version, sha256 = package.pinned()
-        info = await asyncio.to_thread(read_archive, self.content, package.name, sha256)
-        archive = self.content.path_for(sha256)
-        binding: dict[str, Any] = {
-            "kind": REVIEW_KIND,
-            "package": package.name,
-            "version": version,
-            "package_hash": sha256,
-            "source": info.source,
-            "files": len(info.files),
-        }
-        return GuardDecision(
-            allowed=True,
-            data={
-                "review": None,
-                "asks": [
-                    {"message": review_message(site, package, info, archive), "binding": binding}
-                ],
-            },
-        )
+        # Each step of a pipeline is its own package, so each needs its own review.
+        reviews: list[dict[str, Any] | None] = []
+        asks: list[dict[str, Any]] = []
+        asked: set[str] = set()
+        for package in steps:
+            review = await asyncio.to_thread(self.reviewed, site.id, package)
+            reviews.append(None if review is None else _review_data(review))
+            version, sha256 = package.pinned()
+            if review is not None or sha256 in asked:
+                continue
+            asked.add(sha256)
+            info = await asyncio.to_thread(read_archive, self.content, package.name, sha256)
+            archive = self.content.path_for(sha256)
+            binding: dict[str, Any] = {
+                "kind": REVIEW_KIND,
+                "package": package.name,
+                "version": version,
+                "package_hash": sha256,
+                "source": info.source,
+                "files": len(info.files),
+            }
+            asks.append(
+                {"message": review_message(site, package, info, archive), "binding": binding}
+            )
+        data: dict[str, Any] = {"review": reviews[0]} if len(steps) == 1 else {"reviews": reviews}
+        if asks:
+            data["asks"] = asks
+        return GuardDecision(allowed=True, data=data)
 
     # check_exec
 
@@ -295,8 +302,8 @@ class Guard:
         settings = self.settings(site)
         if is_warm(spec):
             return holder_job(spec, idle_s=settings.warm_idle_s)
-        package = spec.package
-        if package is None:
+        steps = spec.steps()
+        if not steps:
             if site.policy == "guarded":
                 raise Refusal(
                     RefusalReason.POLICY_REFUSED,
@@ -306,19 +313,21 @@ class Guard:
                 )
             return spec
         if site.policy == "guarded":
-            review = await asyncio.to_thread(self.reviewed, site.id, package)
-            if review is None:
-                raise Refusal(
-                    RefusalReason.POLICY_REFUSED,
-                    f"{package.name} {package.version} ({package.sha256}) has not been reviewed "
-                    f"on {site.title}",
-                    site=site.id,
-                    next_step="package_review",
-                )
+            for package in steps:
+                review = await asyncio.to_thread(self.reviewed, site.id, package)
+                if review is None:
+                    raise Refusal(
+                        RefusalReason.POLICY_REFUSED,
+                        f"{package.name} {package.version} ({package.sha256}) has not been "
+                        f"reviewed on {site.title}",
+                        site=site.id,
+                        package=package.name,
+                        next_step="package_review",
+                    )
         if not adapter.runs_packages:
             # A package never becomes relay's own job: JARVIS submits it.
             raise not_run_here(adapter.name)
-        if service and not package.service:
-            package = package.model_copy(update={"service": True})
-            return spec.model_copy(update={"package": package})
+        if service and not all(step.service for step in steps):
+            # The whole pipeline is the service: relay keeps it up until it is stopped.
+            return spec.with_steps([step.model_copy(update={"service": True}) for step in steps])
         return spec
