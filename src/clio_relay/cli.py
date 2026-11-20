@@ -114,7 +114,9 @@ def serve(
         uvicorn_config.update(ssl_certfile=str(tls_cert), ssl_keyfile=str(tls_key))
     from clio_relay.shutdown import register_server
 
-    register_server(paths, f"{origin}{normalized}")
+    register_server(
+        paths, server, f"{origin}{normalized}", origin, tls_cert=tls_cert if tls_key else None
+    )
     server.run(
         transport="http",
         host=host,
