@@ -70,11 +70,16 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
 
 
 def ssh_command(
-    plan: ServePlan, env: dict[str, str] | None = None
+    plan: ServePlan, env: dict[str, str] | None = None, known_hosts: Path | None = None
 ) -> tuple[list[str], dict[str, str]]:
-    """Return the ``ssh -L`` that holds every port of an ``ssh`` site's service."""
+    """Return the ``ssh -L`` that holds every port of an ``ssh`` site's service.
+
+    ``known_hosts`` holds the compute node's keys read on the login host; ssh checks
+    it after the person's own known_hosts.
+    """
     if not plan.ssh_argv:
         raise Refusal(RefusalReason.INVALID_CONFIG, "the adapter gave no ssh command")
+    merged = {**os.environ, **(env or {})}
     base, destination = plan.ssh_argv[:-1], plan.ssh_argv[-1]
     argv = [
         *base,
@@ -89,11 +94,62 @@ def ssh_command(
     for port in plan.ports:
         argv += ["-L", f"127.0.0.1:{port.local_port}:127.0.0.1:{port.remote_port}"]
     if plan.host and plan.login_host and plan.host != plan.login_host:
-        jump = shlex.join([*base, "-W", "%h:%p", destination])
-        argv += ["-o", f"ProxyCommand={jump}", plan.host]
+        if known_hosts is not None:
+            argv += ["-o", f'GlobalKnownHostsFile="{known_hosts.as_posix()}"']
+        argv += login_identity(base, destination, merged)
+        argv += ["-o", f"ProxyCommand={_jump_command(base, destination, merged)}", plan.host]
     else:
         argv.append(destination)
-    return argv, {**os.environ, **(env or {})}
+    return argv, merged
+
+
+IDENTITY_KEYS = ("user", "identityfile", "certificatefile", "identitiesonly", "identityagent")
+"""What the login host's ssh settings say about logging in, carried to the node behind it."""
+
+
+def login_identity(base: list[str], destination: str, env: dict[str, str]) -> list[str]:
+    """Return the login destination's login settings as options for the node behind it.
+
+    A person's ssh config names their user and key for the login host, which says
+    nothing of the compute node relay reaches through it. ``ssh -G`` reads what the
+    login host gets, so the node gets the same; empty when ssh cannot say.
+    """
+    program = programs.find(base[0], env) or base[0]
+    try:
+        done = subprocess.run(
+            [program, *base[1:], "-G", destination],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    options: list[str] = []
+    for line in done.stdout.splitlines():
+        key, _sep, value = line.strip().partition(" ")
+        value = value.strip()
+        if key.lower() in IDENTITY_KEYS and value and value.lower() != "none":
+            options += ["-o", f'{key}="{value.replace(chr(92), "/")}"']
+    return options
+
+
+def _jump_command(base: list[str], destination: str, env: dict[str, str]) -> str:
+    """Return the ``ssh -W`` hop through the login host, as ssh's ``ProxyCommand``.
+
+    ssh starts a ``ProxyCommand`` itself. On Windows that is ``CreateProcess``, which
+    looks in ssh's own directory first, so a bare ``ssh`` there would be System32's
+    rather than the one relay found on the PATH (a host's wrapper, say). The hop
+    therefore names the program relay found, quoted the way the platform reads it.
+    """
+    program = programs.find(base[0], env) or base[0]
+    hop = [program, *base[1:], "-W", "%h:%p", destination]
+    if os.name == "nt":
+        return subprocess.list2cmdline([hop[0].replace("%", "%%"), *hop[1:]])
+    return shlex.join([hop[0].replace("%", "%%"), *hop[1:]])
 
 
 def _is_ours(pid: int, marker: str) -> bool:
@@ -196,7 +252,12 @@ class Forward:
     def _command(self) -> tuple[list[str], dict[str, str]]:
         if self.plan.mode == "frp":
             return visitor_command(self.plan, self.directory)
-        return ssh_command(self.plan, self.ssh_env)
+        known_hosts: Path | None = None
+        if self.plan.host_keys:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            known_hosts = self.directory / "known_hosts"
+            known_hosts.write_text("\n".join(self.plan.host_keys) + "\n", encoding="utf-8")
+        return ssh_command(self.plan, self.ssh_env, known_hosts)
 
     async def _spawn(self) -> None:
         argv, env = self._command()
@@ -216,7 +277,7 @@ class Forward:
             )
         except OSError as exc:
             raise Refusal(
-                RefusalReason.INVALID_CONFIG, f"cannot start {argv[0]}: {exc.strerror}"
+                RefusalReason.INVALID_CONFIG, programs.start_failed(argv[0], exc), command=argv[0]
             ) from exc
         finally:
             log.close()

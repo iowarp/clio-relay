@@ -14,9 +14,18 @@ import json
 import re
 from datetime import timedelta
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 
 if TYPE_CHECKING:
     import psij
@@ -24,6 +33,27 @@ if TYPE_CHECKING:
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 CustomValue = str | int | float | bool
+
+
+def _seconds(value: object) -> object:
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return timedelta(seconds=value)
+    if isinstance(value, str):
+        return _TIMEDELTA.validate_python(value)
+    return value
+
+
+_TIMEDELTA: TypeAdapter[timedelta] = TypeAdapter(timedelta)
+
+# Strict validation refuses both a number and a string for a timedelta, so either is
+# turned into one first, and the schema offers both forms.
+Duration = Annotated[
+    timedelta,
+    BeforeValidator(_seconds),
+    WithJsonSchema(
+        {"anyOf": [{"type": "number", "minimum": 0}, {"type": "string", "format": "duration"}]}
+    ),
+]
 
 
 def _check_digest(value: str) -> str:
@@ -82,10 +112,10 @@ class JobResources(_Spec):
 class JobAttributes(_Spec):
     """PSI/J ``JobAttributes`` fields."""
 
-    duration: timedelta | None = Field(
+    duration: Duration | None = Field(
         default=None,
         description=(
-            "Walltime, as seconds or an ISO 8601 duration. Leave it out to use the "
+            "Walltime, as seconds or an ISO 8601 duration (PT2H). Leave it out to use the "
             "site's default walltime or, with none, the scheduler's own limit"
         ),
     )
@@ -336,7 +366,9 @@ class ServiceLifetime(_Spec):
     """How long a service lives (RL19)."""
 
     bound_to: str | None = Field(default=None, description="Operation id of a job it ends with")
-    idle_release: timedelta | None = None
+    idle_release: Duration | None = Field(
+        default=None, description="Seconds or an ISO 8601 duration of idleness before release"
+    )
 
 
 class ServiceSpec(_Spec):

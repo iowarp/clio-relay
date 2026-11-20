@@ -143,7 +143,15 @@ def test_visitor_command_keeps_secrets_in_the_environment(tmp_path: Path) -> Non
     assert "frp-token-value" not in " ".join(argv)
 
 
-def test_ssh_forward_jumps_through_the_login_host(tmp_path: Path) -> None:
+def test_ssh_forward_jumps_through_the_login_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = str(tmp_path / "shims" / "ssh")
+
+    def find(command: str, env: object = None) -> str | None:
+        return found if command == "ssh" else None
+
+    monkeypatch.setattr("clio_relay.programs.find", find)
     plan = frp_plan(tmp_path).model_copy(
         update={
             "mode": "ssh",
@@ -160,6 +168,8 @@ def test_ssh_forward_jumps_through_the_login_host(tmp_path: Path) -> None:
     assert argv[-1] == "ares-comp-03"
     jump = next(item for item in argv if item.startswith("ProxyCommand="))
     assert shlex.split(jump.split("=", 1)[1])[-3:] == ["-W", "%h:%p", "ares"]
+    # ssh starts the hop itself, so it names the program relay found, not a bare name.
+    assert shlex.split(jump.split("=", 1)[1])[0] == found
     assert env["SSH_ASKPASS"] == "/askpass"
     same = plan.model_copy(update={"host": "ares"})
     assert ssh_command(same)[0][-1] == "ares"

@@ -74,6 +74,11 @@ STOP_MARGIN_S = 30.0
 CANCEL_RETRY_S = 60.0
 FOLLOW_FIRST_S = 1.0
 FOLLOW_MAX_S = 10.0
+HOST_KEYS_SH = (
+    'for f in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 "$HOME/.ssh/known_hosts"; '
+    'do [ -r "$f" ] && ssh-keygen -F "$1" -f "$f"; done; exit 0'
+)
+"""Print a host's lines from the site's known_hosts files; ``$1`` is the host."""
 
 _runtime: ServeRuntime | None = None
 
@@ -519,6 +524,26 @@ class ServeRuntime:
             )
         return result
 
+    async def _host_keys(self, adapter: Any, plan: ServePlan) -> list[str]:
+        """Read the compute node's host keys from the login host's known_hosts files.
+
+        The forward reaches the node through the login host, and the desktop has
+        often never seen that node, so ``BatchMode`` would refuse its key. The site's
+        own known_hosts files are read over the login link ssh has already checked.
+        """
+        if plan.mode != "ssh" or not plan.host or plan.host == plan.login_host:
+            return []
+        try:
+            found = await self._exec(adapter, plan, ["sh", "-c", HOST_KEYS_SH, "sh", plan.host])
+        except Exception:
+            logger.warning("service %s: no host keys for %s", plan.operation_id, plan.host)
+            return []
+        return [
+            line.strip()
+            for line in found.stdout.splitlines()
+            if line.strip() and not line.lstrip().startswith("#") and len(line.split()) >= 3
+        ]
+
     async def _hop(self, adapter: Any, plan: ServePlan, mode: str, *args: str) -> ExecResult:
         """Run the login hop's ``mode`` on the site, light (:mod:`clio_relay.login_load`)."""
         site = plan.site_serve
@@ -674,6 +699,7 @@ class ServeRuntime:
             with contextlib.suppress(ValueError):
                 ready: dict[str, Any] = json.loads(raw)
                 plan.host = str(ready.get("host") or "") or None
+            plan.host_keys = await self._host_keys(adapter, plan)
             plan.ready_at = utc_now()
             self._save(plan)
         if plan.desktop_closed_at is not None:
