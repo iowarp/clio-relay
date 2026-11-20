@@ -272,6 +272,42 @@ class SiteAdded(Protocol):
         ...
 
 
+@runtime_checkable
+class ShutsDown(Protocol):
+    """An adapter that holds long-lived processes for its site. Optional.
+
+    ``clio-relay shutdown`` calls it to stop them: a placed worker, an ssh control
+    connection. It must not cancel jobs, and it must return within a few seconds. It
+    returns one ``{kind, pid?, detail}`` per process it stopped, ``kind`` being one of
+    ``site_serve``, ``hop_proxy``, ``connector``, ``tunnel`` or ``frpc``. A typed refusal
+    means the site could not be reached; nothing was stopped there.
+    """
+
+    async def shutdown(self) -> list[dict[str, Any]]:
+        """Stop the site's relay-owned processes and say which."""
+        ...
+
+
+@runtime_checkable
+class CleansSite(Protocol):
+    """An adapter that can remove what relay deployed on its site. Optional.
+
+    ``clio-relay site clean`` calls it after ``shutdown``. ``keep`` is a list of site
+    paths, ``~/`` meaning the home directory, that must survive (a Spack store). It
+    returns ``{removed: [...], kept: [...]}``. An adapter whose ``clean`` goes over the
+    connection its ``shutdown`` closes sets ``clean_over_connection``; that connection
+    is then closed after the clean instead of before it.
+    """
+
+    def clean_targets(self) -> tuple[list[str], list[str]]:
+        """Return the site paths relay deployed, and those it keeps."""
+        ...
+
+    async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
+        """Remove ``targets`` on the site, sparing ``keep``."""
+        ...
+
+
 def not_implemented(adapter: str, verb: str) -> Refusal:
     """Return the refusal for a verb an adapter does not implement."""
     return Refusal(
@@ -367,6 +403,7 @@ __all__ = [
     "Adapter",
     "AdapterContext",
     "BaseAdapter",
+    "CleansSite",
     "EmptyConfig",
     "Endpoint",
     "EndpointPort",
@@ -386,6 +423,7 @@ __all__ = [
     "RefusalReason",
     "STALL_S",
     "ServiceSpec",
+    "ShutsDown",
     "SignInNeed",
     "SiteAdded",
     "SiteFiles",

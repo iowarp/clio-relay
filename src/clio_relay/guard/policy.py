@@ -257,15 +257,25 @@ class Guard:
         return held
 
     async def check_exec(self, site: SiteEntry, command: list[str]) -> GuardDecision:
+        try:
+            settings = self.settings(site)
+        except Refusal:
+            if site.policy != "open":
+                raise
+            settings = SiteGuard()
+        light = {"light": True} if execlist.runs_spack(command, settings.spack) else {}
         if site.policy == "open":
-            return GuardDecision(allowed=True)
-        settings = self.settings(site)
+            return GuardDecision(allowed=True, data=light)
         warm = await asyncio.to_thread(self.warm_jobs, site.id) if command[:1] == ["srun"] else ()
         reason = execlist.refusal(
-            command, extra=settings.read_only, jarvis=settings.jarvis, warm_jobs=warm
+            command,
+            extra=settings.read_only,
+            jarvis=settings.jarvis,
+            warm_jobs=warm,
+            spack=settings.spack,
         )
         if reason is None:
-            return GuardDecision(allowed=True)
+            return GuardDecision(allowed=True, data=light)
         return GuardDecision(
             allowed=False,
             reason=RefusalReason.POLICY_REFUSED,

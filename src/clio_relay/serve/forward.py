@@ -25,6 +25,8 @@ from clio_relay.serve.plan import ServePlan
 
 MAX_BACKOFF_S = 30.0
 POLL_S = 1.0
+CLOSED_MARKER = "closed"
+"""In a forward's directory: ``clio-relay shutdown`` closed it, so no process restarts it."""
 
 
 def port_bound(port: int) -> bool:
@@ -117,17 +119,23 @@ def _is_ours(pid: int, marker: str) -> bool:
     return marker in result.stdout
 
 
-def kill_recorded(pid: int | None, marker: str) -> None:
-    """Stop a forward a previous relay process left behind, if it is still ours."""
+def kill_recorded(pid: int | None, marker: str) -> bool:
+    """Stop a forward a previous relay process left behind, if it is still ours.
+
+    Returns whether it signalled one.
+    """
     if not pid or not _is_ours(pid, marker):
-        return
-    with contextlib.suppress(OSError):
+        return False
+    try:
         if os.name == "nt":
             subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
         else:
             import signal
 
             os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
 
 
 class Forward:
@@ -241,6 +249,9 @@ class Forward:
                         self.on_restart(self.rebound, self.process.pid if self.process else None)
                 continue
             self.restarts += 1
+            if (self.directory / CLOSED_MARKER).exists():
+                self._log("shutdown closed this forward; not starting it again")
+                return
             self._log(
                 f"forward ended, starting it again on the same port (restart {self.restarts})"
             )

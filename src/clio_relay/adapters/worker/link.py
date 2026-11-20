@@ -1,7 +1,11 @@
 """The held link to one placed worker, from relay's side.
 
-One frp ``stcp`` visitor through the rendezvous carries every call
-(:class:`~clio_relay.frp_transport.BrokeredTcpTransport`). Bring-up fetches the
+One frp visitor carries every call: ``stcp`` through the rendezvous
+(``brokered_tcp``, :class:`~clio_relay.frp_transport.BrokeredTcpTransport`), or
+``xtcp`` straight to the site once a UDP hole punch succeeds (``udp_rendezvous``,
+:class:`~clio_relay.frp_transport.UdpRendezvousTransport`). A failed punch is
+:class:`~clio_relay.frp_transport.TransportPunchFailed`; the link never switches
+to the other mode on its own. Bring-up fetches the
 worker's identity and status over it. After that, each HTTP stream proves the
 worker's identity before it carries the bearer token: the worker signs a fresh
 nonce with the session owner token, which relay minted at placement and keeps
@@ -23,20 +27,23 @@ import time
 import urllib.parse
 from typing import Final, cast
 
+from clio_relay.adapters.worker.site_server import LinkMode
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.control_channel import ChannelDropped, ChannelEndpoint
 from clio_relay.errors import RelayError
-from clio_relay.frp_transport import BrokeredTcpTransport
+from clio_relay.frp_transport import BrokeredTcpTransport, UdpRendezvousTransport
 from clio_relay.session_api import (
     OWNER_SESSION_ID_HEADER,
     SESSION_GENERATION_ID_HEADER,
     session_identity_document,
 )
 
-WORKER_PROTOCOL: Final = 4
+WORKER_PROTOCOL: Final = 5
 """3: the site's local adapter hands package jobs to ``jarvis ppl submit``. 4: it also
 stops them, installs their software and installs jarvis-cd (``/stop``, ``/install``,
-``/install-jarvis``), and takes multi-package pipelines."""
+``/install-jarvis``), and takes multi-package pipelines. 5: it runs light on the login
+node, one per user and site, exits when idle, refuses direct jobs on a batch host, stops
+on ``/shutdown``, and holds an ``stcp`` or ``xtcp`` proxy as placement chose."""
 MAX_RESPONSE_BYTES: Final = 8 * 1024 * 1024
 _IDLE_STREAMS: Final = 4
 # The site keeps an idle stream open for 300 s; relay drops its own sooner.
@@ -61,6 +68,7 @@ class WorkerConnection:
         api_token: str,
         session_owner_token: str,
         frpc_bin: str,
+        mode: LinkMode = "brokered_tcp",
     ) -> None:
         self._definition = definition
         self._cluster = definition.name
@@ -70,7 +78,8 @@ class WorkerConnection:
         self._api_token = api_token
         self._owner_token = session_owner_token
         self._frpc_bin = frpc_bin
-        self._transport: BrokeredTcpTransport | None = None
+        self._mode: LinkMode = mode
+        self._transport: BrokeredTcpTransport | UdpRendezvousTransport | None = None
         self._endpoint: ChannelEndpoint | None = None
         self._lock = threading.Lock()
         self._idle: list[tuple[float, http.client.HTTPConnection]] = []
@@ -85,8 +94,12 @@ class WorkerConnection:
         return transport is not None and transport.is_alive()
 
     def connect(self) -> None:
-        """Hold the visitor, then check the worker's identity and status."""
-        transport = BrokeredTcpTransport(
+        """Hold the visitor, then check the worker's identity and status.
+
+        In ``udp_rendezvous`` a failed punch raises ``TransportPunchFailed``.
+        """
+        kind = UdpRendezvousTransport if self._mode == "udp_rendezvous" else BrokeredTcpTransport
+        transport = kind(
             definition=self._definition,
             cluster=self._cluster,
             session_id=self._session_id,

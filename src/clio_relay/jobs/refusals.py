@@ -37,6 +37,7 @@ class RefusalReason(StrEnum):
     NOT_CANCELLABLE = "not_cancellable"
     SUBMIT_FAILED = "submit_failed"
     UNREACHABLE = "unreachable"
+    PUNCH_FAILED = "punch_failed"
     TIMEOUT = "timeout"
 
 

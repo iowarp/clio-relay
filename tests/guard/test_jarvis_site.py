@@ -17,9 +17,13 @@ from clio_relay.jarvis_site import (
 )
 from clio_relay.jarvis_submit import (
     ARCHIVE_DIR,
+    JARVIS_PIN,
+    PIN_ENV,
     SITE_SCRIPT,
     direct_job,
+    explicit_jarvis,
     input_paths,
+    missing_jarvis,
     pipeline_document,
 )
 from clio_relay.jobs.content import ContentStore
@@ -197,3 +201,31 @@ def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
     assert archive not in str(entry)
     job = direct_job(spec, job_dir="/scratch/job")
     assert "stl: /scratch/job/body.stl" in job.arguments[8].splitlines()
+
+
+def test_the_jarvis_setting_is_a_path_or_relays_pinned_one() -> None:
+    assert explicit_jarvis("") == ""
+    assert explicit_jarvis("jarvis") == ""
+    assert explicit_jarvis("~/jv/bin/jarvis") == "~/jv/bin/jarvis"
+    assert explicit_jarvis("/opt/jarvis/bin/jarvis") == "/opt/jarvis/bin/jarvis"
+    for bare in ("jarvis-1.8", "bin/jarvis"):
+        with pytest.raises(ValueError, match="PATH"):
+            explicit_jarvis(bare)
+
+
+def test_the_site_script_expects_relays_pin() -> None:
+    assert PIN_ENV == "CLIO_RELAY_JARVIS_PIN"
+    assert 'command -v "$jarvis"' not in SITE_SCRIPT
+    assert '"${found%/*}/pin"' in SITE_SCRIPT
+
+
+def test_a_missing_jarvis_says_whose_it_is() -> None:
+    explicit = missing_jarvis('{"missing":"jarvis","tried":"/opt/j","explicit":true}', site="lab")
+    assert explicit.data.get("explicit") is True
+    assert "installable" not in explicit.data
+    stale = missing_jarvis('{"missing":"jarvis","tried":"/h/j","pin":"abc"}', site="lab")
+    assert stale.data["pin"] == "abc"
+    assert stale.data["installable"] == JARVIS_PIN
+    absent = missing_jarvis('{"missing":"jarvis","tried":"/h/j"}', site="lab")
+    assert absent.reason == RefusalReason.ADAPTER_UNAVAILABLE
+    assert absent.data["installable"] == JARVIS_PIN

@@ -46,7 +46,8 @@ from mcp.shared.exceptions import MCPError
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
-from clio_relay.adapters.hooks import MountsPages, Transport
+from clio_relay import shutdown as shutdown_ops
+from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -64,6 +65,8 @@ from clio_relay.surface.elicit import (
     tasks_opted_in,
 )
 from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
+from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
+from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
 from clio_relay.surface.progress import latest_note, observation_line
@@ -84,6 +87,25 @@ _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
 
 def _text(value: dict[str, Any]) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=str)
+
+
+def _plan_needs_person(service: RelayService, ask: Ask) -> ToolResult:
+    refusal = Refusal(
+        RefusalReason.NEEDS_APPROVAL,
+        "the site is guarded, so relay asks the person before it runs a command that is not "
+        "read-only. Open the page, or run `clio-relay asks answer`, then call exec again "
+        "with the same command and plan",
+        ask_id=ask.ask_id,
+        asks=[
+            {
+                "ask_id": ask.ask_id,
+                "kind": ask.kind,
+                "message": ask.message,
+                "page": service.ask_provider.page_address(ask),
+            }
+        ],
+    )
+    return refusal_result(refusal)
 
 
 def _summary(view: dict[str, Any]) -> str:
@@ -488,9 +510,14 @@ class RelayServer:
         command: list[str],
         timeout_s: float | None,
         max_output_bytes: int,
-    ) -> ToolResult:
+        plan: ExecPlan | None = None,
+    ) -> ToolResult | InputRequiredToolResult:
         """The ``exec`` verb. With no ``timeout_s`` it runs until the command ends,
-        and tells the person when it goes quiet; cancelling the call stops it."""
+        and tells the person when it goes quiet; cancelling the call stops it.
+
+        On a guarded site a ``plan`` asks the person before a command that is
+        not read-only: in the call when the client shows a form, else as a
+        ``needs_approval`` refusal to retry after the answer."""
 
         async def quiet(idle_s: float, next_s: float) -> None:
             note = (
@@ -499,14 +526,42 @@ class RelayServer:
             )
             await ctx.report_progress(idle_s, message=note)
 
-        try:
-            result = await self.service.exec(
+        async def call() -> dict[str, Any]:
+            return await self.service.exec(
                 site,
                 command,
                 timeout_s=timeout_s,
                 max_output_bytes=max_output_bytes,
                 on_stall=quiet,
+                plan=plan,
             )
+
+        try:
+            if ctx.request_state and ctx.input_responses is not None:
+                self._answer_plan(site, ctx.request_state, ctx.input_responses)
+            try:
+                result = await call()
+            except NeedsPerson as waiting:
+                ask = waiting.ask
+                if "form" not in elicitation_modes(ctx):
+                    return _plan_needs_person(self.service, ask)
+                if modern(ctx):
+                    return InputRequiredToolResult(
+                        mcp_types.InputRequiredResult(
+                            input_requests={ask.ask_id: elicit_request(ask)},
+                            request_state=ask.ask_id,
+                        )
+                    )
+                response = await ctx.session.elicit_form(
+                    message=ask.message,
+                    requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
+                )
+                action, content = response_parts(response)
+                self.service.answer(ask.ask_id, action, content, by="elicitation")
+                try:
+                    result = await call()
+                except NeedsPerson as still:
+                    return _plan_needs_person(self.service, still.ask)
         except Refusal as refusal:
             return refusal_result(refusal)
         text = result["stdout"]
@@ -518,6 +573,16 @@ class RelayServer:
             structured_content=result,
             is_error=result["exit_code"] != 0,
         )
+
+    def _answer_plan(self, site: str, ask_id: str, responses: dict[str, Any]) -> None:
+        """Record the answer a retried exec call carries, for this site's plan asks only."""
+        ask = self.service.asks.get(ask_id)
+        if ask is None or ask_id not in responses or ask.site != site:
+            return
+        if ask.binding.get("kind") != EXEC_PLAN_KIND:
+            return
+        action, content = response_parts(responses[ask_id])
+        self.service.answer(ask_id, action, content, by="input_required")
 
     async def files(
         self, ctx: Context, site: str, args: FilesArgs
@@ -606,9 +671,18 @@ class RelayServer:
                 ),
             ] = None,
             max_output_bytes: Annotated[int, Field(ge=1, le=MAX_INLINE_BYTES)] = 65536,
-        ) -> ToolResult:
+            plan: Annotated[
+                ExecPlan | None,
+                Field(
+                    description=(
+                        "On a guarded site, what a command that is not read-only is for. "
+                        "Relay asks the person once for that exact argv, then runs it lightly"
+                    )
+                ),
+            ] = None,
+        ) -> ToolResult | InputRequiredToolResult:
             """Run one command on the site's login side and return bounded output."""
-            return await relay.exec(ctx, site, command, timeout_s, max_output_bytes)
+            return await relay.exec(ctx, site, command, timeout_s, max_output_bytes, plan)
 
         @server.tool(
             name="files",
@@ -681,6 +755,37 @@ class RelayServer:
             return await relay.serve(ctx, site, spec, service, stop, wait_s)
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
+
+        @server.tool(
+            name="shutdown",
+            title="Stop relay's long-lived processes",
+            annotations=mcp_types.ToolAnnotations(destructive_hint=True, open_world_hint=True),
+        )
+        async def shutdown(  # pyright: ignore[reportUnusedFunction]
+            all: Annotated[  # noqa: A002 - the contract names it all
+                bool | None, Field(description="True: every site, and relay on this host")
+            ] = None,
+            site: Annotated[str | None, Field(description="One site id")] = None,
+            timeout_s: Annotated[
+                float | None,
+                Field(gt=0, le=shutdown_ops.MAX_TIMEOUT_S, description="Per site; default 15"),
+            ] = None,
+        ) -> ToolResult:
+            """Stop what relay keeps running for a site, or for all of them: the worker's
+            site-serve, login hops, desktop tunnels and connectors, frpc, and a detached
+            relay server. Give exactly one of all=true or site. Jobs keep running and are
+            listed in still_running; an unreachable site is listed in failures. A host
+            calls this when it closes."""
+            arguments: dict[str, Any] = {"all": all, "site": site, "timeout_s": timeout_s}
+            try:
+                stopped = await shutdown_ops.shutdown(relay.service, arguments)
+            except Refusal as refusal:
+                return refusal_result(refusal)
+            return ToolResult(
+                content=[mcp_types.TextContent(type="text", text=_text(stopped))],
+                structured_content=stopped,
+            )
+
         server.add_extension(self.tasks)
         server.add_provider(self.skills)
         self.changes.install(server)

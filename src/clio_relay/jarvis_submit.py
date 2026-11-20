@@ -29,10 +29,13 @@ job, so the person's own pipelines are never read or changed. Status, outputs,
 services, cancel and stop all go through JARVIS's ``execution`` commands and its
 record, never through relay's own tracking of the batch job or the scheduler.
 
-A site with no JARVIS where its setting says can have one installed by relay,
-after the person approves it: :data:`BOOTSTRAP_SCRIPT` puts jarvis-cd at
-:data:`JARVIS_PIN` under the CLIO site home, and the site script falls back to
-it.
+Relay always runs its own pinned JARVIS, by absolute path, never a ``jarvis``
+found on the site's ``PATH``: an older one would reject the service reports and
+skip JARVIS's refusal to build on the login node. :data:`BOOTSTRAP_SCRIPT` puts
+jarvis-cd at :data:`JARVIS_PIN` under the CLIO site home, after the person
+approves it, and the site script refuses when it is missing or at another pin.
+A site that needs another JARVIS names its path in the adapter's ``jarvis``
+setting (:func:`explicit_jarvis`).
 """
 
 from __future__ import annotations
@@ -95,13 +98,22 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "96283b3f7ff1a5f5ee0a825f74f62ba1978b924e"
-"""The jarvis-cd commit relay installs on a site that has none."""
+JARVIS_PIN = "9bf89f96921ebeee818e3ba001ab2f1f38877c7b"
+"""The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
 """Where relay installs jarvis-cd, relative to the CLIO site home."""
 FALLBACK_ENV = "CLIO_RELAY_JARVIS_FALLBACK"
-"""The JARVIS the site script uses when the site's setting points to nothing."""
+"""Relay's pinned JARVIS (:func:`bootstrap_path`), which the site script runs unless the
+site's setting names another by path."""
+PIN_ENV = "CLIO_RELAY_JARVIS_PIN"
+"""The pin the site script expects in ``<home>/jarvis-cd/pin`` beside relay's JARVIS."""
+JARVIS_SETTING_HELP = (
+    "Leave empty: relay runs its own pinned jarvis-cd, installed under the CLIO site home. "
+    "Only a site that needs another jarvis names its path here, absolute or from ~/. Relay "
+    "never runs a jarvis found on the site's PATH"
+)
+"""The description of an adapter's ``jarvis`` setting (:func:`explicit_jarvis`)."""
 PIPELINES_DIR = "pipelines"
 """Where the install answers and Spack env of each set of archives are kept, under
 :data:`BOOTSTRAP_DIR`."""
@@ -199,10 +211,31 @@ def bootstrap_path(home: str) -> str:
     return posixpath.join(home, BOOTSTRAP_DIR, "jarvis")
 
 
+def explicit_jarvis(value: str) -> str:
+    """Check an adapter's ``jarvis`` setting; empty means relay's pinned JARVIS.
+
+    A site that needs another JARVIS names it by path: absolute, or from the
+    home directory with a leading ``~/``. A bare name would be looked up on the
+    site's ``PATH``, which relay never does, so it is refused. ``jarvis``, the
+    old default, means relay's pinned JARVIS.
+    """
+    value = value.strip()
+    if value in ("", "jarvis"):
+        return ""
+    if not value.startswith(("/", "~/")):
+        raise ValueError(
+            f"jarvis must be a path (absolute or ~/...), not {value!r}: relay never runs a "
+            "jarvis found on the site's PATH. Leave it empty to use relay's pinned jarvis-cd"
+        )
+    return value
+
+
 def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     """Return the site script's settings for ``spec`` and the CLIO site home ``home``.
 
-    The JARVIS relay installs there (:func:`bootstrap_path`) is the fallback.
+    Relay's pinned JARVIS there (:func:`bootstrap_path`) is the one the script
+    runs, and :data:`JARVIS_PIN` is the pin it must carry. A relative ``home``
+    is from the home directory, as ssh's ``remote_dir`` is.
     The person's install answers and the pipeline's Spack environment are kept
     at ``<home>/jarvis-cd/pipelines/<steps digest>/``, keyed by the set of
     archives (:func:`steps_digest`): the job's JARVIS root and pipeline are per
@@ -220,6 +253,7 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     kept = posixpath.join(home, BOOTSTRAP_DIR, PIPELINES_DIR, steps_digest(spec))
     return {
         FALLBACK_ENV: bootstrap_path(home),
+        PIN_ENV: JARVIS_PIN,
         DECISIONS_ENV: posixpath.join(kept, "decisions.yaml"),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
         SPACK_ROOT_ENV: posixpath.join(home, SPACK_DIR),
@@ -600,17 +634,25 @@ for step in $(printf '%s' "$steps" | tr , ' '); do
   got=$(sha "$archive")
   [ "$got" = "$digest" ] || fail 65 "the archive's SHA-256 is $got, not the reviewed $digest"
 done
-home() { case $1 in "~/"*) printf '%s' "$HOME/${1#??}" ;; *) printf '%s' "$1" ;; esac; }
+home() {
+  case $1 in
+    "") ;;
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s' "$HOME/${1#??}" ;;
+    /*) printf '%s' "$1" ;;
+    *) printf '%s' "$HOME/$1" ;;
+  esac
+}
 fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
+pin=${CLIO_RELAY_JARVIS_PIN:-}
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 spack_config=$(home "${CLIO_RELAY_SPACK_CONFIG:-}")
-unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_DECISIONS CLIO_RELAY_JARVIS_SPACK_ENV
-unset CLIO_RELAY_SPACK_ROOT CLIO_RELAY_SPACK_CONFIG
+unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
+unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT CLIO_RELAY_SPACK_CONFIG
 # Builds run only in a job JARVIS submits (ppl install +submit), never on this host.
 unset JARVIS_ALLOW_LOCAL_BUILD
-jarvis=$(home "$jarvis")
 # The CLIO Spack, when the site has one: JARVIS installs and loads through it.
 if [ -n "$spack_root" ] && [ -f "$spack_root/share/spack/setup-env.sh" ]; then
   export JARVIS_SPACK_ROOT="$spack_root"
@@ -626,14 +668,26 @@ if [ -n "$spack_env" ]; then
   mkdir -p "$spack_env"
   export JARVIS_SPACK_ENV_DIR="$spack_env"
 fi
-found=$(command -v "$jarvis" 2>/dev/null) || found=
-if [ -z "$found" ] && [ -n "$fallback" ] && [ -x "$fallback" ]; then found=$fallback; fi
-if [ -z "$found" ]; then
-  tried=$(printf '%s' "$jarvis" | sed 's/[\\"]/\\&/g')
-  printf '{"missing":"jarvis","reason":"adapter_unavailable","tried":"%s"}\n' "$tried" \
+refuse() {
+  tried=$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')
+  printf '{"missing":"jarvis","reason":"adapter_unavailable","tried":"%s"%s}\n' "$tried" "$2" \
     > "$job/relay.refusal.json"
   cat "$job/relay.refusal.json" >&2
-  fail 69 "$jarvis is not on PATH on this site"
+  fail 69 "$3"
+}
+# Relay runs its pinned JARVIS, or the one the site's setting names by path, and never
+# looks one up on PATH.
+if [ -n "$jarvis" ]; then
+  found=$(home "$jarvis")
+  [ -f "$found" ] && [ -x "$found" ] \
+    || refuse "$found" ',"explicit":true' "the site's jarvis setting $found is not a program"
+else
+  found=$fallback
+  [ -n "$found" ] && [ -f "$found" ] && [ -x "$found" ] \
+    || refuse "$found" '' "relay's jarvis-cd is not installed at ${found:-the site home}"
+  got=$(tr -cd '0-9a-f' < "${found%/*}/pin" 2>/dev/null) || got=
+  [ -z "$pin" ] || [ "$got" = "$pin" ] \
+    || refuse "$found" ",\"pin\":\"$got\"" "relay's jarvis-cd is at ${got:-no pin}, not $pin"
 fi
 printf '%s\n' "$found" > "$job/relay.jarvis"
 root="$job/.relay-jarvis"
@@ -693,10 +747,13 @@ mv -f "$job/$saved.tmp" "$job/$saved"
 [<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
 ``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
 
-It checks each archive's SHA-256 against the reviewed one and finds JARVIS: the
-site's setting, then ``$CLIO_RELAY_JARVIS_FALLBACK`` (where relay installs
-jarvis-cd), writing ``relay.refusal.json`` and exiting 69 when neither is
-there. ``$CLIO_RELAY_JARVIS_DECISIONS`` and ``$CLIO_RELAY_JARVIS_SPACK_ENV``
+It checks each archive's SHA-256 against the reviewed one and picks JARVIS by
+absolute path, never from ``PATH``: the path the site's setting names when it
+names one, else ``$CLIO_RELAY_JARVIS_FALLBACK``, relay's pinned jarvis-cd,
+whose ``pin`` file must say ``$CLIO_RELAY_JARVIS_PIN``. When that JARVIS is
+missing or at another pin it writes ``relay.refusal.json`` (with ``explicit``
+or ``pin`` when they apply) and exits 69. A relative path is from the home
+directory. ``$CLIO_RELAY_JARVIS_DECISIONS`` and ``$CLIO_RELAY_JARVIS_SPACK_ENV``
 become ``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR``
 (:func:`site_environment`). When the CLIO Spack is on the site,
 ``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
@@ -806,7 +863,12 @@ def install_command(
 
 BOOTSTRAP_SCRIPT = r"""set -eu
 home=$1 pin=$2 source=$3
-case $home in "~") home=$HOME ;; "~/"*) home="$HOME/${home#??}" ;; esac
+case $home in
+  "~") home=$HOME ;;
+  "~/"*) home="$HOME/${home#??}" ;;
+  /*) ;;
+  *) home="$HOME/$home" ;;
+esac
 dir="$home/jarvis-cd"
 mkdir -p "$dir"
 log="$dir/install.log"
@@ -815,15 +877,14 @@ python=${CLIO_RELAY_PYTHON:-python3}
 command -v "$python" >/dev/null 2>&1 || { echo "no $python on this site" >&2; exit 69; }
 "$python" -c 'import sys; sys.exit(sys.version_info < (3, 11))' \
   || { echo "jarvis-cd needs Python 3.11 or newer; $python is older" >&2; exit 69; }
-target=
-if "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
+# A fresh environment of relay's own each time: a new pin never keeps an old jarvis-cd,
+# and a failed install leaves no jarvis behind.
+rm -rf "$dir/venv" "$dir/pin" "$dir/jarvis"
+target="$dir/venv/bin/jarvis"
+if ! { "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install --upgrade pip >>"$log" 2>&1 \
-  && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; then
-  target="$dir/venv/bin/jarvis"
-elif "$python" -m pip install --user "jarvis-cd @ $source" >>"$log" 2>&1; then
-  target="$("$python" -m site --user-base)/bin/jarvis"
-fi
-if [ -z "$target" ] || [ ! -x "$target" ]; then
+  && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; } \
+  || [ ! -x "$target" ]; then
   tail -n 40 "$log" >&2
   exit 1
 fi
@@ -834,12 +895,13 @@ printf '{"jarvis":"%s","pin":"%s","log":"%s"}\n' "$dir/jarvis" "$pin" "$log"
 """Install jarvis-cd under the CLIO site home. ``bash -c BOOTSTRAP_SCRIPT <$0> <home>
 <pin> <source>`` (:func:`bootstrap_arguments`).
 
-It makes a virtual environment from the site's ``python3`` (3.11 or newer) and
-installs jarvis-cd at the pinned commit's source archive, falling back to
-``pip install --user``. It links the program at ``<home>/jarvis-cd/jarvis``
-(:func:`bootstrap_path`) and prints ``{"jarvis", "pin", "log"}``. The log is
-``<home>/jarvis-cd/install.log``. It exits 69 when the site has no usable
-Python and 1 when the install fails.
+It makes a fresh virtual environment from the site's ``python3`` (3.11 or
+newer) and installs jarvis-cd at the pinned commit's source archive into it,
+never into the user's own site-packages. It links the program at
+``<home>/jarvis-cd/jarvis`` (:func:`bootstrap_path`), writes the pin beside it
+and prints ``{"jarvis", "pin", "log"}``, all by absolute path. A relative
+``home`` is from the home directory. The log is ``<home>/jarvis-cd/install.log``.
+It exits 69 when the site has no usable Python and 1 when the install fails.
 """
 
 
@@ -851,7 +913,7 @@ def bootstrap_arguments(home: str) -> list[str]:
 def direct_job(
     spec: JobSpec,
     *,
-    jarvis: str = "jarvis",
+    jarvis: str = "",
     job_dir: str | None = None,
     home: str | None = None,
     site: str = "this site",
@@ -1201,21 +1263,50 @@ def build_refused(text: str, *, site: str) -> Refusal:
 
 
 def missing_jarvis(text: str, *, site: str) -> Refusal:
-    """The refusal for a submit that exited 69: ``relay.refusal.json`` or stderr."""
-    tried = "jarvis"
+    """The refusal for a submit that exited 69: ``relay.refusal.json`` or stderr.
+
+    Relay offers to install its pinned jarvis-cd when its own is missing or at
+    another pin; a path the site's setting names is the site's to fix.
+    """
+    written: dict[str, Any] = {}
     for line in reversed(text.splitlines()):
         try:
             found: object = json.loads(line)
         except ValueError:
             continue
         if isinstance(found, dict) and isinstance(cast(dict[str, Any], found).get("tried"), str):
-            tried = cast(str, cast(dict[str, Any], found)["tried"])
+            written = cast(dict[str, Any], found)
             break
+    tried = str(written.get("tried") or "the site home")
+    if written.get("explicit"):
+        return Refusal(
+            RefusalReason.ADAPTER_UNAVAILABLE,
+            f"the jarvis setting of {site} names {tried}, which is not a program there. Fix "
+            f"the path, or clear the setting to use relay's pinned jarvis-cd {JARVIS_PIN[:8]}",
+            missing="jarvis",
+            tried=tried,
+            explicit=True,
+        )
+    pin = written.get("pin")
+    if isinstance(pin, str):
+        now = f"at {pin[:8]}" if pin else "unpinned"
+        message = (
+            f"relay's jarvis-cd on {site} ({tried}) is {now}, not {JARVIS_PIN[:8]}. Relay "
+            "can install the pinned one in the site's CLIO home once you agree"
+        )
+        return Refusal(
+            RefusalReason.ADAPTER_UNAVAILABLE,
+            message,
+            missing="jarvis",
+            tried=tried,
+            pin=pin,
+            installable=JARVIS_PIN,
+        )
     return Refusal(
         RefusalReason.ADAPTER_UNAVAILABLE,
-        f"{site} has no JARVIS at {tried}, so relay cannot hand the package to it. Relay "
-        f"can install jarvis-cd {JARVIS_PIN[:8]} in the site's CLIO home once you agree, "
-        "or set the site's jarvis setting to its path",
+        f"{site} has no jarvis-cd of relay's at {tried}, so relay cannot hand the package to "
+        f"JARVIS. Relay can install jarvis-cd {JARVIS_PIN[:8]} in the site's CLIO home once "
+        "you agree, or the site's jarvis setting can name another by path",
         missing="jarvis",
         tried=tried,
         installable=JARVIS_PIN,
@@ -1385,6 +1476,12 @@ def install_message(report: Mapping[str, Any], *, site: str, package: str) -> st
         if item["missing"]:
             detail = f"{detail} ({item['missing']} missing)"
         built.append(detail)
+    if not built and choice_issues(report):
+        return (
+            f"JARVIS needs {len(choice_issues(report))} choice(s) from you before {package} "
+            f"runs on {site}; nothing has to be built. It applies your answers in a short "
+            "job on the site, then the run goes ahead. Go ahead?"
+        )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
@@ -1406,22 +1503,62 @@ def choice_options(issue: Mapping[str, Any]) -> list[str]:
     return options
 
 
+def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
+    constraint = candidate.get("constraint")
+    if not isinstance(constraint, str) or not constraint:
+        return None
+    facts: list[str] = []
+    source = candidate.get("source")
+    if isinstance(source, str) and source:
+        facts.append(source)
+    modules = candidate.get("modules")
+    if isinstance(modules, list) and modules:
+        facts.append("modules " + ", ".join(str(item) for item in cast(list[object], modules)))
+    prefix = candidate.get("prefix")
+    if isinstance(prefix, str) and prefix:
+        facts.append(prefix)
+    implies = candidate.get("implies")
+    if isinstance(implies, str) and implies:
+        facts.append(implies)
+    return f"{constraint} ({'; '.join(facts)})" if facts else constraint
+
+
 def choice_message(issue: Mapping[str, Any]) -> str:
-    """Return the question to ask for one of JARVIS's answerable issues."""
+    """Return the question to ask for one of JARVIS's answerable issues.
+
+    Each candidate is listed with where it comes from, its prefix and its modules
+    (an ``ambiguous_provider`` MPI that is a site module carries ``modules``).
+    """
     question = issue.get("question")
     subject = issue.get("package") or issue.get("subject") or "the package"
-    if isinstance(question, str) and question:
-        return question
-    return f"JARVIS needs a choice for {subject}: pick one"
+    text = (
+        question
+        if isinstance(question, str) and question
+        else f"JARVIS needs a choice for {subject}: pick one"
+    )
+    lines = [
+        line
+        for candidate in cast(list[object], issue.get("candidates") or [])
+        if (line := _candidate_line(_dict(candidate)))
+    ]
+    if issue.get("kind") == "ambiguous_provider" and issue.get("scope") == "site":
+        text = f"{text} JARVIS keeps the answer for every later run on the site."
+    return f"{text} Options: {'. '.join(lines)}." if lines else text
 
 
 def install_needed(report: Mapping[str, Any], *, site: str) -> Refusal:
     """The refusal for a submit that exited 3: the software is missing or needs a choice."""
     summary = install_summary(report)
+    message = (
+        f"the package's software is not installed on {site}: JARVIS builds "
+        f"{len(summary['build'])} package(s) once you approve"
+    )
+    if not summary["build"] and choice_issues(report):
+        kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})
+        message = f"JARVIS needs a choice on {site} before the run ({', '.join(kinds)})"
     return Refusal(
         RefusalReason.NEEDS_APPROVAL,
-        f"the package's software is not installed on {site}: JARVIS builds "
-        f"{len(summary['build'])} package(s) once you approve",
+        message,
         needs=NEEDS_INSTALL,
         install_report=dict(report),
         summary=summary,

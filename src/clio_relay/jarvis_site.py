@@ -276,6 +276,10 @@ def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
 
 
 DEFAULT_CLIO_JARVIS_BASE = "~/.clio-relay/clio-jarvis"
+CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
+CLIO_JARVIS_REF = "jaimecernuda-spack-linkage"
+CLIO_JARVIS_COMMIT = "aa8b3d56e7912cc798615fe72c248f2e843132e0"
+"""The clio-jarvis relay is proven with: pvserver 0.3.1, which reports a TCP service."""
 
 
 def _site_path(path: str) -> str:
@@ -293,13 +297,15 @@ def clio_jarvis_script(
     tag: str,
     commit: str | None = None,
     base: str = DEFAULT_CLIO_JARVIS_BASE,
-    jarvis: str = "jarvis",
+    jarvis: str,
 ) -> str:
     """The script that puts clio-jarvis ``tag`` in the site's JARVIS, once (RL42).
 
-    It clones the tag into ``<base>/<tag>``, checks the tag's commit when one is
-    given, and runs ``jarvis repo add`` unless that directory is already
-    registered. It prints ``@@repo <dir>`` and ``@@added`` or ``@@present``.
+    ``jarvis`` is that JARVIS's path, absolute or from ``~/``: it is never looked
+    up on the site's ``PATH``. The script clones the tag into ``<base>/<tag>``,
+    checks the tag's commit when one is given, and runs ``jarvis repo add``
+    unless that directory is already registered. It prints ``@@repo <dir>`` and
+    ``@@added`` or ``@@present``.
     """
     q = shlex.quote
     expected = q(commit or "")
@@ -307,7 +313,7 @@ def clio_jarvis_script(
 base={_site_path(base)}
 dest="$base"/{q(tag)}
 jarvis={_site_path(jarvis)}
-command -v "$jarvis" >/dev/null 2>&1 || {{ echo "@@error $jarvis is not on PATH"; exit 69; }}
+[ -f "$jarvis" ] && [ -x "$jarvis" ] || {{ echo "@@error $jarvis is not a program"; exit 69; }}
 if [ ! -d "$dest/.git" ]; then
   mkdir -p "$base"
   rm -rf "$dest.partial"
@@ -336,15 +342,16 @@ fi
 async def add_clio_jarvis(
     adapter: BaseAdapter[Any],
     *,
-    url: str,
-    tag: str,
-    commit: str | None = None,
+    url: str = CLIO_JARVIS_URL,
+    tag: str = CLIO_JARVIS_REF,
+    commit: str | None = CLIO_JARVIS_COMMIT,
     base: str = DEFAULT_CLIO_JARVIS_BASE,
-    jarvis: str = "jarvis",
+    jarvis: str,
 ) -> dict[str, Any]:
     """Add clio-jarvis ``tag`` to the JARVIS on ``adapter``'s site (RL42).
 
-    Idempotent: a second call finds the repository registered and changes nothing.
+    It defaults to the pinned clio-jarvis. Idempotent: a second call finds the
+    repository registered and changes nothing.
     """
     script = clio_jarvis_script(url=url, tag=tag, commit=commit, base=base, jarvis=jarvis)
     result = await adapter.exec(["sh", "-c", script], max_output_bytes=65536)

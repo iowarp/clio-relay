@@ -2,7 +2,8 @@
 
 ``exec`` on a guarded site takes an argument list, never a shell string, and
 runs only commands that read: file listing and reading, scheduler queries,
-module queries, quota queries and JARVIS read commands. A command is checked
+module queries, quota queries, Spack queries (find, info, spec) and JARVIS
+read commands. A command is checked
 argument by argument; relay quotes each argument, so no character in one can
 start a second command.
 
@@ -125,6 +126,28 @@ def _jarvis(arguments: Sequence[str]) -> str | None:
     return "only JARVIS read commands (ppl list/status/print/path, repo list, ...) read"
 
 
+SPACK_READS = frozenset({"find", "info", "spec"})
+"""Spack's read-only queries. None installs, builds or changes a config."""
+_SPACK_GLOBAL_FLAGS = frozenset({"-E", "--no-env", "--color=never", "--color=auto"})
+
+
+def spack_refusal(arguments: Sequence[str]) -> str | None:
+    """Return why a Spack command does not only read, or None for find, info and spec.
+
+    No option may name another config scope or environment (``-C``, ``-e``,
+    ``-D``): a config there could add a package repository, and ``spack info``
+    imports a repository's package files, which is running code.
+    """
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        if arguments[index] not in _SPACK_GLOBAL_FLAGS:
+            return f"spack {arguments[index]} is not allowed here"
+        index += 1
+    if index >= len(arguments) or arguments[index] not in SPACK_READS:
+        return "only `spack find`, `spack info` and `spack spec` read"
+    return None
+
+
 RESTRICTED: dict[str, Callable[[Sequence[str]], str | None]] = {
     "file": _file,
     "find": _find,
@@ -165,12 +188,47 @@ def _srun(arguments: Sequence[str], warm_jobs: Collection[str]) -> tuple[str | N
     return None, inner
 
 
+def is_spack(program: str, spack: Collection[str] = ()) -> bool:
+    """Return whether ``program`` is Spack: bare, or a Spack the site's guard lists."""
+    return program == "spack" or program in spack
+
+
+def runs_spack(command: Sequence[str], spack: Collection[str] = ()) -> bool:
+    """Return whether ``command`` runs Spack on the login node, directly or after ``env``."""
+    if not command:
+        return False
+    if command[0] == "env":
+        _reason, inner = _env(command[1:])
+        return bool(inner) and is_spack(inner[0], spack)
+    return is_spack(command[0], spack)
+
+
+SPACK_ENV = {"SPACK_DISABLE_LOCAL_CONFIG": frozenset({"1", "true"})}
+"""What ``env NAME=VALUE spack ...`` may set before a Spack query: only dropping
+the user scope, never pointing Spack at another config."""
+
+
+def _env(arguments: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Split ``env NAME=VALUE ... spack ...`` into a refusal or the Spack command."""
+    index = 0
+    while index < len(arguments) and "=" in arguments[index]:
+        name, _eq, value = arguments[index].partition("=")
+        if value not in SPACK_ENV.get(name, ()):
+            return "env may set only SPACK_DISABLE_LOCAL_CONFIG=1 here", []
+        index += 1
+    inner = list(arguments[index:])
+    if not inner or inner[0].startswith("-"):
+        return "env runs here only as `env NAME=VALUE ... spack <query>`", []
+    return None, inner
+
+
 def refusal(
     command: Sequence[str],
     *,
     extra: Collection[str] = (),
     jarvis: str = "jarvis",
     warm_jobs: Collection[str] = (),
+    spack: Collection[str] = (),
 ) -> str | None:
     """Return why ``command`` may not run on a guarded site, or None when it only reads."""
     if not command:
@@ -182,6 +240,15 @@ def refusal(
         return None
     if program in ("jarvis", jarvis):
         return _jarvis(arguments)
+    if is_spack(program, spack):
+        return spack_refusal(arguments)
+    if program == "env":
+        reason, inner = _env(arguments)
+        if reason is not None:
+            return reason
+        if not is_spack(inner[0], spack):
+            return "env runs here only before a Spack query"
+        return spack_refusal(inner[1:])
     if "/" in program:
         return f"name the program bare, not as {program!r}"
     if program == "srun":
@@ -190,7 +257,7 @@ def refusal(
             return reason
         if inner[0] == "srun":
             return "srun inside srun is not allowed"
-        return refusal(inner, extra=extra, jarvis=jarvis, warm_jobs=())
+        return refusal(inner, extra=extra, jarvis=jarvis, warm_jobs=(), spack=spack)
     if program in PLAIN:
         return None
     check = RESTRICTED.get(program)
@@ -201,4 +268,4 @@ def refusal(
 
 def listed(extra: Collection[str] = ()) -> list[str]:
     """Return the programs the read-only list names, for a refusal's guidance."""
-    return sorted({*PLAIN, *RESTRICTED, "jarvis", "srun", *extra})
+    return sorted({*PLAIN, *RESTRICTED, "jarvis", "spack", "srun", *extra})

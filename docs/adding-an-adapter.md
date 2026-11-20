@@ -120,6 +120,7 @@ fits:
 | --- | --- |
 | `needs_sign_in` | No credential, or the facility refused it |
 | `unreachable` | The facility does not answer, or answers with a server error |
+| `punch_failed` | A link that must hole punch (frp `xtcp`) could not. Relay never falls back to another link |
 | `invalid_config` | A site setting is wrong |
 | `invalid_spec`, `invalid_arguments` | The job or the call asks for something the facility cannot do |
 | `path_not_found`, `path_exists` | Files; see [files](files.md) |

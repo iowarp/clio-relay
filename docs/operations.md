@@ -71,3 +71,38 @@ kill "$(cat "$D/run/site.pid")"
 frpc stops with it. To remove everything relay placed, delete the worker
 directory once no jobs you need remain under `adapter/`. Remove the site with
 `clio-relay site remove my-site` so relay stops offering it.
+
+## Stop every relay process
+
+When a host closes, it can ask relay to stop what it left running, without
+touching any job:
+
+```bash
+clio-relay shutdown --site my-site +json
+clio-relay shutdown --all +json
+```
+
+The `shutdown` tool on the relay server does the same, with
+`{"site": "my-site"}` or `{"all": true}` and an optional `timeout_s` (15 s by
+default). Relay stops, for each site in parallel and locally: the worker's
+site-serve, the login hop, serve connectors and tunnels, frpc, and a relay
+server you detached with `clio-relay serve --http`. It never cancels a JARVIS
+job. The JSON result (`relay.shutdown.v1`) lists what stopped, each job still
+running (`kind: job`), and each site relay could not reach as a failure. The
+next call to a site signs in and starts what it needs again.
+
+## Clean a site so the next use deploys again
+
+```bash
+clio-relay site clean my-site +json
+```
+
+This asks you first, since it deletes files on the site. After a yes it stops
+relay's processes there, then removes the worker and its binaries,
+site-serve, relay's scripts and job directories, `~/.clio-relay`,
+`~/.config/clio-relay` and the JARVIS bootstrap venv under the site home. It
+keeps the Spack store (`<site home>/spack`, with every package built there):
+rebuilding ParaView takes hours. Pass `--remove-spack` to delete it too, and
+`--yes` to approve on the command line. It refuses while a job of the site
+still runs. The next call signs in and deploys everything again. Every live
+proof starts with it, so deployment is tested each time.

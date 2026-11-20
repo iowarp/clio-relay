@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from clio_relay import jarvis_submit
 
 SchedulerName = Literal["slurm", "pbs", "lsf", "cobalt"]
 SchedulerChoice = Literal["auto", "none", "slurm", "pbs", "lsf", "cobalt"]
@@ -37,16 +39,13 @@ class SshConfig(BaseModel):
     )
     scheduler: SchedulerChoice = Field(
         default="auto",
-        description="auto picks the scheduler whose submit command the site has",
-    )
-    jarvis: str = Field(
-        default="jarvis",
-        min_length=1,
         description=(
-            "The jarvis command on the site, which runs package jobs. A leading ~/ "
-            "means the home directory"
+            "auto picks the scheduler whose submit command the site has, and refuses to run "
+            "jobs on the login host when it finds none but the host shows a batch system. "
+            "none runs them on that host"
         ),
     )
+    jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     interactive_sign_in: bool = Field(
         default=False,
         description=(
@@ -78,3 +77,8 @@ class SshConfig(BaseModel):
             "connection never opened"
         ),
     )
+
+    @field_validator("jarvis")
+    @classmethod
+    def _jarvis_path(cls, value: str) -> str:
+        return jarvis_submit.explicit_jarvis(value)

@@ -38,7 +38,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `ssh_options` | none | Extra `Key=Value` options, passed with `-o` |
 | `remote_dir` | `.clio-relay` | Relay's directory on the site, under your home unless absolute |
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
-| `jarvis` | `jarvis` | The `jarvis` command on the site, for [package jobs](#package-jobs) |
+| `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
 | `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run |
@@ -119,10 +119,18 @@ rather than being called failed. A later poll can still find an exit code, and
 
 ### Hosts with no scheduler
 
-With `scheduler: none`, or on a host where `auto` finds none, the job runs
+With `scheduler: none` the job runs on the ssh host itself,
 detached in its own session (`setsid`, or `nohup` where the host has no
 `setsid`). It keeps running after ssh disconnects, and a later `status` reads
 its exit code from the job directory. `cancel` stops the whole process group.
+
+`auto` never falls back to that on its own on a batch site's login node. When
+it finds no submit command it can use but the host still shows a batch system
+(`squeue`, `sinfo`, `qstat` or `flux` on its `PATH` or a login shell's, or a
+Slurm, PBS or LSF configuration file), `run` refuses with `invalid_config` and
+names what it found. Set the site's `scheduler` to the right one, or to `none`
+to run jobs on that host on purpose. A check that gives no scheduler answer at
+all is refused too.
 
 ### Package jobs
 
@@ -189,11 +197,15 @@ times out after 20 seconds. On a guarded site, relay checks a job's layout
 against its partition before it asks anything (see
 [guarded sites](../guarded-sites.md)).
 
-The `jarvis` setting names the command on the site (default `jarvis`). When
-nothing is there, relay asks before it installs jarvis-cd at a pinned commit
-into the CLIO site home (`<home>/jarvis-cd/jarvis`), in a virtual environment
-made from the site's `python3` 3.11 or newer, or with `pip install --user`.
-That needs the site to reach github.com. Later runs on the site use it.
+Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
+site home, by absolute path for submit, install, check, execution and stop. It
+never runs a `jarvis` found on the site's `PATH`: an older one rejects the
+service reports and builds on the login node. When relay's is missing or at
+another pin, relay asks before it installs the pinned commit there, in a fresh
+virtual environment made from the site's `python3` 3.11 or newer. That needs
+the site to reach github.com. Later runs on the site use it. A site that really
+needs another jarvis names its path in the `jarvis` setting, absolute or from
+`~/`; a bare name is refused.
 
 Some things relay refuses rather than working around JARVIS:
 

@@ -33,6 +33,7 @@ from pathlib import PurePosixPath
 from clio_relay import jarvis_submit
 from clio_relay.adapters import slurm_facts
 from clio_relay.adapters.ssh import store
+from clio_relay.login_load import BATCH_HINT_SH
 
 SCHEDULER_COMMANDS: tuple[tuple[str, str], ...] = (
     ("slurm", "sbatch"),
@@ -142,7 +143,7 @@ def _detect(choice: str) -> str:
     for name, command in reversed(SCHEDULER_COMMANDS):
         lines.append(f"command -v {command} >/dev/null 2>&1 && S={name}")
     lines.append('echo "@@scheduler $S"')
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n" + BATCH_HINT_SH
 
 
 def check_script(remote_dir: str, operation_id: str, scheduler: str, digests: Iterable[str]) -> str:

@@ -50,6 +50,23 @@ def marked_outputs(record: OperationRecord, outputs: list[OutputRef]) -> list[Ou
     return with_provenance(record, checked_views(outputs))
 
 
+RUN_PROVENANCE_ROLE = "provenance"
+RUN_PROVENANCE_SCHEMA = "jarvis.provenance.v1"
+
+
+def run_provenance(outputs: list[OutputRef]) -> dict[str, Any] | None:
+    """Return where the run's own provenance record is, if its package runner wrote one.
+
+    JARVIS writes ``jarvis.provenance.v1`` as the core artifact with role
+    ``provenance``: the Spack it loaded, its config scopes, the MPI launchers, the
+    binaries and the nodes. It is the run's, not one output's.
+    """
+    for output in outputs:
+        if output.metadata.get("role") == RUN_PROVENANCE_ROLE:
+            return {"schema": RUN_PROVENANCE_SCHEMA, "name": output.name, "path": output.path}
+    return None
+
+
 def marked_status(record: OperationRecord, status: JobStatus) -> JobStatus:
     """Return the status with its outputs and its progress outputs marked."""
     update: dict[str, Any] = {"outputs": marked_outputs(record, status.outputs)}

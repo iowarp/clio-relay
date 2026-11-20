@@ -20,7 +20,7 @@ clio-relay site add polaris --adapter ssh --config '{ssh_profile: polaris}' --po
 | `run` of a JARVIS package you have not reviewed | You get a review question first. Nothing is submitted until you say yes. |
 | `run` of a package you reviewed | Runs, after the spend question if the site asks one. |
 | `exec` of a read-only command (`squeue`, `ls`, `cat`, `module avail`, ...) | Runs. |
-| `exec` of anything else (`rm`, `sh -c`, `scancel`, `jarvis ppl run`, ...) | Refused with `policy_refused` and the list of commands that are allowed. |
+| `exec` of anything else (`rm`, `sh -c`, `scancel`, `jarvis ppl run`, ...) | Refused with `policy_refused` and the list of commands that are allowed. With a `plan`, you get a question first, and that exact command runs once after your yes. |
 | A warm allocation | Held after the spend question; `exec` reaches it with `srun --jobid=<job> --overlap <read-only command>`. |
 | `files` list, stat, read, stage, or a write of a new file | Runs. |
 | `files` delete, or a write that replaces a file (`overwrite` on a path that exists) | You get a question first. Nothing is deleted or replaced until you say yes. |
@@ -184,7 +184,9 @@ only commands that read:
 - modules and quotas: `module avail`, `module list`, `module spider`, ...,
   `quota`, `lfs quota`;
 - JARVIS reads: `jarvis ppl list`, `ppl status`, `repo list`, `pkg readme`,
-  and the like.
+  and the like;
+- Spack queries: `spack find`, `spack info`, `spack spec` (see Spack on a
+  guarded site, below).
 
 A program must be named bare, so that a file called `/tmp/x/ls` cannot pass as
 `ls`. Add a site's own read-only tools in `guard.yaml` (below).
@@ -256,8 +258,40 @@ sites:
   polaris:
     jarvis: ~/venvs/jarvis/bin/jarvis   # the jarvis command on the site
     read_only: [myquota]                # more read-only programs, by exact name
+    spack: [.clio-relay/spack/bin/spack] # Spacks whose find, info and spec exec runs
     warm_idle_s: 600                    # idle seconds before a warm allocation is released
 ```
+
+## Spack on a guarded site
+
+`exec` runs Spack's read-only queries, `spack find`, `spack info` and
+`spack spec`, with a bare `spack` or one listed under `spack` in `guard.yaml`
+(by default the CLIO Spack, `.clio-relay/spack/bin/spack` from the home
+directory). An `env SPACK_DISABLE_LOCAL_CONFIG=1` in front is allowed. Options
+that name another configuration or environment (`-C`, `-e`, `-D`) are refused:
+a configuration there could add a package repository, and `spack info` loads
+a repository's package code. A Spack query runs at the lowest priority on the
+login node, under a CPU quota and a memory cap.
+
+A command that is not read-only, such as preparing the CLIO Spack checkout,
+runs only as an approved plan. The tool sends the exact argument list with a
+`plan`:
+
+```json
+{"site": "polaris", "command": ["bash", "-c", "...", "..."], "plan": {"kind": "spack", "summary": "Prepare the CLIO Spack 0.23.1 at ~/.clio-relay/spack"}}
+```
+
+Relay asks you once, showing the summary and the command, bound to the site,
+the plan's kind and the digest of the argument list. Until you answer, the call
+returns `needs_approval` with the ask. After a yes, the same call runs that
+argument list once, at low priority, for at most 900 s; the next run asks
+again. A changed argument list is a new question. No shell string is ever
+accepted on its own.
+
+CLIO's Spack configuration lives in the checkout's site scope,
+`<site home>/spack/etc/spack`. Relay still exports `JARVIS_SPACK_CONFIG` as
+`<site home>/spack-config`, but Spack 0.23.1's `SPACK_DISABLE_LOCAL_CONFIG`
+drops the user scope, so nothing relies on that directory.
 
 ## A limitation
 

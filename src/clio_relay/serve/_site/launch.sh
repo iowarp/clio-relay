@@ -192,6 +192,7 @@ reason=
 trap 'reason=signal' TERM INT HUP
 ready=0
 idle_for=0
+beat=0
 while :; do
     stop_asked && reason=${reason:-stopped}
     [ -n "$reason" ] && break
@@ -199,6 +200,12 @@ while :; do
         reason=exited
         break
     fi
+    # The login hop, when there is one, keeps running while this beats.
+    if [ "$beat" -le 0 ]; then
+        : > "$S/heartbeat"
+        beat=30
+    fi
+    beat=$((beat - 1))
     if [ -n "$frpc_pid" ] && ! alive "$frpc_pid"; then
         restarts=$((restarts + 1))
         echo "$restarts" > "$S/frpc-restarts"
