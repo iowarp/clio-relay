@@ -159,7 +159,10 @@ stays in the catalog: an operation that pinned it keeps working, and a run that
 gives its `sha256` still uses it. An archive staged from a `dir` is never
 superseded, and `site clean` leaves the catalog alone.
 
-The archive of the same files has the same SHA-256 on any relay host and from
-any checkout: members are sorted, with no times or owners, text files keep LF
-line ends (a Windows checkout's CRLF is packed as LF), and a file's mode is
-0755 when it starts with `#!` and 0644 otherwise.
+The archive of the same files has the same SHA-256 on any relay host, from any
+checkout and under any Python: members are sorted, with no times or owners, text
+files keep LF line ends (a Windows checkout's CRLF is packed as LF), and a file's
+mode is 0755 when it starts with `#!` and 0644 otherwise. The gzip holds stored
+(uncompressed) deflate blocks, because compressed bytes differ between zlib builds
+(CPython 3.14 on Windows links zlib-ng), so an archive is about the size of its
+files.

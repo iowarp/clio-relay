@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import gzip
 import hashlib
 import io
 import tarfile
@@ -12,6 +11,7 @@ from importlib.resources import files
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+from clio_relay.stable_gzip import stable_gzip
 
 LAUNCHER_FORMAT = "1"
 SCRIPT_NAME = "tapisjob_app.sh"
@@ -29,16 +29,13 @@ def archive() -> bytes:
     """Return the launcher as a gzip tar. The bytes depend only on the script."""
     body = script()
     buffer = io.BytesIO()
-    with (
-        gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as zipped,
-        tarfile.open(fileobj=zipped, mode="w", format=tarfile.USTAR_FORMAT) as tar,
-    ):
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         info = tarfile.TarInfo(SCRIPT_NAME)
         info.size = len(body)
         info.mode = 0o755
         info.mtime = 0
         tar.addfile(info, io.BytesIO(body))
-    return buffer.getvalue()
+    return stable_gzip(buffer.getvalue())
 
 
 @cache
