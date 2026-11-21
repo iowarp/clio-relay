@@ -53,8 +53,8 @@ def _summary(view: dict[str, Any]) -> str:
         line += f"\n{port['name']}: {address(port)}"
     if ports and view["state"] == OperationState.RUNNING.value:
         line += (
-            f"\nThe service is ready and keeps running until serve(stop={view['operation_id']!r})"
-            " or its job ends; describe(job=...) follows it."
+            f"\nThe service is ready and keeps running until cancel(operation="
+            f"{view['operation_id']!r}) or its job ends; describe(job=...) follows it."
         )
     tail: str | None = result.get("stdout_tail")
     if tail:

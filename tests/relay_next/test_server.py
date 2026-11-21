@@ -91,6 +91,8 @@ def test_tools_are_the_verbs_and_operations(relay_paths: RelayPaths) -> None:
                     "serve",
                     "packages",
                     "shutdown",
+                    "cancel",
+                    "site_clean",
                 }
                 for tool in tools.values():
                     listed = tool.model_dump(by_alias=True, mode="json", exclude_none=True)

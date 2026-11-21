@@ -26,6 +26,8 @@ TOOLS = {
     "serve",
     "packages",
     "shutdown",
+    "cancel",
+    "site_clean",
 }
 # A client that renders relay's catalog gets the endpoint table.
 AD = {

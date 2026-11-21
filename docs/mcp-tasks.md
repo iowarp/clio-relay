@@ -29,7 +29,8 @@ service running and relay's forward answers. A client that polls is woken by a
 status change, not by a new status message, so the ready service is the task's
 result: the operation `running`, `result.endpoint` with each port's `address`,
 and `result.ready_at`. The service keeps running after that, until
-`serve(stop=<task id>)`, `tasks/cancel` or its job's end;
+`cancel(operation=<task id>)`, `serve(stop=<task id>)`, `tasks/cancel` or its
+job's end;
 `describe(job=<task id>)` and `serve(service=<task id>)` follow it. Questions
 relay asks after the service is ready reach the person through relay's page and
 `clio-relay asks`, not as `input_required` on the finished task.
@@ -58,12 +59,13 @@ A client without the tasks extension calls the same tools:
   `ai.iowarp.relay/operation`.
 - `describe(job=<operation id>)` observes the operation at any later time,
   from the same client or another one.
-- `run(cancel=<operation id>)` cancels it.
+- `run(cancel=<operation id>)` cancels it, as does `cancel(operation=<operation
+  id>)`, the tool a host can name as a cancel.
 - `run(resume=<operation id>)` continues an operation that was waiting for a
   person, once the question is answered.
 - `serve` waits up to `wait_s` for the service to be ready and returns how to
   reach it. `serve(service=<operation id>)` observes it and
-  `serve(stop=<operation id>)` stops it.
+  `serve(stop=<operation id>)` or `cancel(operation=<operation id>)` stops it.
 
 Questions reach the person in the best way the connection allows. On a
 `2026-07-28` connection they are input requests on the tool call. On an older

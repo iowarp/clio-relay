@@ -154,6 +154,8 @@ def test_stdio_task(relay_paths: RelayPaths) -> None:
                 "serve",
                 "packages",
                 "shutdown",
+                "cancel",
+                "site_clean",
             }
             task = await call_tool_task(client, "run", {"site": "fx", "spec": ECHO})
             result = await task.result()

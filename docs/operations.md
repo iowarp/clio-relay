@@ -114,6 +114,11 @@ rebuilding ParaView takes hours. Pass `--remove-spack` to delete it too, and
 still runs. The next call signs in and deploys everything again. Every live
 proof starts with it, so deployment is tested each time.
 
+Over MCP the `site_clean` tool does the same, keeping the Spack store. It asks
+the person on every call, open site or guarded, with a question bound to what
+it will remove; once the person says yes, the same call, or the next one with
+the same site, cleans. It refuses while a job of the site still runs.
+
 ## Stage and remove packages
 
 `run` takes only packages relay has staged, so a package is staged before its

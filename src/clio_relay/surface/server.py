@@ -76,15 +76,11 @@ from clio_relay.surface.http_limits import allow_chunk_bodies
 from clio_relay.surface.progress import latest_note
 from clio_relay.surface.read_tools import install as install_read_tools
 from clio_relay.surface.results import CHANGE as _CHANGE
-from clio_relay.surface.results import (
-    OPERATION_META,
-    operation_result,
-    record_result,
-    text,
-)
+from clio_relay.surface.results import OPERATION_META, operation_result, record_result, text
 from clio_relay.surface.results import START as _START
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
+from clio_relay.surface.site_tools import install as install_site_tools
 from clio_relay.surface.skills import SkillResources
 from clio_relay.surface.staging import PackagesArgs
 from clio_relay.surface.staging import packages as packages_op
@@ -582,6 +578,7 @@ class RelayServer:
         )
         relay = self
         install_read_tools(server, relay)
+        install_site_tools(server, relay)
 
         async def run(
             ctx: Context,
@@ -754,8 +751,8 @@ class RelayServer:
         ) -> ToolResult | InputRequiredToolResult:
             """Start a job with ports and return how to reach it. With tasks this returns
             a task whose status names the endpoint; without, it waits up to wait_s for
-            the service to be ready. service observes one; stop ends it. Each endpoint
-            port has an address, host:port: that is what you hand to clients."""
+            the service to be ready. service observes one; stop ends it, as cancel does. Each
+            endpoint port has an address, host:port: that is what you hand to clients."""
             return await relay.serve(ctx, site, spec, service, stop, wait_s)
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))

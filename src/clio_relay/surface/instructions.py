@@ -35,6 +35,8 @@ GENERAL = (
     "service with job=..., the staged packages with packages=true), exec_read (a command "
     "on relay's read-only list, such as squeue or jarvis sched info +json) and files_read "
     "(list, stat, read, has). "
+    "cancel cancels a job or stops a service; site_clean removes relay's deployment from "
+    "a site after the person's yes, keeping the Spack store. "
     "Refusals carry a typed reason in structuredContent.refusal. "
     "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
     "it is also the resource relay://sites/<site>/skill, which files cannot read."
