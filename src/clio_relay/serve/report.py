@@ -11,7 +11,7 @@ import json
 import re
 from typing import Any, cast
 
-from clio_relay.jobs.handles import JobHandle, JobStatus, OutputRef
+from clio_relay.jobs.handles import JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.serve.plan import SERVE_DIR, ServePlan
 
@@ -105,6 +105,14 @@ def final_message(plan: ServePlan, status: JobStatus, stopped: dict[str, Any]) -
         parts.append(redact(plan, status.message))
     else:
         parts.append(f"the job is {status.state.value}")
+    if (
+        plan.package
+        and status.state == JobState.FAILED
+        and status.message
+        and parts[0] != redact(plan, status.message)
+    ):
+        # JARVIS's failure (the package's own typed cause) outranks how the connector ended.
+        parts.append(redact(plan, status.message))
     if plan.cancel_sent:
         parts.append("its job was cancelled")
     restarts = stopped.get("frpc_restarts")
