@@ -115,6 +115,13 @@ class JobStatus(BaseModel):
             "mpi_network issue naming the resource graph field to change"
         ),
     )
+    site_facts: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "JARVIS's metadata.site_facts on the execution (jarvis.site-facts.v1), untouched: "
+            "the advisory site_fact_uncertain questions the run went ahead with"
+        ),
+    )
 
 
 class ExecResult(BaseModel):

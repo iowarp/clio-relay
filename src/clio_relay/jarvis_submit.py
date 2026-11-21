@@ -98,7 +98,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "97c78adb3d9c172ccc0f0e137881aa7297735bad"
+JARVIS_PIN = "f6cb758721052a15b60cf6c0a2eca240458b575e"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -428,7 +428,7 @@ def _token(key: str, value: object) -> object:
     if isinstance(value, str) and not _TOKEN.fullmatch(value):
         raise Refusal(
             RefusalReason.INVALID_SPEC,
-            f"JARVIS's Slurm scheduler takes {key} as one word without spaces or '#', "
+            f"JARVIS's scheduler block takes {key} as one word without spaces or '#', "
             f"not {value!r}",
             field=key,
         )
@@ -1458,9 +1458,8 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
     stop requests and how the job was terminated; an install job's progress
     comes from ``metadata.install``. ``queue`` is JARVIS's
     ``metadata.queue`` while the job waits in the queue, and ``issues`` are the
-    record's typed ``metadata.issues`` (an ``mpi_network`` issue names the
-    resource graph field to change). Relay reads the scheduler only through
-    JARVIS.
+    record's typed ``metadata.issues``, and ``site_facts`` its ``metadata.site_facts``,
+    both untouched. Relay reads the scheduler only through JARVIS.
     """
     native = str(record.get("state") or "unknown")
     code = record.get("return_code")
@@ -1469,8 +1468,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
     control = control_of(record)
     progress = install_progress(record)
     metadata = _dict(record.get("metadata"))
-    issues = [_dict(item) for item in cast(list[Any], metadata.get("issues") or [])]
-    issues = [item for item in issues if item]
+    issues = [item for item in map(_dict, cast(list[Any], metadata.get("issues") or [])) if item]
     if native == "unknown" or native not in _STATES:
         return JobStatus(
             state=last if last is not None and not last.final else JobState.RUNNING,
@@ -1479,6 +1477,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
             control=control,
             progress=progress,
             issues=issues,
+            site_facts=_dict(metadata.get("site_facts")) or None,
         )
     state = _STATES[native]
     queue = _dict(metadata.get("queue"))
@@ -1492,8 +1491,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
             message = f"{message}. {said}" if message else said
     elif waiting and queue and message is None:
         message = queue_message(queue)
-    if state == JobState.COMPLETED and exit_code is None:
-        exit_code = 0
+    exit_code = 0 if state == JobState.COMPLETED and exit_code is None else exit_code
     return JobStatus(
         state=state,
         exit_code=exit_code if state.final else None,
@@ -1503,6 +1501,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
         progress=progress,
         queue=queue if waiting and queue else None,
         issues=issues,
+        site_facts=_dict(metadata.get("site_facts")) or None,
     )
 
 

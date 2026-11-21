@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay import jarvis_submit
+from clio_relay import install_failures, jarvis_submit
 from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
@@ -302,9 +302,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
             "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
             "note": (
                 "Append JARVIS's own arguments to run relay's JARVIS with the site's record: "
-                "sched info +json, rg skill list|show NAME +json, and, once the person "
-                "agrees (with a plan on a guarded site), rg skill set, rg net set, or "
-                "spack prepare --root <spack_root> --site_spack <root> +json"
+                "sched info, rg skill list|show NAME, rg facts show (each +json), and, once the "
+                "person agrees (with a plan on a guarded site), rg facts answer, rg skill set, "
+                "rg net set, or spack prepare --root <spack_root> --site_spack <root> +json"
             ),
         }
 
@@ -437,16 +437,15 @@ class SshAdapter(BaseAdapter[SshConfig]):
             error = "\n".join(sections.get("err", [])).strip() or output
             if jarvis_mode and rc == str(jarvis_submit.EXIT_NO_JARVIS):
                 raise jarvis_submit.missing_jarvis(error, site=self.config.ssh_profile)
+            both, site = f"{output}\n{error}", self.config.ssh_profile
+            if jarvis_mode:
+                install_failures.raise_for(rc, both, site=site)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_DECISION):
                 raise self._install_needed(output, spec)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
-                raise jarvis_submit.build_refused(
-                    output + "\n" + error, site=self.config.ssh_profile
-                )
+                raise jarvis_submit.build_refused(both, site=site)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_REFUSED):
-                raise jarvis_submit.jarvis_refused(
-                    output + "\n" + error, site=self.config.ssh_profile
-                )
+                raise jarvis_submit.jarvis_refused(both, site=site)
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
                 f"{self.config.ssh_profile} refused the job: {error or 'no output'}",
@@ -1027,18 +1026,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"the job directory {job_dir} is gone from {self.config.ssh_profile}; "
                 "run the job again",
             )
-        output = "\n".join(found.get("out", [])).strip()
+        output, site = "\n".join(found.get("out", [])).strip(), self.config.ssh_profile
         rc = _one(found, "rc")
         if rc == str(jarvis_submit.EXIT_NO_JARVIS):
-            raise jarvis_submit.missing_jarvis(output, site=self.config.ssh_profile)
+            raise jarvis_submit.missing_jarvis(output, site=site)
+        install_failures.raise_for(rc, output, site=site)
         if rc == str(jarvis_submit.EXIT_DECISION):
             raise self._install_needed(output, spec)
         if rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
-            raise jarvis_submit.build_refused(output, site=self.config.ssh_profile)
+            raise jarvis_submit.build_refused(output, site=site)
         if rc == str(jarvis_submit.EXIT_REFUSED):
-            raise jarvis_submit.jarvis_refused(
-                output, site=self.config.ssh_profile, what="the install"
-            )
+            raise jarvis_submit.jarvis_refused(output, site=site, what="the install")
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
         if rc != "0" or handle is None:
             raise Refusal(

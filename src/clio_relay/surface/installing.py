@@ -34,7 +34,7 @@ import posixpath
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from clio_relay import jarvis_submit
+from clio_relay import install_failures, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
@@ -152,7 +152,8 @@ async def ask_install(
             await provider.approve(
                 site=site,
                 operation_id=operation_id,
-                message=jarvis_submit.install_message(
+                message=cast(str | None, refusal.data.get("ask_message"))
+                or jarvis_submit.install_message(
                     report,
                     site=site.title,
                     package=_what(job_of(record)),
@@ -328,7 +329,9 @@ async def refresh_install(
         _update(service, operation_id, stage="done", log_offset=offset, log_tail=tail)
         return await _resubmit(service, operation_id, "the install finished; submitting the run")
     if status.state.final:
-        return _ended(service, operation_id, status, handle, tail or state.get("log_tail"))
+        return await _ended(
+            service, operation_id, status, (adapter, handle), tail or state.get("log_tail")
+        )
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)
         if record.state.final:
@@ -359,11 +362,47 @@ async def refresh_install(
     return record
 
 
-def _ended(
-    service: RelayService, operation_id: str, status: JobStatus, handle: JobHandle, tail: object
+async def _job_issues(adapter: BaseAdapter[Any], handle: JobHandle) -> list[dict[str, Any]]:
+    """Return the typed issues the install job wrote to ``install/issues.jsonl``."""
+    log = _log_path(handle)
+    if log is None or "files" not in type(adapter).implements:
+        return []
+    path = posixpath.join(posixpath.dirname(log), "issues.jsonl")
+    try:
+        data = await (await adapter.files()).read(path)
+    except Exception:
+        logger.warning("reading the install issues %s", path, exc_info=True)
+        return []
+    return install_failures.read_jsonl(data.decode("utf-8", errors="replace"))
+
+
+async def _ended(
+    service: RelayService,
+    operation_id: str,
+    status: JobStatus,
+    job: tuple[BaseAdapter[Any], JobHandle],
+    tail: object,
 ) -> OperationRecord:
+    adapter, handle = job
     if status.state == JobState.CANCELLED:
         return service.finish(operation_id, OperationState.CANCELLED, None)
+    if status.exit_code == jarvis_submit.EXIT_DECISION:
+        # The job found a question (a compiler the build host lacks): JARVIS's check
+        # on the login node reads what the job recorded and asks it.
+        return await _resubmit(
+            service, operation_id, "the install job needs a decision; JARVIS checks again"
+        )
+    record = service.operation(operation_id)
+    found = install_failures.from_issues(
+        await _job_issues(adapter, handle),
+        site=service.site(record.site).title,
+        install_log=_log_path(handle),
+        install_job=handle.native_id,
+    )
+    if found is not None and install_kind(found) is not None:
+        return await ask_install(service, operation_id, service.site(record.site), found)
+    if found is not None:
+        return service.finish(operation_id, OperationState.FAILED, found)
     detail = status.message or f"the install job ended {status.native_state or 'badly'}"
     message = f"JARVIS could not install the package's software: {detail}"
     if isinstance(tail, str) and tail.strip():

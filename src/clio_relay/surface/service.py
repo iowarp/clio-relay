@@ -818,10 +818,10 @@ class RelayService:
                 result.setdefault("ready_at", status.observed_at.isoformat())
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
-            if status.issues:
-                result["issues"] = status.issues
-            else:
-                result.pop("issues", None)
+            for key, value in (("issues", status.issues), ("site_facts", status.site_facts)):
+                result.pop(key, None)
+                if value:
+                    result[key] = value
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)

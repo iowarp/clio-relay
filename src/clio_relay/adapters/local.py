@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from clio_relay import jarvis_submit
+from clio_relay import install_failures, jarvis_submit
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
@@ -369,11 +369,11 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return self._jarvis_handle(found, job_dir, operation_id)
 
     def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
-        """Raise the refusal for the site script's no-JARVIS (69), decision (3),
-        build-refused (4) and typed-refusal (5) exits."""
+        """Raise the refusal for the site script's typed exits (69, 3, 4, 5 and 6)."""
         site = self.context.site_id
         if result.exit_code == jarvis_submit.EXIT_NO_JARVIS:
             raise jarvis_submit.missing_jarvis(result.stderr, site=site)
+        install_failures.raise_for(result.exit_code, f"{result.stdout}\n{result.stderr}", site=site)
         if result.exit_code == jarvis_submit.EXIT_BUILD_REFUSED:
             raise jarvis_submit.build_refused(result.stdout + "\n" + result.stderr, site=site)
         if result.exit_code == jarvis_submit.EXIT_REFUSED:

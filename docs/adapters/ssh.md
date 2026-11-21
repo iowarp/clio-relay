@@ -192,10 +192,26 @@ longer than the run, and the approval says how long it may take. Nothing is
 built on the login node: when JARVIS refuses a build outside an allocation
 (exit 4, `build_outside_allocation`), relay reports it as `policy_refused` and
 does not retry it. `describe(job=...)` follows the install log and its progress
-for as long as the install takes, then relay submits the run. When the install
-job fails, the run fails `submit_failed` with the end of the log in its
-message, `install_log` (the whole log on the site, for `files`) and
-`install_job` (the scheduler's job id).
+for as long as the install takes, then relay submits the run. When Spack
+itself fails, JARVIS types the failure and exits 6 (`compiler_unavailable`,
+`fetch_failed`, `build_failed`, `variant_conflict`, `no_recipe`,
+`concretize_failed` or `install_failed`, each with the host, stage, failed
+node, log tail and remedy, in `install/issues.jsonl`). Relay passes it on: a
+failure the person answers, such as the compiler to build with, becomes the
+install questions again; any other fails the run with JARVIS's `kind`, its
+message and remedy, the issues (each with the last 20 lines of the log),
+`install_log` (the whole log on the site, for `files`) and `install_job` (the
+scheduler's job id). An install job that ends without a typed issue fails
+`submit_failed` with the end of the log in its message.
+When a pick rests on a site fact JARVIS cannot settle by itself, such as the
+MPI launch network, JARVIS raises `site_fact_uncertain`. A blocking one stops
+the check before anything is submitted, and relay refuses the run
+`input_missing` with JARVIS's issues as they are (`needs: jarvis rg facts
+answer`). The agent investigates with the issue's probes, proposes a value, and
+once the person confirms, answers through `facts.jarvis.exec` (`rg facts answer
+<issue_id> --value ... --reason ... --set_by <person> --proposed_by <agent>
++json`), then runs again. An advisory one goes ahead, and the operation carries
+JARVIS's `site_facts`.
 The Spack environment is kept under the CLIO site home, at
 `jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
 archives, so the next run of the same packages reuses it. Two installs into
