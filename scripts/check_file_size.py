@@ -104,7 +104,7 @@ SRC_DISTRIBUTION_BASELINE_PERCENT = 89.88
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 95.90
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 95.93
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
