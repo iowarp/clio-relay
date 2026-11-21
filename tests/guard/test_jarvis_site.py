@@ -304,7 +304,7 @@ def test_the_graph_collection_runs_on_compute_nodes() -> None:
     assert graph_pipeline("slurm") == {
         "name": "site_net",
         "pkgs": [{"pkg_type": "builtin.resource_graph"}],
-        "scheduler": {"name": "slurm", "nodes": 2, "time": "00:05:00"},
+        "scheduler": {"nodes": 2, "time": "00:05:00"},
     }
     assert "scheduler" not in graph_pipeline("none")
 

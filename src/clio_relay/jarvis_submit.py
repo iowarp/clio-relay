@@ -272,15 +272,15 @@ def graph_pipeline(scheduler: str, *, nodes: int = 2, time: str = "00:05:00") ->
     """Return JARVIS's pipeline that collects the graph's ``net`` section on compute nodes.
 
     It is JARVIS's ``builtin.resource_graph`` package (``net_only`` by default),
-    submitted as a job of ``nodes`` nodes on the site's ``scheduler``, so the
-    networks are the compute nodes' and never a login host's.
+    submitted as a job of ``nodes`` nodes on the site's scheduler, which JARVIS
+    detects, so the networks are the compute nodes' and never a login host's.
     """
     document: dict[str, Any] = {
         "name": "site_net",
         "pkgs": [{"pkg_type": "builtin.resource_graph"}],
     }
     if scheduler not in ("", "none"):
-        document["scheduler"] = {"name": scheduler, "nodes": nodes, "time": time}
+        document["scheduler"] = {"nodes": nodes, "time": time}
     return document
 
 
