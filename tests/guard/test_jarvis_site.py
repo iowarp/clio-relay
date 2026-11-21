@@ -13,7 +13,7 @@ from clio_relay.adapters.sched_info import SCHEMA as SCHED_SCHEMA
 from clio_relay.adapters.sched_info import partitions as sched_partitions
 from clio_relay.adapters.sched_info import report as sched_report
 from clio_relay.adapters.sched_info import site_facts as sched_facts
-from clio_relay.adapters.ssh.scripts import jarvis_command
+from clio_relay.adapters.ssh.scripts import graph_collect_command, jarvis_command, sched_script
 from clio_relay.jarvis_site import (
     SOURCE_FILE,
     archive_package,
@@ -441,3 +441,21 @@ def test_the_jarvis_exec_runs_relays_jarvis_with_the_site_record() -> None:
     assert "JARVIS_RESOURCE_GRAPH" in script
     assert "JARVIS_SPACK_DECISIONS" in script
     assert 'JARVIS_SPACK_ROOT="$SR"' in script
+
+
+def test_site_level_jarvis_calls_initialize_the_site_root_once() -> None:
+    """sched info, the graph collection and the exec prefix run JARVIS with the
+    site-level root, which JARVIS refuses until ``jarvis init`` has made it."""
+    home = "/home/me/.clio-relay"
+    scripts = {
+        "exec": jarvis_command(home)[2],
+        "sched": sched_script(home),
+        "collect": graph_collect_command(home, "slurm")[2],
+    }
+    for name, script in scripts.items():
+        guard = '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init'
+        assert guard in script, name
+        assert '"$R/config" "$R/private" "$R/shared"' in script, name
+        assert script.index(guard) < script.rindex('"$JB"'), name
+    assert 'ppl submit "$S/site_net.yaml" +json' in scripts["collect"]
+    assert 'ppl run yaml "$S/site_net.yaml" +json' in graph_collect_command(home, "none")[2]

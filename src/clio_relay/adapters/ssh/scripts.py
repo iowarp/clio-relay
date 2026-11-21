@@ -519,6 +519,8 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
     home = remote_dir.rstrip("/") or "/"
     pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
     verb = "run" if scheduler in ("", "none") else "submit"
+    # ``ppl run`` names its source (``yaml <file>``); ``ppl submit`` takes the file.
+    source = "yaml " if verb == "run" else ""
     # The scheduler block is the pipeline's last mapping, so a partition line ends it.
     queue = (
         'case "${1:-}" in\n'
@@ -535,11 +537,11 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
         f"S={root_expression(site)}; R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
         '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
-        'mkdir -p "$R"\n'
-        f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
+        + _INIT_SITE_ROOT
+        + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
         + f'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH={root_expression(graph)} '
-        f'exec "$JB" ppl {verb} yaml "$S/site_net.yaml" +json\n'
+        f'exec "$JB" ppl {verb} {source}"$S/site_net.yaml" +json\n'
     )
     return ["sh", "-c", script, "site_net"]
 
@@ -553,6 +555,15 @@ def _jarvis_env(home: str, jarvis: str) -> str:
         f"SR={root_expression(posixpath.join(home, jarvis_submit.SPACK_DIR))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
     )
+
+
+# The site-level JARVIS root (``$R``) is set up once, the first time a site-level
+# call needs it; a run's own root is set up by the run script.
+_INIT_SITE_ROOT = (
+    'mkdir -p "$R"\n'
+    '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init '
+    '"$R/config" "$R/private" "$R/shared" >/dev/null 2>&1\n'
+)
 
 
 _JARVIS_EXPORTS = (
@@ -573,7 +584,7 @@ def jarvis_command(remote_dir: str, jarvis: str = "") -> list[str]:
     script = (
         _jarvis_env(home, jarvis)
         + '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
-        + 'mkdir -p "$R"\n'
+        + _INIT_SITE_ROOT
         + _JARVIS_EXPORTS
         + 'exec "$JB" "$@"\n'
     )
@@ -589,8 +600,12 @@ def sched_script(remote_dir: str, jarvis: str = "") -> str:
     """
     home = remote_dir.rstrip("/") or "/"
     return (
-        "(\n" + _jarvis_env(home, jarvis) + 'if [ -x "$JB" ]; then\n'
-        '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 90"\n'
+        "(\n"
+        + _jarvis_env(home, jarvis)
+        + 'if [ -x "$JB" ]; then\n'
+        + "  "
+        + _INIT_SITE_ROOT.replace("\n[", "\n  [")
+        + '  T=; command -v timeout >/dev/null 2>&1 && T="timeout 90"\n'
         + "  "
         + _JARVIS_EXPORTS.replace("\nif", "\n  if")
         + '  echo "@@sched"\n'
