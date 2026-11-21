@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from clio_relay import jarvis_submit
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter, SshConfig, scripts
@@ -26,8 +27,6 @@ from clio_relay.jobs.spec import (
     JobAttributes,
     JobResources,
     JobSpec,
-    ServicePort,
-    ServiceSpec,
 )
 from clio_relay.sites.models import SpendPolicy
 
@@ -167,8 +166,11 @@ def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     ]
     assert "sbatch" not in pipeline
     assert rendered.files["relay-jarvis.sh"].startswith("set -eu")
-    assert rendered.submit_command == (
-        f"bash relay-jarvis.sh submit {'a' * 64} clio_jarvis.xcompact3d '~/jv/bin/jarvis' op_x"
+    command = rendered.submit_command
+    assert command.startswith("env ")
+    assert f"CLIO_RELAY_JARVIS_PIN={jarvis_submit.JARVIS_PIN}" in command
+    assert command.endswith(
+        f"bash relay-jarvis.sh submit '~/jv/bin/jarvis' op_x clio_jarvis.xcompact3d@{'a' * 64}"
     )
 
 
@@ -192,12 +194,23 @@ def test_a_jarvis_handle_comes_from_the_submit_line(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_package_service_needs_jarvis_execution_stop(tmp_path: Path) -> None:
-    service = ServiceSpec(job=_package_spec(), ports=[ServicePort(name="pvserver")])
+async def test_a_package_service_needs_jarvis_execution_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = _package_spec()
+    assert spec.package is not None
+    service = spec.model_copy(update={"package": spec.package.model_copy(update={"service": True})})
+    adapter = _adapter(tmp_path)
+
+    async def site_without_scheduler(*_: object, **__: object) -> str:
+        return "@@root /home/u/.clio-relay\n@@ready\n@@scheduler none\n"
+
+    monkeypatch.setattr(adapter, "_ssh", site_without_scheduler)
     with pytest.raises(Refusal) as refused:
-        await _adapter(tmp_path).serve(service, operation_id="op_x")
+        await adapter.run(service, operation_id="op_x")
     assert refused.value.reason == RefusalReason.ADAPTER_UNAVAILABLE
-    assert refused.value.data["needs"] == "jarvis execution stop"
+    assert refused.value.data["needs"] == "jarvis ppl submit"
+    assert "jarvis execution stop" in refused.value.message
 
 
 @pytest.mark.asyncio

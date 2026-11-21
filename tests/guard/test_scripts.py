@@ -99,10 +99,31 @@ PIPELINE = "name: relay_op_x\npkgs:\n- pkg_type: demo.hello\n  pkg_name: pkg\n"
 
 
 def _site(
-    job: Path, env: dict[str, str], *args: str, mode: str = "run"
+    job: Path,
+    env: dict[str, str],
+    digest: str,
+    package: str,
+    jarvis: str,
+    execution: str,
+    *rest: str,
+    mode: str = "run",
 ) -> subprocess.CompletedProcess[str]:
+    steps = f"{package}@{digest}"
+    if "/" not in jarvis and not jarvis.startswith("~"):
+        # Relay never looks JARVIS up on PATH, so a bare name is the stand-in's full path.
+        jarvis = f"{env['PATH'].split(':')[0]}/{jarvis}"
     return subprocess.run(
-        ["/bin/bash", "-c", SITE_SCRIPT, "clio-relay-jarvis", mode, *args],
+        [
+            "/bin/bash",
+            "-c",
+            SITE_SCRIPT,
+            "clio-relay-jarvis",
+            mode,
+            jarvis,
+            execution,
+            steps,
+            *rest,
+        ],
         cwd=job,
         env=env,
         capture_output=True,
@@ -212,17 +233,17 @@ def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> 
     for bad in ("hello", "demo.hello.x", "demo.he-llo", "demo/x.hello"):
         done = _site(job, env, digest, bad, "jarvis", "", PIPELINE)
         assert done.returncode == EXIT_USAGE, bad
-        assert "is not <repo>.<package>" in done.stderr
+        assert "are not <repo>.<package>" in done.stderr
     mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
     assert mode.returncode == EXIT_USAGE
-    assert "mode up is not submit or run" in mode.stderr
+    assert "mode up is not submit, run or install" in mode.stderr
     unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
     assert unnamed.returncode == EXIT_USAGE
     assert "needs an execution id" in unnamed.stderr
     wrong_repo = _site(job, env, digest, "other.hello", "jarvis", "", PIPELINE)
     assert wrong_repo.returncode == EXIT_MISSING
     assert "no other/other directory" in wrong_repo.stderr
-    assert not (tmp_path / "jarvis.log").exists()
+    assert "repo add" not in (tmp_path / "jarvis.log").read_text()
 
 
 def test_the_site_script_says_when_jarvis_is_missing(tmp_path: Path) -> None:
@@ -230,16 +251,18 @@ def test_the_site_script_says_when_jarvis_is_missing(tmp_path: Path) -> None:
     env = _env(tmp_path, tmp_path / "bin")
     done = _site(job, env, digest, "demo.hello", "no-such-jarvis", "op_x", PIPELINE, mode="submit")
     assert done.returncode == EXIT_NO_JARVIS
-    assert "no-such-jarvis is not on PATH" in done.stderr
+    tried = f"{tmp_path / 'bin'}/no-such-jarvis"
+    assert f"the site's jarvis setting {tried} is not a program" in done.stderr
     written = json.loads((job / REFUSAL_FILE).read_text())
     assert written == {
         "missing": "jarvis",
         "reason": "adapter_unavailable",
-        "tried": "no-such-jarvis",
+        "tried": tried,
+        "explicit": True,
     }
     refusal = missing_jarvis(done.stderr, site="lab")
     assert refusal.reason == RefusalReason.ADAPTER_UNAVAILABLE
-    assert refusal.data == {"missing": "jarvis", "tried": "no-such-jarvis"}
+    assert refusal.data == {"missing": "jarvis", "tried": tried, "explicit": True}
 
 
 def test_the_site_script_expands_a_home_jarvis_path(tmp_path: Path) -> None:

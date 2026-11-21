@@ -28,7 +28,7 @@ from fastmcp_tasks.client_models import (
 )
 
 from clio_relay.jobs.records import OperationState
-from clio_relay.surface.server import OPERATION_META, create_server
+from clio_relay.surface.server import OPERATION_META, RelayServer, create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
@@ -401,6 +401,31 @@ def test_client_without_elicitation_gets_a_typed_refusal_and_a_page(
                 "run", {"resume": operation_id, "site": "fx", "spec": ECHO, "wait_s": 30}
             )
             assert _structured(resumed)["state"] == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_answered_asks_are_not_offered_again(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths, spend="always")
+
+    async def scenario() -> None:
+        async with Client(create_server(relay_paths), mode="legacy") as client:
+            result = await client.call_tool(
+                "run", {"site": "fx", "spec": ECHO, "wait_s": 0}, raise_on_error=False
+            )
+            refusal = _structured(result)["refusal"]
+            (shown,) = refusal["data"]["asks"]
+            operation_id = refusal["data"]["operation_id"]
+        service = RelayService(relay_paths)
+        service.answer(shown["ask_id"], "accept", {"approve": True}, by="test")
+        record = service.operation(operation_id)
+        assert record.state == OperationState.AWAITING_INPUT
+        # Between an answer and the next advance, nothing is waiting on the person.
+        reply = RelayServer(service)._needs_person(record)  # pyright: ignore[reportPrivateUsage]
+        view = reply.structured_content
+        assert isinstance(view, dict)
+        assert "refusal" not in view, view
+        assert view["operation_id"] == operation_id
 
     asyncio.run(scenario())
 

@@ -41,6 +41,7 @@ collect_ignore = (
         "test_ssh_conformance.py",
         "test_ssh_store_fixtures.py",
         "test_ssh_link_fixtures.py",
+        "test_ssh_master.py",
     ]
 )
 

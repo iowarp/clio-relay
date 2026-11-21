@@ -196,11 +196,11 @@ def test_a_serve_task_completes_when_the_service_is_ready(
             assert view["result"]["endpoint"]["ports"][0]["name"] == "viz"
             text = " ".join(getattr(item, "text", "") for item in ready.content)
             assert "keeps running until serve(stop=" in text
+            assert ready.meta is not None and ready.meta[SERVICE_META] == {"url": SECRET}
             stopped = await client.call_tool("serve", {"stop": task.task_id})
             assert _structured(stopped)["state"] == "completed"
-            result = await task.result()
-            assert _structured(result)["state"] == "completed"
-            assert result.meta is not None and result.meta[SERVICE_META] == {"url": SECRET}
+            # The task ended at ready, so its result stays the ready view.
+            assert _structured(await task.result())["state"] == "running"
 
     asyncio.run(scenario())
 

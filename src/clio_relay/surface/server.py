@@ -396,19 +396,19 @@ class RelayServer:
         return await self.service.advance(record.operation_id)
 
     def _needs_person(self, record: OperationRecord) -> ToolResult:
-        asks = self.service.operation_asks(record)
-        pending = [ask for ask in asks if ask.state == "pending"] or asks
+        pending = [ask for ask in self.service.operation_asks(record) if ask.state == "pending"]
+        if not pending:  # answers from earlier rounds are not questions
+            return record_result(self.service, record)
         url_only = all(ask.kind == "url" for ask in pending)
-        shown: list[dict[str, Any]] = []
-        for ask in pending:
-            shown.append(
-                {
-                    "ask_id": ask.ask_id,
-                    "kind": ask.kind,
-                    "message": ask.message,
-                    "page": self.service.ask_provider.page_address(ask),
-                }
-            )
+        shown = [
+            {
+                "ask_id": ask.ask_id,
+                "kind": ask.kind,
+                "message": ask.message,
+                "page": self.service.ask_provider.page_address(ask),
+            }
+            for ask in pending
+        ]
         again = (
             "call serve with service set to the operation id"
             if record.kind == "serve"
