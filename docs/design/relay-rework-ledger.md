@@ -334,7 +334,21 @@ Accepted from the coordinator on W3's two open points, with what they mean for r
   - **Serve endpoints (video1k).** Relay no longer picks a service's port. It forwards what `jarvis execution service-runtimes <id> --pipeline-id P +json` reports in `service_endpoints[]`: the port the service bound, taken from its ready event. A `ready_at` appearing raises the ready event. A serve task now completes at ready, with the endpoint in its result, while the operation runs on until it is stopped. This departs from the contract's line 268 (a task through the service's life): clients wake only on a terminal task status or `input_required`, and CLIO slept through both pilots.
   - **Placeholder paths.** The first smoke passed a job-directory placeholder as the STL path. Relay owns that substitution: a parameter whose value is a run input's name, or `./name`, becomes its absolute path. A value that wraps an input's name in a placeholder (`{job_dir}/body.stl`, `$JOB/body.stl`, `<job>/body.stl`) is now refused `invalid_spec`, and the message names the bare input name. `PackageRef.parameters`' description says the same.
   - **Checks that already failed at 21fffaa5.** The rework's merges had grown eight modules past the 800-line cap with the ratchet baseline empty, and src's share under 500 lines had fallen to 89.60 %. `scripts/check_file_size.py` now records each module at its length and the floor at 89.59, both of which may only ratchet down from here. `test_compute_table` had not followed the spend column; `test_the_catalog_pins_a_package_named_alone` had not followed the two-archive refusal (6521399f).
-
+    - **Pins after bfeff98b.** d77ff425 (builtins ship in the tarball, `jarvis_not_initialized`), 20f00d35 (stable MPI candidate keys, `last_install`), 8c3893de (legacy decisions migrate once), and 97c78adb (the collector runs by absolute path; an empty collect fails typed). Relay's own fixes on the way:
+      - the site root gets one `jarvis init`, so `ppl` works on a fresh root;
+      - `ppl submit` takes the pipeline file as its argument (1a6153b0);
+      - each install round gets its own JARVIS execution id, so a second round never reuses the first's record (912fbe33).
+    - **Live proofs on Ares (relay 9c53657e, jarvis-cd 97c78adb).**
+      - Legacy migration: the pre-20f00d35 decisions.yaml was restored, and the next install check applied the MPI answer with no ask (`rekeyed_from`, candidate `openmpi-5.0.5-cphqvsy`, stale `[]`).
+      - Fresh-site failure: before the graph had a `net` section, run job 27985 (4 nodes) failed with exit 14. JARVIS raised an `mpi_network` issue (field `resource_graph.net.override`), and relay passed it through in the op's `result.issues`.
+      - Net collect: 2-node job 27988 ran `builtin.resource_graph`. The graph reads data `172.25.0.0/16` (enp47s0np0, 40000 Mb/s, rdma mlx5_0) and control `172.20.0.0/16` (eno1, 1000 Mb/s). docker0 was dropped as down and 169.254 as link-local.
+      - 4-node run: op_fecc5652 (job 27989, xcompact3d, 64 ranks, 16 per node on comp-03..06) exited 0. Its `launch.json` `network` record shows JARVIS choosing both networks from the graph and setting `OMPI_MCA_btl_tcp_if_include`, `OMPI_MCA_oob_tcp_if_include`, `PRTE_MCA_oob_tcp_if_include` and `UCX_NET_DEVICES` itself. No relay-written file in the job carries an MPI variable. comp-05 and comp-06 show under `hosts_not_in_graph`, because the collect ran on two nodes; the networks are chosen by CIDR, so they still applied.
+    - **Open with JARVIS (reported to the coordinator).**
+      - `jarvis spack prepare` on a login node registered gcc@12.3.0, which compute nodes lack. The paraview install (job 27987) then failed with `CompilerAccessError`, and JARVIS wrote no typed issue, so relay could only report `submit_failed` with the log's tail.
+      - Decisions have no way to be forgotten.
+      - `scheduler_block` names slurm.
+      - `sched info` lacks physical cores.
+    - **Stale asks on resume.** A resumed run can re-present install asks from an earlier round. They are harmless, since the answers are replayed by key, but noisy.
 ### Published interfaces (M1)
 Owned by W1, not frozen. A change goes through W1, which reruns every consumer's contract tests first.
 
