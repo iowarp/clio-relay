@@ -21,7 +21,7 @@ import socket
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
@@ -174,8 +174,14 @@ class ServePlan(BaseModel):
         return env
 
 
-def plan_ports(spec: ServiceSpec) -> list[PortPlan]:
-    """Choose the ports and the per-port secrets of a new service."""
+def plan_ports(spec: ServiceSpec, *, adopt: bool = False) -> list[PortPlan]:
+    """Choose the ports and the per-port secrets of a new service.
+
+    With ``adopt``, a port the request does not fix stays 0: the service is a
+    package that binds its own port and reports it to JARVIS, and relay
+    forwards the port JARVIS records (:func:`adopt_ports`). Relay chooses a
+    port only for a service that reports none.
+    """
     ports: list[PortPlan] = []
     seen: set[str] = set()
     for port in spec.ports:
@@ -194,7 +200,7 @@ def plan_ports(spec: ServiceSpec) -> list[PortPlan]:
             PortPlan(
                 name=port.name,
                 protocol=port.protocol,
-                remote_port=port.port or remote_port_choice(),
+                remote_port=port.port or (0 if adopt else remote_port_choice()),
                 local_port=free_loopback_port(),
                 health_path=port.health_path,
                 protection=port.protection,
@@ -202,6 +208,63 @@ def plan_ports(spec: ServiceSpec) -> list[PortPlan]:
             )
         )
     return ports
+
+
+_REACHABLE = frozenset({"ready", "degraded"})
+
+
+def runtime_endpoints(document: dict[str, Any] | None) -> list[tuple[str, int]]:
+    """Return ``(package_id, port)`` for each service JARVIS reports listening.
+
+    ``document`` is ``jarvis.execution.service-runtimes.v1``; its array holds
+    the latest revision of every service instance. Only a ``ready`` or
+    ``degraded`` instance with a real TCP port counts.
+    """
+    if not document:
+        return []
+    found: list[tuple[str, int]] = []
+    items: object = document.get("service_runtimes")
+    if not isinstance(items, list):
+        return []
+    for item in cast(list[object], items):
+        if not isinstance(item, dict):
+            continue
+        report = cast(dict[str, Any], item)
+        port = report.get("port")
+        if report.get("lifecycle") not in _REACHABLE or isinstance(port, bool):
+            continue
+        if not isinstance(port, int) or not 0 < port < 65536:
+            continue
+        found.append((str(report.get("package_id") or ""), port))
+    return found
+
+
+def adopt_ports(plan: ServePlan, endpoints: list[tuple[str, int]]) -> bool:
+    """Set the plan's site ports to the ones JARVIS reports; True when one changed.
+
+    A port named like the reporting package takes that package's port. Then,
+    when one plan port is left and the rest of the reports name one port, it
+    takes that one. JARVIS's report is what the service bound, so it wins over
+    a port the request named. Anything ambiguous stays as it is.
+    """
+    changed = False
+    left = list(plan.ports)
+    rest = list(endpoints)
+    for port in list(left):
+        named = {value for package, value in rest if package == port.name}
+        if len(named) != 1:
+            continue
+        value = named.pop()
+        changed |= port.remote_port != value
+        port.remote_port = value
+        left.remove(port)
+        rest = [(package, found) for package, found in rest if package != port.name]
+    distinct = {value for _, value in rest}
+    if len(left) == 1 and len(distinct) == 1:
+        value = distinct.pop()
+        changed |= left[0].remote_port != value
+        left[0].remote_port = value
+    return changed
 
 
 def check_wrappable(spec: ServiceSpec) -> None:
@@ -399,8 +462,9 @@ def package_service_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, st
     Steps the request marked ``service`` keep their marks, so the connector runs
     where the marked step's rank 0 serves the ports; with none marked, every
     step runs as a service. ``${CLIO_RELAY_...}`` in a step's parameters
-    is filled from the service's environment, so a package's port parameter can
-    name the port relay chose (``${CLIO_RELAY_PORT_<NAME>}``). The connector's
+    is filled from the service's environment. A port the request does not fix
+    is 0 there, so the package binds its own and reports it to JARVIS, and
+    relay forwards the reported port (:func:`adopt_ports`). The connector's
     settings travel in the job's environment, where
     :func:`clio_relay.jarvis_submit.connector_command` reads them.
     """

@@ -382,10 +382,11 @@ def jarvis_status_script(
 def jarvis_execution_script(
     job_dir: str, verb: jarvis_submit.ExecutionVerb, execution_id: str, pipeline: str
 ) -> str:
-    """Run ``jarvis execution <verb>`` (cancel or stop) in the job directory.
+    """Run ``jarvis execution <verb>`` (cancel, stop or service-runtimes) in the job directory.
 
     Prints ``@@rc`` and the command's output under ``@@out``; the output's last
-    line is the execution record JARVIS committed.
+    line is the document JARVIS printed: the execution record it committed, or
+    its service runtimes.
     """
     command = jarvis_submit.execution_shell(verb, execution_id, job_dir=job_dir, pipeline=pipeline)
     return (

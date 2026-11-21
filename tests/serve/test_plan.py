@@ -11,9 +11,12 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.serve.config import SiteServe
 from clio_relay.serve.plan import (
     HopState,
+    adopt_ports,
     check_wrappable,
     env_suffix,
     plan_ports,
+    ports_file,
+    runtime_endpoints,
     secrets_file,
     service_name,
     site_files,
@@ -57,6 +60,53 @@ def test_ports_refuse_a_repeated_name_and_a_bad_variable() -> None:
     bad = service(ports=[{"name": "web", "protocol": "http", "protection": "secret_env:1x"}])
     with pytest.raises(Refusal, match="names no environment variable"):
         plan_ports(bad)
+
+
+def test_a_package_service_binds_its_own_port_and_relay_injects_none() -> None:
+    spec = service(ports=[{"name": "paraview"}, {"name": "fixed", "port": 9000}])
+    paraview, fixed = plan_ports(spec, adopt=True)
+    assert (paraview.remote_port, fixed.remote_port) == (0, 9000)
+
+
+def _runtimes(*reports: object) -> dict[str, object]:
+    return {
+        "schema_version": "jarvis.execution.service-runtimes.v1",
+        "service_runtimes": list(reports),
+    }
+
+
+def test_runtime_endpoints_keep_only_listening_services_with_a_real_port() -> None:
+    document = _runtimes(
+        {"package_id": "pvserver", "lifecycle": "ready", "port": 59629},
+        {"package_id": "old", "lifecycle": "stopped", "port": 1234},
+        {"package_id": "zero", "lifecycle": "ready", "port": 0},
+        {"package_id": "flag", "lifecycle": "ready", "port": True},
+        {"package_id": "slow", "lifecycle": "degraded", "port": 4000},
+        "not a report",
+    )
+    assert runtime_endpoints(document) == [("pvserver", 59629), ("slow", 4000)]
+    assert runtime_endpoints(None) == []
+    assert runtime_endpoints({"service_runtimes": "x"}) == []
+
+
+def test_a_lone_port_takes_the_port_jarvis_reports(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path)
+    plan.ports = plan_ports(service(ports=[{"name": "paraview"}]), adopt=True)
+    assert adopt_ports(plan, [("pvserver", 59629)]) is True
+    assert plan.ports[0].remote_port == 59629
+    assert adopt_ports(plan, [("pvserver", 59629)]) is False
+    assert b"paraview 59629 " in ports_file(plan)
+
+
+def test_ports_match_the_reporting_package_by_name_and_stay_when_ambiguous(
+    tmp_path: Path,
+) -> None:
+    plan = frp_plan(tmp_path)
+    plan.ports = plan_ports(service(ports=[{"name": "a"}, {"name": "b"}]), adopt=True)
+    assert adopt_ports(plan, [("x", 1), ("y", 2)]) is False
+    assert [port.remote_port for port in plan.ports] == [0, 0]
+    assert adopt_ports(plan, [("a", 1), ("y", 2)]) is True
+    assert [port.remote_port for port in plan.ports] == [1, 2]
 
 
 @pytest.mark.parametrize(

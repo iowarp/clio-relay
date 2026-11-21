@@ -159,6 +159,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
     Config: ClassVar[type[BaseModel]] = SshConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
     runs_packages: ClassVar[bool] = True
+    reads_service_runtimes: ClassVar[bool] = True
     clean_over_connection: ClassVar[bool] = True
 
     def __init__(self, config: SshConfig, context: AdapterContext) -> None:
@@ -885,6 +886,26 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 return current
             raise jarvis_submit.execution_failed(verb, output)
         return await self.status(handle)
+
+    async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
+        """``jarvis execution service-runtimes +json`` for a JARVIS job, read on the site."""
+        if handle.data.get("mode") != "jarvis" or not handle.data.get("job_dir"):
+            return None
+        job_dir = str(handle.data["job_dir"])
+        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
+        sections = parse_sections(
+            await self._ssh(
+                scripts.jarvis_execution_script(
+                    job_dir, "service-runtimes", execution_id, pipeline
+                ),
+                "reading the service runtimes",
+            )
+        )
+        if _one(sections, "rc") != "0":
+            return None
+        return jarvis_submit.parse_document(
+            "\n".join(sections.get("out", [])), jarvis_submit.SERVICE_RUNTIMES_SCHEMA
+        )
 
     # install
 

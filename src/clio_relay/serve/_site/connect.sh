@@ -7,8 +7,11 @@
 # and jarvis execution stop ends it. The connector only carries its ports.
 #
 # It reads serve/ports ("name port protocol health_path" per line) and
-# serve/secrets.env, which it deletes once read. It runs frpc and restarts it
-# if it dies, and writes serve/ready.json once every port listens on this
+# serve/secrets.env, which it deletes once read. A port of 0 is one the
+# package binds itself: relay rewrites serve/ports with the port JARVIS
+# recorded from the package's ready event, and the connector rereads it. It
+# runs frpc once every port is known, restarts it if it dies or the ports
+# change, and writes serve/ready.json once every port listens on this
 # host (checked in /proc/net/tcp, never by connecting) and frpc registered
 # them. With an idle release it writes serve/idle once no connection used the
 # ports for that long; relay then runs jarvis execution stop. It ends with the
@@ -99,13 +102,36 @@ esac
 [ -n "$FRPC" ] && [ -f "$FRPC" ] && [ ! -x "$FRPC" ] && chmod u+x "$FRPC"
 
 frpc_pid=
+ports_sum=
+# The tokens stay in this shell, unexported, and reach only frpc's own environment.
+frp_token=${CLIO_RELAY_FRP_TOKEN:-}
+frp_sk=${CLIO_RELAY_FRP_SK:-}
+hop_token=${CLIO_RELAY_HOP_TOKEN:-}
+unset CLIO_RELAY_FRP_TOKEN CLIO_RELAY_FRP_SK CLIO_RELAY_HOP_TOKEN
+
+# A port of 0 is one the package binds itself; relay writes the port JARVIS
+# recorded for it here once the package reports it.
+ports_known() {
+    while read -r name port proto path; do
+        [ -n "$name" ] || continue
+        [ "$port" != 0 ] || return 1
+    done < "$S/ports"
+    return 0
+}
+
 start_frpc() {
     [ -n "$FRPC" ] || return 0
-    "$FRPC" -c "$S/frpc.toml" >> "$S/frpc.log" 2>&1 < /dev/null &
+    ports_known || return 0
+    ports_sum=$(cksum < "$S/ports")
+    (
+        [ -n "$frp_token" ] && export CLIO_RELAY_FRP_TOKEN="$frp_token"
+        [ -n "$frp_sk" ] && export CLIO_RELAY_FRP_SK="$frp_sk"
+        [ -n "$hop_token" ] && export CLIO_RELAY_HOP_TOKEN="$hop_token"
+        exec "$FRPC" -c "$S/frpc.toml" >> "$S/frpc.log" 2>&1 < /dev/null
+    ) &
     frpc_pid=$!
 }
 start_frpc
-unset CLIO_RELAY_FRP_TOKEN CLIO_RELAY_FRP_SK CLIO_RELAY_HOP_TOKEN
 note "connector started on $(hostname) for the batch shell $BATCH"
 
 reason=
@@ -130,8 +156,16 @@ while :; do
         echo "$restarts" > "$S/frpc-restarts"
         note "frpc exited, starting it again (restart $restarts)"
         start_frpc
+    elif [ -n "$FRPC" ] && [ "$ready" = 0 ] && ports_known &&
+        [ "$(cksum < "$S/ports")" != "$ports_sum" ]; then
+        if [ -n "$frpc_pid" ]; then
+            kill -TERM "$frpc_pid" 2>/dev/null
+            : > "$S/frpc.log"
+            note "the service's ports changed; starting frpc again"
+        fi
+        start_frpc
     fi
-    if [ "$ready" = 0 ] && healthy && registered; then
+    if [ "$ready" = 0 ] && ports_known && healthy && registered; then
         ready=1
         ports=$(awk 'NF { printf "%s\"%s\": %s", (n++ ? ", " : ""), $1, $2 }' "$S/ports")
         write_json ready.json "{\"host\": \"$(hostname)\", \"pid\": $BATCH, \"ports\": {$ports}}"

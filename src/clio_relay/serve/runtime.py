@@ -40,13 +40,17 @@ from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
     HopState,
     ServePlan,
+    adopt_ports,
     check_wrappable,
     new_secret,
     package_service_job,
     plan_ports,
+    ports_file,
+    runtime_endpoints,
     service_name,
     site_file,
     site_files,
+    site_frpc_config,
     wrapped_job,
 )
 from clio_relay.serve.provenance import with_provenance
@@ -420,7 +424,9 @@ class ServeRuntime:
         if package and not getattr(adapter, "runs_packages", False):
             raise jarvis_submit.not_run_here(str(adapter.name))
         mode = self._mode(adapter, site, loaded.rendezvous)
-        ports = plan_ports(spec)
+        ports = plan_ports(
+            spec, adopt=package and bool(getattr(adapter, "reads_service_runtimes", False))
+        )
         if any(port.protocol == "mcp" for port in ports):
             self._refuse_a_second_mount(site_id, service_name(spec), operation_id)
         idle = spec.lifetime.idle_release
@@ -694,16 +700,46 @@ class ServeRuntime:
             return None
         return frpc_problem(plan, await self._read(plan, adapter, "frpc.log", tail=LOG_TAIL))
 
+    async def _adopt_reported_ports(self, plan: ServePlan, adapter: Any) -> bool:
+        """Take the ports JARVIS recorded for the package service; True while one is unknown.
+
+        The package binds its own port and reports it in its ready event; relay
+        forwards that port and never injects one. A changed port rewrites the
+        site's frpc settings first, then ``serve/ports``, which the connector
+        rereads.
+        """
+        if not plan.package or plan.handle is None:
+            return False
+        if not getattr(adapter, "reads_service_runtimes", False):
+            return False
+        try:
+            document = await adapter.service_runtimes(plan.handle)
+        except Refusal as refusal:
+            logger.info("serve %s: service runtimes unread: %s", plan.operation_id, refusal)
+            document = None
+        if adopt_ports(plan, runtime_endpoints(document)):
+            self._save(plan)
+            files: FileAccess = await adapter.files()
+            if plan.mode == "frp":
+                await files.write(
+                    job_path(plan, "frpc.toml"), site_frpc_config(plan), overwrite=True
+                )
+            await files.write(job_path(plan, "ports"), ports_file(plan), overwrite=True)
+        return any(port.remote_port == 0 for port in plan.ports)
+
     async def _running(
         self, plan: ServePlan, adapter: Any, status: JobStatus
     ) -> tuple[JobStatus, Endpoint | None]:
         if plan.ready_at is None:
+            unknown = await self._adopt_reported_ports(plan, adapter)
             raw = await self._read(plan, adapter, "ready.json")
             if raw is None:
                 log = await self._read(plan, adapter, "service.log", tail=LOG_TAIL)
                 line = last_line(plan, log)
                 problem = await self._frpc_problem(plan, adapter)
                 message = "starting: waiting for the service's ports to answer"
+                if unknown:
+                    message = "starting: waiting for JARVIS to report the port the service bound"
                 if plan.mode == "frp":
                     message += " and for frpc to register them"
                 if line:

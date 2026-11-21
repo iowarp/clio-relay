@@ -332,6 +332,8 @@ class BaseAdapter[ConfigT: BaseModel]:
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe"})
     # True when the site runs a reviewed package from the package store, not the agent's command.
     runs_packages: ClassVar[bool] = False
+    # True when service_runtimes reads JARVIS's record, so a package service picks its own port.
+    reads_service_runtimes: ClassVar[bool] = False
     # False for test-only adapters: the Compute tab does not offer them for a new site.
     listed: ClassVar[bool] = True
 
@@ -399,6 +401,16 @@ class BaseAdapter[ConfigT: BaseModel]:
         :meth:`status` reports the job's ``queue`` (it waits).
         """
         raise not_implemented(self.name, "move_queue")
+
+    async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
+        """Return ``jarvis execution service-runtimes +json`` for a JARVIS job, or None.
+
+        It is JARVIS's ``jarvis.execution.service-runtimes.v1`` document: the
+        host and port each package service reported it bound. None when the
+        adapter cannot read it (``reads_service_runtimes`` is False) or JARVIS
+        printed no document yet.
+        """
+        return None
 
     async def sign_in_needed(self) -> SignInNeed | None:
         return None

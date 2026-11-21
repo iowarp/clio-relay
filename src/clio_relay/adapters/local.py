@@ -215,6 +215,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     Config: ClassVar[type[BaseModel]] = LocalConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
     runs_packages: ClassVar[bool] = True
+    reads_service_runtimes: ClassVar[bool] = True
 
     def __init__(self, config: LocalConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
@@ -620,6 +621,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
             )
         return result.stdout
+
+    async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
+        """``jarvis execution service-runtimes +json`` for a JARVIS job."""
+        if handle.data.get("mode") != "jarvis" or not handle.data.get("job_dir"):
+            return None
+        result = await self._run_execution(handle, "service-runtimes")
+        if result.exit_code != 0:
+            return None
+        return jarvis_submit.parse_document(result.stdout, jarvis_submit.SERVICE_RUNTIMES_SCHEMA)
 
     async def _run_execution(
         self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb

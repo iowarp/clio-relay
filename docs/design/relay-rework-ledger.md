@@ -1461,6 +1461,8 @@ Files: `src/clio_relay/serve/` (config, plan, frp, forward, desktop, mount, runt
     - `frpc` or `frpc_binary`, and `python`;
     - `stop_grace_s`, default 30.
 - In the job, `${CLIO_RELAY_PORT_<NAME>}` in args and env becomes the service's port on the node.
+  - A package service on an adapter that reads JARVIS's service runtimes (ssh, local) gets port 0 for any port the request doesn't fix. The package binds its own port and reports it in its ready event, and relay forwards the port in `jarvis execution service-runtimes +json`. Relay never injects one (video1k: op_52a9 and pilot 27978 waited on 42507 while pvserver bound 59629).
+  - The connector starts frpc only once no port in `serve/ports` is 0, and restarts it when relay rewrites that file. The frp tokens stay in the connector's shell, unexported, and reach only frpc's environment.
 - Mounted tools are named `<site>_<name>_<tool>`. Their MCP Apps metadata (`_meta.ui`) passes through unchanged.
 - `serve.descriptor`: the view descriptor schema, vendored byte for byte from clio-jarvis a6aba08 (identical at v0.1.0, 2d12dbb), sha256 `8773b9ed…1b076`, with `problems(descriptor)`.
 - `serve.provenance`: the neutral block `relay.provenance.v1` under an artifact's `metadata["provenance"]`, and `for_output(record, output)`. It names nothing CLIO-specific. `models_gateway.ArtifactRef` reads it first and the legacy `clio.provenance.v1` second.
