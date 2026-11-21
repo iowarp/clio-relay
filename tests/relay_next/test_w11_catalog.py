@@ -16,8 +16,15 @@ def test_entry_is_guarded_with_a_skill_and_a_source(site_id: str) -> None:
     assert entry.policy == "guarded"
     assert entry.spend.ask == "always"
     assert entry.source is not None and entry.source.startswith("https://docs.")
-    assert entry.skill in catalog.skills()
+    assert entry.skill is None or entry.skill in catalog.skills()
     assert entry.to_site().id == site_id
+
+
+@pytest.mark.parametrize("site_id", ["ares", "polaris"])
+def test_relay_ships_no_cluster_facts_for_a_site(site_id: str) -> None:
+    entry = catalog.site(site_id)
+    assert entry.skill is None
+    assert entry.id != "ares" or entry.defaults.queue is None
 
 
 @pytest.mark.parametrize("site_id", ["polaris", "deltaai"])

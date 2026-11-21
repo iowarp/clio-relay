@@ -1,12 +1,16 @@
 """Relay's own ask to move a job that waits long when another partition has room.
 
-A submitted job (a run's, a service's, or an install's) that the scheduler
-expects to start far off, while another partition has idle nodes it fits,
-gets one ask: keep waiting, or move to that partition. Relay never moves a job
-on its own. The person's answer is acted on with the adapter's
-:meth:`~clio_relay.adapters.base.BaseAdapter.move_queue`, so the job keeps its
-id and directory; a later job of the same operation (the run after its
-install) goes to the partition the person chose.
+The facts are JARVIS's: a pending job's execution record carries
+``metadata.queue`` (``jarvis.scheduler.queue.v1``), with the job's partition,
+why it waits (``reason_kind``), when the scheduler expects it to start, and
+the site's other partitions with whether the job fits there now. A submitted
+job (a run's, a service's, or an install's) that is expected to start far off,
+while another partition fits it, gets one ask: keep waiting, or move to that
+partition. Relay never moves a job on its own. The person's answer is acted on
+with the adapter's :meth:`~clio_relay.adapters.base.BaseAdapter.move_queue`,
+which is ``jarvis execution move``: JARVIS checks the move and keeps the job's
+execution; a later job of the same operation (the run after its install) goes
+to the partition the person chose.
 
 The ask is asked once per job and partition: after "keep waiting" relay does
 not ask again for that job, and a job that starts before the person answers
@@ -33,8 +37,8 @@ logger = logging.getLogger(__name__)
 KEY = "queue_switch"
 FIELD = "queue"
 DEFAULT_WAIT = timedelta(hours=1)
-# Waiting for these is the job's own doing, so another partition does not help.
-_OWN_REASONS = ("Dependency", "BeginTime", "JobHeld", "Held", "DependencyNeverSatisfied")
+# A job held by its owner or by a dependency waits on itself, so another partition does not help.
+_OWN_REASONS = frozenset({"job_hold"})
 
 
 def state_of(record: OperationRecord) -> dict[str, Any]:
@@ -109,10 +113,17 @@ async def consider(
     reason = str(facts.get("reason") or "")
     if not isinstance(starts_in, int) or not isinstance(partition, str):
         return record
-    if starts_in < _wait_limit(service, record.site) or reason.startswith(_OWN_REASONS):
+    if facts.get("move_supported") is False or facts.get("reason_kind") in _OWN_REASONS:
         return record
-    idle = cast(list[dict[str, Any]], facts.get("idle_partitions") or [])
-    fitting = [item for item in idle if item.get("fits") and item.get("partition")]
+    if starts_in < _wait_limit(service, record.site):
+        return record
+    listed = cast(list[Any], facts.get("partitions") or [])
+    entries = [cast(dict[str, Any], item) for item in listed if isinstance(item, dict)]
+    fitting = [
+        item
+        for item in entries
+        if item.get("fits") and item.get("partition") and item.get("partition") != partition
+    ]
     if not fitting:
         return record
     key = f"{handle.native_id}:{partition}"
@@ -123,13 +134,18 @@ async def consider(
     options = {keep: ""}
     for item in fitting:
         options[f"move to {item['partition']}"] = str(item["partition"])
-    names = ", ".join(f"{item['partition']} ({item['idle']} idle nodes)" for item in fitting)
+    names = ", ".join(
+        f"{item['partition']} ({item['idle_nodes']} idle nodes)"
+        if isinstance(item.get("idle_nodes"), int)
+        else str(item["partition"])
+        for item in fitting
+    )
     site = service.site(record.site)
     start = facts.get("estimated_start") or "later"
     message = (
         f"{_what(record, phase)} {handle.native_id} waits in the {partition} queue on "
-        f"{site.title}{f' ({reason})' if reason else ''}. Slurm expects it to start at "
-        f"{start}, in about {_hours(starts_in)}. {names} "
+        f"{site.title}{f' ({reason})' if reason else ''}. The scheduler expects it to start "
+        f"at {start}, in about {_hours(starts_in)}. {names} "
         f"{'has' if len(fitting) == 1 else 'have'} room for it now. Keep waiting, or move "
         "it there? Moving keeps the job and its place in relay; it starts when that "
         "partition runs it."

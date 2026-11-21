@@ -2,12 +2,14 @@
 
 It stops relay's processes on the site first (:mod:`clio_relay.shutdown`), then
 removes the worker and its binaries, relay's scripts and job directories, the
-JARVIS bootstrap venv, and ``~/.clio-relay`` and ``~/.config/clio-relay``. The
+JARVIS bootstrap venv with JARVIS's site record (its resource graph and install
+decisions), and ``~/.clio-relay`` and ``~/.config/clio-relay``. The
 person's Spack store (``<site home>/spack`` and ``<site home>/spack-config``) is
 kept unless ``remove_spack`` says otherwise; rebuilding it takes hours. Then it
 drops relay's local state for the site, so the next call signs in and places
-everything again. It observes the site's open operations first, so one whose job
-was cancelled outside relay ends, and it refuses while a job of the site still
+everything again. It observes the site's open operations first, through JARVIS's
+execution record, so one whose job was cancelled outside relay ends, and it
+refuses while a job of the site still
 runs: its directory is among what goes. Operations still waiting on a person,
 with no job yet, are cancelled with the clean.
 """
@@ -185,10 +187,6 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
         if directory.exists():
             shutil.rmtree(directory, ignore_errors=True)
             local.append(str(directory))
-    choices = installing.choices_path(service, site_id)
-    if choices.exists():
-        choices.unlink(missing_ok=True)
-        local.append(str(choices))
     return {
         "schema": SCHEMA,
         "site": site_id,

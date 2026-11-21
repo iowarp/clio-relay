@@ -144,23 +144,6 @@ def _parameters(menu: list[dict[str, Any]] | None, contract: dict[str, Any]) -> 
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if refinement.get("required"):
         schema["required"] = [str(item) for item in refinement["required"]]
-    rules: list[dict[str, Any]] = []
-    for case in cast(list[Any], refinement.get("cases") or []):
-        if not isinstance(case, dict):
-            continue
-        found = cast(dict[str, Any], case)
-        if not isinstance(found.get("when"), dict):
-            continue
-        then: dict[str, Any] = {}
-        if found.get("required"):
-            then["required"] = [str(item) for item in found["required"]]
-        if isinstance(found.get("properties"), dict):
-            then["properties"] = _json(found["properties"])
-        if then:
-            rules.append({"if": {"properties": _json(found["when"])}, "then": then})
-    if rules:
-        # A case's rules hold only when the configuration is in that case.
-        schema["allOf"] = rules
     return schema
 
 
@@ -354,39 +337,6 @@ def with_contract_resources(spec: JobSpec, entries: Sequence[PackageEntry | None
             "resources": spec.resources.model_copy(update=resources),
         }
     )
-
-
-CORES_PARAMETER = "cores_per_node"
-"""The package parameter JARVIS reads a node's cores from: an empty ``ppn`` takes it."""
-
-
-def with_site_cores(
-    spec: JobSpec, entries: Sequence[PackageEntry | None], cores: int | None
-) -> JobSpec:
-    """Set ``cores_per_node`` to the partition's physical cores where a step leaves it unset.
-
-    Only a step whose package declares the parameter gets it, so a package that
-    has none is configured as before. A value the run sets, other than empty,
-    wins. ``cores`` is the physical cores per node of the partition the job runs
-    in, from the site's ``describe``; with none known nothing changes.
-    """
-    steps = spec.steps()
-    if not steps or not cores:
-        return spec
-    changed = False
-    filled: list[PackageRef] = []
-    for step, entry in zip(steps, entries, strict=True):
-        properties = cast(
-            dict[str, Any], (entry.parameters if entry else {}).get("properties") or {}
-        )
-        current = step.parameters.get(CORES_PARAMETER)
-        if CORES_PARAMETER in properties and current in (None, "", 0):
-            step = step.model_copy(
-                update={"parameters": {**step.parameters, CORES_PARAMETER: cores}}
-            )
-            changed = True
-        filled.append(step)
-    return spec.with_steps(filled) if changed else spec
 
 
 def node_range(step: PackageRef) -> tuple[int, int] | None:

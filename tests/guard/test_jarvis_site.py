@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import os
 import tarfile
 from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters.sched_info import SCHEMA as SCHED_SCHEMA
+from clio_relay.adapters.sched_info import partitions as sched_partitions
+from clio_relay.adapters.sched_info import report as sched_report
+from clio_relay.adapters.sched_info import site_facts as sched_facts
+from clio_relay.adapters.ssh.scripts import jarvis_command
 from clio_relay.jarvis_site import (
     SOURCE_FILE,
     archive_package,
@@ -20,13 +26,24 @@ from clio_relay.jarvis_submit import (
     JARVIS_PIN,
     PIN_ENV,
     SITE_SCRIPT,
+    applied_decisions,
+    blocking_issues,
+    choice_issues,
+    choice_message,
     direct_job,
     explicit_jarvis,
+    graph_pipeline,
+    graph_report,
     input_paths,
+    jarvis_refused,
     missing_jarvis,
     pipeline_document,
+    queue_message,
+    record_status,
+    steps_digest,
 )
 from clio_relay.jobs.content import ContentStore
+from clio_relay.jobs.handles import JobState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
@@ -143,16 +160,15 @@ def test_direct_job_keeps_resources_and_inputs() -> None:
     assert job.package is None
     assert job.executable == "/bin/bash"
     assert job.arguments[1] == SITE_SCRIPT
-    assert job.arguments[2:8] == [
+    assert job.arguments[2:7] == [
         "clio-relay-jarvis",
         "run",
-        "b" * 64,
-        "demo.hello",
         "~/jv/bin/jarvis",
         "",
+        f"demo.hello@{'b' * 64}",
     ]
-    assert job.arguments[8].splitlines() == [
-        f"name: relay_{'b' * 12}",
+    assert job.arguments[7].splitlines() == [
+        f"name: relay_{steps_digest(spec)[:12]}",
         "pkgs:",
         "- pkg_type: demo.hello",
         "  pkg_name: pkg",
@@ -166,6 +182,34 @@ def test_direct_job_keeps_resources_and_inputs() -> None:
     with pytest.raises(Refusal) as raised:
         direct_job(spec.model_copy(update={"directory": "/scratch/run"}))
     assert raised.value.reason == RefusalReason.INVALID_SPEC
+
+
+@pytest.mark.parametrize(
+    "value", ["{job_dir}/body.stl", "$CLIO_RELAY_JOB_DIR/body.stl", "<job>/body.stl"]
+)
+def test_a_placeholder_around_an_input_name_is_refused(value: str) -> None:
+    spec = JobSpec.model_validate(
+        {
+            "package": {
+                "name": "demo.hello",
+                "version": "1",
+                "sha256": "b" * 64,
+                "parameters": {"stl": value},
+            },
+            "inputs": [{"name": "body.stl", "sha256": "c" * 64}],
+        }
+    )
+    with pytest.raises(Refusal) as raised:
+        pipeline_document(spec, pipeline="p", job_dir="/scratch/job")
+    assert raised.value.reason == RefusalReason.INVALID_SPEC
+    assert "'body.stl'" in raised.value.message
+    assert spec.package is not None
+    dotted = spec.model_copy(
+        update={"package": spec.package.model_copy(update={"parameters": {"stl": "./body.stl"}})}
+    )
+    assert pipeline_document(dotted, pipeline="p", job_dir="/scratch/job")["pkgs"] == [
+        {"pkg_type": "demo.hello", "pkg_name": "pkg", "stl": "/scratch/job/body.stl"}
+    ]
 
 
 def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
@@ -200,7 +244,7 @@ def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
     assert kept[0]["stl"] == "body.stl"
     assert archive not in str(entry)
     job = direct_job(spec, job_dir="/scratch/job")
-    assert "stl: /scratch/job/body.stl" in job.arguments[8].splitlines()
+    assert "  stl: /scratch/job/body.stl" in job.arguments[7].splitlines()
 
 
 def test_the_jarvis_setting_is_a_path_or_relays_pinned_one() -> None:
@@ -229,3 +273,171 @@ def test_a_missing_jarvis_says_whose_it_is() -> None:
     absent = missing_jarvis('{"missing":"jarvis","tried":"/h/j"}', site="lab")
     assert absent.reason == RefusalReason.ADAPTER_UNAVAILABLE
     assert absent.data["installable"] == JARVIS_PIN
+
+
+def test_a_refusal_keeps_jarvis_typed_issues_even_pretty_printed() -> None:
+    text = (
+        "some log line\n"
+        "{\n"
+        '  "schema_version": "jarvis.refusal.v1",\n'
+        '  "refused": true,\n'
+        '  "issues": [\n'
+        '    {"kind": "execution_move_refused", "field": "queue",\n'
+        '     "message": "the job is already running"}\n'
+        "  ]\n"
+        "}\n"
+    )
+    refusal = jarvis_refused(text, site="lab", what="the move")
+    assert refusal.reason == RefusalReason.INVALID_SPEC
+    assert refusal.data["kinds"] == ["execution_move_refused"]
+    assert "queue: the job is already running" in refusal.message
+
+
+def test_the_graph_collection_runs_on_compute_nodes() -> None:
+    assert graph_pipeline("slurm") == {
+        "name": "site_net",
+        "pkgs": [{"pkg_type": "builtin.resource_graph"}],
+        "scheduler": {"name": "slurm", "nodes": 2, "time": "00:05:00"},
+    }
+    assert "scheduler" not in graph_pipeline("none")
+
+
+def test_the_graph_report_is_jarvis_json_or_none() -> None:
+    report = '{"schema_version": "jarvis.resource-graph.net-report.v1", "data": "x"}\ntrailing'
+    found = graph_report("noise\n" + report)
+    assert found is not None
+    assert found["data"] == "x"
+    assert graph_report("no graph yet") is None
+
+
+def test_a_waiting_job_carries_jarvis_queue_facts() -> None:
+    record = {
+        "state": "submitted",
+        "metadata": {
+            "queue": {
+                "state": "pending",
+                "partition": "big",
+                "reason": "Resources",
+                "starts_in_s": 7200,
+                "partitions": [
+                    {"partition": "big", "fits": True},
+                    {"partition": "small", "fits": True, "idle_nodes": 3},
+                    {"partition": "tiny", "fits": False},
+                ],
+            }
+        },
+    }
+    status = record_status(record)
+    assert status.state == JobState.QUEUED
+    assert status.queue is not None
+    assert status.message == queue_message(status.queue)
+    assert status.message == (
+        "waiting in the queue in big (Resources); the scheduler expects it to start "
+        "in about 2 h. It would fit now in small"
+    )
+
+
+def test_a_failed_job_says_jarvis_typed_issues() -> None:
+    issue = {
+        "kind": "mpi_network",
+        "field": "resource_graph.net.override",
+        "message": "ranks reached the wrong node",
+    }
+    status = record_status({"state": "failed", "return_code": 14, "metadata": {"issues": [issue]}})
+    assert status.state == JobState.FAILED
+    assert status.issues == [issue]
+    assert status.message is not None
+    assert "ranks reached the wrong node" in status.message
+
+
+def test_only_decisions_jarvis_replayed_are_applied() -> None:
+    report = {
+        "applied_decisions": [
+            {"issue_id": "a", "source": "decisions_file", "constraint": "^mpi/abc"},
+            {"issue_id": "b", "source": "answers", "constraint": "%gcc"},
+        ]
+    }
+    assert [item["issue_id"] for item in applied_decisions(report)] == ["a"]
+
+
+def test_a_missing_spack_is_a_choice_of_the_site_spacks() -> None:
+    root = "/opt/site/spack"
+    issue = {
+        "issue_id": "spack-1",
+        "kind": "spack_missing",
+        "subject": "spack",
+        "scope": "site",
+        "package": "*",
+        "answerable": True,
+        "question": "Which Spack should JARVIS use on this site?",
+        "candidates": [{"id": root, "root": root, "constraint": root, "version": "0.23.1"}],
+        "site_spacks": [{"id": root, "root": root, "constraint": root, "version": "0.23.1"}],
+    }
+    report = {"issues": [issue]}
+    assert choice_issues(report) == [issue]
+    assert blocking_issues(report) == []
+    message = choice_message(issue)
+    assert root in message
+    assert "0.23.1" in message
+
+
+def test_no_site_spack_blocks_the_install() -> None:
+    issue: dict[str, object] = {
+        "issue_id": "spack-2",
+        "kind": "spack_missing",
+        "answerable": True,
+        "candidates": [],
+    }
+    report: dict[str, object] = {"issues": [issue]}
+    assert choice_issues(report) == []
+    assert blocking_issues(report) == [issue]
+
+
+def test_describe_reads_jarvis_sched_info() -> None:
+    document = {
+        "schema_version": SCHED_SCHEMA,
+        "provider": "slurm",
+        "partitions": [
+            {
+                "partition": "small",
+                "default": True,
+                "total_nodes": 4,
+                "idle_nodes": 3,
+                "allocated_nodes": 1,
+                "cpus_per_node": 40,
+                "memory_mb_per_node": 1000,
+                "max_time": "1:00:00",
+                "max_time_s": 3600,
+                "gres": "gpu:2",
+            },
+            {"name": "unnamed-is-skipped"},
+            {"partition": ""},
+        ],
+        "mpi": {"choice_needed": True},
+        "site_skills": [{"name": "lab", "description": "the lab's notes"}],
+        "issues": [],
+    }
+    found = sched_report("[jarvis] noise\n" + json.dumps(document, indent=2) + "\n")
+    assert found == document
+    assert sched_report('{"schema_version": "other"}') is None
+    listed = sched_partitions(found)
+    assert [entry.name for entry in listed] == ["small", "unnamed-is-skipped"]
+    small = listed[0]
+    assert (small.default, small.nodes, small.idle, small.allocated) == (True, 4, 3, 1)
+    assert (small.cpus_per_node, small.memory_mb, small.max_time_s) == (40, 1000, 3600)
+    assert small.gres == ["gpu:2"]
+    facts = sched_facts(found)
+    assert facts["provider"] == "slurm"
+    assert facts["site_skills"] == [{"name": "lab", "description": "the lab's notes"}]
+    assert sched_partitions(None) == []
+
+
+def test_the_jarvis_exec_runs_relays_jarvis_with_the_site_record() -> None:
+    argv = jarvis_command("/home/me/.clio-relay")
+    assert argv[:2] == ["sh", "-c"]
+    assert argv[3] == "jarvis"
+    script = argv[2]
+    assert 'exec "$JB" "$@"' in script
+    assert "JARVIS_RESOURCE_GRAPH" in script
+    assert "JARVIS_SPACK_DECISIONS" in script
+    assert 'JARVIS_SPACK_ROOT="$SR"' in script

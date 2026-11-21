@@ -194,14 +194,21 @@ class PackageRef(_Spec):
         default=None,
         description="The archive's SHA-256. Leave out to use the catalogued archive",
     )
-    parameters: dict[str, CustomValue] = Field(default_factory=dict[str, CustomValue])
+    parameters: dict[str, CustomValue] = Field(
+        default_factory=dict[str, CustomValue],
+        description=(
+            "The package's parameters. To pass a run input, set the parameter to the input's "
+            "name, such as body.stl; relay puts in its absolute path on the site. Do not "
+            "write a directory placeholder: nothing on the site expands one"
+        ),
+    )
     service: bool = Field(
         default=False,
         description=(
             "Run the package as a service: start it and keep it up until it is stopped. "
-            "In a serve pipeline, set it on the one step that serves the ports (its rank 0 "
-            "host runs the connector); the other steps run alongside it. With no step "
-            "marked, relay marks the catalog's service packages, or every step."
+            "Optional: in a serve pipeline JARVIS decides which step serves, on which "
+            "node and when it starts, from each package's deployment profile, host_slice "
+            "and start_mode, and relay's connector runs on that node."
         ),
     )
 

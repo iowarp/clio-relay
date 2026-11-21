@@ -24,7 +24,6 @@ spend:
 defaults:
   queue: debug
   duration: PT1H
-skill: alcf-polaris
 source: https://docs.alcf.anl.gov/polaris/running-jobs/
 description: >-
   ALCF's GPU system, 560 nodes with four NVIDIA A100 GPUs each, under PBS. Relay

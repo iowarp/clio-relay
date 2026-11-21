@@ -65,7 +65,12 @@ from clio_relay.surface.elicit import (
     tasks_opted_in,
 )
 from clio_relay.surface.endpoints import address as _address
-from clio_relay.surface.endpoints import endpoint_summary, service_message, service_ready
+from clio_relay.surface.endpoints import (
+    endpoint_summary,
+    service_message,
+    service_ready,
+    service_served,
+)
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
@@ -138,6 +143,11 @@ def _summary(view: dict[str, Any]) -> str:
     ports: list[dict[str, Any]] = endpoint.get("ports") or []
     for port in ports:
         line += f"\n{port['name']}: {_address(port)}"
+    if ports and view["state"] == OperationState.RUNNING.value:
+        line += (
+            f"\nThe service is ready and keeps running until serve(stop={view['operation_id']!r})"
+            " or its job ends; describe(job=...) follows it."
+        )
     tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
@@ -223,6 +233,8 @@ class RelayTasksExtension(ServerExtension):
         return record
 
     def _status(self, record: OperationRecord) -> str:
+        if service_served(record):
+            return "completed"
         if record.state == OperationState.AWAITING_INPUT and self.service.outstanding(record):
             return "input_required"
         if record.state == OperationState.CANCELLED:
@@ -270,7 +282,7 @@ class RelayTasksExtension(ServerExtension):
                     ask.ask_id: elicit_document(ask) for ask in self.service.outstanding(record)
                 },
             )
-        if record.state.final:
+        if record.state.final or fields["status"] == "completed":
             result = record_result(self.service, record)
             final = mcp_types.CallToolResult.model_validate(
                 {

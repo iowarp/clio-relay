@@ -21,13 +21,16 @@ from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
     EXIT_MISSING,
     EXIT_NO_JARVIS,
+    EXIT_REFUSED,
     EXIT_USAGE,
     EXITCODE_FILE,
     JARVIS_FILE,
     PIPELINE_FILE,
     REFUSAL_FILE,
+    SERVICE_NODE_FILE,
     SITE_SCRIPT,
     SUBMISSION_FILE,
+    jarvis_refused,
     missing_jarvis,
     parse_handle,
 )
@@ -44,6 +47,15 @@ case "$1 $2" in
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
+  "ppl check")
+    if [ -n "${JARVIS_CHECK_RC:-}" ]; then
+      printf '{"schema_version":"jarvis.pipeline-check.v1","ok":false,"errors":'
+      printf '[{"kind":"host_slice_overlap","field":"pkgs[1].host_slice",'
+      printf '"message":"the slices overlap"}]}\\n'
+      exit "$JARVIS_CHECK_RC"
+    fi
+    printf '{"schema_version":"jarvis.pipeline-check.v1","ok":true,'
+    printf '"services":[{"nodes":{"first":2,"end":3}}]}\\n' ;;
   "ppl submit")
     if [ -n "${JARVIS_SUBMIT_RC:-}" ]; then echo "sbatch said no" >&2; exit "$JARVIS_SUBMIT_RC"; fi
     echo "submitting $3"
@@ -115,8 +127,10 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert log == [
         f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
         f"JARVIS_ROOT={root} repo add {root}/src/demo",
+        f"JARVIS_ROOT={root} ppl check yaml {job}/{PIPELINE_FILE} +json",
         f"JARVIS_ROOT={root} ppl submit {job}/{PIPELINE_FILE} --execution-id op_x +json",
     ]
+    assert (job / SERVICE_NODE_FILE).read_text() == "0\n"
     assert "sbatch" not in done.stdout
     handle = parse_handle((job / SUBMISSION_FILE).read_text())
     assert handle is not None and handle["execution_id"] == "op_x"
@@ -137,6 +151,32 @@ def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> Non
     assert "sbatch said no" in done.stderr
     assert not (job / SUBMISSION_FILE).exists()
     assert (job / EXITCODE_FILE).read_text() == "3\n"
+
+
+def test_the_connector_node_is_the_one_jarvis_names(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    _program(tmp_path / "bin", "python", '#!/bin/sh\nexec python3 "$@"\n')
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 0, done.stderr
+    assert (job / SERVICE_NODE_FILE).read_text() == "2\n"
+
+
+def test_a_pipeline_jarvis_refuses_is_never_submitted(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_CHECK_RC=str(EXIT_REFUSED))
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == EXIT_REFUSED
+    assert "ppl submit" not in (tmp_path / "jarvis.log").read_text()
+    assert not (job / SUBMISSION_FILE).exists()
+    refusal = jarvis_refused(done.stdout, site="lab", what="the pipeline")
+    assert refusal.reason == RefusalReason.INVALID_SPEC
+    assert refusal.data["kinds"] == ["host_slice_overlap"]
+    assert "the slices overlap" in refusal.message
 
 
 def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:

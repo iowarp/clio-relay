@@ -72,6 +72,8 @@ def test_the_catalog_pins_a_package_named_alone(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     state = tmp_path / "state"
     first = stage(state, archive_package(repo, "demo.hello"), "demo.hello", version="0.1.0")
+    alone = PackageCatalog(state / "packages").resolve(PackageRef(name="demo.hello"))
+    assert alone.pinned() == ("0.1.0", first.sha256)
     (repo / "demo" / "hello" / "pkg.py").write_text("# edited\n")
     second = stage(state, archive_package(repo, "demo.hello"), "demo.hello", version="0.2.0")
     assert ContentStore(state / "content").has(first.sha256)
@@ -79,9 +81,15 @@ def test_the_catalog_pins_a_package_named_alone(tmp_path: Path) -> None:
     assert [entry.version for entry in catalog.all()] == ["0.1.0", "0.2.0"]
     assert [entry.sha256 for entry in catalog.newest()] == [second.sha256]
 
-    newest = catalog.resolve(PackageRef(name="demo.hello", parameters={"out": "x"}))
-    assert newest.pinned() == ("0.2.0", second.sha256)
-    assert newest.parameters == {"out": "x"}
+    with pytest.raises(Refusal) as ambiguous:
+        catalog.resolve(PackageRef(name="demo.hello", parameters={"out": "x"}))
+    assert "0.2.0 sha256 " + second.sha256[:12] in ambiguous.value.message
+    assert "Ask the person which one" in ambiguous.value.message
+    pinned = catalog.resolve(
+        PackageRef(name="demo.hello", version="0.2.0", parameters={"out": "x"})
+    )
+    assert pinned.pinned() == ("0.2.0", second.sha256)
+    assert pinned.parameters == {"out": "x"}
     assert catalog.resolve(PackageRef(name="demo.hello", version="0.1.0")).sha256 == first.sha256
     assert catalog.resolve(PackageRef(name="demo.hello", sha256=first.sha256)).version == "0.1.0"
     given = PackageRef(name="elsewhere", version="1", sha256="a" * 64)

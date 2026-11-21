@@ -89,6 +89,22 @@ def test_runtime_endpoints_keep_only_listening_services_with_a_real_port() -> No
     assert runtime_endpoints({"service_runtimes": "x"}) == []
 
 
+def test_service_endpoints_name_the_port_the_ready_event_announced() -> None:
+    document = {
+        "schema_version": "jarvis.execution.service-runtimes.v1",
+        "service_runtimes": [{"package_id": "ignored", "lifecycle": "ready", "port": 1}],
+        "service_endpoints": [
+            {"name": "pvserver", "source": "progress_ready", "port": 59629, "host": "c1"},
+            {"name": "gone", "source": "progress_ready", "port": 0},
+            {"source": "service_runtime", "package_id": "pv", "lifecycle": "ready", "port": 7},
+            {"source": "service_runtime", "package_id": "old", "lifecycle": "stopped", "port": 8},
+            "not an endpoint",
+        ],
+    }
+    assert runtime_endpoints(document) == [("pvserver", 59629), ("pv", 7)]
+    assert runtime_endpoints({"service_endpoints": []}) == []
+
+
 def test_a_lone_port_takes_the_port_jarvis_reports(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     plan.ports = plan_ports(service(ports=[{"name": "paraview"}]), adopt=True)
@@ -114,15 +130,16 @@ def test_ports_match_the_reporting_package_by_name_and_stay_when_ambiguous(
     [
         (
             {"package": {"name": "pvserver", "version": "1", "sha256": DIGEST}},
-            "package service",
+            "package service cannot take a secret",
         ),
         ({"executable": "x", "launcher": "mpirun"}, "one wrapper process"),
         ({"executable": "x", "inputs": [{"name": "serve/x", "sha256": DIGEST}]}, "relay uses"),
     ],
 )
 def test_wrapper_refuses_what_it_cannot_wrap(job: dict[str, object], words: str) -> None:
+    port = {"name": "a", "protection": "secret_env:TOKEN"} if "package" in job else {"name": "a"}
     with pytest.raises(Refusal, match=words):
-        check_wrappable(service(job=job, ports=[{"name": "a"}]))
+        check_wrappable(service(job=job, ports=[port]))
 
 
 def test_substitute_fills_only_known_relay_variables() -> None:

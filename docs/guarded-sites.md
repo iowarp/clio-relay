@@ -106,8 +106,8 @@ candidates (version, SHA-256, when each was staged), and the agent asks you
 which one and gives `version`, or `version` and `sha256`.
 
 Before anything is asked or submitted, relay checks the job's layout against
-what the site reports in `describe(site=...)` for its partition: the node
-count, ranks per node times threads per rank against the physical cores, the
+what JARVIS reports in `describe(site=...)` for its partition: the node
+count, ranks per node times threads per rank against the CPUs per node, the
 memory per node (up to 90% of a node's), and the walltime against the
 partition's limit. A job that does not fit is refused with the limits, so the
 agent can size it again. The agent can say why it chose the layout, with up
@@ -299,9 +299,7 @@ again. A changed argument list is a new question. No shell string is ever
 accepted on its own.
 
 CLIO's Spack configuration lives in the checkout's site scope,
-`<site home>/spack/etc/spack`. Relay still exports `JARVIS_SPACK_CONFIG` as
-`<site home>/spack-config`, but Spack 0.23.1's `SPACK_DISABLE_LOCAL_CONFIG`
-drops the user scope, so nothing relies on that directory.
+`<site home>/spack/etc/spack`, which `jarvis spack prepare` writes.
 
 ## A limitation
 

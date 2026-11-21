@@ -35,6 +35,16 @@ def service_ready(record: OperationRecord) -> bool:
     )
 
 
+def service_served(record: OperationRecord) -> bool:
+    """Return whether a service operation has been ready once (``result.ready_at``).
+
+    A serve task completes then, with the endpoint as its result, since a task
+    client is woken by a status change and not by a new status message. The
+    service keeps running until it is stopped or ends; the operation says so.
+    """
+    return record.kind == "serve" and bool((record.result or {}).get("ready_at"))
+
+
 def endpoint_summary(record: OperationRecord) -> str | None:
     """Name a service's ports as ``name host:port``. No URLs, which may carry secrets."""
     endpoint: dict[str, Any] = (record.result or {}).get("endpoint") or {}

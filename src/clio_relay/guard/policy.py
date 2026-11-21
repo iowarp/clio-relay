@@ -396,7 +396,7 @@ class Guard:
             raise not_run_here(adapter.name)
         if service and not any(step.service for step in steps):
             # The whole pipeline is the service: relay keeps it up until it is stopped.
-            # Steps the request marked keep their marks: the connector runs on the
-            # first node of their host_slice, where their rank 0 serves the ports.
+            # Steps the request marked keep their marks. Which step serves, and on
+            # which node, is JARVIS's (``ppl check``); the connector goes there.
             return spec.with_steps([step.model_copy(update={"service": True}) for step in steps])
         return spec

@@ -73,11 +73,13 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
             assert [column["id"] for column in table["columns"]] == [
                 "protocol",
                 "security",
+                "spend",
                 "status",
             ]
             assert [column["title"] for column in table["columns"]] == [
                 "Protocol",
                 "Security",
+                "Spending",
                 "Status",
             ]
             protocols = _options(table, "protocol")
@@ -95,10 +97,19 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
             status = [column for column in table["columns"] if column["id"] == "status"][0]
             assert status["editable"] is False
             assert all(option["icon"] and option["tone"] for option in status["options"])
-            assert table["defaults"]["values"] == {"protocol": "ssh", "security": "guarded"}
+            assert table["defaults"]["values"] == {
+                "protocol": "ssh",
+                "security": "guarded",
+                "spend": "always",
+            }
             assert table["add"]["label"] == "Add endpoint"
             row = host.row("fx")
-            assert row["values"] == {"protocol": "fixture", "security": "open", "status": "ready"}
+            assert row["values"] == {
+                "protocol": "fixture",
+                "security": "open",
+                "spend": "never",
+                "status": "ready",
+            }
             assert [item["id"] for item in row["menu"]] == ["probe", "edit", "remove"]
             assert row["menu"][-1]["destructive"] is True
             assert set(row) <= ROW_KEYS and set(table) <= TABLE_KEYS
@@ -261,7 +272,11 @@ def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
             result = await host.choose("", "protocol", "local")
             assert result.structured_content["ok"] is True, said(result)
             await host.choose("", "security", "open")
-            assert host.table()["defaults"]["values"] == {"protocol": "local", "security": "open"}
+            assert host.table()["defaults"]["values"] == {
+                "protocol": "local",
+                "security": "open",
+                "spend": "always",
+            }
             result = await host.choose("", "protocol", "fixture")
             assert result.structured_content["ok"] is False, "a test-only protocol is not offered"
 
@@ -283,6 +298,7 @@ def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
             assert host.get("relay-sites", "/defaults") == {
                 "protocol": ["local"],
                 "security": ["open"],
+                "spend": ["always"],
             }
             host.set("relay-sites", "/defaults/security", ["guarded"])
             result = await host.press("relay-sites", "defaults-save")
@@ -318,7 +334,11 @@ def test_the_page_and_the_cli_share_the_defaults(
             return host.table()["defaults"]["values"]
 
     asyncio.run(pick())
-    assert store.defaults().model_dump() == {"adapter": "local", "policy": "open"}
+    assert store.defaults().model_dump() == {
+        "adapter": "local",
+        "policy": "open",
+        "spend": "always",
+    }
     assert store.path.with_name("site-defaults.yaml").is_file()
 
     # The CLI's site add leaves out --adapter and --policy and gets the page's defaults.
@@ -333,8 +353,12 @@ def test_the_page_and_the_cli_share_the_defaults(
     assert refused.exit_code != 0
     changed = runner.invoke(cli.app, ["site", "defaults", "--policy", "guarded"])
     assert changed.exit_code == 0, changed.output
-    assert json.loads(changed.output) == {"adapter": "local", "policy": "guarded"}
-    assert asyncio.run(shown()) == {"protocol": "local", "security": "guarded"}
+    assert json.loads(changed.output) == {
+        "adapter": "local",
+        "policy": "guarded",
+        "spend": "always",
+    }
+    assert asyncio.run(shown()) == {"protocol": "local", "security": "guarded", "spend": "always"}
 
 
 def test_the_row_menu_probes_edits_and_removes(relay_paths: RelayPaths) -> None:

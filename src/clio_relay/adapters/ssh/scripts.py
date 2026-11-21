@@ -26,12 +26,12 @@ job's JARVIS root ``.relay-jarvis``, whose execution record is the job record.
 
 from __future__ import annotations
 
+import posixpath
 import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
 from clio_relay import jarvis_submit
-from clio_relay.adapters import slurm_facts
 from clio_relay.adapters.ssh import store
 from clio_relay.login_load import BATCH_HINT_SH
 
@@ -301,13 +301,11 @@ def status_script(
     status_command: str | None,
     native_id: str | None,
     accounting_command: str | None = None,
-    queue: bool = False,
 ) -> str:
     """One poll: the record, then the scheduler or the supervisor (RL17).
 
     ``accounting_command`` runs only when the queue no longer lists the job and
-    the job wrote no exit code, as the last evidence of how it ended. ``queue``
-    adds :func:`slurm_facts.queue_script`, which reports a pending job's place.
+    the job wrote no exit code, as the last evidence of how it ended.
     """
     body = f"J={q(job_dir)}\n" + _ENTER_JOB
     body += 'if [ -f final ]; then echo "@@final"; cat final; echo\n' + _LISTING + "exit 0; fi\n"
@@ -336,8 +334,6 @@ def status_script(
             '[ -s child_pid ] && echo "@@started"\n'
         )
     body += '[ -e cancel ] && echo "@@cancel"\n'
-    if queue and native_id is not None:
-        body += slurm_facts.queue_script(native_id)
     body += "exit 0\n"
     return body
 
@@ -346,15 +342,14 @@ def jarvis_status_script(
     job_dir: str,
     execution_id: str,
     pipeline: str | None = None,
-    native_id: str | None = None,
 ) -> str:
     """One poll of a job JARVIS submitted: ``jarvis execution get``, and its artifacts.
 
     ``execution get`` reconciles the record with the scheduler and commits it,
-    so relay keeps no state of its own. The artifacts are read once the record
-    is terminal. ``pipeline`` is as in :func:`jarvis_submit.execution_argv`.
-    With the scheduler's ``native_id``, a pending job's place in the queue is
-    read too (:func:`slurm_facts.queue_script`).
+    so relay keeps no state of its own: a pending job's place in the queue is
+    the record's ``metadata.queue``, and a job that left the queue unseen is
+    ended by JARVIS. The artifacts are read once the record is terminal.
+    ``pipeline`` is as in :func:`jarvis_submit.execution_argv`.
     """
     get = jarvis_submit.execution_shell("get", execution_id, job_dir=job_dir, pipeline=pipeline)
     artifacts = jarvis_submit.execution_shell(
@@ -374,21 +369,27 @@ def jarvis_status_script(
         + "'\"terminal\":true'; then\n"
         + f'  echo "@@artifacts"; {artifacts} 2>/dev/null </dev/null; echo\n'
         + "fi\n"
-        + (slurm_facts.queue_script(native_id) if native_id else "")
         + "exit 0\n"
     )
 
 
 def jarvis_execution_script(
-    job_dir: str, verb: jarvis_submit.ExecutionVerb, execution_id: str, pipeline: str
+    job_dir: str,
+    verb: jarvis_submit.ExecutionVerb,
+    execution_id: str,
+    pipeline: str,
+    extra: Sequence[str] = (),
 ) -> str:
-    """Run ``jarvis execution <verb>`` (cancel, stop or service-runtimes) in the job directory.
+    """Run ``jarvis execution <verb>`` (cancel, stop, move or service-runtimes) in the job
+    directory, with the verb's own options ``extra``.
 
     Prints ``@@rc`` and the command's output under ``@@out``; the output's last
-    line is the document JARVIS printed: the execution record it committed, or
-    its service runtimes.
+    line is the document JARVIS printed: the execution record it committed, its
+    service runtimes, or a typed refusal.
     """
-    command = jarvis_submit.execution_shell(verb, execution_id, job_dir=job_dir, pipeline=pipeline)
+    command = jarvis_submit.execution_shell(
+        verb, execution_id, job_dir=job_dir, pipeline=pipeline, extra=extra
+    )
     return (
         f"J={q(job_dir)}\n"
         + _ENTER_JOB
@@ -473,16 +474,6 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     return body
 
 
-def move_queue_script(native_id: str, partition: str) -> str:
-    """Move a pending Slurm job to another partition, with ``scontrol update``.
-
-    Prints ``@@rc`` and then scontrol's output. Slurm lets the job's owner
-    change the partition of a job that has not started.
-    """
-    command = shlex.join(["scontrol", "update", f"JobId={native_id}", f"Partition={partition}"])
-    return f'out=$({command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'
-
-
 def find_script(remote_dir: str, operation_id: str) -> str:
     """Find a submission from its job directory, which is named by the operation (RL17)."""
     return (
@@ -494,21 +485,146 @@ def find_script(remote_dir: str, operation_id: str) -> str:
     )
 
 
-def describe_script(scheduler: str) -> str:
-    """Report the host, and on Slurm its partitions and MPI facts (short reads only)."""
+def graph_script(remote_dir: str, jarvis: str = "") -> str:
+    """Print where JARVIS keeps the site's record, and its net report when JARVIS is placed.
+
+    ``jarvis rg net show +json`` only reads the site graph, so it is safe on a
+    login host. ``jarvis`` is the site's ``jarvis`` setting; empty is relay's pin.
+    """
+    home = remote_dir.rstrip("/") or "/"
+    program = root_expression(jarvis or jarvis_submit.bootstrap_path(home))
     return (
-        'echo "@@host $(hostname 2>/dev/null)"\n'
+        f"G={root_expression(jarvis_submit.site_graph(home))}\n"
+        f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
+        f"R={root_expression(jarvis_submit.site_root(home))}\n"
+        f"JB={program}\n"
+        'echo "@@graph_path $G"; echo "@@decisions_path $D"\n'
+        'if [ -x "$JB" ]; then\n'
+        '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
+        '  echo "@@graph"\n'
+        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" $T "$JB" rg net show +json </dev/null 2>&1\n'
+        "fi\n"
+    )
+
+
+def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> list[str]:
+    """Return the ``exec`` argv that submits JARVIS's graph collection on ``scheduler``.
+
+    It writes :func:`jarvis_submit.graph_pipeline` beside the site graph and
+    runs ``jarvis ppl submit`` (``ppl run`` with no scheduler), with the site
+    graph and a site-level JARVIS root, printing JARVIS's handle as JSON. An
+    argument after the argv's own (``$1``) is the queue the job goes to; with
+    none, the scheduler's default.
+    """
+    home = remote_dir.rstrip("/") or "/"
+    pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
+    verb = "run" if scheduler in ("", "none") else "submit"
+    # The scheduler block is the pipeline's last mapping, so a partition line ends it.
+    queue = (
+        'case "${1:-}" in\n'
+        '  "") ;;\n'
+        '  *[!A-Za-z0-9_.-]*) echo "not a queue name: $1" >&2; exit 64 ;;\n'
+        '  *) printf \'  partition: %s\\n\' "$1" >> "$S/site_net.yaml" ;;\n'
+        "esac\n"
+        if verb == "submit"
+        else ""
+    )
+    graph = jarvis_submit.site_graph(home)
+    site = posixpath.dirname(graph)
+    script = (
+        f"S={root_expression(site)}; R={root_expression(jarvis_submit.site_root(home))}\n"
+        f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
+        '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
+        'mkdir -p "$R"\n'
+        f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
+        + queue
+        + f'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH={root_expression(graph)} '
+        f'exec "$JB" ppl {verb} yaml "$S/site_net.yaml" +json\n'
+    )
+    return ["sh", "-c", script, "site_net"]
+
+
+def _jarvis_env(home: str, jarvis: str) -> str:
+    """Shell lines that name relay's JARVIS (``JB``) and the site's JARVIS record."""
+    return (
+        f"G={root_expression(jarvis_submit.site_graph(home))}\n"
+        f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
+        f"R={root_expression(jarvis_submit.site_root(home))}\n"
+        f"SR={root_expression(posixpath.join(home, jarvis_submit.SPACK_DIR))}\n"
+        f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
+    )
+
+
+_JARVIS_EXPORTS = (
+    'export JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" JARVIS_SPACK_DECISIONS="$D"\n'
+    'if [ -x "$SR/bin/spack" ]; then export JARVIS_SPACK_ROOT="$SR"; fi\n'
+)
+
+
+def jarvis_command(remote_dir: str, jarvis: str = "") -> list[str]:
+    """Return the ``exec`` argv prefix that runs relay's JARVIS with the site's record.
+
+    The caller appends JARVIS's own arguments (``sched info +json``, ``spack
+    prepare ... +json``, ``rg skill show NAME +json``, ``rg net set ...``). It
+    exports the site graph, the decisions file, a site-level JARVIS root and,
+    when it has ``bin/spack``, the site's JARVIS Spack, as every relay job does.
+    """
+    home = remote_dir.rstrip("/") or "/"
+    script = (
+        _jarvis_env(home, jarvis)
+        + '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
+        + 'mkdir -p "$R"\n'
+        + _JARVIS_EXPORTS
+        + 'exec "$JB" "$@"\n'
+    )
+    return ["sh", "-c", script, "jarvis"]
+
+
+def sched_script(remote_dir: str, jarvis: str = "") -> str:
+    """Print ``jarvis sched info +json`` under ``@@sched`` when JARVIS is placed.
+
+    JARVIS reads the scheduler, the MPI candidates, the network and the site
+    skills itself, with light reads only, so it is safe on a login host. Without
+    JARVIS it prints ``@@nosched``.
+    """
+    home = remote_dir.rstrip("/") or "/"
+    return (
+        "(\n" + _jarvis_env(home, jarvis) + 'if [ -x "$JB" ]; then\n'
+        '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 90"\n'
+        + "  "
+        + _JARVIS_EXPORTS.replace("\nif", "\n  if")
+        + '  echo "@@sched"\n'
+        '  $T "$JB" sched info +json </dev/null 2>&1\n'
+        "else\n"
+        '  echo "@@nosched"\n'
+        "fi\n"
+        ")\n"
+    )
+
+
+def describe_script(scheduler: str, remote_dir: str | None = None, jarvis: str = "") -> str:
+    """Report the host, JARVIS's site graph and JARVIS's scheduler facts.
+
+    Short reads only. The graph part is :func:`graph_script` and the scheduler
+    part :func:`sched_script`, when ``remote_dir`` is given. Relay reads no
+    partitions or MPI facts itself; before JARVIS is on the site it lists only
+    the queue names.
+    """
+    queues = (
+        'case "$S" in\n'
+        'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null ;;\n'
+        "pbs) echo \"@@queues\"; qstat -Q 2>/dev/null | awk 'NR>2 {print $1}' ;;\n"
+        "esac\n"
+    )
+    jarvis_part = ""
+    if remote_dir is not None:
+        jarvis_part = graph_script(remote_dir, jarvis) + sched_script(remote_dir, jarvis)
+    return (
+        jarvis_part + 'echo "@@host $(hostname 2>/dev/null)"\n'
         'echo "@@os $(uname -s 2>/dev/null)"\n'
         'echo "@@machine $(uname -m 2>/dev/null)"\n'
         'echo "@@cpus $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"\n'
-        'echo "@@home $HOME"\n'
-        + _detect(scheduler)
-        + 'case "$S" in\n'
-        + 'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null\n'
-        + slurm_facts.SCRIPT
-        + ";;\n"
-        + "pbs) echo \"@@queues\"; qstat -Q 2>/dev/null | awk 'NR>2 {print $1}' ;;\n"
-        + "esac\n"
+        'echo "@@home $HOME"\n' + _detect(scheduler) + queues
     )
 
 

@@ -26,6 +26,7 @@ import importlib
 import io
 import json
 import logging
+import posixpath
 import re
 import shlex
 import shutil
@@ -37,7 +38,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 from pydantic import BaseModel
 
 from clio_relay import jarvis_submit
-from clio_relay.adapters import slurm_facts
+from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
@@ -219,7 +220,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # describe
 
     async def describe(self) -> SiteInfo:
-        text = await self._ssh(scripts.describe_script(self.config.scheduler), "describe")
+        text = await self._ssh(
+            scripts.describe_script(
+                self.config.scheduler, self.config.remote_dir, self.config.jarvis
+            ),
+            "describe",
+        )
         sections = parse_sections(text)
 
         def first(key: str) -> str | None:
@@ -228,15 +234,44 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
         cpus = first("cpus")
         queues = sorted({line.strip() for line in sections.get("queues", []) if line.strip()})
-        partitions = slurm_facts.partitions(sections.get("partitions", []))
+        sched_text = "\n".join(sections.get("sched", []))
+        sched = sched_info.report(sched_text)
+        partitions = sched_info.partitions(sched)
         scheduler = first("scheduler") or "none"
+        graph_text = "\n".join(sections.get("graph", []))
+        graph: dict[str, Any] = {
+            "path": first("graph_path"),
+            "decisions": first("decisions_path"),
+            "net": jarvis_submit.graph_report(graph_text),
+            "collect": {
+                "exec": scripts.graph_collect_command(
+                    self.config.remote_dir, scheduler, self.config.jarvis
+                ),
+                "pipeline": jarvis_submit.graph_pipeline(scheduler),
+                "plan": {
+                    "kind": "resource_graph",
+                    "summary": (
+                        "Submit JARVIS's builtin.resource_graph job (2 nodes, 5 minutes) to "
+                        "collect the networks the compute nodes share into the site's "
+                        "resource graph."
+                    ),
+                },
+                "note": (
+                    "JARVIS's builtin.resource_graph job collects the networks on compute "
+                    "nodes; run this with exec (and this plan on a guarded site) once the "
+                    "person approves, then describe again"
+                ),
+            },
+        }
+        if graph["net"] is None and graph_text.strip():
+            graph["detail"] = graph_text.strip()[-500:]
         return SiteInfo(
             adapter=self.name,
             address=self.config.ssh_profile,
             scheduler=scheduler,
             queues=queues or [partition.name for partition in partitions],
             partitions=partitions,
-            mpi=slurm_facts.mpi(sections) if scheduler == "slurm" else {},
+            mpi=cast(dict[str, Any], (sched or {}).get("mpi") or {}),
             facts={
                 "host": first("host"),
                 "os": first("os"),
@@ -244,9 +279,34 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "cpus": int(cpus) if cpus and cpus.isdigit() else None,
                 "home": first("home"),
                 "remote_dir": self.config.remote_dir,
+                "resource_graph": graph,
+                "sched": self._sched_facts(sched, sections, sched_text),
+                "jarvis": self._jarvis_facts(),
             },
             verbs=sorted(self.implements),
         )
+
+    def _sched_facts(
+        self, sched: dict[str, Any] | None, sections: dict[str, list[str]], text: str
+    ) -> dict[str, Any]:
+        if sched is not None:
+            return sched_info.site_facts(sched)
+        if "nosched" in sections:
+            return {"note": "relay has not placed JARVIS on this site yet; its first run does"}
+        return {"note": "jarvis sched info gave no report", "detail": text.strip()[-500:] or None}
+
+    def _jarvis_facts(self) -> dict[str, Any]:
+        home = self.config.remote_dir.rstrip("/") or "/"
+        return {
+            "exec": scripts.jarvis_command(self.config.remote_dir, self.config.jarvis),
+            "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
+            "note": (
+                "Append JARVIS's own arguments to run relay's JARVIS with the site's record: "
+                "sched info +json, rg skill list|show NAME +json, and, once the person "
+                "agrees (with a plan on a guarded site), rg skill set, rg net set, or "
+                "spack prepare --root <spack_root> --site_spack <root> +json"
+            ),
+        }
 
     # price
 
@@ -381,6 +441,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 raise self._install_needed(output, spec)
             if jarvis_mode and rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
                 raise jarvis_submit.build_refused(
+                    output + "\n" + error, site=self.config.ssh_profile
+                )
+            if jarvis_mode and rc == str(jarvis_submit.EXIT_REFUSED):
+                raise jarvis_submit.jarvis_refused(
                     output + "\n" + error, site=self.config.ssh_profile
                 )
             raise Refusal(
@@ -602,7 +666,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 status_command=status_command,
                 native_id=handle.native_id,
                 accounting_command=accounting_command,
-                queue=mode == "scheduler" and handle.data.get("scheduler") == "slurm",
             ),
             "status",
         )
@@ -623,8 +686,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
             status = self._scheduler_status(executor, handle, sections, recorded)
         else:
             status = _detached_status(sections)
-        if not status.state.final:
-            status.queue = slurm_facts.queue(sections)
         if status.state.final:
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
@@ -659,9 +720,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         sections = parse_sections(
             await self._ssh(
-                scripts.jarvis_status_script(
-                    job_dir, execution_id, pipeline, native_id=handle.native_id
-                ),
+                scripts.jarvis_status_script(job_dir, execution_id, pipeline),
                 "status",
             )
         )
@@ -686,10 +745,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{answer.strip()[-500:] or 'no output'}",
             )
         status = jarvis_submit.record_status(record)
-        if not status.state.final:
-            status = _gone_from_slurm(status, slurm_facts.scheduler_state(sections), handle)
-        if not status.state.final:
-            status.queue = slurm_facts.queue(sections)
         if not status.state.final or handle.data.get("install"):
             return status
         snapshot = jarvis_submit.parse_document(
@@ -844,23 +899,46 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return await self.cancel(handle)
 
     async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
-        """Move a pending Slurm job, JARVIS's or relay's own, to ``queue_name``."""
-        slurm = handle.data.get("mode") == "jarvis" or handle.data.get("scheduler") == "slurm"
-        native = handle.native_id or ""
-        if not slurm or not native.isdigit():
+        """Move a pending JARVIS job to ``queue_name`` with ``jarvis execution move``.
+
+        JARVIS checks that the job still waits, that the queue exists and that
+        the job fits there, and refuses with typed issues (exit 5) otherwise;
+        relay passes those on (:func:`jarvis_submit.jarvis_refused`).
+        """
+        if handle.data.get("mode") != "jarvis":
             raise not_implemented(self.name, "move_queue")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", queue_name):
-            raise Refusal(
-                RefusalReason.INVALID_ARGUMENTS, f"{queue_name!r} is not a partition name"
-            )
+            raise Refusal(RefusalReason.INVALID_ARGUMENTS, f"{queue_name!r} is not a queue name")
+        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         sections = parse_sections(
-            await self._ssh(scripts.move_queue_script(native, queue_name), "moving the job")
+            await self._ssh(
+                scripts.jarvis_execution_script(
+                    str(handle.data["job_dir"]),
+                    "move",
+                    execution_id,
+                    pipeline,
+                    extra=["--queue", queue_name],
+                ),
+                "moving the job",
+            )
         )
-        if _one(sections, "rc") != "0":
-            detail = "\n".join(sections.get("rc", [])[1:]).strip()
+        rc = _one(sections, "rc")
+        output = "\n".join(sections.get("out", [])).strip()
+        if "nojarvis" in sections:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"the job directory on {self.config.ssh_profile} does not say which JARVIS "
+                "submitted the job",
+            )
+        if rc == str(jarvis_submit.EXIT_REFUSED):
+            raise jarvis_submit.jarvis_refused(
+                output, site=self.config.ssh_profile, what=f"moving the job to {queue_name}"
+            )
+        if rc != "0":
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
-                f"Slurm did not move job {native} to {queue_name}: {detail or 'no output'}",
+                f"jarvis execution move did not move the job to {queue_name}: "
+                f"{output[-500:] or 'no output'}",
                 queue=queue_name,
             )
 
@@ -957,6 +1035,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
             raise self._install_needed(output, spec)
         if rc == str(jarvis_submit.EXIT_BUILD_REFUSED):
             raise jarvis_submit.build_refused(output, site=self.config.ssh_profile)
+        if rc == str(jarvis_submit.EXIT_REFUSED):
+            raise jarvis_submit.jarvis_refused(
+                output, site=self.config.ssh_profile, what="the install"
+            )
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
         if rc != "0" or handle is None:
             raise Refusal(
@@ -1148,43 +1230,6 @@ def _stored_final(lines: list[str]) -> JobStatus:
         return JobStatus.model_validate_json(text)
     except ValueError:
         return JobStatus(state=JobState.FAILED, native_state="final", message=text[:500] or None)
-
-
-_UNSEEN = frozenset({"unknown", "submitted"})
-"""JARVIS record states that say nothing of a job Slurm has dropped."""
-
-
-def _gone_from_slurm(status: JobStatus, slurm: str | None, handle: JobHandle) -> JobStatus:
-    """End a JARVIS job Slurm cancelled, or no longer knows while JARVIS can't see it.
-
-    A job cancelled outside relay (a person's ``scancel``) leaves the queue, and
-    a site without Slurm accounting gives JARVIS no way to say how it ended, so
-    its record stays ``unknown``, or ``submitted`` for a job cancelled before it
-    started. Slurm's own word is the answer then.
-    """
-    if slurm == "CANCELLED":
-        return status.model_copy(
-            update={
-                "state": JobState.CANCELLED,
-                "native_state": "CANCELLED",
-                "message": f"Slurm job {handle.native_id} was cancelled outside relay",
-                "queue": None,
-            }
-        )
-    if slurm == "GONE" and status.native_state in _UNSEEN:
-        return status.model_copy(
-            update={
-                "state": JobState.FAILED,
-                "native_state": "gone",
-                "message": (
-                    f"Slurm job {handle.native_id} is gone from the scheduler and JARVIS "
-                    "cannot tell how it ended (the site keeps no job accounting); it was "
-                    "likely cancelled outside relay"
-                ),
-                "queue": None,
-            }
-        )
-    return status
 
 
 def _detached_status(sections: dict[str, list[str]]) -> JobStatus:

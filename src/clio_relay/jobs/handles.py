@@ -103,8 +103,16 @@ class JobStatus(BaseModel):
     queue: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Where a pending job stands, when the scheduler says: its partition, the reason "
-            "it waits, the estimated start, and the other partitions with idle nodes"
+            "Where a pending job stands, as JARVIS reports it (jarvis.scheduler.queue.v1): "
+            "its partition, the reason it waits, the estimated start, and the other "
+            "partitions with whether the job fits there now"
+        ),
+    )
+    issues: list[dict[str, Any]] = Field(
+        default_factory=list[dict[str, Any]],
+        description=(
+            "JARVIS's typed issues (jarvis.issue.v1) on the execution, such as an "
+            "mpi_network issue naming the resource graph field to change"
         ),
     )
 

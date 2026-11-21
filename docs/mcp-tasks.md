@@ -13,9 +13,9 @@ operation id, so the same work can be followed through either.
 
 | Task status | When |
 | --- | --- |
-| `working` | The job is queued or running, or the service is starting or running |
+| `working` | The job is queued or running, or the service is starting |
 | `input_required` | The site asked something and is waiting for an answer |
-| `completed` | The job reached a final state, whether it succeeded or failed |
+| `completed` | The job reached a final state, whether it succeeded or failed, or the service is ready |
 | `cancelled` | The work was cancelled |
 
 `tasks/get` returns the status and a status message that carries the latest
@@ -24,8 +24,15 @@ listening on. Relay suggests polling every two seconds and keeps a task for
 seven days. When the work is done, `tasks/get` carries the final tool result:
 the exit code, the outputs with their view descriptors, and the provenance.
 
-A `serve` task stays `working` while the service runs. Cancelling the task
-stops the service.
+A `serve` task completes as soon as the service is ready: JARVIS reports the
+service running and relay's forward answers. A client that polls is woken by a
+status change, not by a new status message, so the ready service is the task's
+result: the operation `running`, `result.endpoint` with each port's `address`,
+and `result.ready_at`. The service keeps running after that, until
+`serve(stop=<task id>)`, `tasks/cancel` or its job's end;
+`describe(job=<task id>)` and `serve(service=<task id>)` follow it. Questions
+relay asks after the service is ready reach the person through relay's page and
+`clio-relay asks`, not as `input_required` on the finished task.
 
 ### answering questions
 

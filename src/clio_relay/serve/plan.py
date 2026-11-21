@@ -214,14 +214,20 @@ _REACHABLE = frozenset({"ready", "degraded"})
 
 
 def runtime_endpoints(document: dict[str, Any] | None) -> list[tuple[str, int]]:
-    """Return ``(package_id, port)`` for each service JARVIS reports listening.
+    """Return ``(name, port)`` for each service JARVIS reports listening.
 
-    ``document`` is ``jarvis.execution.service-runtimes.v1``; its array holds
-    the latest revision of every service instance. Only a ``ready`` or
-    ``degraded`` instance with a real TCP port counts.
+    ``document`` is ``jarvis.execution.service-runtimes.v1``. Its
+    ``service_endpoints`` array says where each ready service actually bound,
+    from the package's ready event (``source: progress_ready``, named like the
+    event's port) or a runtime report (``source: service_runtime``, keyed here
+    by its package). A JARVIS without that array is read from
+    ``service_runtimes``: a ``ready`` or ``degraded`` instance by package.
     """
     if not document:
         return []
+    endpoints: object = document.get("service_endpoints")
+    if isinstance(endpoints, list):
+        return _endpoint_ports(cast(list[object], endpoints))
     found: list[tuple[str, int]] = []
     items: object = document.get("service_runtimes")
     if not isinstance(items, list):
@@ -231,11 +237,32 @@ def runtime_endpoints(document: dict[str, Any] | None) -> list[tuple[str, int]]:
             continue
         report = cast(dict[str, Any], item)
         port = report.get("port")
-        if report.get("lifecycle") not in _REACHABLE or isinstance(port, bool):
+        if report.get("lifecycle") not in _REACHABLE or not _real_port(port):
             continue
-        if not isinstance(port, int) or not 0 < port < 65536:
+        found.append((str(report.get("package_id") or ""), cast(int, port)))
+    return found
+
+
+def _real_port(port: object) -> bool:
+    return isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536
+
+
+def _endpoint_ports(items: list[object]) -> list[tuple[str, int]]:
+    found: list[tuple[str, int]] = []
+    for item in items:
+        if not isinstance(item, dict):
             continue
-        found.append((str(report.get("package_id") or ""), port))
+        entry = cast(dict[str, Any], item)
+        port = entry.get("port")
+        if not _real_port(port):
+            continue
+        if entry.get("source") == "service_runtime":
+            if entry.get("lifecycle") not in _REACHABLE:
+                continue
+            name = entry.get("package_id") or entry.get("package_name")
+        else:
+            name = entry.get("name") or entry.get("package_id")
+        found.append((str(name or ""), cast(int, port)))
     return found
 
 
@@ -459,9 +486,9 @@ def _filled(value: CustomValue, env: dict[str, str]) -> CustomValue:
 def package_service_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, str]) -> JobSpec:
     """Return the JARVIS pipeline relay submits for a package service.
 
-    Steps the request marked ``service`` keep their marks, so the connector runs
-    where the marked step's rank 0 serves the ports; with none marked, every
-    step runs as a service. ``${CLIO_RELAY_...}`` in a step's parameters
+    The marks say only that the job is a service relay keeps up; which step
+    serves, and on which node, is JARVIS's (``ppl check``), and the connector
+    runs on that node. ``${CLIO_RELAY_...}`` in a step's parameters
     is filled from the service's environment. A port the request does not fix
     is 0 there, so the package binds its own and reports it to JARVIS, and
     relay forwards the reported port (:func:`adopt_ports`). The connector's

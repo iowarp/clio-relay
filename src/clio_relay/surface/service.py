@@ -13,14 +13,12 @@ import logging
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay import mpi_network
-from clio_relay.adapters import registry, slurm_facts
+from clio_relay import jarvis_submit
+from clio_relay.adapters import registry
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
-    PartitionInfo,
     SiteAdded,
-    SiteInfo,
     Verb,
 )
 from clio_relay.adapters.hooks import (
@@ -51,7 +49,6 @@ from clio_relay.packages import (
     pipeline_conflict,
     stage_current,
     with_contract_resources,
-    with_site_cores,
 )
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
@@ -61,7 +58,7 @@ from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
 from clio_relay.surface.guarding import approval_message, review_asks
-from clio_relay.surface.outputs import marked_status, run_provenance, stderr_tail, stdout_tail
+from clio_relay.surface.outputs import marked_status, run_provenance, stdout_tail
 from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import DefaultGuard, StubAskProvider, StubServe
@@ -70,14 +67,6 @@ from clio_relay.surface.transient import drop_transient
 logger = logging.getLogger(__name__)
 
 SUBMIT_GRACE = timedelta(minutes=2)
-CORES_DESCRIBE_TIMEOUT_S = 20.0
-
-
-def partition_for(info: SiteInfo, queue: str | None) -> PartitionInfo | None:
-    """Return the partition ``queue`` names, or the site's default one."""
-    if queue:
-        return next((found for found in info.partitions if found.name == queue), None)
-    return next((found for found in info.partitions if found.default), None)
 
 
 _JOB_TO_OPERATION = {
@@ -273,33 +262,6 @@ class RelayService:
             return spec
         return spec.model_copy(update={"attributes": attributes.model_copy(update=changes)})
 
-    async def site_cores(self, site: SiteEntry, spec: JobSpec, verb: Verb) -> JobSpec:
-        """Set the steps' ``cores_per_node`` from the partition's physical cores.
-
-        The partition is the one the job names, else the site's default, as
-        ``describe`` reads it live from the scheduler. The guard's cached
-        ``describe`` is used when it has one. A site that cannot be described
-        now leaves the parameter to the package.
-        """
-        if not spec.steps():
-            return spec
-        info: SiteInfo | None = None
-        try:
-            reader = getattr(self.guard, "site_info", None)
-            if reader is not None:
-                info = await reader(site)
-            else:
-                adapter = self.adapter_for(site, verb)
-                if "describe" in adapter.implements:
-                    info = await asyncio.wait_for(adapter.describe(), CORES_DESCRIBE_TIMEOUT_S)
-        except Exception as error:  # noqa: BLE001 - the package's own setting applies then
-            logger.info("not setting cores_per_node on %s: %s", site.id, error)
-        partition = partition_for(info, spec.attributes.queue_name) if info else None
-        if partition is None:
-            return spec
-        entries = [self.packages.entry(step, self.content) for step in spec.steps()]
-        return with_site_cores(spec, entries, partition.physical_cores)
-
     async def start_run(
         self, site_id: str, spec: JobSpec, *, task: bool = False
     ) -> OperationRecord:
@@ -319,33 +281,20 @@ class RelayService:
 
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
         """Return the run's job as relay records and digests it."""
-        return await self.site_cores(site, self.apply_defaults(site, spec), "run")
+        return self.apply_defaults(site, spec)
 
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
-        """Fill the service job's site defaults, and say which steps serve the ports.
+        """Fill the service job's site defaults.
 
-        Steps the request marked ``service`` keep their marks. With none marked,
-        the steps whose catalog contract is a ``service`` are marked, so a coupled
-        pipeline (a server beside a simulation) serves from the server's step.
+        Which step of a coupled pipeline serves, where, and when it starts is
+        JARVIS's: ``ppl check`` reads each package's deployment profile, its
+        ``host_slice`` and ``start_mode``, before anything is submitted.
         """
-        job = self.apply_defaults(site, spec.job)
-        steps = job.steps()
-        if len(steps) > 1 and not any(step.service for step in steps):
-            entries = [self.packages.entry(step, self.content) for step in steps]
-            serving = [entry is not None and entry.kind == "service" for entry in entries]
-            if any(serving) and not all(serving):
-                job = job.with_steps(
-                    [
-                        step.model_copy(update={"service": True}) if marked else step
-                        for step, marked in zip(steps, serving, strict=True)
-                    ]
-                )
-        return spec.model_copy(update={"job": job})
+        return spec.model_copy(update={"job": self.apply_defaults(site, spec.job)})
 
     async def prepared_serve(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Return the service as relay records and digests it."""
-        spec = self.prepare_service(site, spec)
-        return spec.model_copy(update={"job": await self.site_cores(site, spec.job, "serve")})
+        return self.prepare_service(site, spec)
 
     async def start_serve(
         self, site_id: str, spec: ServiceSpec, *, task: bool = False
@@ -560,9 +509,6 @@ class RelayService:
                 continue
             if ask.state in ("declined", "cancelled"):
                 message = f"the person declined: {ask.message}"
-                forgotten = installing.forget_carried(self, record, ask)
-                if forgotten:
-                    message = f"{message}. {forgotten}"
                 return self.finish(
                     operation_id,
                     OperationState.CANCELLED,
@@ -839,11 +785,8 @@ class RelayService:
         endpoint: Endpoint | None = None,
     ) -> OperationRecord:
         tail: str | None = None
-        errors: str | None = None
         if status.state.final:
             tail = await stdout_tail(adapter, status)
-            if status.state is JobState.FAILED:
-                errors = await stderr_tail(adapter, status)
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if record.state.final:
@@ -862,7 +805,7 @@ class RelayService:
                 result["control"] = status.control
             if status.queue:
                 result["queue"] = status.queue
-                status.message = status.message or slurm_facts.queue_message(status.queue)
+                status.message = status.message or jarvis_submit.queue_message(status.queue)
             else:
                 result.pop("queue", None)
             if status.message is not None:
@@ -871,17 +814,14 @@ class RelayService:
                 result.pop("message", None)
             if record.kind == "serve" and endpoint is not None:
                 result["endpoint"] = public_endpoint(endpoint)
+                # The first time the forward answers: a task client wakes on it.
+                result.setdefault("ready_at", status.observed_at.isoformat())
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
-            if status.state is JobState.FAILED:
-                handle_data = record.handle.data if record.handle is not None else {}
-                root = handle_data.get("root")
-                hint = mpi_network.failure_hint(
-                    "\n".join(text for text in (status.message, tail, errors) if text),
-                    root=root if isinstance(root, str) else None,
-                )
-                if hint is not None:
-                    result["mpi_network_hint"] = hint
+            if status.issues:
+                result["issues"] = status.issues
+            else:
+                result.pop("issues", None)
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)

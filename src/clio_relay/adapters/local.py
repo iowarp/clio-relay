@@ -369,13 +369,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return self._jarvis_handle(found, job_dir, operation_id)
 
     def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
-        """Raise the refusal for the site script's no-JARVIS (69), decision (3) and
-        build-refused (4) exits."""
+        """Raise the refusal for the site script's no-JARVIS (69), decision (3),
+        build-refused (4) and typed-refusal (5) exits."""
         site = self.context.site_id
         if result.exit_code == jarvis_submit.EXIT_NO_JARVIS:
             raise jarvis_submit.missing_jarvis(result.stderr, site=site)
         if result.exit_code == jarvis_submit.EXIT_BUILD_REFUSED:
             raise jarvis_submit.build_refused(result.stdout + "\n" + result.stderr, site=site)
+        if result.exit_code == jarvis_submit.EXIT_REFUSED:
+            raise jarvis_submit.jarvis_refused(result.stdout + "\n" + result.stderr, site=site)
         if result.exit_code == jarvis_submit.EXIT_DECISION:
             report = jarvis_submit.parse_install_report(result.stdout)
             if report is None:

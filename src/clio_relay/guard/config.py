@@ -24,7 +24,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 WARM_IDLE_S = 600
 """A warm allocation nobody uses for this long releases itself (RL26)."""
 CLIO_SPACK = (".clio-relay/spack/bin/spack",)
-"""The CLIO Spack (clio-kit's ``spack_prepare_site``), relative to the home directory."""
+"""The CLIO Spack (``jarvis spack prepare``), relative to the home directory."""
 
 
 class SiteGuard(BaseModel):

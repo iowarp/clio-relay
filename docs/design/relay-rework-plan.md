@@ -265,7 +265,7 @@ Relay adds two things PSI/J does not have: the list of inputs (RL16), and on a g
 
 **RL23. Lifetime, reconnection, several viewers, the end.**
 
-- A service task reaches `working` with the endpoint in its status when the health path answers. New output is recorded as task progress. In CLIO progress alone does not start a turn (`_record_progress` in `gact/external_tasks.py`), so an agent that is asked to keep watching sets a loop with CLIO's `set_loop` and reads the progress on each wake. (Question 4.)
+- A service task reaches `working` with the endpoint in its status when the health path answers. (Superseded by video1k, ledger W1: the task completes then, with the endpoint as its result, so a polling client wakes; the service runs on until stopped.) New output is recorded as task progress. In CLIO progress alone does not start a turn (`_record_progress` in `gact/external_tasks.py`), so an agent that is asked to keep watching sets a loop with CLIO's `set_loop` and reads the progress on each wake. (Question 4.)
 - The endpoint is durable. When the desktop sleeps or the link drops, relay re-binds the same loopback port on return. The service kept its state, so a view resumes where it was. (Question 5.)
 - Any number of browser connections may use one endpoint. Whether they share state is the service's business. (Question 6.)
 - On stop, the service gets a termination signal and a grace period to write its final artifacts. The task result lists them, and CLIO registers them as artifacts as it does for any task. (Question 7.)

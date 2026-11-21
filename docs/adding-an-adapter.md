@@ -253,16 +253,16 @@ so the approval says how long the build may take), with
 `jarvis_submit.build_refused` when it exits 4
 (JARVIS will not build outside an allocation; never retry it), and with
 `jarvis_submit.missing_jarvis` when the site script exits 69: JARVIS is
-missing, or JARVIS found no Spack (`missing: spack`, with no install offer and
-a `remedy`: where to prepare a Spack and which site Spacks it can reuse).
-Relay turns those into the install questions and calls `install` or
-`install_jarvis` itself.
+missing or at another pin. Relay turns that into the install question and
+calls `install` or `install_jarvis` itself. A missing Spack is JARVIS's own
+`spack_missing` question (exit 3), asked like any other choice.
 
-A Slurm adapter's `describe()` fills `SiteInfo.partitions` (a `PartitionInfo`
-per partition: nodes, CPUs and physical cores per node, memory, max time and
-idle or allocated counts) and `SiteInfo.mpi` (the site's MPI facts), with
-`clio_relay.adapters.slurm_facts`. The guard sizes jobs against them, and a
-site that reports none is not checked. `Charge.with_layout(spec)` adds the
+An adapter whose site runs JARVIS fills `SiteInfo.partitions` (a
+`PartitionInfo` per partition: nodes, CPUs per node, memory, max time and idle
+or allocated counts) and `SiteInfo.mpi` from `jarvis sched info +json`, with
+`clio_relay.adapters.sched_info`. Relay reads no scheduler or MPI facts
+itself. The guard sizes jobs against the partitions, and a site that reports
+none is not checked. `Charge.with_layout(spec)` adds the
 layout (threads, memory, each step's nodes, the job's `sizing`) to a price.
 
 ### Register it

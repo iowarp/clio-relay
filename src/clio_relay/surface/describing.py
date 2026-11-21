@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
@@ -11,7 +11,6 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import installing
 from clio_relay.surface.skills import skill_link, skills
 
 if TYPE_CHECKING:
@@ -85,8 +84,10 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
 
     ``packages`` are the JARVIS packages relay can run there. ``run`` takes one
     as ``package: {name, parameters}`` and pins its version and SHA-256.
-    ``install_choices`` are the site-scope choices (which MPI) the person made,
-    which later installs on the site carry.
+    The site's cluster facts are JARVIS's, not relay's: an adapter that reads
+    them reports ``info.facts.resource_graph``, with the graph's path, the
+    install decisions JARVIS records, and the net report of ``jarvis rg net
+    show`` (``None`` until the graph has a ``net`` section).
     """
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
@@ -95,17 +96,33 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
             skill_link, site, service.paths.config_dir, with_text=True
         ),
         "packages": await asyncio.to_thread(package_listing, service, site),
-        "install_choices": {
-            subject: entry["constraint"]
-            for subject, entry in installing.site_choices(service, site.id).items()
-        },
     }
     try:
         adapter = service.adapter_for(site, "describe")
-        described["info"] = (await adapter.describe()).model_dump(mode="json")
+        info = (await adapter.describe()).model_dump(mode="json")
+        _collect_on_default_queue(info, site.defaults.queue)
+        described["info"] = info
         need = await adapter.sign_in_needed()
         described["sign_in"] = None if need is None else need.model_dump(mode="json")
     except Refusal as refusal:
         described["info"] = None
         described["refusal"] = refusal.to_dict()
     return described
+
+
+def _collect_on_default_queue(info: dict[str, Any], queue: str | None) -> None:
+    """Send the graph collection the adapter offers to the site's default queue."""
+    facts: object = info.get("facts")
+    if not queue or not isinstance(facts, dict):
+        return
+    graph: object = cast(dict[str, Any], facts).get("resource_graph")
+    if not isinstance(graph, dict):
+        return
+    collect: object = cast(dict[str, Any], graph).get("collect")
+    if not isinstance(collect, dict):
+        return
+    offered = cast(dict[str, Any], collect)
+    command: object = offered.get("exec")
+    if isinstance(command, list):
+        cast(list[str], command).append(queue)
+        offered["queue"] = queue

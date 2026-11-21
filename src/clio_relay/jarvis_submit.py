@@ -46,13 +46,12 @@ import math
 import posixpath
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from typing import Any, Literal, cast
 
 import yaml
 
-from clio_relay import mpi_network
 from clio_relay.jobs.handles import VIEW_METADATA, JobProgress, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
@@ -99,7 +98,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "af290aef6a3592a102b99df38545a2345e3dc28b"
+JARVIS_PIN = "bfeff98bc30dc4a6ec895a29b4228f61ac138605"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -116,22 +115,25 @@ JARVIS_SETTING_HELP = (
 )
 """The description of an adapter's ``jarvis`` setting (:func:`explicit_jarvis`)."""
 PIPELINES_DIR = "pipelines"
-"""Where the install answers and Spack env of each set of archives are kept, under
-:data:`BOOTSTRAP_DIR`."""
+"""Where the Spack env of each set of archives is kept, under :data:`BOOTSTRAP_DIR`."""
+SITE_DIR = "site"
+"""JARVIS's site record under :data:`BOOTSTRAP_DIR`: the resource graph and the decisions."""
+GRAPH_FILE = "resource_graph.yaml"
+"""The site's JARVIS resource graph, in :data:`SITE_DIR`."""
+DECISIONS_FILE = "decisions.yaml"
+"""The site's JARVIS install decisions, in :data:`SITE_DIR`, beside the graph."""
+GRAPH_ENV = "CLIO_RELAY_JARVIS_GRAPH"
+"""The file the site script exports as ``JARVIS_RESOURCE_GRAPH``."""
 DECISIONS_ENV = "CLIO_RELAY_JARVIS_DECISIONS"
 """The file the site script exports as ``JARVIS_SPACK_DECISIONS``."""
 SPACK_ENV_ENV = "CLIO_RELAY_JARVIS_SPACK_ENV"
 """The directory the site script exports as ``JARVIS_SPACK_ENV_DIR``."""
 SPACK_DIR = "spack"
-"""The CLIO Spack checkout, relative to the CLIO site home (clio-kit's ``spack_prepare_site``)."""
+"""The site's JARVIS Spack, relative to the CLIO site home (``jarvis spack prepare --root``)."""
 SPACK_CONFIG_DIR = "spack-config"
-"""The CLIO Spack's own user configuration, relative to the CLIO site home."""
+"""An older CLIO Spack configuration directory, which ``site clean`` still removes."""
 SPACK_ROOT_ENV = "CLIO_RELAY_SPACK_ROOT"
 """The Spack the site script exports as ``JARVIS_SPACK_ROOT`` when it is there."""
-SPACK_CONFIG_ENV = "CLIO_RELAY_SPACK_CONFIG"
-"""The directory the site script exports as ``JARVIS_SPACK_CONFIG`` when it is there."""
-MPI_NETWORK_ENV = "CLIO_RELAY_MPI_NETWORK"
-"""The file that keeps the site's MPI network (:mod:`clio_relay.mpi_network`)."""
 
 EXIT_DECISION = 3
 """JARVIS needs to install software, or a decision, before the job can run."""
@@ -147,7 +149,20 @@ EXIT_MISSING = 66
 EXIT_NO_JARVIS = 69
 """The site has no JARVIS where the site's setting says."""
 
-ExecutionVerb = Literal["get", "progress", "artifacts", "service-runtimes", "cancel", "stop"]
+EXIT_REFUSED = 5
+"""JARVIS refused with a ``jarvis.refusal.v1`` document of typed issues (``ppl check``,
+``execution move``)."""
+
+REFUSAL_SCHEMA = "jarvis.refusal.v1"
+CHECK_SCHEMA = "jarvis.pipeline-check.v1"
+CHECK_FILE = "relay.check.json"
+"""``jarvis ppl check +json`` of the job's pipeline, which the site script keeps."""
+SERVICE_NODE_FILE = "relay.service-node"
+"""The allocation index of the service's first host, from :data:`CHECK_FILE`."""
+
+ExecutionVerb = Literal[
+    "get", "progress", "artifacts", "service-runtimes", "cancel", "stop", "move"
+]
 EXECUTION_VERBS: tuple[ExecutionVerb, ...] = (
     "get",
     "progress",
@@ -155,6 +170,7 @@ EXECUTION_VERBS: tuple[ExecutionVerb, ...] = (
     "service-runtimes",
     "cancel",
     "stop",
+    "move",
 )
 
 NEEDS_INSTALL = "jarvis ppl install"
@@ -233,24 +249,75 @@ def explicit_jarvis(value: str) -> str:
     return value
 
 
+def site_graph(home: str) -> str:
+    """Return the site's JARVIS resource graph under the CLIO site home ``home``."""
+    return posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
+
+
+def site_decisions(home: str) -> str:
+    """Return the site's JARVIS install decisions file, beside :func:`site_graph`."""
+    return posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, DECISIONS_FILE)
+
+
+def site_root(home: str) -> str:
+    """Return the JARVIS root relay uses for site-level reads, such as ``rg net show``."""
+    return posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, "root")
+
+
+GRAPH_SCHEMA = "jarvis.resource-graph.net-report.v1"
+"""What ``jarvis rg net show +json`` prints: the site graph's networks and the chosen ones."""
+
+
+def graph_pipeline(scheduler: str, *, nodes: int = 2, time: str = "00:05:00") -> dict[str, Any]:
+    """Return JARVIS's pipeline that collects the graph's ``net`` section on compute nodes.
+
+    It is JARVIS's ``builtin.resource_graph`` package (``net_only`` by default),
+    submitted as a job of ``nodes`` nodes on the site's ``scheduler``, so the
+    networks are the compute nodes' and never a login host's.
+    """
+    document: dict[str, Any] = {
+        "name": "site_net",
+        "pkgs": [{"pkg_type": "builtin.resource_graph"}],
+    }
+    if scheduler not in ("", "none"):
+        document["scheduler"] = {"name": scheduler, "nodes": nodes, "time": time}
+    return document
+
+
+def graph_report(text: str) -> dict[str, Any] | None:
+    """Return JARVIS's net report from ``rg net show +json`` output, or ``None``."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        found, _end = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    return cast(dict[str, Any], found) if isinstance(found, dict) else None
+
+
 def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     """Return the site script's settings for ``spec`` and the CLIO site home ``home``.
 
     Relay's pinned JARVIS there (:func:`bootstrap_path`) is the one the script
     runs, and :data:`JARVIS_PIN` is the pin it must carry. A relative ``home``
     is from the home directory, as ssh's ``remote_dir`` is.
-    The person's install answers and the pipeline's Spack environment are kept
-    at ``<home>/jarvis-cd/pipelines/<steps digest>/``, keyed by the set of
-    archives (:func:`steps_digest`): the job's JARVIS root and pipeline are per
-    operation, so JARVIS's own per-pipeline ``decisions.yaml`` and ``spack.lock``
-    would be forgotten, and a repeat run would concretize again.
 
-    The CLIO Spack, ``<home>/spack`` with its configuration in
-    ``<home>/spack-config``, is offered too. The site script exports it as
-    ``JARVIS_SPACK_ROOT`` (and ``JARVIS_SPACK_CONFIG``) only when the checkout
-    has ``share/spack/setup-env.sh``, so a site without one keeps JARVIS's own
-    lookup (``SPACK_ROOT``). The site's MPI network is kept at
-    ``<home>/jarvis-cd/mpi-network`` (:mod:`clio_relay.mpi_network`).
+    The job's JARVIS root is per operation, so the site's facts are kept where
+    every root finds them: the resource graph (:func:`site_graph`, exported as
+    ``JARVIS_RESOURCE_GRAPH``) and the install decisions JARVIS records and
+    replays (:func:`site_decisions`, exported as ``JARVIS_SPACK_DECISIONS``).
+    Relay keeps no record of its own of either. The pipeline's Spack
+    environment is kept at ``<home>/jarvis-cd/pipelines/<steps digest>/``,
+    keyed by the set of archives (:func:`steps_digest`), so a repeat run does
+    not concretize again.
+
+    The site's JARVIS Spack, ``<home>/spack``, is offered too: the root
+    ``jarvis spack prepare`` chains to the site's own Spack, with its
+    configuration in the root's site scope. The site script exports it as
+    ``JARVIS_SPACK_ROOT`` only when the checkout has ``bin/spack``, so a site
+    without one keeps JARVIS's own lookup, and JARVIS asks ``spack_missing``
+    when it finds none.
     """
     if not home:
         return {}
@@ -258,11 +325,10 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     return {
         FALLBACK_ENV: bootstrap_path(home),
         PIN_ENV: JARVIS_PIN,
-        DECISIONS_ENV: posixpath.join(kept, "decisions.yaml"),
+        GRAPH_ENV: site_graph(home),
+        DECISIONS_ENV: site_decisions(home),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
         SPACK_ROOT_ENV: posixpath.join(home, SPACK_DIR),
-        SPACK_CONFIG_ENV: posixpath.join(home, SPACK_CONFIG_DIR),
-        MPI_NETWORK_ENV: posixpath.join(home, BOOTSTRAP_DIR, mpi_network.FILE),
     }
 
 
@@ -446,48 +512,10 @@ def is_service(spec: JobSpec) -> bool:
     return any(step.service for step in spec.steps())
 
 
-def slice_start(step: PackageRef) -> int:
-    """Return the first allocation host of a step's ``host_slice``, as JARVIS indexes it.
-
-    No slice is the whole allocation, so 0. A negative start counts from the
-    end, as in Python. JARVIS refuses a malformed slice when it loads the
-    pipeline, so one here is taken as 0.
-    """
-    value = step.nodes()
-    match = re.fullmatch(r"\s*(-?\d*):(-?\d*)\s*", value) if value is not None else None
-    if match is None or not match.group(1):
-        return 0
-    return int(match.group(1))
-
-
-def service_step(spec: JobSpec) -> PackageRef:
-    """Return the step whose first host serves the ports: the service steps' first.
-
-    Rank 0 of that step listens on the ports, on the first host of its
-    ``host_slice``, wherever the slice sits in the allocation. Service steps
-    that start on different hosts are refused: relay could not tell which one
-    serves the ports.
-    """
-    steps = [step for step in steps_of(spec) if step.service]
-    if not steps:
-        raise ValueError("not a package service")
-    starts = sorted({slice_start(step) for step in steps})
-    if len(starts) > 1:
-        raise Refusal(
-            RefusalReason.INVALID_SPEC,
-            "the pipeline's service steps start on different nodes "
-            f"({', '.join(f'{step.name} at {slice_start(step)}' for step in steps)}); "
-            "set service: true on the one step that serves the ports and leave it false "
-            "on the steps that run alongside it",
-            field="packages",
-        )
-    return steps[0]
-
-
 _SLICE_HOST = (
-    'h=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk -v s={start} '
-    "'{{ h[NR - 1] = $0 }} END {{ if (s < 0) s += NR; if (s >= 0 && s < NR) print h[s] }}'); "
-    'if [ -z "$h" ]; then echo "no host {start} in the allocation $SLURM_JOB_NODELIST"; '
+    'h=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk -v s="$s" '
+    "'{ h[NR - 1] = $0 } END { if (s < 0) s += NR; if (s >= 0 && s < NR) print h[s] }'); "
+    'if [ -z "$h" ]; then echo "no host $s in the allocation $SLURM_JOB_NODELIST"; '
     "exit 1; fi; "
 )
 
@@ -501,11 +529,13 @@ def connector_command(spec: JobSpec, *, job_dir: str) -> str:
     Its settings are arguments, so they do not depend on the environment JARVIS
     gives the batch shell.
 
-    It runs where the service step's rank 0 listens: the first host of its
-    ``host_slice`` (:func:`service_step`). When that is the allocation's first
-    host it runs beside the batch shell. Otherwise it is a one-task step of the
-    job, ``srun --overlap`` on that host, which Slurm ends with the job. Either
-    way it runs on a compute node, inside the allocation JARVIS submitted.
+    JARVIS says which step serves and where: the site script keeps the first
+    allocation index of the first service ``jarvis ppl check`` names in
+    :data:`SERVICE_NODE_FILE`. Relay does not work it out from the steps. When
+    that index is 0 (or JARVIS names none) the connector runs beside the batch
+    shell. Otherwise it is a one-task step of the job, ``srun --overlap`` on
+    that host, which Slurm ends with the job. Either way it runs on a compute
+    node, inside the allocation JARVIS submitted.
     """
     env = spec.environment
     job = shlex.quote(job_dir)
@@ -517,12 +547,14 @@ def connector_command(spec: JobSpec, *, job_dir: str) -> str:
         ]
     )
     log = shlex.quote(posixpath.join(job_dir, "serve", "connect.log"))
+    node = shlex.quote(posixpath.join(job_dir, SERVICE_NODE_FILE))
     inner = f"cd {job} && exec sh {CONNECTOR} {arguments}"
-    start = slice_start(service_step(spec))
-    if start == 0:
-        return f"({inner}) </dev/null >>{log} 2>&1 &"
     step = f'exec srun --overlap --nodes=1 --ntasks=1 --nodelist="$h" sh -c {shlex.quote(inner)}'
-    return f"({_SLICE_HOST.format(start=start)}{step}) </dev/null >>{log} 2>&1 &"
+    return (
+        f's=$(cat {node} 2>/dev/null) || s=; case $s in ""|*[!0-9-]*) s=0 ;; esac; '
+        f'if [ "$s" = 0 ]; then ({inner}) </dev/null >>{log} 2>&1 & '
+        f"else ({_SLICE_HOST}{step}) </dev/null >>{log} 2>&1 & fi"
+    )
 
 
 def _parameter(key: str, value: CustomValue) -> CustomValue:
@@ -547,9 +579,31 @@ def input_paths(spec: JobSpec, job_dir: str) -> dict[str, str]:
     }
 
 
-def _resolved(value: CustomValue, paths: Mapping[str, str]) -> CustomValue:
-    if isinstance(value, str):
-        return paths.get(value, value)
+_PLACEHOLDER = re.compile(r"[$%]|\{[^}]*\}|<[^>]*>")
+
+
+def _resolved(key: str, value: CustomValue, paths: Mapping[str, str], package: str) -> CustomValue:
+    """Return ``value`` with a run input's name turned into its absolute path.
+
+    ``./name`` resolves as ``name`` does. A value that wraps an input's name in
+    a placeholder such as ``{job_dir}/name`` or ``$JOB/name`` is refused: relay
+    puts the path in itself, and nothing on the site expands the placeholder.
+    """
+    if not isinstance(value, str) or not paths:
+        return value
+    if value in paths:
+        return paths[value]
+    normal = posixpath.normpath(value) if not value.startswith("/") else value
+    if normal in paths:
+        return paths[normal]
+    name = posixpath.basename(value)
+    if name in paths and _PLACEHOLDER.search(value):
+        raise Refusal(
+            RefusalReason.INVALID_SPEC,
+            f"{key} is {value!r}, a placeholder path nothing on the site expands; "
+            f"set {key} to the input's name {name!r} and relay puts its absolute path in",
+            package=package,
+        )
     return value
 
 
@@ -589,7 +643,7 @@ def pipeline_document(
         entry: dict[str, object] = {"pkg_type": step.name, "pkg_name": name}
         entry.update(
             {
-                key: _resolved(_parameter(key, value), paths)
+                key: _resolved(key, _parameter(key, value), paths, step.name)
                 for key, value in sorted(step.parameters.items())
             }
         )
@@ -608,8 +662,7 @@ def render_pipeline(document: Mapping[str, object]) -> str:
 
 # The site script
 
-SITE_SCRIPT = (
-    r"""set -eu
+SITE_SCRIPT = r"""set -eu
 mode=$1 jarvis=$2 execution=$3 steps=$4
 shift 4
 job=$PWD
@@ -659,19 +712,24 @@ home() {
 fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
 pin=${CLIO_RELAY_JARVIS_PIN:-}
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
+graph=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
-spack_config=$(home "${CLIO_RELAY_SPACK_CONFIG:-}")
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
-unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT CLIO_RELAY_SPACK_CONFIG
+unset CLIO_RELAY_JARVIS_GRAPH
+unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT
 # Builds run only in a job JARVIS submits (ppl install +submit), never on this host.
 unset JARVIS_ALLOW_LOCAL_BUILD
-# The CLIO Spack, when the site has one: JARVIS installs and loads through it.
-if [ -n "$spack_root" ] && [ -f "$spack_root/share/spack/setup-env.sh" ]; then
+# The site's JARVIS Spack (jarvis spack prepare), when there is one. Without it JARVIS
+# looks for a Spack itself and asks spack_missing when it finds none.
+if [ -n "$spack_root" ] && [ -x "$spack_root/bin/spack" ]; then
   export JARVIS_SPACK_ROOT="$spack_root"
-  if [ -n "$spack_config" ] && [ -d "$spack_config" ]; then
-    export JARVIS_SPACK_CONFIG="$spack_config"
-  fi
+fi
+# The site's own JARVIS record, shared by every per-job root: the resource graph and the
+# install decisions. JARVIS reads and writes both; relay keeps no copy.
+if [ -n "$graph" ]; then
+  mkdir -p "$(dirname "$graph")"
+  export JARVIS_RESOURCE_GRAPH="$graph"
 fi
 if [ -n "$decisions" ]; then
   mkdir -p "$(dirname "$decisions")"
@@ -703,52 +761,6 @@ else
     || refuse "$found" ",\"pin\":\"$got\"" "relay's jarvis-cd is at ${got:-no pin}, not $pin"
 fi
 printf '%s\n' "$found" > "$job/relay.jarvis"
-"""
-    + mpi_network.SHELL
-    + r"""
-# The network MPI's TCP channels use: the job's own setting, else the site's, which is
-# found once from Slurm's node addresses and kept in the CLIO site home. sbatch exports
-# it with the rest of this environment, and Open MPI forwards OMPI_MCA_* to every rank.
-# The record's first word is the network (or none); the second says who named it.
-net_file=$(home "${CLIO_RELAY_MPI_NETWORK:-}")
-unset CLIO_RELAY_MPI_NETWORK
-if [ "$mode" != install ]; then
-  own=
-  for key in OMPI_MCA_btl_tcp_if_include OMPI_MCA_btl_tcp_if_exclude \
-    OMPI_MCA_oob_tcp_if_include OMPI_MCA_oob_tcp_if_exclude \
-    PRTE_MCA_oob_tcp_if_include PRTE_MCA_oob_tcp_if_exclude; do
-    eval "value=\${$key:-}"
-    [ -z "$value" ] || own="$own$key=$value "
-  done
-  if [ -n "$own" ]; then
-    printf '%s job\n' "$own" > "$job/relay.mpi-network"
-  else
-    net=
-    src=site
-    if [ -n "$net_file" ] && [ -s "$net_file" ]; then
-      read -r net src < "$net_file" || true
-      src=${src:-site}
-    fi
-    if [ -z "$net" ]; then
-      py="${found%/*}/python"
-      [ -x "$py" ] || py="${found%/*}/venv/bin/python"
-      [ -x "$py" ] || py=$(command -v python3 2>/dev/null) || py=
-      [ -z "$py" ] || net=$(relay_mpi_network "$py" | cut -d' ' -f1) || net=
-      src=slurm-node-addresses
-      if [ -n "$net" ] && [ -n "$net_file" ]; then
-        mkdir -p "$(dirname "$net_file")"
-        printf '%s slurm-node-addresses\n' "$net" > "$net_file"
-      fi
-    fi
-    if [ -n "$net" ] && [ "$net" != none ]; then
-      export OMPI_MCA_btl_tcp_if_include="$net" OMPI_MCA_oob_tcp_if_include="$net"
-      export PRTE_MCA_oob_tcp_if_include="$net"
-      printf 'OMPI_MCA_btl_tcp_if_include=%s %s\n' "$net" "${src%% *}" > "$job/relay.mpi-network"
-    elif [ "$net" = none ]; then
-      printf 'none %s\n' "${src%% *}" > "$job/relay.mpi-network"
-    fi
-  fi
-fi
 root="$job/.relay-jarvis"
 export JARVIS_ROOT="$root"
 # Set up once per set of archives: the root keeps the install records and executions.
@@ -808,50 +820,38 @@ if [ "$mode" = install ]; then
     +submit --execution-id "$execution" +json) || rc=$?
   saved=relay.install.json
 else
+  # JARVIS checks the pipeline's coupling and rules; relay keeps its answer, and the
+  # connector starts on the first host of the service it names.
+  crc=0
+  "$found" ppl check yaml "$pipeline" +json > "$job/relay.check.json.tmp" || crc=$?
+  mv -f "$job/relay.check.json.tmp" "$job/relay.check.json"
+  if [ "$crc" -ne 0 ]; then
+    cat "$job/relay.check.json"
+    exit "$crc"
+  fi
+  py="${found%/*}/python"
+  [ -x "$py" ] || py="${found%/*}/venv/bin/python"
+  if [ -x "$py" ]; then
+    "$py" -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+s = (d.get("services") or [{}])[0]
+f = (s.get("nodes") or {}).get("first", 0)
+print(f if isinstance(f, int) and not isinstance(f, bool) else 0)' \
+      "$job/relay.check.json" > "$job/relay.service-node" 2>/dev/null \
+      || printf '0\n' > "$job/relay.service-node"
+  else
+    printf '0\n' > "$job/relay.service-node"
+  fi
   out=$(JARVIS_INSTALL_ON_LOAD=check "$found" ppl submit "$pipeline" \
     --execution-id "$execution" +json) || rc=$?
   saved=relay.submission.json
 fi
 printf '%s\n' "$out"
 [ "$rc" -ne 3 ] || report
-if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'spack is not available'; then
-  quote() { printf '%s' "$1" | tr -d '\r\n' | sed 's/[\\"]/\\&/g'; }
-  # The site's own Spacks, as its login profile sets them up: SPACK_ROOT, a spack
-  # on PATH, and the Spack module trees on MODULEPATH. They are reported, not used.
-  found_spacks=$(bash -lc 'printf "SPACK_ROOT %s\n" "${SPACK_ROOT:-}"
-p=$(command -v spack 2>/dev/null) && case $p in /*) echo "PATH ${p%/bin/spack}" ;; esac
-printf "%s\n" "${MODULEPATH:-}" | tr ":" "\n" |
-  sed -n "s:^\(/.*\)/share/spack/.*:MODULEPATH \1:p"' \
-    </dev/null 2>/dev/null | tr -d '\r' || true)
-  site_spacks="" seen=" "
-  while read -r how where; do
-    [ -n "$where" ] || continue
-    where=${where%/}
-    case $seen in *" $where "*) continue ;; esac
-    seen="$seen$where "
-    [ "$where" != "${spack_root%/}" ] || continue
-    [ -x "$where/bin/spack" ] && [ -f "$where/share/spack/setup-env.sh" ] || continue
-    version=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' \
-      "$where/lib/spack/spack/__init__.py" 2>/dev/null | head -n 1)
-    writable=false
-    [ -w "$where" ] && writable=true
-    site_spacks="${site_spacks:+$site_spacks,}{\"root\":\"$(quote "$where")\""
-    site_spacks="$site_spacks,\"found_by\":\"$how\",\"version\":\"$(quote "$version")\""
-    site_spacks="$site_spacks,\"writable\":$writable}"
-  done <<EOF
-$found_spacks
-EOF
-  printf '{"missing":"spack","reason":"adapter_unavailable","tried":"%s","config":"%s",' \
-    "$(quote "$spack_root")" "$(quote "$spack_config")" > "$job/relay.refusal.json"
-  printf '"site_spacks":[%s]}\n' "$site_spacks" >> "$job/relay.refusal.json"
-  cat "$job/relay.refusal.json" >&2
-  exit 69
-fi
 [ "$rc" -eq 0 ] || exit "$rc"
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
 """
-)
 """The site script. ``bash -c SITE_SCRIPT <$0> <mode> <jarvis> <execution> <steps>
 [<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
 ``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
@@ -862,28 +862,29 @@ names one, else ``$CLIO_RELAY_JARVIS_FALLBACK``, relay's pinned jarvis-cd,
 whose ``pin`` file must say ``$CLIO_RELAY_JARVIS_PIN``. When that JARVIS is
 missing or at another pin it writes ``relay.refusal.json`` (with ``explicit``
 or ``pin`` when they apply) and exits 69. A relative path is from the home
-directory. ``$CLIO_RELAY_JARVIS_DECISIONS`` and ``$CLIO_RELAY_JARVIS_SPACK_ENV``
-become ``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR``
-(:func:`site_environment`). When the CLIO Spack is on the site,
+directory. ``$CLIO_RELAY_JARVIS_GRAPH``, ``$CLIO_RELAY_JARVIS_DECISIONS`` and
+``$CLIO_RELAY_JARVIS_SPACK_ENV`` become ``JARVIS_RESOURCE_GRAPH``,
+``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR`` (:func:`site_environment`).
+When the CLIO Spack is on the site,
 ``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
-``share/spack/setup-env.sh`` is there) and ``$CLIO_RELAY_SPACK_CONFIG`` becomes
-``JARVIS_SPACK_CONFIG`` (only when that directory is there). The script unsets
+``bin/spack`` is there). The script unsets
 ``JARVIS_ALLOW_LOCAL_BUILD``: relay never builds outside a job. It unpacks the
 archives into the job's private
 JARVIS root and registers each repository once, once per set of archives. Before
 it registers one whose archive lists Python requirements
 (:data:`~clio_relay.jarvis_site.REQUIREMENTS_FILE`), it installs them with relay's
 jarvis-cd ``pip`` (only for relay's own JARVIS, logged in
-``relay.requirements.log``), and fails with exit 1 when that install fails. For a
-``submit`` or ``run``, it names the network MPI's TCP channels use
-(:mod:`clio_relay.mpi_network`): unless the job's environment names one, it
-exports the site's, kept in ``$CLIO_RELAY_MPI_NETWORK`` (found from Slurm's
-node addresses the first time; a first line of ``none`` turns it off), and
-writes what the job used to ``relay.mpi-network``. Then it
-hands the pipeline to JARVIS:
+``relay.requirements.log``), and fails with exit 1 when that install fails.
+Relay sets no MPI network: JARVIS's MPI launches apply the one the site's
+resource graph selects. Then it hands the pipeline to JARVIS:
 
-- ``submit`` runs ``ppl submit`` under ``JARVIS_INSTALL_ON_LOAD=check`` and keeps
-  the handle line as ``relay.submission.json``;
+- ``submit`` first runs ``ppl check +json`` and keeps its document as
+  ``relay.check.json``; when JARVIS refuses the pipeline (exit 5, typed issues)
+  it prints that document and exits 5. It writes the first allocation index of
+  the first service JARVIS names to ``relay.service-node``, where the connector
+  starts (:func:`connector_command`). Then it runs ``ppl submit`` under
+  ``JARVIS_INSTALL_ON_LOAD=check`` and keeps the handle line as
+  ``relay.submission.json``;
 - ``install`` (the answers JSON comes first) keeps the answers as
   ``relay.answers.json``, runs ``ppl install ... +submit`` and keeps the handle
   line as ``relay.install.json``. A pipeline YAML given to ``install`` is the
@@ -893,12 +894,9 @@ hands the pipeline to JARVIS:
 
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
-and exits 3. When JARVIS stops because it finds no Spack to install with, the
-script writes ``relay.refusal.json`` with ``missing: spack``, the CLIO Spack
-path it offered (``tried``) and its config directory, and ``site_spacks``: the
-Spacks the site's login profile sets up (``SPACK_ROOT``, a ``spack`` on PATH, and
-Spack module trees on ``MODULEPATH``), each with its version and whether it is
-writable. Then it exits 69. Answers already given reach every check through
+and exits 3; a site where JARVIS finds no Spack is one of those questions
+(``spack_missing``, whose candidates are the site's Spacks JARVIS found).
+Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
 allocation) passes through unchanged; relay reports it with
 :func:`build_refused` and never retries it. The exit code is also written to
@@ -969,11 +967,6 @@ INSTALL_WALLTIME_HELP = (
     "is longer. Keep it within the site's partition limit"
 )
 
-_INSTALL_DROPPED_KEYS = frozenset(
-    {"pre_cmds", "ntasks", "cpus_per_task", "gpus_per_node", "mem", "hostfile"}
-)
-"""The run's scheduler keys the install job does not take: it is one task on a whole node."""
-
 INSTALL_PIPELINE_FILE = "relay.install-pipeline.yaml"
 """The pipeline the install job builds with, beside the run's :data:`PIPELINE_FILE`."""
 
@@ -990,28 +983,22 @@ def install_walltime(spec: JobSpec, walltime_s: int) -> str:
 def install_pipeline(document: Mapping[str, object], spec: JobSpec, *, walltime_s: int) -> str:
     """Render the pipeline the install job builds with, from the run's ``document``.
 
-    JARVIS's install job keeps the pipeline's scheduler walltime, so the run's
-    (often minutes) would cut a build short. This one has
-    :func:`install_walltime` instead, and no ``pre_cmds``: the install job
-    serves nothing, so a package service's connector does not start in it.
-
-    A build is one process using every CPU it is given, not the run's ranks, so
-    the job is one task on a whole node (``exclusive``). Spack's ``build_jobs``
-    is capped by the CPUs the job can use, so it then builds with the whole
-    node instead of the run's few cores.
+    JARVIS sizes its own build job (``ppl install +submit``: one node, one task,
+    the whole node). Relay only drops its own ``pre_cmds`` (the install job
+    serves nothing, so a package service's connector does not start in it) and
+    gives the site's install walltime as ``scheduler.install.time``
+    (:func:`install_walltime`), which JARVIS applies to install jobs only.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
         return render_pipeline(document)
     scheduler = {
-        key: value
-        for key, value in cast(Mapping[str, object], found).items()
-        if key not in _INSTALL_DROPPED_KEYS
+        key: value for key, value in cast(Mapping[str, object], found).items() if key != "pre_cmds"
     }
-    scheduler["nodes"] = 1
-    scheduler["ntasks_per_node"] = 1
-    scheduler["exclusive"] = True
-    scheduler["time"] = install_walltime(spec, walltime_s)
+    install = scheduler.get("install")
+    own = dict(cast(Mapping[str, object], install)) if isinstance(install, Mapping) else {}
+    own.setdefault("time", install_walltime(spec, walltime_s))
+    scheduler["install"] = own
     return render_pipeline({**document, "scheduler": scheduler})
 
 
@@ -1284,12 +1271,14 @@ def execution_argv(
     job_dir: str,
     jarvis: str,
     pipeline: str | None = None,
+    extra: Sequence[str] = (),
 ) -> list[str]:
     """Return the argv of ``jarvis execution <verb>`` for an execution, ``+json``.
 
     ``pipeline`` defaults to the operation's, ``pipeline_id(execution_id)``; the
     install job (:func:`install_execution_id`) names the operation's pipeline.
-    ``cancel`` and ``stop`` print the execution record as ``get`` does.
+    ``cancel`` and ``stop`` print the execution record as ``get`` does. ``extra``
+    are the verb's own options, such as ``move``'s ``--queue``.
     """
     if verb not in EXECUTION_VERBS:
         raise ValueError(f"unknown execution verb {verb!r}")
@@ -1300,6 +1289,7 @@ def execution_argv(
         "execution",
         verb,
         execution_id,
+        *extra,
         "--pipeline-id",
         pipeline or pipeline_id(execution_id),
         "+json",
@@ -1307,13 +1297,20 @@ def execution_argv(
 
 
 def execution_shell(
-    verb: ExecutionVerb, execution_id: str, *, job_dir: str, pipeline: str | None = None
+    verb: ExecutionVerb,
+    execution_id: str,
+    *,
+    job_dir: str,
+    pipeline: str | None = None,
+    extra: Sequence[str] = (),
 ) -> str:
     """Return ``jarvis execution <verb>`` as shell, with JARVIS from ``relay.jarvis``.
 
     The command runs in the job directory, after ``jarvis=$(cat relay.jarvis)``.
     """
-    argv = execution_argv(verb, execution_id, job_dir=job_dir, jarvis="JARVIS", pipeline=pipeline)
+    argv = execution_argv(
+        verb, execution_id, job_dir=job_dir, jarvis="JARVIS", pipeline=pipeline, extra=extra
+    )
     parts = [shlex.quote(part) for part in argv]
     parts[2] = '"$jarvis"'
     return " ".join(parts)
@@ -1459,7 +1456,11 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
     ``unknown`` (JARVIS cannot see the scheduler's job right now) keeps ``last``,
     the state relay knew before. ``control`` carries the record's cancel and
     stop requests and how the job was terminated; an install job's progress
-    comes from ``metadata.install``.
+    comes from ``metadata.install``. ``queue`` is JARVIS's
+    ``metadata.queue`` while the job waits in the queue, and ``issues`` are the
+    record's typed ``metadata.issues`` (an ``mpi_network`` issue names the
+    resource graph field to change). Relay reads the scheduler only through
+    JARVIS.
     """
     native = str(record.get("state") or "unknown")
     code = record.get("return_code")
@@ -1467,18 +1468,30 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
     error = record.get("error")
     control = control_of(record)
     progress = install_progress(record)
+    metadata = _dict(record.get("metadata"))
+    issues = [_dict(item) for item in cast(list[Any], metadata.get("issues") or [])]
+    issues = [item for item in issues if item]
     if native == "unknown" or native not in _STATES:
         return JobStatus(
             state=last if last is not None and not last.final else JobState.RUNNING,
             native_state=native,
-            message="jarvis can't see the Slurm job right now",
+            message="jarvis can't see the scheduler's job right now",
             control=control,
             progress=progress,
+            issues=issues,
         )
     state = _STATES[native]
+    queue = _dict(metadata.get("queue"))
+    waiting = state == JobState.QUEUED and queue.get("state", "pending") == "pending"
     message = _control_message(control, state) or (
         error if isinstance(error, str) and error else None
     )
+    if state.final and issues:
+        said = "; ".join(str(item.get("message")) for item in issues if item.get("message"))
+        if said:
+            message = f"{message}. {said}" if message else said
+    elif waiting and queue and message is None:
+        message = queue_message(queue)
     if state == JobState.COMPLETED and exit_code is None:
         exit_code = 0
     return JobStatus(
@@ -1488,7 +1501,38 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
         message=message,
         control=control,
         progress=progress,
+        queue=queue if waiting and queue else None,
+        issues=issues,
     )
+
+
+def _duration(seconds: int) -> str:
+    hours, rest = divmod(max(seconds, 0), 3600)
+    minutes = rest // 60
+    if hours:
+        return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+    return f"{minutes} min" if minutes else "under a minute"
+
+
+def queue_message(queue: Mapping[str, Any]) -> str:
+    """Say where a pending job stands, from JARVIS's ``jarvis.scheduler.queue.v1``."""
+    partition = queue.get("partition")
+    where = f" in {partition}" if isinstance(partition, str) and partition else ""
+    reason = queue.get("reason")
+    why = f" ({reason})" if isinstance(reason, str) and reason else ""
+    starts = _int(queue.get("starts_in_s"))
+    when = ""
+    if starts is not None:
+        when = f"; the scheduler expects it to start in about {_duration(starts)}"
+    elif isinstance(queue.get("estimated_start"), str):
+        when = f"; the scheduler expects it to start at {queue['estimated_start']}"
+    fits = [
+        str(item.get("partition"))
+        for item in (_dict(raw) for raw in cast(list[Any], queue.get("partitions") or []))
+        if item.get("fits") and item.get("partition") and item.get("partition") != partition
+    ]
+    others = f". It would fit now in {', '.join(fits)}" if fits else ""
+    return f"waiting in the queue{where}{why}{when}{others}"
 
 
 def _dict(value: object) -> dict[str, Any]:
@@ -1582,75 +1626,61 @@ def build_refused(text: str, *, site: str) -> Refusal:
     )
 
 
-def missing_spack(written: dict[str, Any], *, tried: str, site: str) -> Refusal:
-    """The refusal for a site with no Spack for JARVIS to install with.
+def refusal_document(text: str) -> dict[str, Any]:
+    """Return the last ``jarvis.refusal.v1`` or failed ``jarvis.pipeline-check.v1`` in ``text``.
 
-    Its ``remedy`` says what a generic agent does about it: prepare a Spack
-    checkout at ``root`` that reuses the site's own Spack (``site_spacks``, the
-    ones the site's login profile sets up) as an upstream. Relay never installs
-    into a site's Spack: it is shared, usually not writable, and JARVIS writes
-    its environments and install records into the Spack it uses.
+    A document may be on one line or pretty-printed over several; each starts a line.
     """
-    raw_spacks: object = written.get("site_spacks")
-    listed = cast(list[object], raw_spacks) if isinstance(raw_spacks, list) else []
-    site_spacks: list[dict[str, Any]] = [
-        {
-            "root": str(item.get("root")),
-            "found_by": str(item.get("found_by") or ""),
-            "version": str(item.get("version") or "") or None,
-            "writable": bool(item.get("writable")),
-            "used": False,
-        }
-        for item in (cast(dict[str, Any], raw) for raw in listed if isinstance(raw, dict))
-        if item.get("root")
-    ]
-    why = (
-        "JARVIS installs only through a Spack of its own, which chains to the site's Spack as "
-        "an upstream; relay never builds into a site's Spack"
+    decoder = json.JSONDecoder()
+    for start in reversed([match.start() for match in re.finditer(r"(?m)^\s*\{", text)]):
+        try:
+            found, _end = decoder.raw_decode(text[start:].lstrip())
+        except ValueError:
+            continue
+        if not isinstance(found, dict):
+            continue
+        document = cast(dict[str, Any], found)
+        if document.get("schema_version") in (REFUSAL_SCHEMA, CHECK_SCHEMA) or (
+            document.get("refused") is True or document.get("ok") is False
+        ):
+            return document
+    return {}
+
+
+def typed_issues(document: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return a refusal's ``issues``, or a failed check's ``errors``, as JARVIS typed them."""
+    raw = document.get("issues")
+    if not isinstance(raw, list):
+        raw = document.get("errors")
+    listed = cast(list[Any], raw) if isinstance(raw, list) else []
+    return [cast(dict[str, Any], item) for item in listed if isinstance(item, dict)]
+
+
+def jarvis_refused(text: str, *, site: str, what: str = "the pipeline") -> Refusal:
+    """The refusal for a JARVIS command that exited 5 with typed issues.
+
+    JARVIS checks the pipeline's coupling and configuration rules
+    (``ppl check``) and refuses a queue move it cannot make. Relay does not
+    judge these itself: it passes JARVIS's ``issues`` (``jarvis.issue.v1``:
+    ``kind``, ``field``, ``issue_id``, ``message``, ``details``) on, and its
+    message is theirs, so the agent sees which field to change.
+    """
+    document = refusal_document(text)
+    issues = typed_issues(document)
+    said = "; ".join(
+        f"{item.get('field')}: {item.get('message')}" if item.get("field") else str(item["message"])
+        for item in issues
+        if item.get("message")
     )
-    for item in site_spacks:
-        item["why_not_used"] = why + ("" if item["writable"] else ", and this one is not writable")
-    config = str(written.get("config") or "") or None
-    if site_spacks:
-        first = site_spacks[0]
-        found = (
-            f" The site has its own Spack at {first['root']}"
-            f"{' ' + first['version'] if first['version'] else ''} (from {first['found_by']}); "
-            "relay does not build into it, so the new checkout reuses it as an upstream."
-        )
-        how = (
-            f"Clone Spack {first['version'] or 'at the release of the site Spack'} into {tried}, "
-            f"point its upstreams.yaml at the install tree of {first['root']}, turn on "
-            "concretizer reuse, and run spack compiler find and spack external find"
-        )
-    else:
-        found = " The site's login profile sets up no Spack of its own."
-        how = (
-            f"Clone a Spack release into {tried}, and run spack compiler find and spack "
-            "external find"
-        )
-    remedy: dict[str, Any] = {
-        "action": "prepare_spack",
-        "root": tried,
-        "setup_env": f"{tried.rstrip('/')}/share/spack/setup-env.sh",
-        "config": config,
-        "site_spacks": site_spacks,
-        "steps": how,
-        "where": (
-            "the site's login node, through exec: a clone and configuration only, which is "
-            "light. Install nothing there; JARVIS builds what is missing in its install job"
-        ),
-        "then": "call run again with the same spec",
-    }
+    if not said:
+        said = "\n".join(text.strip().splitlines()[-5:]) or "no output"
     return Refusal(
-        RefusalReason.ADAPTER_UNAVAILABLE,
-        f"{site} has no Spack for JARVIS to install the package with: relay looked for a "
-        f"Spack checkout at {tried} (its share/spack/setup-env.sh) and JARVIS found no spack "
-        f"on the site's PATH.{found} Prepare a Spack checkout at {tried} (remedy: "
-        f"{remedy['action']}): {how}. That is light login-node work; then run again",
-        missing="spack",
-        tried=tried,
-        remedy=remedy,
+        RefusalReason.INVALID_SPEC,
+        f"JARVIS on {site} refused {what}: {said}",
+        issues=issues,
+        kinds=sorted({str(item.get("kind")) for item in issues if item.get("kind")}),
+        exit_code=EXIT_REFUSED,
+        retry=False,
     )
 
 
@@ -1659,9 +1689,7 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
 
     Relay offers to install its pinned jarvis-cd when its own is missing or at
     another pin; a path the site's setting names is the site's to fix. A site
-    with no Spack for JARVIS to install with (``missing: spack``) is the site's
-    to fix too: relay offers no install, and its refusal carries the remedy
-    (:func:`missing_spack`).
+    with no Spack is JARVIS's question (``spack_missing``), not a refusal here.
     """
     written: dict[str, Any] = {}
     for line in reversed(text.splitlines()):
@@ -1673,8 +1701,6 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
             written = cast(dict[str, Any], found)
             break
     tried = str(written.get("tried") or "the site home")
-    if written.get("missing") == "spack":
-        return missing_spack(written, tried=tried, site=site)
     if written.get("explicit"):
         return Refusal(
             RefusalReason.ADAPTER_UNAVAILABLE,
@@ -1873,6 +1899,21 @@ def install_summary(
     return {"reuse": sorted(reuse), "build": build, "issues": len(_issues(report))}
 
 
+def applied_decisions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the decisions JARVIS applied from its own record, not from this round's answers.
+
+    JARVIS replays what the person chose before (``source: decisions_file``)
+    while it is still one of its candidates; relay keeps no copy of its own.
+    """
+    found = report.get("applied_decisions")
+    listed = cast(list[Any], found) if isinstance(found, list) else []
+    return [
+        item
+        for item in (_dict(raw) for raw in listed)
+        if item.get("source") == "decisions_file" and item.get("constraint")
+    ]
+
+
 def install_message(
     report: Mapping[str, Any],
     *,
@@ -1880,17 +1921,16 @@ def install_message(
     package: str,
     names: Mapping[str, str] | None = None,
     walltime: str | None = None,
-    carried: Mapping[str, str] | None = None,
 ) -> str:
     """Return the approval question for installing the package's software on the site.
 
-    ``walltime`` is the install job's, when the adapter reported it. ``carried``
-    names the site choices the person made before, ``{subject: constraint}``,
-    which the install applies without asking them again.
+    ``walltime`` is the install job's, when the adapter reported it. The choices
+    JARVIS replays from its decisions record (:func:`applied_decisions`) are
+    named, so the person sees what is reused without being asked again.
     """
     summary = install_summary(report, names)
-    carried = dict(carried or {})
-    asked = len(choice_issues(report)) - len(carried)
+    applied = applied_decisions(report)
+    asked = len(choice_issues(report))
     built: list[str] = []
     for item in summary["build"]:
         detail = item["spec"] or item["package"]
@@ -1898,33 +1938,35 @@ def install_message(
             detail = f"{detail} ({item['missing']} missing)"
         built.append(detail)
     reuse = ""
-    if carried:
-        reuse = (
-            " It uses the "
-            + ", ".join(f"{subject} {value}" for subject, value in sorted(carried.items()))
-            + f" chosen for {site} before; decline to choose again."
+    if applied:
+        named = ", ".join(
+            f"{item.get('subject') or item.get('package') or 'a choice'} {item['constraint']}"
+            for item in applied
         )
-    if not built and choice_issues(report):
-        if asked <= 0:
-            return (
-                f"JARVIS applies the earlier choice(s) for {site} in a short job before "
-                f"{package} runs; nothing has to be built.{reuse} Go ahead?"
-            )
+        where = report.get("decisions_path")
+        kept = f" in {where}" if isinstance(where, str) and where else ""
+        reuse = f" JARVIS applies the {named} chosen for {site} before (kept{kept})."
+    if not built and asked:
         return (
             f"JARVIS needs {asked} choice(s) from you before {package} "
             f"runs on {site}; nothing has to be built. It applies your answers in a short "
             f"job on the site, then the run goes ahead.{reuse} Go ahead?"
+        )
+    if not built:
+        return (
+            f"JARVIS applies its recorded choices for {site} in a short job before "
+            f"{package} runs; nothing has to be built.{reuse} Go ahead?"
         )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
     if built:
         parts.append("Built: " + ", ".join(built) + ".")
-    if asked > 0:
+    if asked:
         parts.append(f"JARVIS has {asked} question(s) for you after this.")
     if reuse:
         parts.append(reuse.strip())
-    job = f"a job on one whole node of up to {walltime}" if walltime else "a job"
+    job = f"an install job of up to {walltime}" if walltime else "an install job"
     parts.append(f"JARVIS installs it as {job} on the site before the run. Install it?")
     return " ".join(parts)
 
@@ -1950,6 +1992,9 @@ def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
     modules = candidate.get("modules")
     if isinstance(modules, list) and modules:
         facts.append("modules " + ", ".join(str(item) for item in cast(list[object], modules)))
+    version = candidate.get("version")
+    if isinstance(version, str) and version:
+        facts.append(version)
     prefix = candidate.get("prefix")
     if isinstance(prefix, str) and prefix:
         facts.append(prefix)
@@ -1977,8 +2022,14 @@ def choice_message(issue: Mapping[str, Any]) -> str:
         for candidate in cast(list[object], issue.get("candidates") or [])
         if (line := _candidate_line(_dict(candidate)))
     ]
-    if issue.get("kind") == "ambiguous_provider" and issue.get("scope") == "site":
-        text = f"{text} Relay keeps the answer for every later install on the site."
+    previous = _dict(issue.get("previous_answer"))
+    if previous.get("constraint"):
+        text = (
+            f"{text} The earlier answer, {previous['constraint']}, no longer matches "
+            "what JARVIS finds, so it asks again."
+        )
+    if issue.get("scope") == "site":
+        text = f"{text} JARVIS records the answer for the site's later installs."
     return f"{text} Options: {'. '.join(lines)}." if lines else text
 
 

@@ -168,9 +168,10 @@ def test_serve_without_tasks_waits_for_the_endpoint(
     assert len(hook.started) == 1 and hook.stopped == hook.started
 
 
-def test_serve_task_status_names_the_endpoint(
+def test_a_serve_task_completes_when_the_service_is_ready(
     relay_paths: RelayPaths, fake_serve: list[FakeServe]
 ) -> None:
+    """A task client wakes on a status change, so ready completes the task with the endpoint."""
     _lab(relay_paths)
 
     async def scenario() -> None:
@@ -178,15 +179,23 @@ def test_serve_task_status_names_the_endpoint(
             task = await call_tool_task(client, "serve", {"site": "lab", "spec": SPEC})
             assert RelayService(relay_paths).operation(task.task_id).task
             message = ""
+            status = await task.status()
             for _ in range(100):
                 status = await task.status()
                 message = status.status_message or ""
-                if "relay-host:8080" in message:
-                    assert status.status == "working"
+                if status.status != "working":
                     break
                 await asyncio.sleep(0.1)
+            assert status.status == "completed", message
             assert "viz relay-host:8080" in message, message
             assert "token" not in message
+            ready = await task.result()
+            view = _structured(ready)
+            assert view["state"] == "running"
+            assert view["result"]["ready_at"]
+            assert view["result"]["endpoint"]["ports"][0]["name"] == "viz"
+            text = " ".join(getattr(item, "text", "") for item in ready.content)
+            assert "keeps running until serve(stop=" in text
             stopped = await client.call_tool("serve", {"stop": task.task_id})
             assert _structured(stopped)["state"] == "completed"
             result = await task.result()
