@@ -303,8 +303,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             "note": (
                 "Append JARVIS's own arguments to run relay's JARVIS with the site's record: "
                 "sched info, rg skill list|show NAME, rg facts show (each +json), and, once the "
-                "person agrees (with a plan on a guarded site), rg facts answer, rg skill set, "
-                "rg net set, or spack prepare --root <spack_root> --site_spack <root> +json"
+                "person agrees, rg facts answer, rg skill set, rg net set, or spack prepare "
+                "--root <spack_root> --site_spack <root> +json. A guarded site asks a plan for each"
             ),
         }
 

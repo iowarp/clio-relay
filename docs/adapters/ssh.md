@@ -264,7 +264,8 @@ the person must choose) from it. `info.facts.sched` holds the provider, the
 account, the site skills and JARVIS's `issues`. `info.facts.jarvis.exec` is an
 `exec` argument prefix that runs relay's JARVIS with the site's record; append
 JARVIS's own arguments, such as `sched info +json` or `rg skill show <name>
-+json`. Before relay has placed JARVIS on the site, `describe` lists only the
++json`. The prefix is a shell, so on a guarded site each call through it, reads
+included, runs with a `plan` and the person's yes. Before relay has placed JARVIS on the site, `describe` lists only the
 queue names. On a guarded site, relay checks a job's layout against its
 partition before it asks anything (see [guarded sites](../guarded-sites.md)).
 The site's cluster facts, such as which network MPI uses, are JARVIS's
