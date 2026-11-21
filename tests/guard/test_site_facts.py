@@ -55,6 +55,37 @@ def test_advisory_questions_and_install_reports_do_not_block() -> None:
     install_failures.raise_for(0, json.dumps({"issues": [_issue("block")]}), site="ares")
 
 
+def _ucx_unusable() -> dict[str, Any]:
+    issue = _issue("advisory", "sha256:cc")
+    issue["details"]["reasons"] = [
+        {
+            "code": "ucx_device_unusable",
+            "severity": "advisory",
+            "roles": ["data"],
+            "message": "UCX on comp-05 cannot use mlx5_0:1 (not_listed_by_ucx)",
+            "ucx": {
+                "comp-05": {
+                    "status": "not_listed_by_ucx",
+                    "port": "mlx5_0:1",
+                    "link_layer": "InfiniBand",
+                    "ucx_rdma_devices": [],
+                }
+            },
+        }
+    ]
+    return issue
+
+
+def test_a_ucx_device_unusable_advisory_passes_through_untouched() -> None:
+    advisory = _ucx_unusable()
+    check = json.dumps({"ok": True, "questions": [], "warnings": [advisory]})
+    install_failures.raise_for(3, check, site="ares")
+    assert site_facts.questions(check) == []
+    facts = {"schema_version": "jarvis.site-facts.v1", "issues": [advisory], "confirmed": []}
+    status = record_status({"state": "succeeded", "metadata": {"site_facts": facts}})
+    assert status.site_facts == facts
+
+
 def test_the_execution_carries_jarvis_site_facts_untouched() -> None:
     facts = {
         "schema_version": "jarvis.site-facts.v1",
