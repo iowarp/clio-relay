@@ -202,7 +202,10 @@ only commands that read:
 - modules and quotas: `module avail`, `module list`, `module spider`, ...,
   `quota`, `lfs quota`;
 - JARVIS reads: `jarvis ppl list`, `ppl status`, `repo list`, `pkg readme`,
-  and the like;
+  and the like, and the site record reads in exactly these shapes:
+  `jarvis sched info +json`, `jarvis rg facts show +json`, `jarvis rg skill
+  list +json` and `jarvis rg skill show <name> +json`. On an ssh site a bare
+  `jarvis` is relay's JARVIS with the site's record;
 - Spack queries: `spack find`, `spack info`, `spack spec` (see Spack on a
   guarded site, below).
 

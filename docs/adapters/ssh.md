@@ -261,11 +261,16 @@ sched info +json`, a light read that is safe on a login host, and fills
 `info.partitions` (nodes, CPUs and memory per node, the time limit, idle and
 allocated counts) and `info.mpi` (the MPIs an install would offer and whether
 the person must choose) from it. `info.facts.sched` holds the provider, the
-account, the site skills and JARVIS's `issues`. `info.facts.jarvis.exec` is an
-`exec` argument prefix that runs relay's JARVIS with the site's record; append
-JARVIS's own arguments, such as `sched info +json` or `rg skill show <name>
-+json`. The prefix is a shell, so on a guarded site each call through it, reads
-included, runs with a `plan` and the person's yes. Before relay has placed JARVIS on the site, `describe` lists only the
+account, the site skills and JARVIS's `issues`. `info.facts.jarvis.read` is
+`["jarvis"]`: in `exec`, a bare `jarvis` is relay's JARVIS with the site's
+record, and its arguments reach JARVIS as they are, never parsed by a shell.
+Reads go that way, with no plan even on a guarded site, when they have one of
+these exact shapes: `jarvis sched info +json`, `jarvis rg facts show +json`,
+`jarvis rg skill list +json` or `jarvis rg skill show <name> +json`.
+`info.facts.jarvis.exec` is an `exec` argument prefix (a shell) that runs the
+same JARVIS for everything else; append JARVIS's own arguments, such as `rg
+facts answer ...` or `spack prepare ...`. On a guarded site each call through
+it runs with a `plan` and the person's yes. Before relay has placed JARVIS on the site, `describe` lists only the
 queue names. On a guarded site, relay checks a job's layout against its
 partition before it asks anything (see [guarded sites](../guarded-sites.md)).
 The site's cluster facts, such as which network MPI uses, are JARVIS's

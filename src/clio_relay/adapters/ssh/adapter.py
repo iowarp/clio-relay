@@ -299,12 +299,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
         home = self.config.remote_dir.rstrip("/") or "/"
         return {
             "exec": scripts.jarvis_command(self.config.remote_dir, self.config.jarvis),
+            "read": ["jarvis"],
             "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
             "note": (
-                "Append JARVIS's own arguments to run relay's JARVIS with the site's record: "
-                "sched info, rg skill list|show NAME, rg facts show (each +json), and, once the "
-                "person agrees, rg facts answer, rg skill set, rg net set, or spack prepare "
-                "--root <spack_root> --site_spack <root> +json. A guarded site asks a plan for each"
+                "read + sched info|rg facts show|rg skill list|show NAME +json: no shell, no plan. "
+                "exec + rg facts answer|rg skill set|rg net set|spack prepare --root <spack_root> "
+                "--site_spack <root> +json, once the person agrees; a guarded site asks a plan"
             ),
         }
 
@@ -1076,7 +1076,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a command")
         result = await self.transport.ssh(
-            scripts.exec_script(command),
+            scripts.exec_script(command, self.config.remote_dir, self.config.jarvis),
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
             what="exec",

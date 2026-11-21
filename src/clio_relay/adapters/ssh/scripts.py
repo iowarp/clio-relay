@@ -643,7 +643,22 @@ def describe_script(scheduler: str, remote_dir: str | None = None, jarvis: str =
     )
 
 
-def exec_script(command: Sequence[str]) -> str:
+def relay_jarvis(command: Sequence[str], remote_dir: str, jarvis: str = "") -> list[str]:
+    """Return ``command`` with a bare ``jarvis`` program run as relay's JARVIS.
+
+    ``jarvis`` in ``exec`` names relay's JARVIS with the site's record
+    (:func:`jarvis_command`), at the start or after the login-load wrapper
+    (:func:`clio_relay.login_load.light_argv`). The arguments after it reach
+    JARVIS as ``"$@"``, never parsed by a shell. Any other command is unchanged.
+    """
+    argv = list(command)
+    at = 4 if argv[:2] == ["sh", "-c"] and argv[3:4] == ["clio-light"] else 0
+    if argv[at : at + 1] != ["jarvis"]:
+        return argv
+    return [*argv[:at], *jarvis_command(remote_dir, jarvis), *argv[at + 1 :]]
+
+
+def exec_script(command: Sequence[str], remote_dir: str | None = None, jarvis: str = "") -> str:
     """Run one command from the home directory, stopped when relay lets go.
 
     Relay holds the session's standard input open. When it closes, because the
@@ -653,7 +668,10 @@ def exec_script(command: Sequence[str]) -> str:
     A program that is not a file on the ssh session's PATH, such as Lmod's
     ``module`` shell function, runs in a login shell, which defines it. The
     login shell gets the arguments as ``"$@"``, so it never parses them again.
+    With ``remote_dir``, a bare ``jarvis`` is relay's JARVIS (:func:`relay_jarvis`).
     """
+    if remote_dir is not None:
+        command = relay_jarvis(command, remote_dir, jarvis)
     joined = shlex.join(list(command))
     program = shlex.quote(command[0])
     return (

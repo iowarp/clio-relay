@@ -14,6 +14,7 @@ the site's ``guard.yaml`` lists it, so a file someone wrote cannot pass as
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Collection, Sequence
 
 PLAIN = frozenset(
@@ -58,6 +59,16 @@ _JARVIS_READS = {
     "pkg": frozenset({"readme", "help", "path"}),
     "execution": frozenset({"get", "list", "progress", "artifacts"}),
 }
+JARVIS_SITE_READS: dict[tuple[str, ...], int] = {
+    ("sched", "info"): 0,
+    ("rg", "facts", "show"): 0,
+    ("rg", "skill", "list"): 0,
+    ("rg", "skill", "show"): 1,
+}
+"""JARVIS's reads of the site record: these words, this many names, then ``+json``
+and nothing else, so no option can point JARVIS at another file or turn a read
+into a write."""
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _MODULE_READS = frozenset(
     {"avail", "list", "spider", "show", "display", "help", "whatis", "keyword", "overview"}
 )
@@ -123,7 +134,22 @@ def _module(arguments: Sequence[str]) -> str | None:
 def _jarvis(arguments: Sequence[str]) -> str | None:
     if len(arguments) >= 2 and arguments[1] in _JARVIS_READS.get(arguments[0], ()):
         return None
-    return "only JARVIS read commands (ppl list/status/print/path, repo list, ...) read"
+    for words, names in JARVIS_SITE_READS.items():
+        if tuple(arguments[: len(words)]) != words:
+            continue
+        rest = arguments[len(words) :]
+        if (
+            len(rest) == names + 1
+            and rest[-1] == "+json"
+            and all(_NAME.fullmatch(item) for item in rest[:-1])
+        ):
+            return None
+        shape = " ".join([*words, *["NAME"] * names, "+json"])
+        return f"jarvis {' '.join(words)} reads here only as `jarvis {shape}`"
+    return (
+        "only JARVIS read commands (ppl list/status/print/path, repo list, sched info +json, "
+        "rg facts show +json, rg skill list|show +json, ...) read"
+    )
 
 
 SPACK_READS = frozenset({"find", "info", "spec"})

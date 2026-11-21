@@ -151,10 +151,9 @@ def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     job_dir = PurePosixPath("/home/u/.clio-relay/jobs/op_x")
     rendered = adapter._render_jarvis(_package_spec(), "op_x", job_dir, "relay-op_x")  # pyright: ignore[reportPrivateUsage]
     pipeline = rendered.files["relay.pipeline.yaml"]
-    assert pipeline.splitlines()[:11] == [
+    assert pipeline.splitlines()[:10] == [
         "name: relay_op_x",
         "scheduler:",
-        "  name: slurm",
         "  job_name: relay-op_x",
         "  nodes: 4",
         "  ntasks_per_node: 32",

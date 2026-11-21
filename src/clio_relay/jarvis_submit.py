@@ -98,7 +98,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "f6cb758721052a15b60cf6c0a2eca240458b575e"
+JARVIS_PIN = "742d7a4aabb956edac9b47f9311c3c7942566ee3"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -443,14 +443,14 @@ def scheduler_block(
     stderr: str | None = None,
     job_dir: str | None = None,
 ) -> dict[str, object]:
-    """Return the pipeline's ``scheduler:`` block for ``spec`` on Slurm.
+    """Return the pipeline's ``scheduler:`` block for ``spec``, naming no scheduler.
 
-    The resources and walltime are those the spend ask priced: ``nodes()``,
-    ``ranks_per_node()`` and ``duration``. A ``slurm.<key>`` custom attribute
-    adds ``--<key>``. With no duration, JARVIS writes no ``--time`` and the
-    scheduler's default applies. With no ``stdout`` or ``stderr``, JARVIS
-    writes the logs in its execution directory and registers them as the
-    ``stdout`` and ``stderr`` artifacts.
+    JARVIS detects it (typed ``scheduler_missing``). The resources and walltime
+    are those the spend ask priced: ``nodes()``, ``ranks_per_node()`` and ``duration``.
+    A ``slurm.<key>`` custom attribute adds ``--<key>``. With no duration, JARVIS
+    writes no ``--time`` and the scheduler's default applies. With no ``stdout``
+    or ``stderr``, JARVIS writes the logs in its execution directory and
+    registers them as the ``stdout`` and ``stderr`` artifacts.
 
     For a package service (:func:`is_service`) ``job_dir`` is required: the
     block's ``pre_cmds`` start relay's connector, ``serve/connect.sh``, beside
@@ -458,7 +458,7 @@ def scheduler_block(
     """
     resources = spec.resources
     attributes = spec.attributes
-    block: dict[str, object] = {"name": "slurm", "job_name": job_name, "nodes": resources.nodes()}
+    block: dict[str, object] = {"job_name": job_name, "nodes": resources.nodes()}
     ranks = resources.ranks_per_node()
     if ranks is not None:
         block["ntasks_per_node"] = ranks

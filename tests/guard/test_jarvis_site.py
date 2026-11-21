@@ -13,7 +13,13 @@ from clio_relay.adapters.sched_info import SCHEMA as SCHED_SCHEMA
 from clio_relay.adapters.sched_info import partitions as sched_partitions
 from clio_relay.adapters.sched_info import report as sched_report
 from clio_relay.adapters.sched_info import site_facts as sched_facts
-from clio_relay.adapters.ssh.scripts import graph_collect_command, jarvis_command, sched_script
+from clio_relay.adapters.ssh.scripts import (
+    exec_script,
+    graph_collect_command,
+    jarvis_command,
+    relay_jarvis,
+    sched_script,
+)
 from clio_relay.jarvis_site import (
     SOURCE_FILE,
     archive_package,
@@ -46,6 +52,7 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+from clio_relay.login_load import light_argv
 
 from .conftest import make_repo
 
@@ -441,6 +448,22 @@ def test_the_jarvis_exec_runs_relays_jarvis_with_the_site_record() -> None:
     assert "JARVIS_RESOURCE_GRAPH" in script
     assert "JARVIS_SPACK_DECISIONS" in script
     assert 'JARVIS_SPACK_ROOT="$SR"' in script
+
+
+def test_a_bare_jarvis_in_exec_is_relays_jarvis_with_its_arguments_unparsed() -> None:
+    home = "/home/me/.clio-relay"
+    read = ["jarvis", "rg", "facts", "show", "+json"]
+    assert relay_jarvis(read, home) == [*jarvis_command(home), "rg", "facts", "show", "+json"]
+    light = light_argv(["jarvis", "rg", "facts", "answer", "id; rm -rf ~", "+json"])
+    wrapped = relay_jarvis(light, home)
+    assert wrapped[:4] == light[:4]
+    assert wrapped[4:8] == jarvis_command(home)
+    assert wrapped[8:] == ["rg", "facts", "answer", "id; rm -rf ~", "+json"]
+    for other in (["ls", "jarvis"], ["/opt/jarvis", "ppl", "list"], ["sh", "-c", "jarvis"]):
+        assert relay_jarvis(other, home) == other
+    script = exec_script(read, home)
+    assert "set -- sh -c " in script and "jarvis rg facts show +json\n" in script
+    assert exec_script(read).startswith('cd "$HOME" 2>/dev/null\nset -- jarvis rg')
 
 
 def test_site_level_jarvis_calls_initialize_the_site_root_once() -> None:
