@@ -25,7 +25,7 @@ Ubuntu 22.04. Relay reaches it with the `ssh` adapter, so every call is one
 
 | Partition | Nodes | Use it for |
 | --- | --- | --- |
-| `compute` (the default) | 22 | Normal jobs, up to 2 days |
+| `compute` (Slurm's default) | 22 | Normal jobs, up to 2 days |
 | `debug` | 6 | Short tests, up to 4 days |
 
 Each node has 40 hardware threads (two 10-core Xeon Silver 4114 with
@@ -35,8 +35,11 @@ hyperthreading) and 48 GB of memory. `describe` shows the current numbers.
 
 - Use `run` for anything heavier than a quick look. The login node is for
   editing, submitting and light work only; compilation and I/O go in a job.
-- A job spec with no `queue` lands in `compute`. Set `queue: debug` for a
-  quick test.
+- Leave the queue unset unless the person names one. A job with no queue
+  goes to the site's `defaults.queue`, which `describe` shows under `site`,
+  and to Slurm's default, `compute`, only when the site sets none. When a
+  submitted job waits long and another partition is idle, relay asks the
+  person whether to move it.
 - Each job gets its own directory under `~/.clio-relay/jobs/<operation id>/`
   on Ares, with `stdout`, `stderr` and the job's outputs. `files` reads it.
 - Inputs are staged once by content: a second job with the same input does

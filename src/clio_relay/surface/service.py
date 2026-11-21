@@ -56,7 +56,7 @@ from clio_relay.packages import (
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface import exec_plan, installing
+from clio_relay.surface import exec_plan, installing, queue_switch
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
@@ -322,8 +322,25 @@ class RelayService:
         return await self.site_cores(site, self.apply_defaults(site, spec), "run")
 
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
-        """Fill the service job's site defaults."""
-        return spec.model_copy(update={"job": self.apply_defaults(site, spec.job)})
+        """Fill the service job's site defaults, and say which steps serve the ports.
+
+        Steps the request marked ``service`` keep their marks. With none marked,
+        the steps whose catalog contract is a ``service`` are marked, so a coupled
+        pipeline (a server beside a simulation) serves from the server's step.
+        """
+        job = self.apply_defaults(site, spec.job)
+        steps = job.steps()
+        if len(steps) > 1 and not any(step.service for step in steps):
+            entries = [self.packages.entry(step, self.content) for step in steps]
+            serving = [entry is not None and entry.kind == "service" for entry in entries]
+            if any(serving) and not all(serving):
+                job = job.with_steps(
+                    [
+                        step.model_copy(update={"service": True}) if marked else step
+                        for step, marked in zip(steps, serving, strict=True)
+                    ]
+                )
+        return spec.model_copy(update={"job": job})
 
     async def prepared_serve(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Return the service as relay records and digests it."""
@@ -532,8 +549,15 @@ class RelayService:
         record = self.operation(operation_id)
         if record.state != OperationState.AWAITING_INPUT:
             return record
+        if queue_switch.asking(record):
+            phase = queue_switch.state_of(record).get("phase")
+            handle = installing.install_handle(record) if phase == "install" else record.handle
+            return await queue_switch.advance(self, operation_id, handle)
+        relayed = queue_switch.ask_ids(record)
         waiting = False
         for ask in self.operation_asks(record):
+            if ask.ask_id in relayed:
+                continue
             if ask.state in ("declined", "cancelled"):
                 message = f"the person declined: {ask.message}"
                 forgotten = installing.forget_carried(self, record, ask)
@@ -630,7 +654,9 @@ class RelayService:
         try:
             # The guard may rewrite what is submitted; record.spec stays what was approved.
             spec = await self.guard.prepare(
-                site, JobSpec.model_validate(record.spec), adapter=adapter
+                site,
+                queue_switch.applied(record, JobSpec.model_validate(record.spec)),
+                adapter=adapter,
             )
             handle = await adapter.run(spec, operation_id=operation_id)
         except Refusal as refusal:
@@ -661,7 +687,9 @@ class RelayService:
     ) -> OperationRecord:
         try:
             service = ServiceSpec.model_validate(record.spec)
-            job = await self.guard.prepare(site, service.job, adapter=adapter, service=True)
+            job = await self.guard.prepare(
+                site, queue_switch.applied(record, service.job), adapter=adapter, service=True
+            )
             endpoint = await self.serve_hook.start(
                 site, adapter, service.model_copy(update={"job": job}), record
             )
@@ -744,7 +772,10 @@ class RelayService:
             reason = exc.message if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
             return self.observation_failed(operation_id, reason, "job")
         status = await with_package_progress(adapter, record, status)
-        return await self._apply(operation_id, adapter, status)
+        record = await self._apply(operation_id, adapter, status)
+        if status.queue and record.kind == "run":
+            record = await queue_switch.consider(self, operation_id, adapter, handle, "job")
+        return record
 
     async def _refresh_service(
         self,

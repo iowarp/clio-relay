@@ -45,6 +45,7 @@ from clio_relay.jobs.records import OperationRecord, OperationState, write_json_
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface import queue_switch
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -192,10 +193,13 @@ def pending(record: OperationRecord) -> bool:
 
 
 def job_of(record: OperationRecord) -> JobSpec:
-    """Return the job an operation submits: the run's spec, or the service's job."""
+    """Return the job an operation submits: the run's spec, or the service's job.
+
+    A partition the person moved the operation to applies here too.
+    """
     if record.kind == "serve":
-        return ServiceSpec.model_validate(record.spec).job
-    return JobSpec.model_validate(record.spec)
+        return queue_switch.applied(record, ServiceSpec.model_validate(record.spec).job)
+    return queue_switch.applied(record, JobSpec.model_validate(record.spec))
 
 
 def _can_install(service: RelayService, site: SiteEntry, adapter: str, kind: InstallKind) -> bool:
@@ -474,6 +478,8 @@ async def refresh_install(
         if status.state == JobState.RUNNING:
             record.move(OperationState.RUNNING, "the install job is running")
         service.operations.put(operation_id, record)
+    if status.queue:
+        return await queue_switch.consider(service, operation_id, adapter, handle, "install")
     return record
 
 

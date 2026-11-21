@@ -396,7 +396,9 @@ def _filled(value: CustomValue, env: dict[str, str]) -> CustomValue:
 def package_service_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, str]) -> JobSpec:
     """Return the JARVIS pipeline relay submits for a package service.
 
-    Every step runs as a service. ``${CLIO_RELAY_...}`` in a step's parameters
+    Steps the request marked ``service`` keep their marks, so the connector runs
+    where the marked step's rank 0 serves the ports; with none marked, every
+    step runs as a service. ``${CLIO_RELAY_...}`` in a step's parameters
     is filled from the service's environment, so a package's port parameter can
     name the port relay chose (``${CLIO_RELAY_PORT_<NAME>}``). The connector's
     settings travel in the job's environment, where
@@ -408,10 +410,11 @@ def package_service_job(spec: ServiceSpec, plan: ServePlan, staged: dict[str, st
     env["CLIO_RELAY_OPERATION"] = plan.operation_id
     if plan.mode == "frp":
         env["CLIO_RELAY_FRPC"] = plan.site_serve.frpc or f"{SERVE_DIR}/frpc"
+    marked = any(step.service for step in job.steps())
     steps = [
         step.model_copy(
             update={
-                "service": True,
+                "service": step.service or not marked,
                 "parameters": {key: _filled(value, env) for key, value in step.parameters.items()},
             }
         )

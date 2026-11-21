@@ -215,8 +215,9 @@ def queue_script(native_id: str) -> str:
     """Return the shell text that reports a pending Slurm job's place in the queue.
 
     It prints ``@@queue`` (``squeue`` for the job, only while it is pending)
-    and then ``@@idle`` (``sinfo`` per partition). Both are short reads, and
-    nothing prints for a job that is running, gone, or not Slurm's.
+    and then ``@@idle`` (``sinfo`` per partition), and ``@@alive``: squeue's
+    exit code and the job's state in any state (:func:`scheduler_state`). All
+    are short reads, and nothing prints for a job that is not Slurm's.
     """
     if not native_id.isdigit():
         return ""
@@ -227,16 +228,39 @@ def queue_script(native_id: str) -> str:
         '  if [ -n "$qline" ]; then\n'
         '    echo "@@queue"; printf "%s\\n" "$qline"\n'
         f"    echo \"@@idle\"; $T sinfo -h -o '{IDLE_FORMAT}' 2>/dev/null\n"
+        '    qstart=$(printf "%s" "$qline" | cut -d"|" -f3)\n'
+        '    echo "@@clock"; date +%s; date -d "$qstart" +%s 2>/dev/null\n'
         "  fi\n"
+        f"  alive=$($T squeue -h -j {native_id} -o %T 2>&1); arc=$?\n"
+        '  echo "@@alive"; echo "$arc"; printf "%s\\n" "$alive"\n'
         "fi\n"
     )
+
+
+def scheduler_state(sections: Mapping[str, Sequence[str]]) -> str | None:
+    """Return Slurm's state for the job from :func:`queue_script`'s ``@@alive``.
+
+    ``"GONE"`` when Slurm no longer knows the job id, the state name (such as
+    ``PENDING`` or ``CANCELLED``) while it does, and None when squeue did not
+    answer.
+    """
+    lines = [line.strip() for line in sections.get("alive", []) if line.strip()]
+    if not lines:
+        return None
+    code, rest = lines[0], lines[1:]
+    if any("invalid job id" in line.lower() for line in rest):
+        return "GONE"
+    if code != "0":
+        return None
+    return rest[0].split()[0].upper() if rest else "GONE"
 
 
 def queue(sections: Mapping[str, Sequence[str]]) -> dict[str, Any] | None:
     """Return where a pending job stands, from :func:`queue_script`'s sections.
 
     The result has the job's ``partition``, Slurm's ``reason`` and
-    ``estimated_start`` (None while Slurm has no estimate), and
+    ``estimated_start`` (None while Slurm has no estimate), ``starts_in_s``
+    (seconds from now to that estimate, by the site's clock), and
     ``idle_partitions``: the other partitions that are up with idle nodes, each
     with ``idle`` nodes, its ``max_time`` and whether the job ``fits`` (enough
     idle nodes and a long enough time limit). None when the job is not pending.
@@ -268,10 +292,16 @@ def queue(sections: Mapping[str, Sequence[str]]) -> dict[str, Any] | None:
         long_enough = needed is None or most is None or most >= needed
         found.append({**entry, "fits": entry["idle"] >= nodes and long_enough})
     found.sort(key=lambda item: (not item["fits"], -item["idle"]))
+    estimated = start if start and start.upper() not in {"N/A", "NONE"} else None
+    clock = [_number(line) for line in sections.get("clock", []) if line.strip()]
+    starts_in: int | None = None
+    if estimated and len(clock) >= 2 and clock[0] is not None and clock[1] is not None:
+        starts_in = max(0, clock[1] - clock[0])
     return {
         "partition": partition or None,
         "reason": reason or None,
-        "estimated_start": start if start and start.upper() not in {"N/A", "NONE"} else None,
+        "estimated_start": estimated,
+        "starts_in_s": starts_in,
         "nodes": nodes,
         "time_limit": limit or None,
         "idle_partitions": found,

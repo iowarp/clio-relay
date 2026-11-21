@@ -391,6 +391,15 @@ class BaseAdapter[ConfigT: BaseModel]:
         """
         raise not_implemented(self.name, "install_jarvis")
 
+    async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
+        """Move a job that still waits in the scheduler's queue to ``queue_name``.
+
+        The job keeps its id, directory and place in relay's records. Relay calls
+        it only on the person's answer to its queue ask, and only while
+        :meth:`status` reports the job's ``queue`` (it waits).
+        """
+        raise not_implemented(self.name, "move_queue")
+
     async def sign_in_needed(self) -> SignInNeed | None:
         return None
 

@@ -40,6 +40,14 @@ class SiteDefaults(BaseModel):
     account: str | None = None
     queue: str | None = None
     duration: timedelta | None = None
+    queue_wait: timedelta | None = Field(
+        default=None,
+        description=(
+            "How far off the scheduler's start estimate may be before relay asks the "
+            "person whether to move a waiting job to a partition with room for it now. "
+            "Unset means one hour"
+        ),
+    )
 
 
 class SiteEntry(BaseModel):

@@ -26,6 +26,7 @@ import importlib
 import io
 import json
 import logging
+import re
 import shlex
 import shutil
 import threading
@@ -37,7 +38,14 @@ from pydantic import BaseModel
 
 from clio_relay import jarvis_submit
 from clio_relay.adapters import slurm_facts
-from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.base import (
+    AdapterContext,
+    BaseAdapter,
+    SignInNeed,
+    SiteInfo,
+    Verb,
+    not_implemented,
+)
 from clio_relay.adapters.hooks import Charge
 from clio_relay.adapters.ssh import pricing, scripts, signals, slurm_paths, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
@@ -678,6 +686,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             )
         status = jarvis_submit.record_status(record)
         if not status.state.final:
+            status = _gone_from_slurm(status, slurm_facts.scheduler_state(sections), handle)
+        if not status.state.final:
             status.queue = slurm_facts.queue(sections)
         if not status.state.final or handle.data.get("install"):
             return status
@@ -831,6 +841,27 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if handle.data.get("mode") == "jarvis":
             return await self._jarvis_control(handle, "stop")
         return await self.cancel(handle)
+
+    async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
+        """Move a pending Slurm job, JARVIS's or relay's own, to ``queue_name``."""
+        slurm = handle.data.get("mode") == "jarvis" or handle.data.get("scheduler") == "slurm"
+        native = handle.native_id or ""
+        if not slurm or not native.isdigit():
+            raise not_implemented(self.name, "move_queue")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", queue_name):
+            raise Refusal(
+                RefusalReason.INVALID_ARGUMENTS, f"{queue_name!r} is not a partition name"
+            )
+        sections = parse_sections(
+            await self._ssh(scripts.move_queue_script(native, queue_name), "moving the job")
+        )
+        if _one(sections, "rc") != "0":
+            detail = "\n".join(sections.get("rc", [])[1:]).strip()
+            raise Refusal(
+                RefusalReason.SUBMIT_FAILED,
+                f"Slurm did not move job {native} to {queue_name}: {detail or 'no output'}",
+                queue=queue_name,
+            )
 
     async def _jarvis_control(
         self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb
@@ -1096,6 +1127,38 @@ def _stored_final(lines: list[str]) -> JobStatus:
         return JobStatus.model_validate_json(text)
     except ValueError:
         return JobStatus(state=JobState.FAILED, native_state="final", message=text[:500] or None)
+
+
+def _gone_from_slurm(status: JobStatus, slurm: str | None, handle: JobHandle) -> JobStatus:
+    """End a JARVIS job Slurm cancelled, or no longer knows while JARVIS can't see it.
+
+    A job cancelled outside relay (a person's ``scancel``) leaves the queue, and
+    a site without Slurm accounting gives JARVIS no way to say how it ended, so
+    its record stays ``unknown``. Slurm's own word is the answer then.
+    """
+    if slurm == "CANCELLED":
+        return status.model_copy(
+            update={
+                "state": JobState.CANCELLED,
+                "native_state": "CANCELLED",
+                "message": f"Slurm job {handle.native_id} was cancelled outside relay",
+                "queue": None,
+            }
+        )
+    if slurm == "GONE" and status.native_state == "unknown":
+        return status.model_copy(
+            update={
+                "state": JobState.FAILED,
+                "native_state": "gone",
+                "message": (
+                    f"Slurm job {handle.native_id} is gone from the scheduler and JARVIS "
+                    "cannot tell how it ended (the site keeps no job accounting); it was "
+                    "likely cancelled outside relay"
+                ),
+                "queue": None,
+            }
+        )
+    return status
 
 
 def _detached_status(sections: dict[str, list[str]]) -> JobStatus:

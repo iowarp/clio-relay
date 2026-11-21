@@ -13,8 +13,9 @@ Tapis runs it on Ares through Slurm as a Tapis `BATCH` job.
 
 ## Running
 
-- `run` takes an executable and arguments, as on any open site. Pick a queue from
-  `describe`; each Slurm partition is a Tapis logical queue.
+- `run` takes an executable and arguments, as on any open site. Each Slurm
+  partition is a Tapis logical queue. Leave the queue unset unless the person
+  names one: the site's `defaults.queue` in `describe` applies.
 - The Tapis job UUID is in the task's result. Quote it when you report the run.
 - Outputs stay in the job's directory on Ares. Read them with `files`, which goes
   through Tapis Files.
