@@ -58,8 +58,8 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/frp_link.py": 812,
     "src/clio_relay/jarvis_submit.py": 2075,
     "src/clio_relay/serve/runtime.py": 948,
-    "src/clio_relay/surface/server.py": 939,
-    "src/clio_relay/surface/service.py": 983,
+    "src/clio_relay/surface/server.py": 860,
+    "src/clio_relay/surface/service.py": 981,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests

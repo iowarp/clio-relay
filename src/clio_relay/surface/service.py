@@ -903,24 +903,22 @@ class RelayService:
         max_output_bytes: int,
         on_stall: StallReport | None = None,
         plan: ExecPlan | None = None,
+        read_only: bool = False,
     ) -> dict[str, Any]:
         """Run one command (RL9). With no ``timeout_s`` it runs until it ends.
 
         On a guarded site a command that is not read-only runs only with a
         ``plan`` the person approved (:mod:`clio_relay.surface.exec_plan`);
-        until then this raises :class:`NeedsPerson`.
+        until then this raises :class:`NeedsPerson`. ``read_only`` runs only reads.
         """
         site = self.site(site_id)
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "exec needs a command")
-        decision = await self.guard.check_exec(site, command)
+        decision = await self.guard.check_exec(site, command, read_only=read_only)
         approved: Ask | None = None
         if not decision.allowed:
-            if (
-                plan is None
-                or site.policy != "guarded"
-                or decision.reason != RefusalReason.POLICY_REFUSED
-            ):
+            guarded = site.policy == "guarded" and not read_only
+            if plan is None or not guarded or decision.reason != RefusalReason.POLICY_REFUSED:
                 decision.raise_if_refused()
             else:
                 approved = await exec_plan.approve(self, site, command, plan)

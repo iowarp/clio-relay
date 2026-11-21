@@ -46,7 +46,7 @@ adapter carries it to the site.
 
 | Path | What it holds |
 | --- | --- |
-| `src/clio_relay/surface/` | The MCP server and its tools (the five verbs, `packages`, `shutdown`), the service behind them, and the Compute tab |
+| `src/clio_relay/surface/` | The MCP server and its tools (the five verbs, the read tools `exec_read` and `files_read`, `packages`, `shutdown`), the service behind them, and the Compute tab |
 | `src/clio_relay/guard/` | Open and guarded sites: package review, read-only exec, spend questions |
 | `src/clio_relay/adapters/base.py` | The adapter contract |
 | `src/clio_relay/adapters/<name>/` | One adapter each: `ssh`, `tapis`, `globus`, `iri`, `sky`, `worker` |

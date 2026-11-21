@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal
 
 import mcp_types
 from fastmcp import Context, FastMCP
@@ -64,7 +63,6 @@ from clio_relay.surface.elicit import (
     response_parts,
     tasks_opted_in,
 )
-from clio_relay.surface.endpoints import address as _address
 from clio_relay.surface.endpoints import (
     endpoint_summary,
     service_message,
@@ -75,7 +73,16 @@ from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
-from clio_relay.surface.progress import latest_note, observation_line
+from clio_relay.surface.progress import latest_note
+from clio_relay.surface.read_tools import install as install_read_tools
+from clio_relay.surface.results import CHANGE as _CHANGE
+from clio_relay.surface.results import (
+    OPERATION_META,
+    operation_result,
+    record_result,
+    text,
+)
+from clio_relay.surface.results import START as _START
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.skills import SkillResources
@@ -86,28 +93,11 @@ from clio_relay.wording import with_article
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
 TASK_POLL_INTERVAL_MS = 2000
-OPERATION_META = "ai.iowarp.relay/operation"
-SERVICE_META = "ai.iowarp.relay/service"
 TASK_TOOLS = frozenset({"run", "serve"})
 _NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
-
-# Relay acts only on the sites the person registered, each under its own policy, and it
-# asks itself for the decisions that policy names (spend, installs, reviews). So its
-# world is closed in the MCP sense, and a client that accepts bounded changes without a
-# question can run relay calls unattended while relay's own asks still reach the person.
-_READ = mcp_types.ToolAnnotations(read_only_hint=True, open_world_hint=False)
-_CHANGE = mcp_types.ToolAnnotations(
-    read_only_hint=False, destructive_hint=True, open_world_hint=False
-)
-_START = mcp_types.ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, open_world_hint=False
-)
-
-
-def _text(value: dict[str, Any]) -> str:
-    return json.dumps(value, indent=2, sort_keys=True, default=str)
+_text = text
 
 
 def _plan_needs_person(service: RelayService, ask: Ask) -> ToolResult:
@@ -127,53 +117,6 @@ def _plan_needs_person(service: RelayService, ask: Ask) -> ToolResult:
         ],
     )
     return refusal_result(refusal)
-
-
-def _summary(view: dict[str, Any]) -> str:
-    line = f"Operation {view['operation_id']} on {view['site']} is {view['state']}"
-    if view.get("exit_code") is not None:
-        line += f" with exit code {view['exit_code']}"
-    line += "."
-    result: dict[str, Any] = view.get("result") or {}
-    if not OperationState(view["state"]).final:
-        seen = observation_line(view)
-        if seen:
-            line += f"\n{seen}."
-    endpoint: dict[str, Any] = result.get("endpoint") or {}
-    ports: list[dict[str, Any]] = endpoint.get("ports") or []
-    for port in ports:
-        line += f"\n{port['name']}: {_address(port)}"
-    if ports and view["state"] == OperationState.RUNNING.value:
-        line += (
-            f"\nThe service is ready and keeps running until serve(stop={view['operation_id']!r})"
-            " or its job ends; describe(job=...) follows it."
-        )
-    tail: str | None = result.get("stdout_tail")
-    if tail:
-        line += f"\n\nstdout (tail):\n{tail}"
-    if view.get("error"):
-        line += f"\n\n{view['error'].get('reason')}: {view['error'].get('message')}"
-    return line
-
-
-def operation_result(view: dict[str, Any]) -> ToolResult:
-    """Render an operation. A failed job is an error result; a cancelled one is not."""
-    return ToolResult(
-        content=[mcp_types.TextContent(type="text", text=_summary(view))],
-        structured_content=view,
-        meta={OPERATION_META: view["operation_id"]},
-        is_error=view["state"] == OperationState.FAILED.value,
-    )
-
-
-def record_result(service: RelayService, record: OperationRecord) -> ToolResult:
-    """Render an operation, with a service's panel data in ``_meta`` only (RL22)."""
-    result = operation_result(service.view(record))
-    if record.kind == "serve":
-        ui = service.serve_hook.ui_data(record)
-        if ui is not None:
-            result.meta = {**(result.meta or {}), SERVICE_META: ui}
-    return result
 
 
 class RelayTasksExtension(ServerExtension):
@@ -544,13 +487,16 @@ class RelayServer:
         timeout_s: float | None,
         max_output_bytes: int,
         plan: ExecPlan | None = None,
+        *,
+        read_only: bool = False,
     ) -> ToolResult | InputRequiredToolResult:
         """The ``exec`` verb. With no ``timeout_s`` it runs until the command ends,
         and tells the person when it goes quiet; cancelling the call stops it.
 
         On a guarded site a ``plan`` asks the person before a command that is
         not read-only: in the call when the client shows a form, else as a
-        ``needs_approval`` refusal to retry after the answer."""
+        ``needs_approval`` refusal to retry after the answer. With ``read_only``
+        (``exec_read``) only a read-only command runs, and nothing asks."""
 
         async def quiet(idle_s: float, next_s: float) -> None:
             note = (
@@ -567,10 +513,11 @@ class RelayServer:
                 max_output_bytes=max_output_bytes,
                 on_stall=quiet,
                 plan=plan,
+                read_only=read_only,
             )
 
         try:
-            if ctx.request_state and ctx.input_responses is not None:
+            if ctx.request_state and ctx.input_responses is not None and not read_only:
                 self._answer_plan(site, ctx.request_state, ctx.input_responses)
             try:
                 result = await call()
@@ -634,37 +581,7 @@ class RelayServer:
             lifespan=self._lifespan,
         )
         relay = self
-
-        @server.tool(
-            name="describe",
-            title="Describe relay, a site, or an operation",
-            annotations=_READ,
-        )
-        async def describe(  # pyright: ignore[reportUnusedFunction]
-            site: Annotated[str | None, Field(description="A site id")] = None,
-            job: Annotated[str | None, Field(description="An operation id")] = None,
-        ) -> ToolResult:
-            """Without arguments, list the sites. With site, describe it, its routes and
-            the JARVIS packages relay can run there (packages, with their parameters),
-            and return its guide (skill.text) when it has one: read it before the first
-            run there. With job, observe one operation: its state, when relay last looked
-            (result.observed_at), the latest step (result.progress) and the outputs."""
-            try:
-                described = await relay.service.describe(site, job)
-            except Refusal as refusal:
-                return refusal_result(refusal)
-            if job is not None:
-                return operation_result(described)
-            content = [mcp_types.TextContent(type="text", text=_text(described))]
-            skill = cast("dict[str, Any] | None", described.get("skill")) if site else None
-            guide = skill.get("text") if skill else None
-            if skill and isinstance(guide, str) and guide:
-                listed = {**described, "skill": {**skill, "text": "(below)"}}
-                content = [
-                    mcp_types.TextContent(type="text", text=_text(listed)),
-                    mcp_types.TextContent(type="text", text=guide),
-                ]
-            return ToolResult(content=content, structured_content=described)
+        install_read_tools(server, relay)
 
         async def run(
             ctx: Context,
@@ -714,7 +631,9 @@ class RelayServer:
                 ),
             ] = None,
         ) -> ToolResult | InputRequiredToolResult:
-            """Run one command on the site's login side and return bounded output."""
+            """Run one command on the site's login side and return bounded output. A
+            command that only reads (ls, squeue, jarvis sched info +json and the like)
+            runs through exec_read, which never asks."""
             return await relay.exec(ctx, site, command, timeout_s, max_output_bytes, plan)
 
         @server.tool(
@@ -748,7 +667,8 @@ class RelayServer:
             a dropped link, stat "<path>.relay-part" gives the offset to resume at. A
             larger download is reads at increasing offsets. stage puts bytes in the
             site's content store and returns the SHA-256 a JobSpec input names. On a
-            guarded site, delete and a write that replaces a file wait for the person's yes."""
+            guarded site, delete and a write that replaces a file wait for the person's yes.
+            list, stat, read and has only read: files_read does them and never asks."""
             return await relay.files(
                 ctx,
                 site,
@@ -798,7 +718,8 @@ class RelayServer:
             package sources change, a stage or run by name uses their new archive and lists
             the old one with superseded_by; pin its sha256 to run it. Staging runs
             nothing: a guarded site reviews the archive by its SHA-256 before its first run
-            there, and the archive reaches the site through relay's own transfer."""
+            there, and the archive reaches the site through relay's own transfer.
+            describe(packages=true) lists them too, as a read."""
             arguments = PackagesArgs(
                 op=op,
                 package=package,

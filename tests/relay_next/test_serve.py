@@ -32,7 +32,8 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.changes import ServerChanges
-from clio_relay.surface.server import SERVICE_META, create_server
+from clio_relay.surface.results import SERVICE_META
+from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.stubs import StubAskProvider, StubServe

@@ -262,7 +262,9 @@ class Guard:
                 held.add(handle.native_id)
         return held
 
-    async def check_exec(self, site: SiteEntry, command: list[str]) -> GuardDecision:
+    async def check_exec(
+        self, site: SiteEntry, command: list[str], *, read_only: bool = False
+    ) -> GuardDecision:
         try:
             settings = self.settings(site)
         except Refusal:
@@ -270,7 +272,7 @@ class Guard:
                 raise
             settings = SiteGuard()
         light = {"light": True} if execlist.runs_spack(command, settings.spack) else {}
-        if site.policy == "open":
+        if site.policy == "open" and not read_only:
             return GuardDecision(allowed=True, data=light)
         warm = await asyncio.to_thread(self.warm_jobs, site.id) if command[:1] == ["srun"] else ()
         reason = execlist.refusal(
@@ -282,6 +284,22 @@ class Guard:
         )
         if reason is None:
             return GuardDecision(allowed=True, data=light)
+        if read_only:
+            return GuardDecision(
+                allowed=False,
+                reason=RefusalReason.POLICY_REFUSED,
+                message=(
+                    f"exec_read runs only read-only commands, given as an argument list: "
+                    f"{reason}. Use exec for a command that changes anything"
+                    + (", with a plan the person approves." if site.policy == "guarded" else ".")
+                ),
+                data={
+                    "site": site.id,
+                    "program": command[0] if command else None,
+                    "read_only": execlist.listed(settings.read_only),
+                    "next_step": "exec",
+                },
+            )
         return GuardDecision(
             allowed=False,
             reason=RefusalReason.POLICY_REFUSED,

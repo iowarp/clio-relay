@@ -302,7 +302,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             "read": ["jarvis"],
             "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
             "note": (
-                "read + sched info|rg facts show|rg skill list|show NAME +json: no shell, no plan. "
+                "exec_read + sched info|rg facts show|rg skill list|show NAME +json: no plan. "
                 "exec + rg facts answer|rg skill set|rg net set|spack prepare --root <spack_root> "
                 "--site_spack <root> +json, once the person agrees; a guarded site asks a plan"
             ),

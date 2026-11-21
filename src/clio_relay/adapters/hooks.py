@@ -243,8 +243,15 @@ class GuardHook(Protocol):
         """Decide whether ``spec`` may run on ``site``."""
         ...
 
-    async def check_exec(self, site: SiteEntry, command: list[str]) -> GuardDecision:
-        """Decide whether ``command`` may run through ``exec``."""
+    async def check_exec(
+        self, site: SiteEntry, command: list[str], *, read_only: bool = False
+    ) -> GuardDecision:
+        """Decide whether ``command`` may run through ``exec``.
+
+        With ``read_only`` the call came through ``exec_read``, which a client
+        trusts never to change anything: allow ``command`` only when it reads,
+        whatever the site's policy.
+        """
         ...
 
     async def price(self, site: SiteEntry, spec: JobSpec) -> Charge:

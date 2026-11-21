@@ -135,7 +135,19 @@ class DefaultGuard:
             data={"site": site.id},
         )
 
-    async def check_exec(self, site: SiteEntry, command: list[str]) -> GuardDecision:
+    async def check_exec(
+        self, site: SiteEntry, command: list[str], *, read_only: bool = False
+    ) -> GuardDecision:
+        if read_only:
+            return GuardDecision(
+                allowed=False,
+                reason=RefusalReason.GUARD_UNAVAILABLE,
+                message=(
+                    "no guard is installed to check that a command only reads, so exec_read "
+                    "runs nothing; use exec"
+                ),
+                data={"site": site.id},
+            )
         return await self.check_run(site, JobSpec(executable=command[0] if command else "true"))
 
     async def price(self, site: SiteEntry, spec: JobSpec) -> Charge:

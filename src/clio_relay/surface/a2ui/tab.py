@@ -85,6 +85,34 @@ _TITLES = {
     surfaces.CONNECT_SITE: "Sign in to an endpoint",
 }
 
+# What each action does to relay's endpoints. Opening a form, editing a draft,
+# cancelling and asking to remove change only the page; probing writes relay's
+# probe cache; adding and signing in add; saving, switching, setting and
+# confirming a removal replace or delete what was there.
+_PAGE_ONLY = mcp_types.ToolAnnotations(
+    read_only_hint=True, destructive_hint=False, open_world_hint=False
+)
+_ADDS = mcp_types.ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, open_world_hint=False
+)
+_REPLACES = mcp_types.ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, open_world_hint=False
+)
+_ANNOTATIONS = {
+    surfaces.OPEN_ADD: _PAGE_ONLY,
+    surfaces.EDIT_SITE: _PAGE_ONLY,
+    surfaces.CANCEL: _PAGE_ONLY,
+    surfaces.REMOVE_SITE: _PAGE_ONLY,
+    surfaces.PROBE_SITE: _ADDS,
+    surfaces.ADD_SITE: _ADDS,
+    surfaces.ADD_FROM_CATALOG: _ADDS,
+    surfaces.CONNECT_SITE: _ADDS,
+    surfaces.SAVE_SITE: _REPLACES,
+    surfaces.SWITCH_ADAPTER: _REPLACES,
+    surfaces.SET_VALUE: _REPLACES,
+    surfaces.CONFIRM_REMOVE: _REPLACES,
+}
+
 
 class ComputeTab(TabActions):
     """The page's state, rendering and actions for one relay server."""
@@ -405,7 +433,7 @@ def _action_tool(server: FastMCP[Any], tab: ComputeTab, action: str) -> None:
         title=_TITLES[action],
         description=f"{_TITLES[action]} from the Compute page. Only the page calls this.",
         app=AppConfig(visibility=["app"]),
-        annotations=mcp_types.ToolAnnotations(open_world_hint=False),
+        annotations=_ANNOTATIONS[action],
     )(act)
 
 

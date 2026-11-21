@@ -13,9 +13,10 @@ from clio_relay.guard import WARM_EXECUTABLE, Guard
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+from clio_relay.surface.stubs import DefaultGuard
 from clio_relay.testing.fixture_adapter import FixtureAdapter, FixtureConfig
 
-from .conftest import answer, make_repo, site, stage
+from .conftest import answer, context_for, make_repo, site, stage
 
 
 def package_spec(digest: str, name: str = "demo.hello", **extra: Any) -> JobSpec:
@@ -41,6 +42,27 @@ async def test_open_sites_run_anything(guard: Guard) -> None:
     decision = await guard.check_run(site("open"), JobSpec(executable="/bin/rm", arguments=["-rf"]))
     assert decision.allowed
     assert (await guard.check_exec(site("open"), ["rm", "-rf", "/tmp/x"])).allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["open", "guarded"])
+async def test_a_read_only_exec_runs_only_reads_on_every_site(guard: Guard, policy: str) -> None:
+    where = site(policy)
+    for command in (["ls", "-l"], ["jarvis", "rg", "facts", "show", "+json"], ["squeue"]):
+        assert (await guard.check_exec(where, command, read_only=True)).allowed, command
+    refused = await guard.check_exec(where, ["rm", "-rf", "/tmp/x"], read_only=True)
+    assert not refused.allowed
+    assert refused.reason == RefusalReason.POLICY_REFUSED
+    assert refused.data["next_step"] == "exec"
+
+
+@pytest.mark.asyncio
+async def test_without_a_guard_a_read_only_exec_runs_nothing(tmp_path: Path) -> None:
+    stub = DefaultGuard(context_for(tmp_path))
+    assert (await stub.check_exec(site("open"), ["ls"])).allowed
+    decision = await stub.check_exec(site("open"), ["ls"], read_only=True)
+    assert not decision.allowed
+    assert decision.reason == RefusalReason.GUARD_UNAVAILABLE
 
 
 @pytest.mark.asyncio

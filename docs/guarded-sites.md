@@ -212,6 +212,12 @@ only commands that read:
 A program must be named bare, so that a file called `/tmp/x/ls` cannot pass as
 `ls`. Add a site's own read-only tools in `guard.yaml` (below).
 
+The `exec_read` tool runs this same list on every site, open or guarded, and
+refuses anything else with `policy_refused` and the next step `exec`. It never
+asks, and its annotations say it only reads, so a client can let an agent call
+it without a question, even in a planning mode. Use `exec` for anything that
+changes the site.
+
 ## The spend question
 
 Each site's `spend.ask` decides when relay asks before it submits:

@@ -1,7 +1,8 @@
 # Architecture
 
-Relay is an MCP server with seven tools (the five verbs, `packages` and
-`shutdown`), a command line, and a set of adapters
+Relay is an MCP server with nine tools (the five verbs, the read tools
+`exec_read` and `files_read`, `packages` and `shutdown`), a command line, and a
+set of adapters
 that each know one way into a site. This page follows a call from the agent to
 the site and back.
 
@@ -25,13 +26,19 @@ flowchart LR
 1. **Surface.** `surface/server.py` serves the verbs `describe`, `run`,
    `exec`, `files` and `serve` over stdio or Streamable HTTP, with `packages`
    (list, stage and remove the packages `run` takes, `surface/staging.py`) and
-   `shutdown` beside them. `run` and `serve`
+   `shutdown` beside them. The tools that only read, `describe`, `exec_read`
+   (the read-only command list of [guarded sites](guarded-sites.md#read-only-exec))
+   and `files_read` (list, stat, read and has), live in `surface/read_tools.py`;
+   the result rendering and the annotations are in `surface/results.py`.
+   `describe` also lists the staged packages (`packages=true`) and gives a
+   service's endpoint and readiness (`job=<service>`). `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
    configured sites and the staged packages (`surface/instructions.py`), so an
    agent knows what relay can run before it calls a tool. The tool annotations
-   say `describe` only reads and the rest change things, all in a closed world:
+   say the three read tools only read and never destroy (`readOnlyHint` true,
+   `destructiveHint` false) and the rest change things, all in a closed world:
    relay touches only the sites you registered, and the guard below asks for
    what their policy names. So a client that accepts bounded changes without a
    question can run relay calls unattended, and relay's own asks still reach you.

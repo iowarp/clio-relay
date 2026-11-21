@@ -27,7 +27,8 @@ from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.packages import stage
 from clio_relay.surface.describing import site_report
 from clio_relay.surface.package_progress import JARVIS_SHARED, with_package_progress
-from clio_relay.surface.server import RelayTasksExtension, operation_result
+from clio_relay.surface.results import operation_result
+from clio_relay.surface.server import RelayTasksExtension
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
