@@ -14,7 +14,7 @@ script hands it to JARVIS:
   for an adapter that starts the job itself (no batch scheduler).
 - ``install`` runs ``jarvis ppl install yaml <pipeline> --answers <file>
   +submit --execution-id <op>-install +json``: JARVIS installs what the
-  pipeline's packages need, as a job of its own.
+  pipeline's packages need, as a job of its own; a later round is <op>-install-2 on.
 
 A submit loads the pipeline with ``JARVIS_INSTALL_ON_LOAD=check``. When a
 package's software is missing or needs a decision, JARVIS exits 3 before it
@@ -98,7 +98,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "bfeff98bc30dc4a6ec895a29b4228f61ac138605"
+JARVIS_PIN = "20f00d35d49302ffd6e10ea4a6b78744fd5060ea"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -807,15 +807,16 @@ report() {
   exit 3
 }
 if [ "$mode" = run ]; then
-  if [ -n "$execution" ]; then
-    "$found" ppl run yaml "$pipeline" --execution-id "$execution" +json
-  else
-    "$found" ppl run yaml "$pipeline" +json
-  fi
+  "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
   exit 0
 fi
 rc=0
 if [ "$mode" = install ]; then
+  # Each install round is its own execution, as JARVIS refuses to reuse one.
+  base=$execution n=1
+  while ls -d "$root"/shared/*/executions/"$execution" >/dev/null 2>&1; do
+    n=$((n + 1)); execution=$base-$n
+  done
   out=$("$found" ppl install yaml "$pipeline" --answers "$answers" \
     +submit --execution-id "$execution" +json) || rc=$?
   saved=relay.install.json
@@ -1014,11 +1015,10 @@ def install_command(
 ) -> str:
     """Return the shell command that submits the install job for ``spec``'s software.
 
-    It runs in the job directory after a submit exited 3, with the person's
-    ``answers`` (:func:`answers_document`). The install job is
-    ``install_execution_id(operation_id)`` in the operation's pipeline; ``home`` is
-    as in :func:`submit_command`. ``pipeline`` is the YAML of
-    :func:`install_pipeline`, which the site script keeps as
+    It runs in the job directory after a submit exited 3, with the person's ``answers``
+    (:func:`answers_document`). The install job is ``install_execution_id(operation_id)``
+    in the operation's pipeline; ``home`` is as in :func:`submit_command`. ``pipeline``
+    is the YAML of :func:`install_pipeline`, which the site script keeps as
     :data:`INSTALL_PIPELINE_FILE`; without it the install builds with the run's.
     """
     arguments = site_arguments(
