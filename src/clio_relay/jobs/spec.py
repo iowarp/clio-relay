@@ -119,7 +119,13 @@ class JobAttributes(_Spec):
             "site's default walltime or, with none, the scheduler's own limit"
         ),
     )
-    queue_name: str | None = None
+    queue_name: str | None = Field(
+        default=None,
+        description=(
+            "The partition or queue. Leave it out unless the person names one: relay uses "
+            "the site's defaults.queue (describe shows it) or, with none, the scheduler's"
+        ),
+    )
     account: str | None = None
     reservation_id: str | None = None
     project_name: str | None = None
@@ -193,7 +199,9 @@ class PackageRef(_Spec):
         default=False,
         description=(
             "Run the package as a service: start it and keep it up until it is stopped. "
-            "The guard sets it on the copy it submits for a service."
+            "In a serve pipeline, set it on the one step that serves the ports (its rank 0 "
+            "host runs the connector); the other steps run alongside it. With no step "
+            "marked, relay marks the catalog's service packages, or every step."
         ),
     )
 

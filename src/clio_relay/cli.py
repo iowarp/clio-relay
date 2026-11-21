@@ -514,7 +514,7 @@ def site_clean(
     async def go() -> dict[str, Any]:
         service = RelayService(_paths())
         try:
-            planned = cleaning.plan(service, site_id, remove_spack=remove_spack)
+            planned = await cleaning.plan(service, site_id, remove_spack=remove_spack)
             if not await approved(service, planned):
                 raise Refusal(RefusalReason.POLICY_REFUSED, f"cleaning {site_id} was not approved")
             return await cleaning.clean(service, planned)

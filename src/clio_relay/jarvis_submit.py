@@ -477,7 +477,8 @@ def service_step(spec: JobSpec) -> PackageRef:
             RefusalReason.INVALID_SPEC,
             "the pipeline's service steps start on different nodes "
             f"({', '.join(f'{step.name} at {slice_start(step)}' for step in steps)}); "
-            "set service: true on the one step that serves the ports",
+            "set service: true on the one step that serves the ports and leave it false "
+            "on the steps that run alongside it",
             field="packages",
         )
     return steps[0]

@@ -472,6 +472,16 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
     return body
 
 
+def move_queue_script(native_id: str, partition: str) -> str:
+    """Move a pending Slurm job to another partition, with ``scontrol update``.
+
+    Prints ``@@rc`` and then scontrol's output. Slurm lets the job's owner
+    change the partition of a job that has not started.
+    """
+    command = shlex.join(["scontrol", "update", f"JobId={native_id}", f"Partition={partition}"])
+    return f'out=$({command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'
+
+
 def find_script(remote_dir: str, operation_id: str) -> str:
     """Find a submission from its job directory, which is named by the operation (RL17)."""
     return (

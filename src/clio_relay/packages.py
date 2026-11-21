@@ -144,6 +144,23 @@ def _parameters(menu: list[dict[str, Any]] | None, contract: dict[str, Any]) -> 
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if refinement.get("required"):
         schema["required"] = [str(item) for item in refinement["required"]]
+    rules: list[dict[str, Any]] = []
+    for case in cast(list[Any], refinement.get("cases") or []):
+        if not isinstance(case, dict):
+            continue
+        found = cast(dict[str, Any], case)
+        if not isinstance(found.get("when"), dict):
+            continue
+        then: dict[str, Any] = {}
+        if found.get("required"):
+            then["required"] = [str(item) for item in found["required"]]
+        if isinstance(found.get("properties"), dict):
+            then["properties"] = _json(found["properties"])
+        if then:
+            rules.append({"if": {"properties": _json(found["when"])}, "then": then})
+    if rules:
+        # A case's rules hold only when the configuration is in that case.
+        schema["allOf"] = rules
     return schema
 
 
