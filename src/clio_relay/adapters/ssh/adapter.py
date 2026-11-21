@@ -1129,12 +1129,17 @@ def _stored_final(lines: list[str]) -> JobStatus:
         return JobStatus(state=JobState.FAILED, native_state="final", message=text[:500] or None)
 
 
+_UNSEEN = frozenset({"unknown", "submitted"})
+"""JARVIS record states that say nothing of a job Slurm has dropped."""
+
+
 def _gone_from_slurm(status: JobStatus, slurm: str | None, handle: JobHandle) -> JobStatus:
     """End a JARVIS job Slurm cancelled, or no longer knows while JARVIS can't see it.
 
     A job cancelled outside relay (a person's ``scancel``) leaves the queue, and
     a site without Slurm accounting gives JARVIS no way to say how it ended, so
-    its record stays ``unknown``. Slurm's own word is the answer then.
+    its record stays ``unknown``, or ``submitted`` for a job cancelled before it
+    started. Slurm's own word is the answer then.
     """
     if slurm == "CANCELLED":
         return status.model_copy(
@@ -1145,7 +1150,7 @@ def _gone_from_slurm(status: JobStatus, slurm: str | None, handle: JobHandle) ->
                 "queue": None,
             }
         )
-    if slurm == "GONE" and status.native_state == "unknown":
+    if slurm == "GONE" and status.native_state in _UNSEEN:
         return status.model_copy(
             update={
                 "state": JobState.FAILED,

@@ -119,6 +119,13 @@ the job stays open with `native_state` `unknown` and a message saying so,
 rather than being called failed. A later poll can still find an exit code, and
 `cancel` ends it.
 
+A package job's status also asks `squeue` for the job in any state. A job
+cancelled outside relay (`scancel`) ends `cancelled`, and one Slurm no longer
+knows, with no exit code and JARVIS unsure of it, ends `failed` with
+`native_state` `gone`. `site clean` refreshes the site's open operations
+first, so these end on their own; it cancels operations still waiting on the
+person and refuses only while a job is really queued or running.
+
 ### Hosts with no scheduler
 
 With `scheduler: none` the job runs on the ssh host itself,
@@ -201,8 +208,15 @@ carried answers, so the next install asks again. `site clean` removes them.
 While the install job or the run waits in Slurm's queue, the operation's
 `result.queue` and its message say why it waits, Slurm's estimated start, and
 the partitions with idle nodes that fit the job (`idle_partitions`, each with
-`fits`). Relay never moves a job to another partition itself: cancel it and run
-again with `queue=` once you agree.
+`fits`). When Slurm's estimate is further off than the site's
+`defaults.queue_wait` (one hour unless set) and another partition has idle
+nodes that fit, relay asks the person once per partition: keep waiting, or
+move the job there. Moving uses `scontrol update JobId=<id> Partition=<name>`
+on the pending job, so the job keeps its id, directory and approvals, and the
+operation's `queue_name` follows it. Relay never moves a job without that
+answer, and a wait the job causes itself (a dependency, a begin time, a hold)
+is not asked about. If the job starts or ends before the person answers, the
+ask is withdrawn.
 
 When the CLIO Spack is on the site (`<home>/spack`, made by clio-kit's
 `spack_prepare_site`), relay tells JARVIS to use it with `JARVIS_SPACK_ROOT`,
