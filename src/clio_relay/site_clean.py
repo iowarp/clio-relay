@@ -20,6 +20,11 @@ while it ran, or that another relay started, also stops the clean. The prune
 on the site checks once more before it removes anything. The refusal names each
 job and its operation; cancel them with relay's ``cancel`` first. Operations still
 waiting on a person, with no job yet, are cancelled with the clean.
+
+What the site's runs wrote outside relay's directories (a case's results under
+the person's home, say) is the person's, not relay's deployment. The ask names
+those outputs, from the operations' records, and the clean keeps them unless
+``remove_outputs`` says otherwise; the result lists the ones it kept.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ logger = logging.getLogger(__name__)
 SCHEMA = "relay.site_clean.v1"
 COMMON_TARGETS = ("~/.clio-relay", "~/.config/clio-relay")
 """Relay's state on any site, whichever adapter reaches it."""
+_LISTED_OUTPUTS = 6
 
 
 def _cleaners(service: RelayService, site_id: str) -> tuple[list[Any], list[str]]:
@@ -205,12 +211,15 @@ async def plan(
     *,
     remove_spack: bool = False,
     forget_decisions: bool = False,
+    remove_outputs: bool = False,
 ) -> dict[str, Any]:
     """Return what clean would remove and keep, or refuse while a job of the site runs.
 
     The site's open operations are observed first, so one whose job was
     cancelled outside relay, or ended while nobody looked, no longer blocks it.
     The first adapter that can clean does it, with every cleaning adapter's paths.
+    ``outputs`` are what the site's runs wrote outside relay's directories; the
+    clean removes them too only with ``remove_outputs``.
     """
     running, waiting = await _reconcile(service, site_id)
     cleaners, names = _cleaners(service, site_id)
@@ -225,6 +234,7 @@ async def plan(
         targets += found
         keep += spared
     targets = list(dict.fromkeys([*targets, *COMMON_TARGETS, *_hop_dirs(service, site_id)]))
+    outputs = run_outputs(service, site_id, targets)
     return {
         "site": site_id,
         "adapter": cleaners[0].name,
@@ -232,7 +242,75 @@ async def plan(
         "targets": targets,
         "keep": kept(keep, spack=not remove_spack, decisions=not forget_decisions),
         "cancels": waiting,
+        "outputs": outputs,
+        "remove_outputs": remove_outputs,
     }
+
+
+def _under(path: str, targets: list[str]) -> bool:
+    """Say whether ``path``, absolute on the site, is inside one of relay's ``targets``."""
+    for target in targets:
+        if target.startswith("/"):
+            root = target.rstrip("/")
+            if path == root or path.startswith(root + "/"):
+                return True
+            continue
+        # ``~/x`` or ``x`` is under the home, which relay does not know here.
+        part = "/" + target.removeprefix("~").strip("/") + "/"
+        if part != "//" and part in path + "/":
+            return True
+    return False
+
+
+def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list[dict[str, Any]]:
+    """What the site's runs wrote outside relay's directories, from their records.
+
+    A clean leaves these unless the person asks: a case's results are the
+    person's, not relay's deployment. A path inside another listed one is left
+    out, since removing the outer one removes it.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    for record in service.operations.all():
+        if record.site != site_id or record.kind not in ("run", "serve"):
+            continue
+        for output in record.outputs:
+            path = output.path.rstrip("/")
+            if not path.startswith("/") or path in found or _under(path, targets):
+                continue
+            found[path] = {
+                "path": path,
+                "name": output.name,
+                "operation_id": record.operation_id,
+                "size": output.size,
+            }
+    paths = sorted(found)
+    return [found[path] for path in paths if not any(path.startswith(o + "/") for o in paths)]
+
+
+def _size(count: int) -> str:
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if count >= scale:
+            return f"{count / scale:.1f} {unit}"
+    return f"{count} bytes"
+
+
+def _outputs_line(planned: dict[str, Any]) -> str:
+    outputs = cast(list[dict[str, Any]], planned.get("outputs") or [])
+    if not outputs:
+        return ""
+    shown = [
+        item["path"] + (f" ({_size(int(item['size']))})" if item.get("size") else "")
+        for item in outputs[:_LISTED_OUTPUTS]
+    ]
+    if len(outputs) > _LISTED_OUTPUTS:
+        shown.append(f"{len(outputs) - _LISTED_OUTPUTS} more")
+    named = ", ".join(shown)
+    if planned.get("remove_outputs"):
+        return f" It also deletes what relay's runs wrote outside its directories: {named}."
+    return (
+        f" It keeps what relay's runs wrote outside its directories: {named}. To delete "
+        "those too, clean again with remove_outputs."
+    )
 
 
 def _hop_dirs(service: RelayService, site_id: str) -> list[str]:
@@ -266,7 +344,7 @@ def describe_plan(planned: dict[str, Any]) -> str:
     return (
         f"Clean {planned['site']}? Relay stops its processes there, then deletes "
         f"{', '.join(planned['targets'])} on the site, keeping {keeping}. The next use "
-        f"places the worker and JARVIS again.{waiting}"
+        f"places the worker and JARVIS again.{_outputs_line(planned)}{waiting}"
     )
 
 
@@ -278,6 +356,9 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
     site_id = str(planned["site"])
     cleaners, _names = _cleaners(service, site_id)
     cleaner = cleaners[0]
+    listed = cast(list[dict[str, Any]], planned.get("outputs") or [])
+    outputs = [str(item["path"]) for item in listed]
+    removing = outputs if planned.get("remove_outputs") else []
     cancelled: list[str] = []
     for operation_id in cast(list[str], planned.get("cancels") or []):
         record = await service.cancel(operation_id)
@@ -289,7 +370,7 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
         else frozenset[str]()
     )
     stopped = await shutdown(service, {"site": site_id}, spare=spare)
-    report = await cleaner.clean(list(planned["targets"]), list(planned["keep"]))
+    report = await cleaner.clean([*planned["targets"], *removing], list(planned["keep"]))
     if report.get("live"):
         raise still_running(site_id, [], list(report["live"]), _known_jobs(service, site_id))
     if spare and isinstance(cleaner, ShutsDown):
@@ -318,4 +399,5 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
         "refused": report.get("refused", []),
         "local_removed": local,
         "cancelled": cancelled,
+        "outputs_kept": [path for path in outputs if not removing],
     }

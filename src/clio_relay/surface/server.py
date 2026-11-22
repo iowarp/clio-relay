@@ -64,9 +64,9 @@ from clio_relay.surface.elicit import (
 )
 from clio_relay.surface.endpoints import (
     endpoint_summary,
+    service_done,
     service_message,
     service_ready,
-    service_served,
 )
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
@@ -174,7 +174,7 @@ class RelayTasksExtension(ServerExtension):
         return record
 
     def _status(self, record: OperationRecord) -> str:
-        if service_served(record):
+        if service_done(record):
             return "completed"
         if record.state == OperationState.AWAITING_INPUT and self.service.outstanding(record):
             return "input_required"
@@ -193,7 +193,7 @@ class RelayTasksExtension(ServerExtension):
             return f"the service is running: {endpoint_summary(record)}"
         latest = service_message(record)
         if latest is not None:
-            shown = record.state.value if record.state.final else "starting"
+            shown = record.state.value if record.state.final or service_done(record) else "starting"
             return f"the service is {shown}: {latest}"
         note = latest_note(record)
         return f"relay operation is {record.state.value}" + (f": {note}" if note else "")

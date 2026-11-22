@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from clio_relay.adapters.hooks import Ask, AskProvider, Charge, GuardDecision, charge_steps
+from clio_relay import jarvis_submit
+from clio_relay.adapters.base import BaseAdapter
+from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, charge_steps
 from clio_relay.jobs.records import OperationRecord
+from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import Layout, PackageRef
 from clio_relay.sites.models import SiteEntry
+
+if TYPE_CHECKING:
+    from clio_relay.surface.service import RelayService
 
 
 def _duration(seconds: float) -> str:
@@ -133,23 +139,57 @@ def approval_message(
     )
 
 
+def bootstraps_jarvis(service: RelayService, site: SiteEntry, adapter: str) -> bool:
+    """Say whether relay would install its own jarvis-cd for ``adapter`` on ``site``.
+
+    It does when the adapter has the hook and the site's settings name no
+    jarvis-cd of the site's own.
+    """
+    try:
+        found = service.adapter_named(site, adapter)
+    except Refusal:
+        return False
+    hook = "install_jarvis"
+    if getattr(type(found), hook, None) is getattr(BaseAdapter, hook):
+        return False
+    return not getattr(found.config, "jarvis", "x")
+
+
+def jarvis_line(site: SiteEntry) -> str:
+    """The sentence a package review adds when its yes also covers relay's jarvis-cd."""
+    return (
+        f"If {site.title} has no jarvis-cd of relay's yet, a yes also lets relay install "
+        f"jarvis-cd {jarvis_submit.JARVIS_PIN[:8]} in a virtual environment under the CLIO "
+        "home there, which needs the site to reach github.com."
+    )
+
+
 async def review_asks(
-    provider: AskProvider, site: SiteEntry, record: OperationRecord, decision: GuardDecision
+    service: RelayService, site: SiteEntry, record: OperationRecord, decision: GuardDecision
 ) -> list[Ask]:
     """Turn the guard's package reviews into approve asks.
 
     Each review in ``decision.data["asks"]`` has a ``message`` and a ``binding``
     (``kind: "package_review"``, ``package``, ``version``, ``package_hash`` and
     ``source``). The ask binds it to the site and the spec the person sees, so
-    ``advance`` checks it like any approval.
+    ``advance`` checks it like any approval. Where relay would install its own
+    jarvis-cd, the review says so and binds the pin: the person answers one
+    question, not a second one about jarvis-cd once the submit finds none.
     """
     reviews: list[dict[str, Any]] = decision.data.get("asks", [])
+    jarvis = bool(reviews) and bootstraps_jarvis(service, site, record.adapter)
+    extra: dict[str, Any] = {"jarvis": jarvis_submit.JARVIS_PIN} if jarvis else {}
     return [
-        await provider.approve(
+        await service.ask_provider.approve(
             site=site,
             operation_id=record.operation_id,
-            message=review["message"],
-            binding={**review["binding"], "site": site.id, "spec_digest": record.spec_digest},
+            message=review["message"] + ("\n" + jarvis_line(site) if jarvis else ""),
+            binding={
+                **review["binding"],
+                **extra,
+                "site": site.id,
+                "spec_digest": record.spec_digest,
+            },
         )
         for review in reviews
     ]

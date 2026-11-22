@@ -301,7 +301,9 @@ runs only as an approved plan. The tool sends the exact argument list with a
 ```
 
 Relay asks you once, showing the summary and the command, bound to the site,
-the plan's kind and the digest of the argument list. Until you answer, the call
+the plan's kind and the digest of the argument list. A plan whose command
+submits a scheduler job sets `"submits": true`, and the question then says it
+submits a job from the login node rather than running the work there. Until you answer, the call
 returns `needs_approval` with the ask. After a yes, the same call runs that
 argument list once, at low priority, for at most 900 s; the next run asks
 again. A changed argument list is a new question. No shell string is ever

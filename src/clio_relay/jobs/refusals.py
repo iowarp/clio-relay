@@ -38,6 +38,7 @@ class RefusalReason(StrEnum):
     SUBMIT_FAILED = "submit_failed"
     UNREACHABLE = "unreachable"
     PUNCH_FAILED = "punch_failed"
+    HOST_KEY_UNVERIFIED = "host_key_unverified"
     TIMEOUT = "timeout"
 
 

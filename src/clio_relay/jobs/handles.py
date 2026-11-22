@@ -122,6 +122,13 @@ class JobStatus(BaseModel):
             "the advisory site_fact_uncertain questions the run went ahead with"
         ),
     )
+    service_error: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "For a service: a refusal's wire form saying why relay cannot bring it to the "
+            "desktop, such as host_key_unverified. The job itself runs on"
+        ),
+    )
 
 
 class ExecResult(BaseModel):

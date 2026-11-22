@@ -59,18 +59,29 @@ def _summary(view: dict[str, Any]) -> str:
     tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
+    unreachable: dict[str, Any] = result.get("service_error") or {}
+    if unreachable:
+        line += (
+            f"\n\nThe service cannot reach this desktop: {unreachable.get('reason')}: "
+            f"{unreachable.get('message')}"
+        )
     if view.get("error"):
         line += f"\n\n{view['error'].get('reason')}: {view['error'].get('message')}"
     return line
 
 
 def operation_result(view: dict[str, Any]) -> ToolResult:
-    """Render an operation. A failed job is an error result; a cancelled one is not."""
+    """Render an operation. A failed job is an error result; a cancelled one is not.
+
+    So is a service relay could not bring to the desktop, though its job runs on.
+    """
+    result: dict[str, Any] = view.get("result") or {}
+    unreachable = bool(result.get("service_error")) and not result.get("ready_at")
     return ToolResult(
         content=[mcp_types.TextContent(type="text", text=_summary(view))],
         structured_content=view,
         meta={OPERATION_META: view["operation_id"]},
-        is_error=view["state"] == OperationState.FAILED.value,
+        is_error=view["state"] == OperationState.FAILED.value or unreachable,
     )
 
 

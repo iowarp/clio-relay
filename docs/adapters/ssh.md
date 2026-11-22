@@ -184,8 +184,18 @@ The submit first checks that the site has the software the packages need.
 When it does not, nothing is submitted. Relay asks you to approve the install
 (what JARVIS reuses and what it builds), then asks one question for each
 choice JARVIS cannot make alone, such as which of two compilers to build
-with. JARVIS then installs the software as its own job,
+with. Where JARVIS checks and builds on a site is one of those choices
+(`install_placement`): JARVIS offers the login host under its limits, a compute
+job, or asking each time, with its recommendation, the login host's
+measurements and the queue estimate, and per-package options when one package
+is costlier than the rest. Relay shows the question and JARVIS's evidence as
+they are, records the answer with the site's decisions through `--answers`,
+and has no placement policy of its own. When the site chose the login host for
+checks, the check runs there and relay submits no check job. JARVIS then
+installs the software as its own job,
 `jarvis ppl install +submit`, on a compute node, and sizes that job itself.
+Relay declares `JARVIS_INSTALL_PLACEMENT_BUILD=compute_job` as its default for
+builds, since it builds only through a job; a site's recorded answer wins.
 Relay only gives it `install_walltime_s` as `scheduler.install.time` (4 hours
 by default, or the run's walltime when longer), since a build often takes
 longer than the run, and the approval says how long it may take. Nothing is
@@ -298,7 +308,9 @@ itself: `python3`, then any `python3.N` on the site's `PATH`, newest first, then
 a `python` environment module (`module avail`, newest first). Name
 another in `jarvis_python`. When none is new enough, the refusal lists what
 relay tried. Package jobs run jarvis-cd with that same Python. The install
-needs the site to reach github.com. Later runs on the site use it. A site that really
+needs the site to reach github.com. Later runs on the site use it. On a guarded
+site the package review says this too, so a yes to the review covers the
+install and relay asks no second question about jarvis-cd. A site that really
 needs another jarvis names its path in the `jarvis` setting, absolute or from
 `~/`; a bare name is refused.
 

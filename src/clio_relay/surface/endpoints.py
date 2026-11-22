@@ -45,6 +45,24 @@ def service_served(record: OperationRecord) -> bool:
     return record.kind == "serve" and bool((record.result or {}).get("ready_at"))
 
 
+def service_error(record: OperationRecord) -> dict[str, Any] | None:
+    """Return why relay cannot bring a running service to the desktop, or ``None``.
+
+    A serve task ends then too, as an error carrying the typed reason, so the
+    client wakes and need not wait for the job to end. The job runs on until it
+    is stopped or ends.
+    """
+    found = (record.result or {}).get("service_error")
+    if record.kind != "serve" or not isinstance(found, dict):
+        return None
+    return found  # pyright: ignore[reportUnknownVariableType]
+
+
+def service_done(record: OperationRecord) -> bool:
+    """Return whether a serve task has its answer: the service is served, or cannot be."""
+    return service_served(record) or service_error(record) is not None
+
+
 def endpoint_summary(record: OperationRecord) -> str | None:
     """Name a service's ports as ``name host:port``. No URLs, which may carry secrets."""
     endpoint: dict[str, Any] = (record.result or {}).get("endpoint") or {}

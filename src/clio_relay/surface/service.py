@@ -359,7 +359,7 @@ class RelayService:
             asks.append(
                 await self.ask_provider.url(site=site, operation_id=operation_id, need=need)
             )
-        asks.extend(await review_asks(self.ask_provider, site, record, decision))
+        asks.extend(await review_asks(self, site, record, decision))
         if spends and site.spend.needs_approval(charge.node_hours):
             binding = {
                 "site": site.id,
@@ -817,10 +817,10 @@ class RelayService:
                 result.setdefault("ready_at", status.observed_at.isoformat())
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
-            for key, value in (("issues", status.issues), ("site_facts", status.site_facts)):
+            for key in ("issues", "site_facts", "service_error"):
                 result.pop(key, None)
-                if value:
-                    result[key] = value
+                if getattr(status, key):
+                    result[key] = getattr(status, key)
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)

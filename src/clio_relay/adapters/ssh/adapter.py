@@ -262,6 +262,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
         partitions = sched_info.partitions(sched)
         scheduler = first("scheduler") or "none"
         graph_text = "\n".join(sections.get("graph", []))
+        pipeline = jarvis_submit.graph_pipeline(scheduler)
+        job: dict[str, Any] | None = pipeline.get("scheduler")
+        where = f"on {job['nodes']} compute nodes for up to {job['time']}" if job else "here"
+        summary = (
+            f"JARVIS's builtin.resource_graph job runs {where} and collects the networks "
+            "it sees into the site's resource graph."
+        )
         graph: dict[str, Any] = {
             "path": first("graph_path"),
             "decisions": first("decisions_path"),
@@ -270,15 +277,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "exec": scripts.graph_collect_command(
                     self.config.remote_dir, scheduler, self.config.jarvis
                 ),
-                "pipeline": jarvis_submit.graph_pipeline(scheduler),
-                "plan": {
-                    "kind": "resource_graph",
-                    "summary": (
-                        "Submit JARVIS's builtin.resource_graph job (2 nodes, 5 minutes) to "
-                        "collect the networks the compute nodes share into the site's "
-                        "resource graph."
-                    ),
-                },
+                "pipeline": pipeline,
+                "plan": {"kind": "resource_graph", "summary": summary, "submits": job is not None},
                 "note": (
                     "JARVIS's builtin.resource_graph job collects the networks on compute "
                     "nodes; run this with exec (and this plan on a guarded site) once the "
@@ -1050,17 +1050,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "run the job again",
             )
         output, site = "\n".join(found.get("out", [])).strip(), self.config.ssh_profile
-        rc, walltime_s = _one(found, "rc"), self.config.install_walltime_s
+        rc, w = _one(found, "rc"), self.config.install_walltime_s
         jarvis_exits.refuse(
-            rc,
-            output,
-            output,
-            spec=spec,
-            site=site,
-            install_walltime_s=walltime_s,
-            what="the install",
+            rc, output, output, spec=spec, site=site, install_walltime_s=w, what="the install"
         )
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
+        if here := jarvis_exits.checked_here(self.name, rc, output, answers, handle):
+            return here
         if rc != "0" or handle is None:
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,

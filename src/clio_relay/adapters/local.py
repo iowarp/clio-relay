@@ -383,13 +383,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
         """Raise the refusal for the site script's typed exits (69, 3, 4, 5 and 6)."""
+        r, site, w = result, self.context.site_id, self.config.install_walltime_s
         jarvis_exits.refuse(
-            result.exit_code,
-            result.stdout,
-            result.stderr,
-            spec=spec,
-            site=self.context.site_id,
-            install_walltime_s=self.config.install_walltime_s,
+            r.exit_code, r.stdout, r.stderr, spec=spec, site=site, install_walltime_s=w
         )
 
     async def install(
@@ -420,7 +416,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             argv, timeout_s=self.config.submit_timeout_s, max_output_bytes=1 << 20, cwd=job_dir
         )
         self._refuse_jarvis_exit(result, spec)
-        found = jarvis_submit.parse_handle(result.stdout)
+        found, out = jarvis_submit.parse_handle(result.stdout), result.stdout
+        if here := jarvis_exits.checked_here(self.name, result.exit_code, out, answers, found):
+            return here
         if result.exit_code != 0 or found is None:
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,

@@ -35,6 +35,7 @@ from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve.config import Rendezvous, SiteServe, frp_unusable
 from clio_relay.serve.forward import CLOSED_MARKER, Forward, forward_marker, kill_recorded
+from clio_relay.serve.keys import ForwardCare
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
     HopState,
@@ -68,7 +69,6 @@ from clio_relay.serve.report import (
     times,
 )
 from clio_relay.serve.runtime_util import (
-    HOST_KEYS_SH,
     maybe,
     safe_name,
     scheduler_job_name,
@@ -116,7 +116,7 @@ async def start_for(adapter: Any, spec: ServiceSpec, *, operation_id: str) -> En
     return await _runtime.start_for(adapter, spec, operation_id=operation_id)
 
 
-class ServeRuntime:
+class ServeRuntime(ForwardCare):
     """Every service this relay host started, and their desktop ports."""
 
     def __init__(
@@ -141,6 +141,7 @@ class ServeRuntime:
         self._locks: dict[str, asyncio.Lock] = {}
         self._followers: dict[str, asyncio.Task[None]] = {}
         self._latest: dict[str, tuple[float, JobStatus]] = {}
+        self._adapters: dict[str, Any] = {}
         self._resumed = False
 
     # The hook
@@ -172,6 +173,7 @@ class ServeRuntime:
         """Observe a service, and bring its desktop port up once it answers."""
         await self.resume()
         plan = self._plan(record.operation_id)
+        self._adapters[plan.operation_id] = adapter
         seen = self._following(plan)
         if seen is not None:
             return seen, None
@@ -367,6 +369,7 @@ class ServeRuntime:
                 and plan.ready_at is not None
                 and plan.stop_requested_at is None
                 and plan.desktop_closed_at is None
+                and plan.forward_error is None
             ):
                 record = self.records.get(plan.operation_id)
                 if record is not None and record.state.final:
@@ -515,26 +518,6 @@ class ServeRuntime:
                 exit_code=result.exit_code,
             )
         return result
-
-    async def _host_keys(self, adapter: Any, plan: ServePlan) -> list[str]:
-        """Read the compute node's host keys from the login host's known_hosts files.
-
-        The forward reaches the node through the login host, and the desktop has
-        often never seen that node, so ``BatchMode`` would refuse its key. The site's
-        own known_hosts files are read over the login link ssh has already checked.
-        """
-        if plan.mode != "ssh" or not plan.host or plan.host == plan.login_host:
-            return []
-        try:
-            found = await self._exec(adapter, plan, ["sh", "-c", HOST_KEYS_SH, "sh", plan.host])
-        except Exception:
-            logger.warning("service %s: no host keys for %s", plan.operation_id, plan.host)
-            return []
-        return [
-            line.strip()
-            for line in found.stdout.splitlines()
-            if line.strip() and not line.lstrip().startswith("#") and len(line.split()) >= 3
-        ]
 
     async def _hop(self, adapter: Any, plan: ServePlan, mode: str, *args: str) -> ExecResult:
         """Run the login hop's ``mode`` on the site, light (:mod:`clio_relay.login_load`)."""
@@ -728,14 +711,23 @@ class ServeRuntime:
             with contextlib.suppress(ValueError):
                 ready: dict[str, Any] = json.loads(raw)
                 plan.host = str(ready.get("host") or "") or None
-            plan.host_keys = await self._host_keys(adapter, plan)
+            self._save(plan)
+            blocked = await self._keys_blocked(plan, adapter, status)
+            if blocked is not None:
+                return blocked, None
             plan.ready_at = utc_now()
             self._save(plan)
         if plan.desktop_closed_at is not None:
             message = "running; relay's desktop ports were closed by shutdown"
             return status.model_copy(update={"message": message}), None
+        blocked = await self._keys_blocked(plan, adapter, status)
+        if blocked is not None:
+            return blocked, None
         forward = await self._ensure_forward(plan, adapter)
-        if not forward.bound():
+        blocked = await self._forward_blocked(plan, adapter, forward, status)
+        if blocked is not None:
+            return blocked, None
+        if not forward.serving():
             message = "the service is up; binding the desktop port"
             error = forward.last_error()
             if error:
@@ -763,7 +755,8 @@ class ServeRuntime:
         follower = self._followers.get(plan.operation_id)
         if follower is None or follower.done():
             return None
-        if plan.final is not None or plan.ready_at is not None or plan.stop_requested_at:
+        stopping = plan.final is not None or plan.stop_requested_at
+        if stopping or plan.ready_at is not None or plan.forward_error is not None:
             return None
         seen = self._latest.get(plan.operation_id)
         if seen is None or time.monotonic() - seen[0] > FRESH_S:
@@ -796,7 +789,7 @@ class ServeRuntime:
                                 return
                             seen, endpoint = await self._running(plan, adapter, current)
                             self._latest[plan.operation_id] = (time.monotonic(), seen)
-                        if endpoint is not None:
+                        if endpoint is not None or plan.forward_error is not None:
                             return
                     except Exception:
                         logger.warning(
@@ -821,9 +814,9 @@ class ServeRuntime:
                 plan.forward_pid = pid
                 self._save(plan)
 
-            forward = Forward(
-                plan, self.state_dir / "serve" / "forwards" / plan.operation_id, restarted
-            )
+            directory = self.state_dir / "serve" / "forwards" / plan.operation_id
+            failed = self._failure_callback(plan.operation_id)
+            forward = Forward(plan, directory, restarted, on_failure=failed)
             self.forwards[plan.operation_id] = forward
         if adapter is not None and plan.mode == "ssh":
             transport = getattr(adapter, "transport", None)
@@ -932,7 +925,9 @@ class ServeRuntime:
             outputs = with_provenance(record, outputs)
         await self._stop_hop(adapter, plan)
         message = final_message(plan, status, stopped)
-        final = status.model_copy(update={"outputs": outputs, "message": message})
+        final = status.model_copy(
+            update={"outputs": outputs, "message": message, "service_error": plan.forward_error}
+        )
         plan.final = final.model_dump(mode="json")
         self._save(plan)
         return final

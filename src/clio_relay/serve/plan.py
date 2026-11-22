@@ -122,6 +122,22 @@ class ServePlan(BaseModel):
         default_factory=list[str],
         description="known_hosts lines for ``host``, read on the login host over its checked link",
     )
+    host_keys_for: str | None = Field(
+        default=None, description="The host ``host_keys`` were read for; another host reads again"
+    )
+    host_key_reads: int = Field(
+        default=0, description="Failed tries to read ``host``'s keys on the login host"
+    )
+    host_keys_reread: bool = Field(
+        default=False, description="Relay read the keys again once after ssh refused them"
+    )
+    forward_error: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Why the desktop forward stopped for good (a refusal's wire form), such as "
+            "``host_key_unverified``; relay does not start it again while the job runs"
+        ),
+    )
     ready_at: datetime | None = None
     stop_requested_at: datetime | None = None
     cancel_sent: bool = False

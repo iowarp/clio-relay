@@ -28,7 +28,10 @@ Either refusal turns the operation back into asks instead of a failure:
   in the site's CLIO home and submits the run again. The approval is
   site-scoped: operations that find the site without JARVIS at the same time
   share it, and the install script's site lock makes the later install wait
-  for the first and reuse it.
+  for the first and reuse it. On a guarded site the package review already
+  says relay installs its jarvis-cd when the site has none, so an accepted
+  review covers it and relay asks no second question
+  (:func:`~clio_relay.surface.install_share.jarvis_consented`).
 
 JARVIS's site-scope questions (which MPI) are shared the same way: operations on
 the site that get the same question hold one ask, and one answer moves them all
@@ -59,6 +62,7 @@ from clio_relay import install_failures, install_wording, jarvis_report, jarvis_
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import approval_covers as approval_covers
+from clio_relay.jarvis_exits import ran_here
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -67,8 +71,15 @@ from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import queue_switch
 from clio_relay.surface.install_share import CHOICE_FIELD as CHOICE_FIELD
 from clio_relay.surface.install_share import JARVIS_KIND as JARVIS_KIND
-from clio_relay.surface.install_share import choice_ask, shared_jarvis_ask, site_lock_id
+from clio_relay.surface.install_share import (
+    choice_answers,
+    choice_ask,
+    jarvis_consented,
+    offer_map,
+    shared_jarvis_ask,
+)
 from clio_relay.surface.install_share import holders as holders
+from clio_relay.surface.install_share import site_lock_id as site_lock_id
 from clio_relay.surface.install_share import withdrawable as withdrawable
 
 if TYPE_CHECKING:
@@ -211,13 +222,20 @@ async def ask_install(
                 )
             )
         choices: dict[str, str] = {}
+        offers: dict[str, dict[str, tuple[str, str]]] = {}
         with service.asks.locked(site_lock_id(site.id)):
             for issue in to_ask:
                 ask = await choice_ask(service, site, operation_id, issue)
                 choices[ask.ask_id] = str(issue.get("issue_id"))
+                offers[ask.ask_id] = offer_map(issue)
                 asks.append(ask)
         state["choices"] = choices
+        state["offers"] = offers
     else:
+        if jarvis_consented(service, site.id, record):
+            # The package review the person accepted already said relay installs it.
+            _hold(service, operation_id, state, [], refusal.message)
+            return await service.advance(operation_id)
         with service.asks.locked(site_lock_id(site.id)):
             ask = shared_jarvis_ask(service, site.id, operation_id) or await provider.approve(
                 site=site,
@@ -256,18 +274,6 @@ def _hold(
     return record
 
 
-def _answers(service: RelayService, state: dict[str, Any]) -> dict[str, Any]:
-    """Return the person's answers to this round's open issues; JARVIS replays the rest."""
-    picked: dict[str, tuple[str, str]] = {}
-    for ask_id, issue_id in cast(dict[str, str], state.get("choices") or {}).items():
-        ask = service.asks.get(ask_id)
-        content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
-        value = content.get(CHOICE_FIELD)
-        if isinstance(value, str) and value:
-            picked[issue_id] = (value, ask_id)
-    return jarvis_report.answers_document(picked)
-
-
 def _update(service: RelayService, operation_id: str, **changes: Any) -> OperationRecord:
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)
@@ -292,10 +298,14 @@ async def start_install(
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
-        answers = _answers(service, state)
+        answers = choice_answers(service, state)
         if state.get("recheck"):
             answers[jarvis_submit.RECHECK] = True
         handle = await adapter.install(job, operation_id=operation_id, answers=answers)
+        if ran_here(handle):
+            # The site runs JARVIS's check on the submitting host (install_placement).
+            _update(service, operation_id, stage="done", job_ended=True)
+            return await _resubmit(service, operation_id, "JARVIS checked the software here")
     except Refusal as refusal:
         if install_kind(refusal) is not None:
             return await ask_install(service, operation_id, site, refusal)

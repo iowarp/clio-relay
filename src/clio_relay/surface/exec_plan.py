@@ -52,6 +52,13 @@ class ExecPlan(BaseModel):
     summary: str = Field(
         min_length=1, max_length=2000, description="What the command does, for the person"
     )
+    submits: bool = Field(
+        default=False,
+        description=(
+            "The command submits a scheduler job and the work runs there; the login node "
+            "only submits it"
+        ),
+    )
 
 
 def argv_digest(command: list[str]) -> str:
@@ -72,11 +79,19 @@ def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
     shown = shlex.join(command)
     if len(shown) > SHOWN_CHARS:
         shown = f"{shown[:SHOWN_CHARS]}... ({len(shown) - SHOWN_CHARS} more characters)"
+    if plan.submits:
+        question = f"Submit {with_article(plan.kind)} job from {site.title}'s login node?"
+        runs = (
+            "It submits once, at low priority, for at most "
+            f"{PLAN_TIMEOUT_S:.0f} s; the work runs in the scheduler's job, not on the login node."
+        )
+    else:
+        question = f"Run {with_article(plan.kind)} plan on {site.title}'s login node?"
+        runs = f"It runs once, at low priority, for at most {PLAN_TIMEOUT_S:.0f} s."
     return (
-        f"Run {with_article(plan.kind)} plan on {site.title}'s login node? {plan.summary}\n\n"
-        f"The site is guarded, so relay asks before a command that is not read-only. It runs "
-        f"once, at low priority, for at most {PLAN_TIMEOUT_S:.0f} s. Command (sha256 "
-        f"{argv_digest(command)[:16]}):\n{shown}"
+        f"{question} {plan.summary}\n\n"
+        f"The site is guarded, so relay asks before a command that is not read-only. {runs} "
+        f"Command (sha256 {argv_digest(command)[:16]}):\n{shown}"
     )
 
 

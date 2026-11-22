@@ -183,7 +183,58 @@ def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
     implies = candidate.get("implies")
     if isinstance(implies, str) and implies:
         facts.append(implies)
+    does = candidate.get("does")
+    if isinstance(does, str) and does:
+        facts.append(does)
+    if candidate.get("recommended") is True:
+        facts.append("recommended")
     return f"{constraint} ({'; '.join(facts)})" if facts else constraint
+
+
+MAX_EVIDENCE = 6
+"""The most evidence lines of an issue (``install_placement``'s) a question repeats."""
+
+
+def once(issue: Mapping[str, Any]) -> bool:
+    """Say whether an issue's answer is for this occasion only (``ask_each_time``)."""
+    subject = issue.get("subject")
+    return issue.get("once") is True or (isinstance(subject, str) and subject.endswith(".occasion"))
+
+
+def package_overrides(issue: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """Return an issue's ``(package, override issue_id)`` pairs, in JARVIS's order.
+
+    ``install_placement`` offers one per package, so a person can place one
+    package apart from the site's answer for the rest (a long build, say).
+    """
+    pairs: list[tuple[str, str]] = []
+    for raw in cast(list[object], issue.get("package_overrides") or []):
+        entry = _dict(raw)
+        package, issue_id = entry.get("package"), entry.get("issue_id")
+        if isinstance(package, str) and package and isinstance(issue_id, str) and issue_id:
+            pairs.append((package, issue_id))
+    return pairs
+
+
+def override_option(constraint: str, package: str) -> str:
+    """The option that answers ``constraint`` for one package only."""
+    return f"{constraint} for {package} only"
+
+
+def override_choices(issue: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
+    """Return ``{option: (override issue_id, constraint)}`` for an issue's per-package options."""
+    if once(issue):
+        return {}
+    return {
+        override_option(constraint, package): (issue_id, constraint)
+        for package, issue_id in package_overrides(issue)
+        for constraint in choice_options(issue)
+    }
+
+
+def choice_offers(issue: Mapping[str, Any]) -> list[str]:
+    """Return the options to offer: the candidates, then the per-package ones."""
+    return [*choice_options(issue), *override_choices(issue)]
 
 
 def choice_message(issue: Mapping[str, Any]) -> str:
@@ -210,9 +261,24 @@ def choice_message(issue: Mapping[str, Any]) -> str:
             f"{text} The earlier answer, {previous['constraint']}, no longer matches "
             "what JARVIS finds, so it asks again."
         )
-    if issue.get("scope") == "site":
+    if once(issue):
+        text = f"{text} The answer is for this run only; JARVIS asks again next time."
+    elif issue.get("scope") == "site":
         text = f"{text} JARVIS records the answer for the site's later installs."
-    return f"{text} Options: {'. '.join(lines)}." if lines else text
+    overrides = package_overrides(issue)
+    if overrides and not once(issue):
+        named = ", ".join(package for package, _ in overrides)
+        text = (
+            f"{text} An option ending in 'for <package> only' places that package alone "
+            f"({named}), and JARVIS asks again for the rest."
+        )
+    text = f"{text} Options: {'. '.join(lines)}." if lines else text
+    evidence = [
+        str(item)
+        for item in cast(list[object], issue.get("evidence") or [])[:MAX_EVIDENCE]
+        if isinstance(item, str) and item
+    ]
+    return f"{text} Evidence: {'; '.join(evidence)}." if evidence else text
 
 
 def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None = None) -> Refusal:

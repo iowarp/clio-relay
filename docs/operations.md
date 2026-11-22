@@ -111,13 +111,19 @@ site-serve, relay's scripts and job directories, `~/.clio-relay`,
 keeps the Spack store (`<site home>/spack`, with every package built there):
 rebuilding ParaView takes hours. It also keeps JARVIS's recorded install
 answers (`<site home>/jarvis-cd/site/decisions.yaml`: which MPI, which
-compiler), facts about the cluster you confirmed, so the next install does not
+compiler, where checks run), facts about the cluster you confirmed, so the next install does not
 ask them again. Pass `--remove-spack` to delete the Spack store too,
 `--forget-decisions` to delete the answers, and `--yes` to approve on the
 command line. To forget one answer rather than all of them, use JARVIS's
 `jarvis ppl install --forget <selector>` on the site. The next call signs in
 and deploys everything again. Every live proof starts with it, so deployment is
 tested each time.
+
+What relay's runs wrote outside its own directories, such as a case's results
+under your home, is yours, so clean keeps it. The question names those outputs,
+taken from the operations' records, and the result lists them as
+`outputs_kept`. Pass `--remove-outputs` (`remove_outputs` over MCP) to delete
+them with the rest; the question then says it deletes them.
 
 Clean removes nothing while one of relay's jobs still runs on the site, since
 its directory is among what goes. It does not trust relay's records alone: it
@@ -138,8 +144,9 @@ the operation as it ends. On an operation that already ended whose job the
 scheduler still lists, it cancels that job and notes it in the operation's
 history.
 
-Over MCP the `site_clean` tool does the same, keeping the Spack store and the
-answers; its `forget_decisions` argument deletes the answers. It asks
+Over MCP the `site_clean` tool does the same, keeping the Spack store, the
+answers and the runs' outputs; its `forget_decisions` argument deletes the
+answers and `remove_outputs` the outputs. It asks
 the person on every call, open site or guarded, with a question bound to what
 it will remove; once the person says yes, the same call, or the next one with
 the same site, cleans. It refuses while one of relay's jobs still runs, the

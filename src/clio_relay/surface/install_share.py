@@ -22,7 +22,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import Ask
+from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.records import OperationRecord
+from clio_relay.jobs.spec import canonical_digest
 from clio_relay.sites.models import SiteEntry
 
 if TYPE_CHECKING:
@@ -76,14 +78,46 @@ def shared_jarvis_ask(service: RelayService, site_id: str, operation_id: str) ->
     return None
 
 
+def jarvis_consented(service: RelayService, site_id: str, record: OperationRecord) -> bool:
+    """Say whether the person already agreed that relay installs its jarvis-cd here.
+
+    A package review that named relay's jarvis-cd at this pin covers it
+    (:func:`~clio_relay.surface.guarding.review_asks`): this operation's own,
+    accepted and unchanged, or one on another live operation of the site that is
+    installing jarvis-cd now. The bootstrap's site lock makes the second install
+    wait for the first and reuse it.
+    """
+    for other in [record, *_live_elsewhere(service, record.operation_id)]:
+        if other.site != site_id:
+            continue
+        own = other.operation_id == record.operation_id
+        other_state = _install_state(other)
+        if not own and (other_state.get("kind") != "jarvis" or other_state.get("stage") == "done"):
+            continue
+        for ask in service.operation_asks(other):
+            if (
+                ask.kind == "approve"
+                and ask.state == "accepted"
+                and ask.binding.get("kind") == REVIEW_KIND
+                and ask.binding.get("jarvis") == jarvis_submit.JARVIS_PIN
+                and ask.binding_digest == canonical_digest(ask.binding)
+            ):
+                return True
+    return False
+
+
 def choice_binding(site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None:
     """Return what a site-scope JARVIS question is bound to, or ``None`` for any other.
 
     JARVIS's ``issue_id`` digests the question with its candidates; the options
     are bound too, so a question that offers something else is asked on its own.
+    A question for this occasion only (:func:`~clio_relay.jarvis_report.once`) is
+    each operation's own.
     """
     issue_id = issue.get("issue_id")
     if issue.get("scope") != "site" or not isinstance(issue_id, str) or not issue_id:
+        return None
+    if jarvis_report.once(issue):
         return None
     return {
         "site": site_id,
@@ -92,6 +126,48 @@ def choice_binding(site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None
         "issue_id": issue_id,
         "options": jarvis_report.choice_options(issue),
     }
+
+
+def offer_map(issue: dict[str, Any]) -> dict[str, tuple[str, str]]:
+    """Return ``{option: (issue_id, constraint)}`` for every option of a question's ask."""
+    issue_id = str(issue.get("issue_id"))
+    own = {option: (issue_id, option) for option in jarvis_report.choice_options(issue)}
+    return {**own, **jarvis_report.override_choices(issue)}
+
+
+def choice_answers(service: RelayService, state: dict[str, Any]) -> dict[str, Any]:
+    """Return the person's answers to this round's open issues; JARVIS replays the rest.
+
+    ``state`` has ``choices`` (``{ask_id: issue_id}``) and ``offers``
+    (``{ask_id:`` :func:`offer_map` ``}``). A per-package option
+    (``<constraint> for <package> only``) answers that package's override issue
+    instead, and leaves the site's question open. An option this operation was
+    not offered (a shared ask's other package) answers nothing here.
+    """
+    picked: dict[str, tuple[str, str]] = {}
+    offers = cast(dict[str, dict[str, list[str]]], state.get("offers") or {})
+    for ask_id, issue_id in cast(dict[str, str], state.get("choices") or {}).items():
+        ask = service.asks.get(ask_id)
+        content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
+        value = content.get(CHOICE_FIELD)
+        if not isinstance(value, str) or not value:
+            continue
+        if ask_id not in offers:
+            picked[issue_id] = (value, ask_id)
+        elif (offer := offers[ask_id].get(value)) is not None:
+            picked[offer[0]] = (offer[1], ask_id)
+    return jarvis_report.answers_document(picked)
+
+
+def _answers_site(ask: Ask, issue: dict[str, Any]) -> bool:
+    """Say whether an accepted shared ask answered the site's question itself.
+
+    A per-package answer (``... for <package> only``) leaves the question open.
+    """
+    content = cast(dict[str, Any], (ask.answer or {}).get("content") or {})
+    return ask.state == "accepted" and content.get(CHOICE_FIELD) in jarvis_report.choice_options(
+        issue
+    )
 
 
 async def choice_ask(
@@ -111,7 +187,7 @@ async def choice_ask(
                 if (
                     ask.kind == "choose"
                     and ask.binding == binding
-                    and ask.state in ("pending", "accepted")
+                    and (ask.state == "pending" or _answers_site(ask, issue))
                 ):
                     return ask
     ask = await service.ask_provider.choose(
@@ -119,7 +195,7 @@ async def choice_ask(
         operation_id=operation_id,
         message=jarvis_report.choice_message(issue),
         field_name=CHOICE_FIELD,
-        options=jarvis_report.choice_options(issue),
+        options=jarvis_report.choice_offers(issue),
     )
     if binding is not None:
         ask.bind(binding)

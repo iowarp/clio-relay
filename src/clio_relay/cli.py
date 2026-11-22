@@ -496,12 +496,17 @@ def site_clean(
         bool,
         typer.Option(help="Delete JARVIS's recorded install answers; they are asked again"),
     ] = False,
+    remove_outputs: Annotated[
+        bool,
+        typer.Option(help="Delete what relay's runs wrote outside its directories too"),
+    ] = False,
     wait_s: Annotated[float, typer.Option(help="How long to wait for the answer")] = 600.0,
 ) -> None:
     """Remove relay's deployment on a site, so the next use deploys it again.
 
-    It stops relay's processes there first, and keeps the Spack store and JARVIS's
-    recorded install answers unless told.
+    It stops relay's processes there first, and keeps the Spack store, JARVIS's
+    recorded install answers and the runs' outputs outside relay's directories
+    unless told.
     """
     from clio_relay import site_clean as cleaning
     from clio_relay.surface.service import RelayService
@@ -543,7 +548,11 @@ def site_clean(
         service = RelayService(_paths())
         try:
             planned = await cleaning.plan(
-                service, site_id, remove_spack=remove_spack, forget_decisions=forget_decisions
+                service,
+                site_id,
+                remove_spack=remove_spack,
+                forget_decisions=forget_decisions,
+                remove_outputs=remove_outputs,
             )
             if not await approved(service, planned):
                 raise Refusal(RefusalReason.POLICY_REFUSED, f"cleaning {site_id} was not approved")

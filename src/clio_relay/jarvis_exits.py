@@ -1,6 +1,6 @@
 """The site script's typed exits, as refusals, for every adapter that runs it.
 
-The site script (:data:`~clio_relay.jarvis_submit.SITE_SCRIPT`) exits 69 when
+The site script (:data:`~clio_relay.jarvis_site_script.SITE_SCRIPT`) exits 69 when
 relay's JARVIS is missing, 3 when JARVIS needs software installed or a choice,
 4 when JARVIS refused to build outside an allocation, 5 when JARVIS refused the
 pipeline and 6 for a typed install failure. Its ``check`` mode (the light
@@ -10,9 +10,11 @@ record says the package's software is all there.
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 from clio_relay import install_failures, jarvis_report, jarvis_submit
+from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
@@ -62,6 +64,41 @@ def checked(output: str) -> dict[str, Any]:
             scheduler="jarvis",
         )
     return report
+
+
+CHECKED_HERE = "checked_here"
+"""The install handle's data key when a ``recheck`` needed no job.
+
+The site chose to run JARVIS's check on the submitting host
+(``install_placement``), and the check there found the software all there.
+"""
+
+
+def checked_here(
+    adapter: str,
+    exit_code: int | str | None,
+    output: str,
+    answers: Mapping[str, Any],
+    handle: object,
+) -> JobHandle | None:
+    """Return the handle of a ``recheck`` that JARVIS checked on the submitting host.
+
+    It is None unless the recheck exited 0 with JARVIS's install report and printed
+    no job ``handle``.
+    """
+    code = str(exit_code) if exit_code is not None else None
+    if handle is not None or code != "0" or not jarvis_submit.is_recheck(answers):
+        return None
+    if jarvis_report.parse_install_report(output) is None:
+        return None
+    return JobHandle(adapter=adapter, data={CHECKED_HERE: True, "install": True})
+
+
+def ran_here(handle: JobHandle) -> bool:
+    """Say whether an install handle is :func:`checked_here`'s, also through a worker."""
+    remote = handle.data.get("remote")
+    data = cast(dict[str, Any], remote).get("data") if isinstance(remote, dict) else handle.data
+    return isinstance(data, dict) and cast(dict[str, Any], data).get(CHECKED_HERE) is True
 
 
 def install_only_refused(scheduler: str | None, *, site: str) -> Refusal:

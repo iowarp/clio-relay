@@ -109,7 +109,12 @@ def test_an_ssh_package_service_is_up_when_jarvis_saw_it_ready(tmp_path: Path) -
         return []
 
     class Bound:
+        failure = None
+
         def bound(self) -> bool:
+            return False
+
+        def serving(self) -> bool:
             return False
 
         def last_error(self) -> str | None:

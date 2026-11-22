@@ -43,10 +43,16 @@ flowchart LR
    install task on its own, and a task too: it asks JARVIS's light
    `ppl install +check`, which runs no Spack on the login host and answers
    from the record (`install-check.json`) of the last check a job made. With no
-   matching record (`install_unchecked`) relay asks nothing and submits a
-   check job (the site script's `recheck` mode, `ppl install +check +submit`).
+   matching record (`install_unchecked`) relay asks nothing and runs the site
+   script's `recheck` mode: JARVIS's `ppl install +check --answers` on the
+   submitting host first, then a check job (`ppl install +check +submit`) only
+   when JARVIS defers to one. Where checks run is the site's choice, which
+   JARVIS asks (`install_placement`, with its evidence and recommendation) and
+   relay relays like any other question; when the site chose the login host
+   under JARVIS's limits, the check runs there and no job is sent. Relay builds
+   only in a job (`JARVIS_INSTALL_PLACEMENT_BUILD=compute_job`).
    When JARVIS reports only questions, relay asks them, then runs that check
-   job with the answers, so nothing is asked or built when everything is
+   with the answers, so nothing is asked or built when everything is
    installed. It
    takes the run's install path when software is missing (the same asks, then
    `ppl install +submit` as a job on the compute nodes), installs relay's

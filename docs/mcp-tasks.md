@@ -38,6 +38,15 @@ job's end;
 relay asks after the service is ready reach the person through relay's page and
 `clio-relay asks`, not as `input_required` on the finished task.
 
+A service relay cannot bring to this desktop also completes the task, at once,
+rather than retrying: the tool result is an error with `result.service_error`,
+a typed reason and a message. `host_key_unverified` means relay could not
+verify the compute node's ssh host key (it reads the node's keys from the
+login node and checks them again once); `unreachable` means the node refused
+the forward, for example because the job's allocation ended. The job's own end
+then ends the operation as usual. Relay never reports a port as forwarded
+before its own forward holds it.
+
 ### answering questions
 
 Some sites ask for something before they continue: a one-time code, a sign-in,
