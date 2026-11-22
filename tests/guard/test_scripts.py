@@ -53,9 +53,16 @@ case "$1 $2" in
       *" +submit "*)
         printf '{"execution_id":"install","schema_version":"jarvis.execution.handle.v1"}\\n'
         exit 0 ;;
+      *" +check "*) ;;
+      *)
+        # JARVIS's own build on this host, under its limits.
+        sleep "${JARVIS_BUILD_SLEEP:-0}"
+        printf '{"schema_version":"jarvis.install-report.v1","satisfied":true}\\n'
+        exit "${JARVIS_BUILD_RC:-0}" ;;
     esac
-    printf '{"schema_version":"jarvis.install-report.v1","satisfied":%s,"issues":%s}\\n' \\
+    printf '{"schema_version":"jarvis.install-report.v1","satisfied":%s,"issues":%s,' \\
       "${JARVIS_SATISFIED:-true}" "${JARVIS_ISSUES:-[]}"
+    printf '"placement":%s}\\n' "${JARVIS_PLACEMENT:-null}"
     exit "${JARVIS_INSTALL_RC:-0}" ;;
   "ppl check")
     if [ -n "${JARVIS_CHECK_RC:-}" ]; then
@@ -308,9 +315,10 @@ def test_a_recheck_jarvis_checks_here_submits_no_job(tmp_path: Path, rc: int, is
     assert json.loads((job / "relay.install-report.json").read_text()) == report
 
 
-def test_relay_builds_only_in_a_job_and_leaves_check_placement_to_the_site() -> None:
-    assert "export JARVIS_INSTALL_PLACEMENT_BUILD=compute_job" in SITE_SCRIPT
-    assert "unset JARVIS_INSTALL_PLACEMENT_CHECK" in SITE_SCRIPT
+def test_relay_sets_no_placement_and_no_limits_of_its_own() -> None:
+    assert "unset JARVIS_INSTALL_PLACEMENT_CHECK JARVIS_INSTALL_PLACEMENT_BUILD" in SITE_SCRIPT
+    assert "export JARVIS_INSTALL_PLACEMENT" not in SITE_SCRIPT
+    assert "+allow_local" not in SITE_SCRIPT and "nice " not in SITE_SCRIPT
 
 
 def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:

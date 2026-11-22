@@ -417,7 +417,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         )
         self._refuse_jarvis_exit(result, spec)
         found, out = jarvis_submit.parse_handle(result.stdout), result.stdout
-        if here := jarvis_exits.checked_here(self.name, result.exit_code, out, answers, found):
+        if here := jarvis_exits.without_job(self.name, result.exit_code, out, found, "supervised"):
             return here
         if result.exit_code != 0 or found is None:
             raise Refusal(

@@ -23,7 +23,12 @@ Either refusal turns the operation back into asks instead of a failure:
   to install what it finds missing. When JARVIS has no record to answer from
   (``install_unchecked``), relay asks nothing and runs that check job at once;
   if the light check still finds no record after a job ended, the operation
-  fails with JARVIS's reason rather than loop;
+  fails with JARVIS's reason rather than loop. Where checks and builds run is
+  the site's answer to JARVIS's ``install_placement`` question, relayed like the
+  others: when the person placed the build on the login host
+  (``login_limited``), JARVIS's own ``ppl install --answers`` runs there in the
+  background under JARVIS's limits (:func:`~clio_relay.jarvis_exits.login_build`),
+  relay follows it the same way with no time limit, and only a cancel stops it;
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
   in the site's CLIO home and submits the run again. The approval is
   site-scoped: operations that find the site without JARVIS at the same time
@@ -54,7 +59,6 @@ decisions JARVIS applies (:func:`~clio_relay.jarvis_report.applied_decisions`).
 from __future__ import annotations
 
 import logging
-import posixpath
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -62,13 +66,13 @@ from clio_relay import install_failures, install_wording, jarvis_report, jarvis_
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import approval_covers as approval_covers
-from clio_relay.jarvis_exits import ran_here
+from clio_relay.jarvis_exits import build_refused, built_here, ran_here
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import queue_switch
+from clio_relay.surface import install_logs, queue_switch
 from clio_relay.surface.install_share import CHOICE_FIELD as CHOICE_FIELD
 from clio_relay.surface.install_share import JARVIS_KIND as JARVIS_KIND
 from clio_relay.surface.install_share import (
@@ -89,7 +93,6 @@ logger = logging.getLogger(__name__)
 
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
-LOG_TAIL_BYTES = 4096
 MAX_ROUNDS = 6
 """How many install rounds (check jobs, questions, installs) one operation may go through
 before relay stops asking."""
@@ -330,6 +333,11 @@ async def start_install(
             if state.get("recheck")
             else "installing the package's software as a job on the site"
         )
+        if built_here(handle) is not None:
+            message = (
+                "JARVIS builds the package's software on the site's login host under its "
+                "own limits, in the background with no time limit; cancel stops it"
+            )
         record.result = {**(record.result or {}), INSTALL_KEY: state, "message": message}
         cancelled = record.state == OperationState.CANCELLED
         record.move(OperationState.QUEUED, message)
@@ -349,38 +357,6 @@ async def _resubmit(service: RelayService, operation_id: str, note: str) -> Oper
     return await service.submit(operation_id)
 
 
-def _log_path(handle: JobHandle) -> str | None:
-    execution = handle.data.get("execution_dir")
-    job_dir = handle.data.get("job_dir") or handle.data.get("root")
-    if not isinstance(execution, str) or not execution:
-        if not isinstance(job_dir, str) or not job_dir:
-            return None
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-        execution = jarvis_submit.execution_dir(job_dir, execution_id, pipeline=pipeline)
-    return posixpath.join(execution, "install", "install.log")
-
-
-async def _log_tail(
-    adapter: BaseAdapter[Any], handle: JobHandle, offset: int
-) -> tuple[str | None, int]:
-    """Return the install log written since ``offset`` (its last part), and the new offset."""
-    path = _log_path(handle)
-    if path is None or "files" not in type(adapter).implements:
-        return None, offset
-    try:
-        files = await adapter.files()
-        size = (await files.stat(path)).size or 0
-        if size <= offset:
-            return None, offset
-        start = max(offset, size - LOG_TAIL_BYTES)
-        data = await files.read(path, offset=start, limit=size - start)
-    except Exception:
-        # The log is not there until the install job starts, and a missed read is no loss.
-        logger.debug("reading the install log %s", path, exc_info=True)
-        return None, offset
-    return data.decode("utf-8", errors="replace"), size
-
-
 async def refresh_install(
     service: RelayService, operation_id: str, adapter: BaseAdapter[Any], handle: JobHandle
 ) -> OperationRecord:
@@ -392,7 +368,7 @@ async def refresh_install(
         reason = exc.message if isinstance(exc, Refusal) else f"{type(exc).__name__}: {exc}"
         return service.observation_failed(operation_id, reason, "install")
     state = state_of(service.operation(operation_id))
-    tail, offset = await _log_tail(adapter, handle, int(state.get("log_offset") or 0))
+    tail, offset = await install_logs.log_tail(adapter, handle, int(state.get("log_offset") or 0))
     if status.state == JobState.COMPLETED:
         checked = bool(state.get("recheck"))
         _update(
@@ -432,25 +408,14 @@ async def refresh_install(
         result.pop("observation_failed_at", None)
         record.result = result
         if status.state == JobState.RUNNING:
-            record.move(OperationState.RUNNING, "the install job is running")
+            running = "the install job is running"
+            if built_here(handle) is not None:
+                running = "JARVIS is building on the login host"
+            record.move(OperationState.RUNNING, running)
         service.operations.put(operation_id, record)
     if status.queue:
         return await queue_switch.consider(service, operation_id, adapter, handle, "install")
     return record
-
-
-async def _job_issues(adapter: BaseAdapter[Any], handle: JobHandle) -> list[dict[str, Any]]:
-    """Return the typed issues the install job wrote to ``install/issues.jsonl``."""
-    log = _log_path(handle)
-    if log is None or "files" not in type(adapter).implements:
-        return []
-    path = posixpath.join(posixpath.dirname(log), "issues.jsonl")
-    try:
-        data = await (await adapter.files()).read(path)
-    except Exception:
-        logger.warning("reading the install issues %s", path, exc_info=True)
-        return []
-    return install_failures.read_jsonl(data.decode("utf-8", errors="replace"))
 
 
 async def _ended(
@@ -463,6 +428,14 @@ async def _ended(
     adapter, handle = job
     if status.state == JobState.CANCELLED:
         return service.finish(operation_id, OperationState.CANCELLED, None)
+    login = built_here(handle)
+    if login is not None and status.exit_code == jarvis_submit.EXIT_BUILD_REFUSED:
+        # JARVIS would not build on the login host after all (it was too busy for
+        # its limits): final, and the person chooses again on a later install.
+        text = await install_logs.login_report(adapter, login)
+        site = service.site(service.operation(operation_id).site).title
+        refusal = build_refused(text or str(tail or ""), site=site)
+        return service.finish(operation_id, OperationState.FAILED, refusal)
     if status.exit_code == jarvis_submit.EXIT_DECISION:
         # The job found a question (which MPI, a compiler the build host lacks) and
         # recorded it: the light check on the login host reads that record and asks it.
@@ -472,9 +445,9 @@ async def _ended(
         )
     record = service.operation(operation_id)
     found = install_failures.from_issues(
-        await _job_issues(adapter, handle),
+        await install_logs.job_issues(adapter, handle),
         site=service.site(record.site).title,
-        install_log=_log_path(handle),
+        install_log=install_logs.log_path(handle),
         install_job=handle.native_id,
     )
     if found is not None and install_kind(found) is not None:
@@ -493,7 +466,7 @@ async def _ended(
             message,
             needs=jarvis_submit.NEEDS_INSTALL,
             exit_code=status.exit_code,
-            install_log=_log_path(handle),
+            install_log=install_logs.log_path(handle),
             install_job=handle.native_id,
         ),
     )

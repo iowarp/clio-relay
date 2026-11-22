@@ -252,7 +252,7 @@ A batch adapter that runs packages turns the site script's typed exits into
 refusals with `jarvis_exits.refuse`. In detail, it refuses with `jarvis_report.install_needed`
 when the submit exits 3 (with `walltime=jarvis_submit.install_walltime(...)`,
 so the approval says how long the build may take), with
-`jarvis_submit.build_refused` when it exits 4
+`jarvis_exits.build_refused` when it exits 4
 (JARVIS will not build outside an allocation; never retry it), and with
 `jarvis_submit.missing_jarvis` when the site script exits 69: JARVIS is
 missing or at another pin. Before those, it calls

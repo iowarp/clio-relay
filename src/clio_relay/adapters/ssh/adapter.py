@@ -1037,11 +1037,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             ),
             home=self.config.remote_dir,
         )
-        result = await self.transport.ssh(
-            scripts.jarvis_install_script(str(job_dir), command),
-            timeout_s=None,
-            what="submitting the install",
-        )
+        script = scripts.jarvis_install_script(str(job_dir), command)
+        result = await self.transport.ssh(script, timeout_s=None, what="submitting the install")
         found = parse_sections(result.text())
         if "nodir" in found:
             raise Refusal(
@@ -1055,7 +1052,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             rc, output, output, spec=spec, site=site, install_walltime_s=w, what="the install"
         )
         handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
-        if here := jarvis_exits.checked_here(self.name, rc, output, answers, handle):
+        base = {"root": str(root), "job_name": job_name(operation_id), "install": True}
+        if here := jarvis_exits.without_job(self.name, rc, output, handle, "detached", base):
             return here
         if rc != "0" or handle is None:
             raise Refusal(
@@ -1066,7 +1064,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 exit_code=_int(rc),
             )
         native, data = jarvis_submit.handle_data(handle, job_dir=str(job_dir))
-        data.update(root=str(root), job_name=job_name(operation_id), install=True)
+        data.update(base)
         return JobHandle(adapter=self.name, native_id=native, data=data)
 
     async def install_jarvis(self) -> str:

@@ -8,7 +8,7 @@ record, and how many questions follow.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.jarvis_report import applied_decisions, choice_issues, install_summary
 
@@ -70,5 +70,28 @@ def install_message(
     if reuse:
         parts.append(reuse.strip())
     job = f"an install job of up to {walltime}" if walltime else "an install job"
-    parts.append(f"JARVIS installs it as {job} on the site {last}. Install it?")
+    parts.append(_where_built(report, site=site, job=job, last=last))
     return " ".join(parts)
+
+
+def _where_built(report: Mapping[str, Any], *, site: str, job: str, last: str) -> str:
+    """Say where JARVIS builds, from its build placement (``placement.build.choice``).
+
+    Relay sets no placement: the site's answer to JARVIS's ``install_placement``
+    question does, and JARVIS chooses the limits on the login host.
+    """
+    placement: object = report.get("placement")
+    build = cast(dict[str, Any], placement).get("build") if isinstance(placement, dict) else None
+    plan = cast(dict[str, Any], build) if isinstance(build, dict) else {}
+    choice = plan.get("choice")
+    if choice == "login_limited":
+        return (
+            f"JARVIS builds it on {site}'s login host under its own limits {last}, as a "
+            "background task with no time limit that you can stop. Install it?"
+        )
+    if choice is None and plan.get("questions"):
+        return (
+            f"Where JARVIS builds it, on the login host under its limits or as {job}, is "
+            f"one of its questions; it installs it {last}. Install it?"
+        )
+    return f"JARVIS installs it as {job} on the site {last}. Install it?"

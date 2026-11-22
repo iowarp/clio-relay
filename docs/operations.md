@@ -111,7 +111,7 @@ site-serve, relay's scripts and job directories, `~/.clio-relay`,
 keeps the Spack store (`<site home>/spack`, with every package built there):
 rebuilding ParaView takes hours. It also keeps JARVIS's recorded install
 answers (`<site home>/jarvis-cd/site/decisions.yaml`: which MPI, which
-compiler, where checks run), facts about the cluster you confirmed, so the next install does not
+compiler, where checks and builds run), facts about the cluster you confirmed, so the next install does not
 ask them again. Pass `--remove-spack` to delete the Spack store too,
 `--forget-decisions` to delete the answers, and `--yes` to approve on the
 command line. To forget one answer rather than all of them, use JARVIS's

@@ -145,8 +145,9 @@ SPACK_ROOT_ENV = "CLIO_RELAY_SPACK_ROOT"
 EXIT_DECISION = 3
 """JARVIS needs to install software, or a decision, before the job can run."""
 EXIT_BUILD_REFUSED = 4
-"""JARVIS refused to build outside an allocation (``refused.kind: build_outside_allocation``).
-Relay builds only through ``ppl install +submit``, so this is a refusal, never a retry."""
+"""JARVIS refused to build outside an allocation (``refused.kind: build_outside_allocation``):
+the site's build placement is a job, or the login host had no room for JARVIS's limits.
+Relay never retries it."""
 EXIT_USAGE = 64
 """A bad mode, package name or execution id."""
 EXIT_DIGEST = 65
@@ -1201,40 +1202,6 @@ def artifact_outputs(snapshot: Mapping[str, Any], *, execution: str) -> list[Out
 
 
 # Refusals
-
-
-def build_refused(text: str, *, site: str) -> Refusal:
-    """The refusal for a JARVIS command that exited 4: it would have built on the login host.
-
-    ``text`` is the command's output; its install report's ``refused`` says what
-    and which packages. Relay builds only through ``ppl install +submit``, in a
-    job, and never opts in to a local build, so this is final, not a retry.
-    """
-    refused: dict[str, Any] = {}
-    for line in reversed(text.splitlines()):
-        try:
-            found: object = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(found, dict):
-            value = cast(dict[str, Any], found).get("refused")
-            if isinstance(value, dict):
-                refused = cast(dict[str, Any], value)
-                break
-    what = refused.get("what") if isinstance(refused.get("what"), str) else "build"
-    packages = [str(item) for item in cast(list[Any], refused.get("packages") or [])]
-    named = f" ({', '.join(packages)})" if packages else ""
-    return Refusal(
-        RefusalReason.POLICY_REFUSED,
-        f"JARVIS on {site} refused to {what}{named} outside an allocation: the login "
-        "node takes only light work. Relay builds only in a job JARVIS submits "
-        "(ppl install +submit), so it does not retry this",
-        kind=refused.get("kind") or "build_outside_allocation",
-        what=what,
-        packages=packages,
-        exit_code=EXIT_BUILD_REFUSED,
-        retry=False,
-    )
 
 
 def refusal_document(text: str) -> dict[str, Any]:

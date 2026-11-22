@@ -101,7 +101,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
         state.choice = answer["constraint"] if answer else None
         # JARVIS checked on the login host, within its limits: no job.
         printed = json.dumps(_report([], satisfied=True))
-        here = jarvis_exits.checked_here("fixture", 0, printed, answers, None)
+        here = jarvis_exits.checked_here("fixture", 0, printed, None)
         assert here is not None
         return here
 

@@ -63,13 +63,10 @@ spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
 unset CLIO_RELAY_JARVIS_GRAPH
 unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT
-# Builds run only in a job JARVIS submits (ppl install +submit), never on this host.
 unset JARVIS_ALLOW_LOCAL_BUILD
-# So relay, the caller, defaults JARVIS's build placement to a job instead of asking
-# where builds run; a site's recorded answer still comes first. Where checks run stays
-# the site's choice: JARVIS asks it (install_placement) and relay relays it.
-export JARVIS_INSTALL_PLACEMENT_BUILD=compute_job
-unset JARVIS_INSTALL_PLACEMENT_CHECK
+# Where checks and builds run is the site's choice: JARVIS asks it (install_placement),
+# relay relays it and sets no placement and no limits of its own.
+unset JARVIS_INSTALL_PLACEMENT_CHECK JARVIS_INSTALL_PLACEMENT_BUILD
 # The site's JARVIS Spack (jarvis spack prepare), when there is one. Without it JARVIS
 # looks for a Spack itself and asks spack_missing when it finds none.
 if [ -n "$spack_root" ] && [ -x "$spack_root/bin/spack" ]; then
@@ -165,24 +162,111 @@ light() {
   exit "$rc"
 }
 [ "$mode" != check ] && [ "$mode" != submit ] || light
-deferred() {
-  # Whether JARVIS's report only says a job must check (install_unchecked).
+route() {
+  # Where JARVIS's report sends this install: "job" (a job checks or builds: every issue
+  # install_unchecked, or for an install also not_installed with a compute_job build),
+  # "login" (an install whose build JARVIS placed on this host, login_limited, with the
+  # host free) or "here" (the report is the answer: all there, or a question).
   py="${found%/*}/python"
   [ -x "$py" ] || py="${found%/*}/venv/bin/python"
-  [ -x "$py" ] || return 0
+  [ "$2" -eq 3 ] || { echo here; return 0; }
+  [ -x "$py" ] || { echo job; return 0; }
   printf '%s\n' "$1" | tail -n 1 | "$py" -c 'import json, sys
 try:
-    issues = json.loads(sys.stdin.read()).get("issues") or []
+    report = json.loads(sys.stdin.read())
 except ValueError:
-    issues = []
-sys.exit(0 if issues and all(i.get("kind") == "install_unchecked" for i in issues) else 1)'
+    report = {}
+kinds = {i.get("kind") for i in report.get("issues") or [] if isinstance(i, dict)}
+placement = report.get("placement") or {}
+build = (placement.get("build") or {}).get("choice")
+limits = (placement.get("evidence") or {}).get("limits") or {}
+if kinds == {"install_unchecked"}:
+    print("job")
+elif sys.argv[1] != "install" or not kinds or not kinds <= {"install_unchecked", "not_installed"}:
+    print("here")
+elif kinds == {"not_installed"} and build == "login_limited" and not limits.get("defer"):
+    print("login")
+else:
+    print("job")' "$mode"
 }
-if [ "$mode" = recheck ]; then
-  # JARVIS's install placement may run the check here, under its limits; it records
-  # placement answers only on this host. It defers to a job with install_unchecked.
+login_build() {
+  # JARVIS builds on this host under its own limits (ppl install --answers): relay starts
+  # it detached and returns at once, sets no limits, and the person's cancel stops it.
+  lb="$job/relay.login-build" report=$1
+  pid=$(cat "$lb/pid" 2>/dev/null) || pid=
+  if [ -z "$pid" ] || [ -s "$lb/exit_code" ] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -rf "$lb"
+    mkdir -p "$lb"
+    cat > "$lb/supervise.sh" <<'SUPERVISE'
+cd "$1" || exit 1
+shift
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+st() {
+  printf '{"state":"%s","exit_code":%s,"supervisor_pid":%s,"child_pid":%s}\n' \
+    "$1" "$2" "$$" "${c:-null}" > state.json.tmp && mv -f state.json.tmp state.json
+}
+c=
+echo $$ > pid.tmp && mv -f pid.tmp pid
+st queued null
+if [ -e cancel ]; then
+  echo 143 > exit_code.tmp && mv -f exit_code.tmp exit_code
+  st cancelled 143
+  exit 0
+fi
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$@" </dev/null >report.json 2>progress.log &
+else
+  "$@" </dev/null >report.json 2>progress.log &
+fi
+c=$!
+echo "$c" > child_pid
+echo "$(ts) running pid $c" >> states
+st running null
+ec=0
+wait "$c" || ec=$?
+if [ -e cancel ] && [ "$ec" -ne 0 ]; then s=cancelled
+elif [ "$ec" -eq 0 ]; then s=completed
+else s=failed; fi
+echo "$ec" > exit_code.tmp && mv -f exit_code.tmp exit_code
+st "$s" "$ec"
+SUPERVISE
+    set -- sh "$lb/supervise.sh" "$lb" "$found" ppl install yaml "$pipeline" \
+      --answers "$answers" +json
+    if command -v setsid >/dev/null 2>&1; then
+      (setsid "$@" </dev/null >"$lb/supervisor.log" 2>&1 &)
+    else
+      (nohup "$@" </dev/null >"$lb/supervisor.log" 2>&1 &)
+    fi
+    n=0
+    while [ ! -s "$lb/pid" ] && [ $n -lt 300 ]; do
+      sleep 0.1 2>/dev/null || sleep 1; n=$((n + 1))
+    done
+    pid=$(cat "$lb/pid" 2>/dev/null) || pid=
+    [ -n "$pid" ] || fail 1 "JARVIS's build on this host did not start: $(cat "$lb/supervisor.log")"
+  fi
+  rm -f "$job/relay.install.json"
+  py="${found%/*}/python"
+  [ -x "$py" ] || py="${found%/*}/venv/bin/python"
+  "$py" -c 'import json, socket, sys
+try:
+    log = json.loads(sys.argv[3]).get("log")
+except (ValueError, AttributeError):
+    log = None
+log = log if isinstance(log, str) and log else sys.argv[1] + "/progress.log"
+print(json.dumps({"schema_version": "clio-relay.login-build.v1", "dir": sys.argv[1],
+                  "pid": int(sys.argv[2]), "host": socket.gethostname(), "log": log}))' \
+    "$lb" "$pid" "$(printf '%s\n' "$report" | tail -n 1)"
+  exit 0
+}
+if [ "$mode" = recheck ] || [ "$mode" = install ]; then
+  # JARVIS records the answers (where checks and builds run among them) only on this
+  # host, and under the site's login_limited choice checks here within its limits. Its
+  # report says where the rest goes (route): a job, its build here, or nowhere.
   rc=0
   out=$("$found" ppl install yaml "$pipeline" --answers "$answers" +check +json) || rc=$?
-  if [ "$rc" -ne 3 ] || ! deferred "$out"; then
+  where=$(route "$out" "$rc")
+  [ "$where" != login ] || login_build "$out"
+  if [ "$where" != job ]; then
     [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] && keep_report "$out"
     rm -f "$job/relay.install.json"
     printf '%s\n' "$out"
@@ -254,7 +338,9 @@ directory. ``$CLIO_RELAY_JARVIS_GRAPH``, ``$CLIO_RELAY_JARVIS_DECISIONS`` and
 When the CLIO Spack is on the site,
 ``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
 ``bin/spack`` is there). The script unsets
-``JARVIS_ALLOW_LOCAL_BUILD``: relay never builds outside a job. It unpacks the
+``JARVIS_ALLOW_LOCAL_BUILD`` and JARVIS's placement variables: where checks and
+builds run is the site's answer to JARVIS's ``install_placement`` question, and
+relay sets no placement and no limits. It unpacks the
 archives into the job's private
 JARVIS root and registers each repository once, once per set of archives. Before
 it registers one whose archive lists Python requirements
@@ -276,19 +362,26 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   ``JARVIS_INSTALL_ON_LOAD=check`` (checked in the allocation) and keeps the
   handle line as ``relay.submission.json``;
 - ``install`` (the answers JSON comes first) keeps the answers as
-  ``relay.answers.json``, runs ``ppl install ... +submit`` and keeps the handle
-  line as ``relay.install.json``. A pipeline YAML given to ``install`` is the
+  ``relay.answers.json``. A pipeline YAML given to ``install`` is the
   install job's own (:func:`install_pipeline`), kept as
-  ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was;
-  ``recheck`` is ``install`` with ``+check``: the job only checks. It first runs
-  ``ppl install +check --answers`` on this host, the command whose answers JARVIS
-  records for where checks run (``install_placement``): under the site's
-  ``login_limited`` choice JARVIS checks here within its limits, and the script
-  prints that report and exits with its code (0 when all is there, 3 with new
-  questions) without a job. Only when JARVIS defers to a job (every issue
-  ``install_unchecked``) does it submit the check job. Builds keep JARVIS's
-  ``compute_job`` placement (``JARVIS_INSTALL_PLACEMENT_BUILD``), as relay builds
-  only through ``ppl install +submit``;
+  ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was.
+  It first runs ``ppl install +check --answers`` on this host, the command whose
+  answers JARVIS records for where checks and builds run (``install_placement``);
+  under the site's ``login_limited`` check JARVIS checks here within its limits.
+  JARVIS's report then routes it: exit 0 (all there) or a new question prints
+  that report and exits with its code, without a job. When the only issue is
+  ``not_installed`` and JARVIS placed the build on this host (its ``placement``
+  says ``build.choice`` ``login_limited`` and the host is not too busy), it
+  starts JARVIS's own ``ppl install --answers +json`` detached in
+  ``relay.login-build/`` (its report, ``progress.log``, ``pid``, ``child_pid``,
+  ``exit_code`` and ``state.json``), prints a ``clio-relay.login-build.v1``
+  document (``dir``, ``pid``, ``host`` and JARVIS's ``log``) and exits 0. JARVIS
+  sets and applies the limits; relay sets none and no time limit, and a cancel
+  stops it. Otherwise (a check JARVIS defers to a job, ``install_unchecked``, or a
+  ``compute_job`` build) it runs ``ppl install ... +submit`` and keeps the handle
+  line as ``relay.install.json``;
+  ``recheck`` is ``install`` with ``+check``: the job only checks, and it never
+  builds here;
 - ``run`` runs ``ppl run`` in place;
 - ``check`` runs only the light ``ppl install +check``, for an install ahead of
   any run: it exits 0 with the report when the software is all there, else 3.
@@ -301,8 +394,8 @@ site where JARVIS finds no Spack is one of those questions (``spack_missing``,
 whose candidates are the site's Spacks JARVIS found). ``ppl submit``'s own
 exit 3 prints the same report, kept the same way.
 Answers already given reach every check through
-``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
-allocation) passes through unchanged; relay reports it with
-:func:`build_refused` and never retries it. The exit code is also written to
-``relay.exitcode``.
+``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build where it was asked,
+outside an allocation or on a login host too busy for its limits) passes through
+unchanged; relay reports it with :func:`build_refused` and never retries it. The
+exit code is also written to ``relay.exitcode``.
 """

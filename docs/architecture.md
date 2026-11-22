@@ -49,8 +49,11 @@ flowchart LR
    when JARVIS defers to one. Where checks run is the site's choice, which
    JARVIS asks (`install_placement`, with its evidence and recommendation) and
    relay relays like any other question; when the site chose the login host
-   under JARVIS's limits, the check runs there and no job is sent. Relay builds
-   only in a job (`JARVIS_INSTALL_PLACEMENT_BUILD=compute_job`).
+   under JARVIS's limits, the check runs there and no job is sent. Where builds
+   run is the same kind of site choice, per package when JARVIS offers it:
+   on the login host, relay starts JARVIS's own `ppl install --answers` there
+   as a background task with no time limit that only a cancel stops, and JARVIS
+   sets and applies the limits; otherwise the build is JARVIS's install job.
    When JARVIS reports only questions, relay asks them, then runs that check
    with the answers, so nothing is asked or built when everything is
    installed. It

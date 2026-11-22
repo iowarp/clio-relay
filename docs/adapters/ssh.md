@@ -191,17 +191,22 @@ measurements and the queue estimate, and per-package options when one package
 is costlier than the rest. Relay shows the question and JARVIS's evidence as
 they are, records the answer with the site's decisions through `--answers`,
 and has no placement policy of its own. When the site chose the login host for
-checks, the check runs there and relay submits no check job. JARVIS then
-installs the software as its own job,
-`jarvis ppl install +submit`, on a compute node, and sizes that job itself.
-Relay declares `JARVIS_INSTALL_PLACEMENT_BUILD=compute_job` as its default for
-builds, since it builds only through a job; a site's recorded answer wins.
-Relay only gives it `install_walltime_s` as `scheduler.install.time` (4 hours
-by default, or the run's walltime when longer), since a build often takes
-longer than the run, and the approval says how long it may take. Nothing is
-built on the login node: when JARVIS refuses a build outside an allocation
-(exit 4, `build_outside_allocation`), relay reports it as `policy_refused` and
-does not retry it. `describe(job=...)` follows the install log and its progress
+checks, the check runs there and relay submits no check job. Where JARVIS
+builds is the same choice, and relay declares no default for it, so a site
+that has not answered gets JARVIS's own recommendation in the question.
+When the site chose a compute job, JARVIS installs the software as its own
+job, `jarvis ppl install +submit`, on a compute node, and sizes that job
+itself. Relay only gives it `install_walltime_s` as `scheduler.install.time`
+(4 hours by default, or the run's walltime when longer), since a build often
+takes longer than the run, and the approval says how long it may take. When
+the site chose the login host, relay starts JARVIS's own
+`jarvis ppl install --answers` there, detached, under the operation's
+`relay.login-build/` folder. JARVIS sets and applies its limits; relay sets
+none and gives the build no time limit, so it runs as a background task with
+progress until it ends or you cancel it. When JARVIS refuses a build outside
+an allocation (exit 4, `build_outside_allocation`), for example because the
+login host had no room for its limits, relay reports it as `policy_refused`
+and does not retry it. `describe(job=...)` follows the install log and its progress
 for as long as the install takes, then relay submits the run. When Spack
 itself fails, JARVIS types the failure and exits 6 (`compiler_unavailable`,
 `fetch_failed`, `build_failed`, `variant_conflict`, `no_recipe`,
