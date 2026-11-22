@@ -19,7 +19,7 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, cast
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.records import OperationRecord
 from clio_relay.sites.models import SiteEntry
@@ -88,7 +88,7 @@ def choice_binding(site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None
         "scope": "site",
         "kind": CHOICE_KIND,
         "issue_id": issue_id,
-        "options": jarvis_submit.choice_options(issue),
+        "options": jarvis_report.choice_options(issue),
     }
 
 
@@ -115,9 +115,9 @@ async def choice_ask(
     ask = await service.ask_provider.choose(
         site=site,
         operation_id=operation_id,
-        message=jarvis_submit.choice_message(issue),
+        message=jarvis_report.choice_message(issue),
         field_name=CHOICE_FIELD,
-        options=jarvis_submit.choice_options(issue),
+        options=jarvis_report.choice_options(issue),
     )
     if binding is not None:
         ask.bind(binding)

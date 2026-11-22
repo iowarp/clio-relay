@@ -20,6 +20,12 @@ from clio_relay.adapters.ssh.scripts import (
     relay_jarvis,
     sched_script,
 )
+from clio_relay.jarvis_report import (
+    applied_decisions,
+    blocking_issues,
+    choice_issues,
+    choice_message,
+)
 from clio_relay.jarvis_site import (
     SOURCE_FILE,
     archive_package,
@@ -32,10 +38,6 @@ from clio_relay.jarvis_submit import (
     JARVIS_PIN,
     PIN_ENV,
     SITE_SCRIPT,
-    applied_decisions,
-    blocking_issues,
-    choice_issues,
-    choice_message,
     direct_job,
     explicit_jarvis,
     graph_pipeline,

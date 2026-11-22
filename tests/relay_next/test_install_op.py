@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
-from clio_relay import install_wording, jarvis_exits, jarvis_submit
+from clio_relay import install_wording, jarvis_exits, jarvis_report, jarvis_submit
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -66,7 +66,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
         if not state.jarvis:
             raise jarvis_submit.missing_jarvis('{"missing":"jarvis","tried":"/h/j"}', site="fx")
         if not state.installed:
-            raise jarvis_submit.install_needed(_report(False), site="fx", walltime="01:00:00")
+            raise jarvis_report.install_needed(_report(False), site="fx", walltime="01:00:00")
         return _report(True)
 
     async def install(

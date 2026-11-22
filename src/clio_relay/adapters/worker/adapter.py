@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from clio_relay import jarvis_submit, programs
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
+from clio_relay.adapters.worker.batch_ssh import batch_ssh
 from clio_relay.adapters.worker.files import WorkerFileAccess
 from clio_relay.adapters.worker.site_server import IDLE_EXIT_S, LinkMode
 from clio_relay.jobs.handles import (
@@ -61,7 +62,13 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import LoginLimits, light_function
 from clio_relay.serve.config import DEFAULT_STUN_SERVER
-from clio_relay.site_prune import parse_report, prune_script, site_keeps
+from clio_relay.site_prune import (
+    jobs_script,
+    parse_live,
+    parse_report,
+    prune_script,
+    site_keeps,
+)
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.link import WorkerConnection
@@ -73,7 +80,6 @@ READY_MARKER = "CLIO_RELAY_WORKER_READY "
 _MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024
 _CONNECT_ATTEMPTS = 20
 _CALL_S = 120.0
-CLEAN_TIMEOUT_S = 60.0
 # How long one exec poll waits on the site for output news before answering.
 _EXEC_POLL_WAIT_S = 20.0
 _REMOTE_DIR_PATTERN = re.compile(r"^(~/)?[A-Za-z0-9_./-]+$")
@@ -770,49 +776,19 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
         """Prune over a plain ``ssh``: the worker is stopped by then, so its link is gone."""
         self._drop_connection()
+        return parse_report(await self._plain_ssh(prune_script(targets, keep), "cleaning"))
+
+    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+        """Ask the site's scheduler, over a plain ``ssh``, which of relay's jobs still run."""
+        return parse_live(await self._plain_ssh(jobs_script(known), "listing relay's jobs on"))
+
+    async def _plain_ssh(self, script: str, what: str) -> str:
+        """Run ``script`` over a plain ``ssh`` that signs in without a prompt."""
         argv = self.ssh_argv()
         argv[argv.index("BatchMode=no")] = "BatchMode=yes"
-        script = prune_script(targets, keep)
-        program = programs.resolved(argv)
-        if program is None:
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                programs.missing(argv[0]),
-                site=self.context.site_id,
-                command=argv[0],
-            )
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *program,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=os.name == "posix",
-            )
-        except OSError as exc:
-            raise Refusal(
-                RefusalReason.UNREACHABLE, f"ssh did not start: {exc}", site=self.context.site_id
-            ) from exc
-        try:
-            out, err = await asyncio.wait_for(
-                process.communicate(script.encode("utf-8")), CLEAN_TIMEOUT_S
-            )
-        except TimeoutError as exc:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            raise Refusal(
-                RefusalReason.TIMEOUT,
-                f"cleaning {self.config.ssh_profile} took over {CLEAN_TIMEOUT_S:g} s",
-                site=self.context.site_id,
-            ) from exc
-        if process.returncode != 0:
-            raise Refusal(
-                RefusalReason.NEEDS_SIGN_IN,
-                f"cleaning {self.config.ssh_profile} needs an ssh that signs in without a "
-                f"prompt (exit {process.returncode}): {err.decode('utf-8', 'replace')[-1000:]}",
-                site=self.context.site_id,
-            )
-        return parse_report(out.decode("utf-8", "replace"))
+        return await batch_ssh(
+            argv, script, f"{what} {self.config.ssh_profile}", self.context.site_id
+        )
 
     def _site_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {

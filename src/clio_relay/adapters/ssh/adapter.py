@@ -52,6 +52,7 @@ from clio_relay.adapters.ssh import pricing, scripts, signals, slurm_paths, stor
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
+from clio_relay.adapters.ssh.statuses import accounted_status, detached_status, stored_final
 from clio_relay.adapters.ssh.transport import SshTransport
 from clio_relay.jobs import psij_executors
 from clio_relay.jobs.handles import (
@@ -67,7 +68,13 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import direct_refused
-from clio_relay.site_prune import parse_report, prune_script, site_keeps
+from clio_relay.site_prune import (
+    jobs_script,
+    parse_live,
+    parse_report,
+    prune_script,
+    site_keeps,
+)
 
 if TYPE_CHECKING:
     from psij import Job
@@ -206,6 +213,22 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 exit_code=result.exit_code,
             )
         return parse_report(result.text())
+
+    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+        """Ask the site's scheduler which of relay's jobs still run."""
+        result = await self.transport.ssh(
+            jobs_script(known),
+            timeout_s=self.config.command_timeout_s,
+            what="listing relay's jobs",
+        )
+        if result.exit_code != 0:
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"listing relay's jobs on {self.config.ssh_profile} failed "
+                f"(exit {result.exit_code}): {result.error_text()[-500:] or 'no output'}",
+                site=self.context.site_id,
+            )
+        return parse_live(result.text())
 
     def ssh_argv(self) -> list[str]:
         """Return the base ``ssh`` argv (program, options, host) for ``serve``."""
@@ -676,7 +699,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 message=f"the job directory {job_dir} is gone from {self.config.ssh_profile}",
             )
         if "final" in sections:
-            status = _stored_final(sections["final"])
+            status = stored_final(sections["final"])
             status.outputs = self._outputs(handle, sections.get("outputs", []))
             return status
         last = (sections.get("last") or [""])[0].split()
@@ -684,7 +707,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if executor is not None:
             status = self._scheduler_status(executor, handle, sections, recorded)
         else:
-            status = _detached_status(sections)
+            status = detached_status(sections)
         if status.state.final:
             payload = status.model_dump_json(exclude={"outputs"}).encode()
             line = f"{status.state.value} exit {status.exit_code}"
@@ -1182,70 +1205,3 @@ def _launcher(executor: BatchSchedulerExecutor, job: Job) -> tuple[str, list[Pat
     deploy = cast(list[Path], launcher._files_to_deploy())  # pyright: ignore
     files = [deployed.parent / path.name for path in deploy]
     return deployed.parent.name, files
-
-
-_ACCOUNTED_FAILURES = (
-    "FAILED",
-    "TIMEOUT",
-    "NODE_FAIL",
-    "OUT_OF_MEMORY",
-    "BOOT_FAIL",
-    "DEADLINE",
-    "PREEMPTED",
-)
-
-
-def accounted_status(lines: list[str]) -> JobStatus | None:
-    """Read Slurm accounting (``State|ExitCode``) for a job the queue has forgotten."""
-    for line in lines:
-        state, _, code = line.strip().partition("|")
-        if not state:
-            continue
-        native = state.split()[0]
-        exit_code = _int(code.split(":", 1)[0]) if code else None
-        if native == "COMPLETED":
-            return JobStatus(
-                state=JobState.COMPLETED if exit_code in (0, None) else JobState.FAILED,
-                exit_code=exit_code,
-                native_state=native,
-            )
-        if native == "CANCELLED":
-            return JobStatus(state=JobState.CANCELLED, exit_code=exit_code, native_state=native)
-        if native in _ACCOUNTED_FAILURES:
-            return JobStatus(
-                state=JobState.FAILED,
-                exit_code=exit_code,
-                native_state=native,
-                message=f"Slurm accounting says {state.lower()}",
-            )
-        return None
-    return None
-
-
-def _stored_final(lines: list[str]) -> JobStatus:
-    text = "\n".join(lines).strip()
-    try:
-        return JobStatus.model_validate_json(text)
-    except ValueError:
-        return JobStatus(state=JobState.FAILED, native_state="final", message=text[:500] or None)
-
-
-def _detached_status(sections: dict[str, list[str]]) -> JobStatus:
-    exit_code = _int(_one(sections, "exit"))
-    cancelled = "cancel" in sections
-    if exit_code is not None:
-        if cancelled and exit_code != 0:
-            return JobStatus(state=JobState.CANCELLED, exit_code=exit_code, native_state="exited")
-        state = JobState.COMPLETED if exit_code == 0 else JobState.FAILED
-        return JobStatus(state=state, exit_code=exit_code, native_state="exited")
-    if "alive" in sections:
-        if "started" in sections:
-            return JobStatus(state=JobState.RUNNING, native_state="running")
-        return JobStatus(state=JobState.QUEUED, native_state="starting")
-    if cancelled:
-        return JobStatus(state=JobState.CANCELLED, native_state="gone")
-    return JobStatus(
-        state=JobState.FAILED,
-        native_state="lost",
-        message="the supervisor is gone without an exit code; the host may have restarted",
-    )

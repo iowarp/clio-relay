@@ -230,6 +230,29 @@ def shutdown(
 
 
 @app.command()
+def cancel(
+    operation: Annotated[str, typer.Argument(help="The operation id run or serve returned")],
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+) -> None:
+    """Cancel a job from run, or stop a service from serve, the way the cancel tool does."""
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return service.view(await service.cancel(operation))
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@app.command()
 def adapters() -> None:
     """List installed adapters and their verbs."""
     found: dict[str, Any] = {}

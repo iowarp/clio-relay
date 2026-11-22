@@ -28,7 +28,10 @@ A `serve` task completes as soon as the service is ready: JARVIS reports the
 service running and relay's forward answers. A client that polls is woken by a
 status change, not by a new status message, so the ready service is the task's
 result: the operation `running`, `result.endpoint` with each port's `address`,
-and `result.ready_at`. The service keeps running after that, until
+and `result.ready_at`. A poll does not wait behind relay's own look at the
+site: while relay brings the service up, it answers with the latest state it
+saw, so the task completes within seconds of the service being ready, not a
+whole check later. The service keeps running after that, until
 `cancel(operation=<task id>)`, `serve(stop=<task id>)`, `tasks/cancel` or its
 job's end;
 `describe(job=<task id>)` and `serve(service=<task id>)` follow it. Questions

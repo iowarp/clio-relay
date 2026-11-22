@@ -2,13 +2,17 @@
 
 Adapters that implement :class:`~clio_relay.adapters.base.CleansSite` send
 :func:`prune_script` over their own connection and read it back with
-:func:`parse_report`.
+:func:`parse_report`. Before anything goes, the site's scheduler is asked for the
+person's live jobs that are relay's (:func:`jobs_script`): the site, not relay's
+local records, says what still runs, so a job whose record ended early, or that
+another relay started, still stops the clean.
 """
 
 from __future__ import annotations
 
 import posixpath
 import shlex
+from typing import Any
 
 from clio_relay.jarvis_submit import (
     BOOTSTRAP_DIR,
@@ -20,6 +24,8 @@ from clio_relay.jarvis_submit import (
 
 DECISIONS_TAIL = posixpath.join(BOOTSTRAP_DIR, SITE_DIR, DECISIONS_FILE)
 """Where JARVIS records the person's install answers, under a site home."""
+JOB_PREFIX = "relay-"
+"""The scheduler job names relay's adapters give an operation's job."""
 
 
 def spack_keeps(home: str) -> list[str]:
@@ -50,14 +56,75 @@ def kept(keep: list[str], *, spack: bool = True, decisions: bool = True) -> list
     )
 
 
+def _jobs_bash(known: list[str]) -> str:
+    """Bash that prints ``live<TAB>id|name|state`` for each of relay's live jobs.
+
+    A job is relay's when its name starts with :data:`JOB_PREFIX` or its id is in
+    ``known`` (jobs JARVIS named, such as an install). Slurm, LSF, Flux and PBS
+    are asked, whichever the site has; a site with none has no jobs to wait for.
+    """
+    ids = " ".join(
+        item for item in known if item and all(c.isalnum() or c in "._-[]" for c in item)
+    )
+    return f"""relay_known=' {ids} '
+relay_user=$(id -un)
+relay_listed() {{
+  if command -v squeue >/dev/null 2>&1; then
+    squeue -h -u "$relay_user" -o '%i|%j|%T' 2>/dev/null
+  elif command -v bjobs >/dev/null 2>&1; then
+    bjobs -noheader -o 'jobid job_name stat delimiter="|"' 2>/dev/null
+  elif command -v flux >/dev/null 2>&1; then
+    flux jobs -n -o '{{id}}|{{name}}|{{status}}' 2>/dev/null
+  elif command -v qstat >/dev/null 2>&1; then
+    qstat -w -u "$relay_user" 2>/dev/null | awk 'NF>=10 && $1 ~ /^[0-9]/ {{print $1"|"$4"|"$10}}'
+  fi
+}}
+relay_live() {{
+  while IFS='|' read -r id name state; do
+    [ -n "$id" ] || continue
+    case $name in
+      {JOB_PREFIX}*) ;;
+      *) case $relay_known in *" $id "*) ;; *) continue ;; esac ;;
+    esac
+    printf 'live\t%s|%s|%s\n' "$id" "$name" "$state"
+  done
+}}
+relay_running=$(relay_listed | relay_live)
+"""
+
+
+def jobs_script(known: list[str] | None = None) -> str:
+    """Return the shell command that lists relay's live jobs on a site; read it with
+    :func:`parse_live`. ``known`` adds native job ids from relay's own records."""
+    script = (
+        _jobs_bash(list(known or []))
+        + '[ -n "$relay_running" ] && printf \'%s\\n\' "$relay_running"\nexit 0\n'
+    )
+    return shlex.join(["bash", "-c", script, "clio-relay-jobs"])
+
+
+def parse_live(text: str) -> list[dict[str, str]]:
+    """Read :func:`jobs_script`'s (or a refused prune's) ``live`` lines."""
+    found: list[dict[str, str]] = []
+    for line in text.splitlines():
+        word, sep, rest = line.partition("\t")
+        if sep and word == "live":
+            native_id, _, tail = rest.partition("|")
+            name, _, state = tail.partition("|")
+            found.append({"native_id": native_id, "name": name, "state": state})
+    return found
+
+
 def prune_script(targets: list[str], keep: list[str]) -> str:
     """Return the shell command that removes ``targets`` on a site, sparing ``keep``.
 
     A path is absolute, ``~`` or ``~/...``, or relative to the home directory.
     ``keep`` entries may hold ``*`` globs. It never removes the home directory, ``/``
     or an ancestor of the home, and prints ``removed``, ``kept``, ``absent`` or
-    ``refused`` and a path on each line. The prune itself is bash, so the command
-    is ``bash -c <prune>``: it runs the same under ``sh`` (dash) or a login shell.
+    ``refused`` and a path on each line. While one of relay's jobs still runs on
+    the site it removes nothing and prints a ``live`` line for each instead. The
+    prune itself is bash, so the command is ``bash -c <prune>``: it runs the same
+    under ``sh`` (dash) or a login shell.
     """
     return shlex.join(["bash", "-c", _prune_bash(targets, keep), "clio-relay-prune"])
 
@@ -65,6 +132,14 @@ def prune_script(targets: list[str], keep: list[str]) -> str:
 def _prune_bash(targets: list[str], keep: list[str]) -> str:
     quoted_targets = " ".join(shlex.quote(item) for item in targets)
     quoted_keep = " ".join(shlex.quote(item) for item in keep)
+    return (
+        _jobs_bash([])
+        + 'if [ -n "$relay_running" ]; then printf \'%s\\n\' "$relay_running"; exit 0; fi\n'
+        + _prune_body(quoted_targets, quoted_keep)
+    )
+
+
+def _prune_body(quoted_targets: str, quoted_keep: str) -> str:
     return f"""set -u
 shopt -s nullglob dotglob
 IFS=$'\\n'
@@ -132,11 +207,17 @@ exit 0
 """
 
 
-def parse_report(text: str) -> dict[str, list[str]]:
-    """Read the script's lines into ``removed``, ``kept``, ``absent`` and ``refused``."""
-    report: dict[str, list[str]] = {"removed": [], "kept": [], "absent": [], "refused": []}
+def parse_report(text: str) -> dict[str, Any]:
+    """Read the script's lines into ``removed``, ``kept``, ``absent`` and ``refused``.
+
+    A prune that found relay's jobs still running also has ``live``.
+    """
+    report: dict[str, Any] = {"removed": [], "kept": [], "absent": [], "refused": []}
     for line in text.splitlines():
         word, sep, path = line.partition("\t")
         if sep and word in report and path not in report[word]:
             report[word].append(path)
+    live = parse_live(text)
+    if live:
+        report["live"] = live
     return report

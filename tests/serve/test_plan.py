@@ -17,6 +17,7 @@ from clio_relay.serve.plan import (
     plan_ports,
     ports_file,
     runtime_endpoints,
+    runtime_ready_host,
     secrets_file,
     service_name,
     site_files,
@@ -123,6 +124,52 @@ def test_ports_match_the_reporting_package_by_name_and_stay_when_ambiguous(
     assert [port.remote_port for port in plan.ports] == [0, 0]
     assert adopt_ports(plan, [("a", 1), ("y", 2)]) is True
     assert [port.remote_port for port in plan.ports] == [1, 2]
+
+
+def test_the_ready_host_is_the_node_jarvis_saw_every_port_ready_on(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path)
+    plan.ports = plan_ports(service(ports=[{"name": "paraview"}]), adopt=True)
+    ready = {
+        "service_endpoints": [
+            {
+                "name": "pv",
+                "source": "progress_ready",
+                "port": 48385,
+                "host": "0.0.0.0",
+                "node": "ares-comp-03",
+            },
+        ]
+    }
+    assert runtime_ready_host(ready, plan) is None
+    adopt_ports(plan, runtime_endpoints(ready))
+    assert runtime_ready_host(ready, plan) == "ares-comp-03"
+    stopped = {
+        "service_endpoints": [
+            {
+                "source": "service_runtime",
+                "package_id": "pv",
+                "lifecycle": "stopped",
+                "port": 48385,
+                "host": "ares-comp-03",
+            },
+        ]
+    }
+    assert runtime_ready_host(stopped, plan) is None
+    assert runtime_ready_host(None, plan) is None
+
+
+def test_ports_ready_on_two_nodes_name_no_host(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path)
+    plan.ports = plan_ports(service(ports=[{"name": "a", "port": 1}, {"name": "b", "port": 2}]))
+    split = {
+        "service_endpoints": [
+            {"name": "a", "source": "progress_ready", "port": 1, "host": "c1"},
+            {"name": "b", "source": "progress_ready", "port": 2, "host": "c2"},
+        ]
+    }
+    assert runtime_ready_host(split, plan) is None
+    split["service_endpoints"][1]["host"] = "c1"
+    assert runtime_ready_host(split, plan) == "c1"
 
 
 @pytest.mark.parametrize(

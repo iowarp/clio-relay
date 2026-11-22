@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
@@ -73,7 +73,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
         if name in state.installed:
             return _report(True, [])
         issues = state.issues.get(name, [_issue()])
-        raise jarvis_submit.install_needed(_report(False, issues), site="fx")
+        raise jarvis_report.install_needed(_report(False, issues), site="fx")
 
     async def install(
         self: FixtureAdapter, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]

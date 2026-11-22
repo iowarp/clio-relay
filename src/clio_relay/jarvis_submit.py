@@ -153,6 +153,11 @@ EXIT_NO_JARVIS = 69
 EXIT_REFUSED = 5
 """JARVIS refused with a ``jarvis.refusal.v1`` document of typed issues (``ppl check``,
 ``execution move``)."""
+EXIT_INSTALLED = 7
+"""A ``recheck`` found the software all there once the answers applied: nothing to build."""
+RECHECK = "clio_relay_recheck"
+"""The key in :func:`install_command`'s answers that makes it a ``recheck``: JARVIS checks
+the software again with the person's answers, and nothing is built."""
 
 REFUSAL_SCHEMA = "jarvis.refusal.v1"
 CHECK_SCHEMA = "jarvis.pipeline-check.v1"
@@ -669,8 +674,8 @@ shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
-case $mode in submit|run|install|check) ;;
-  *) fail 64 "mode $mode is not submit, run, install or check" ;;
+case $mode in submit|run|install|check|recheck) ;;
+  *) fail 64 "mode $mode is not submit, run, install, check or recheck" ;;
 esac
 printf '%s\n' "$steps" | tr , '\n' \
   | grep -Evq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+@[0-9a-f]{64}$' \
@@ -684,8 +689,8 @@ elif [ "$mode" != run ]; then
 fi
 pipeline="$job/relay.pipeline.yaml"
 answers="$job/relay.answers.json"
-if [ "$mode" = install ]; then
-  [ $# -ge 1 ] || fail 64 "an install needs the answers"
+if [ "$mode" = install ] || [ "$mode" = recheck ]; then
+  [ $# -ge 1 ] || fail 64 "an $mode needs the answers"
   printf '%s\n' "$1" > "$answers.tmp" && mv -f "$answers.tmp" "$answers"
   shift
   [ $# -eq 0 ] || pipeline="$job/relay.install-pipeline.yaml"
@@ -813,9 +818,10 @@ report() {
   mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
   [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
   [ "$mode" != check ] || exit "$rc"
+  [ "$mode" != recheck ] || [ "$rc" -ne 0 ] || exit 7
   exit 3
 }
-[ "$mode" != check ] || report
+[ "$mode" != check ] && [ "$mode" != recheck ] || report
 if [ "$mode" = run ]; then
   "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
   exit 0
@@ -905,7 +911,11 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was;
 - ``run`` runs ``ppl run`` in place;
 - ``check`` runs only ``ppl install +check``, for an install ahead of any run: it
-  exits 0 with the report when the software is all there, else 3 as below.
+  exits 0 with the report when the software is all there, else 3 as below;
+- ``recheck`` keeps the answers as ``install`` does, then runs only
+  ``ppl install +check`` with them, for a round that only answered JARVIS's
+  questions: it exits 7 with the report when the software is all there (nothing
+  to build), else 3 as below.
 
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
@@ -918,7 +928,7 @@ allocation) passes through unchanged; relay reports it with
 ``relay.exitcode``.
 """
 
-SiteMode = Literal["submit", "run", "install", "check"]
+SiteMode = Literal["submit", "run", "install", "check", "recheck"]
 
 
 def steps_argument(spec: JobSpec) -> str:
@@ -937,12 +947,12 @@ def site_arguments(
 ) -> list[str]:
     """Return the site script's arguments after ``$0``.
 
-    ``answers`` is for ``install`` only. ``pipeline`` is the YAML text, for an
-    adapter that cannot place ``relay.pipeline.yaml`` in the job directory
-    itself.
+    ``answers`` is for ``install`` and ``recheck`` only. ``pipeline`` is the YAML
+    text, for an adapter that cannot place ``relay.pipeline.yaml`` in the job
+    directory itself.
     """
     arguments = [mode, jarvis, execution, steps_argument(spec)]
-    if mode == "install":
+    if mode in ("install", "recheck"):
         arguments.append(json.dumps(dict(answers or {}), sort_keys=True, separators=(",", ":")))
     return arguments if pipeline is None else [*arguments, pipeline]
 
@@ -1036,14 +1046,19 @@ def install_command(
     in the operation's pipeline; ``home`` is as in :func:`submit_command`. ``pipeline``
     is the YAML of :func:`install_pipeline`, which the site script keeps as
     :data:`INSTALL_PIPELINE_FILE`; without it the install builds with the run's.
+
+    Answers with :data:`RECHECK` set make it a ``recheck`` instead: JARVIS checks
+    the run's pipeline again with the answers, submits nothing, and the site
+    script exits :data:`EXIT_INSTALLED` when nothing is left to build.
     """
+    recheck = bool(answers.get(RECHECK))
     arguments = site_arguments(
         spec,
-        mode="install",
+        mode="recheck" if recheck else "install",
         jarvis=jarvis,
         execution=install_execution_id(operation_id),
-        answers=answers,
-        pipeline=pipeline,
+        answers={key: value for key, value in answers.items() if key != RECHECK},
+        pipeline=None if recheck else pipeline,
     )
     return _site_command(spec, arguments, script=script, home=home)
 
@@ -1674,208 +1689,3 @@ def execution_failed(verb: str, text: str) -> Refusal:
         f"jarvis execution {verb} did not end the job: {tail}",
         needs=f"jarvis execution {verb}",
     )
-
-
-# Installing the package's software
-
-
-def parse_install_report(text: str) -> dict[str, Any] | None:
-    """Return the last ``jarvis.install-report.v1`` line in ``text``."""
-    return parse_document(text, INSTALL_REPORT_SCHEMA)
-
-
-def report_digest(report: Mapping[str, Any]) -> str:
-    """Return the sha256 of an install report's installers and issues.
-
-    Paths and the mode are left out, so the digest binds what the person approves.
-    """
-    bound = {"installers": report.get("installers"), "issues": report.get("issues")}
-    text = json.dumps(bound, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def _issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
-    found = report.get("issues")
-    if not isinstance(found, list):
-        return []
-    return [_dict(item) for item in cast(list[object], found) if _dict(item)]
-
-
-def choice_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return the issues the person answers by picking one of JARVIS's candidates."""
-    return [
-        issue
-        for issue in _issues(report)
-        if issue.get("answerable")
-        and isinstance(issue.get("candidates"), list)
-        and issue["candidates"]
-    ]
-
-
-def blocking_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return the issues no answer fixes: no recipe, or answerable with no candidates.
-
-    ``not_installed`` is not blocking: the install itself fixes it.
-    """
-    blocking: list[dict[str, Any]] = []
-    for issue in _issues(report):
-        if issue.get("kind") == "not_installed":
-            continue
-        if issue in choice_issues(report):
-            continue
-        blocking.append(issue)
-    return blocking
-
-
-def install_summary(
-    report: Mapping[str, Any], names: Mapping[str, str] | None = None
-) -> dict[str, Any]:
-    """Return what the install reuses and what it builds, per package.
-
-    ``reuse`` names the packages the site already has; ``build`` lists the others,
-    with the spec and how many of its dependencies are missing. JARVIS reports a
-    package by its pipeline step (``pkg_name``); ``names`` (:func:`package_names`)
-    turns that back into the package.
-    """
-    names = names or {}
-    reuse: list[str] = []
-    build: list[dict[str, Any]] = []
-    for method, installer in _dict(report.get("installers")).items():
-        for step, package in _dict(_dict(installer).get("packages")).items():
-            name = names.get(step, step)
-            entry = _dict(package)
-            if entry.get("status") == "satisfied":
-                reuse.append(name)
-                continue
-            missing = entry.get("missing")
-            count = len(cast(list[object], missing)) if isinstance(missing, list) else None
-            build.append(
-                {
-                    "package": name,
-                    "method": method,
-                    "status": entry.get("status"),
-                    "spec": entry.get("spec"),
-                    "missing": count,
-                }
-            )
-    return {"reuse": sorted(reuse), "build": build, "issues": len(_issues(report))}
-
-
-def applied_decisions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Return the decisions JARVIS applied from its own record, not from this round's answers.
-
-    JARVIS replays what the person chose before (``source: decisions_file``)
-    while it is still one of its candidates; relay keeps no copy of its own.
-    """
-    found = report.get("applied_decisions")
-    listed = cast(list[Any], found) if isinstance(found, list) else []
-    return [
-        item
-        for item in (_dict(raw) for raw in listed)
-        if item.get("source") == "decisions_file" and item.get("constraint")
-    ]
-
-
-def choice_options(issue: Mapping[str, Any]) -> list[str]:
-    """Return an issue's candidate constraints, in JARVIS's order."""
-    options: list[str] = []
-    for candidate in cast(list[object], issue.get("candidates") or []):
-        constraint = _dict(candidate).get("constraint")
-        if isinstance(constraint, str) and constraint and constraint not in options:
-            options.append(constraint)
-    return options
-
-
-def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
-    constraint = candidate.get("constraint")
-    if not isinstance(constraint, str) or not constraint:
-        return None
-    facts: list[str] = []
-    source = candidate.get("source")
-    if isinstance(source, str) and source:
-        facts.append(source)
-    modules = candidate.get("modules")
-    if isinstance(modules, list) and modules:
-        facts.append("modules " + ", ".join(str(item) for item in cast(list[object], modules)))
-    version = candidate.get("version")
-    if isinstance(version, str) and version:
-        facts.append(version)
-    prefix = candidate.get("prefix")
-    if isinstance(prefix, str) and prefix:
-        facts.append(prefix)
-    implies = candidate.get("implies")
-    if isinstance(implies, str) and implies:
-        facts.append(implies)
-    return f"{constraint} ({'; '.join(facts)})" if facts else constraint
-
-
-def choice_message(issue: Mapping[str, Any]) -> str:
-    """Return the question to ask for one of JARVIS's answerable issues.
-
-    Each candidate is listed with where it comes from, its prefix and its modules
-    (an ``ambiguous_provider`` MPI that is a site module carries ``modules``).
-    """
-    question = issue.get("question")
-    subject = issue.get("package") or issue.get("subject") or "the package"
-    text = (
-        question
-        if isinstance(question, str) and question
-        else f"JARVIS needs a choice for {subject}: pick one"
-    )
-    lines = [
-        line
-        for candidate in cast(list[object], issue.get("candidates") or [])
-        if (line := _candidate_line(_dict(candidate)))
-    ]
-    previous = _dict(issue.get("previous_answer"))
-    if previous.get("constraint"):
-        text = (
-            f"{text} The earlier answer, {previous['constraint']}, no longer matches "
-            "what JARVIS finds, so it asks again."
-        )
-    if issue.get("scope") == "site":
-        text = f"{text} JARVIS records the answer for the site's later installs."
-    return f"{text} Options: {'. '.join(lines)}." if lines else text
-
-
-def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None = None) -> Refusal:
-    """The refusal for a submit that exited 3: the software is missing or needs a choice.
-
-    ``walltime`` is the install job's (:func:`install_walltime`), for the ask.
-    """
-    summary = install_summary(report)
-    message = (
-        f"the package's software is not installed on {site}: JARVIS builds "
-        f"{len(summary['build'])} package(s) once you approve"
-    )
-    if not summary["build"] and choice_issues(report):
-        kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})
-        message = f"JARVIS needs a choice on {site} before the run ({', '.join(kinds)})"
-    extra: dict[str, Any] = {"install_walltime": walltime} if walltime else {}
-    return Refusal(
-        RefusalReason.NEEDS_APPROVAL,
-        message,
-        needs=NEEDS_INSTALL,
-        install_report=dict(report),
-        summary=summary,
-        **extra,
-    )
-
-
-def install_blocked(issues: list[dict[str, Any]], *, site: str) -> Refusal:
-    """The refusal when JARVIS reports an install issue no answer can fix."""
-    first = issues[0]
-    detail = first.get("detail") or first.get("question") or first.get("kind")
-    hint = first.get("hint")
-    message = f"JARVIS cannot install the package's software on {site}: {detail}"
-    if isinstance(hint, str) and hint:
-        message = f"{message}. {hint}"
-    return Refusal(RefusalReason.SUBMIT_FAILED, message, issues=issues, needs=NEEDS_INSTALL)
-
-
-def answers_document(choices: Mapping[str, tuple[str, str]]) -> dict[str, Any]:
-    """Return JARVIS's answers file from ``{issue_id: (constraint, ask_id)}``."""
-    return {
-        issue_id: {"constraint": constraint, "answered_by": "person", "ask_id": ask_id}
-        for issue_id, (constraint, ask_id) in choices.items()
-    }

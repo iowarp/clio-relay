@@ -19,7 +19,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
-from clio_relay import jarvis_submit, site_facts
+from clio_relay import jarvis_report, jarvis_submit, site_facts
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 EXIT_INSTALL_FAILED = 6
@@ -131,7 +131,7 @@ def asks_again(issues: list[dict[str, Any]], *, site: str) -> Refusal:
     """The install refusal for failures the person answers; relay asks, then installs again."""
     failed = install_failed(issues, site=site)
     report: dict[str, Any] = {"issues": issues, "installers": {}}
-    refusal = jarvis_submit.install_needed(report, site=site)
+    refusal = jarvis_report.install_needed(report, site=site)
     refusal.data["ask_message"] = (
         f"{failed.message}. JARVIS asks {len(issues)} question(s) about it; with your "
         "answers it runs the install job again. Go ahead?"
@@ -146,14 +146,14 @@ def from_issues(issues: list[dict[str, Any]], *, site: str, **extra: Any) -> Ref
     if not failed:
         return None
     report = {"issues": failed}
-    if jarvis_submit.choice_issues(report) and not jarvis_submit.blocking_issues(report):
+    if jarvis_report.choice_issues(report) and not jarvis_report.blocking_issues(report):
         return asks_again(failed, site=site)
     return install_failed(failed, site=site, **extra)
 
 
 def refusal(text: str, *, site: str) -> Refusal:
     """The refusal for a ``ppl install`` or ``ppl submit`` that exited 6."""
-    report = jarvis_submit.parse_install_report(text) or {}
+    report = jarvis_report.parse_install_report(text) or {}
     named = {str(item) for item in cast(list[object], report.get("failures") or [])}
     issues = [
         issue

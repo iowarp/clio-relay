@@ -21,7 +21,7 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationRecord, OperationState
@@ -107,7 +107,7 @@ async def check(
         if not record.state.final:
             record.result = {
                 **(record.result or {}),
-                "installed": jarvis_submit.install_summary(report, names),
+                "installed": jarvis_report.install_summary(report, names),
                 "message": message,
             }
             service.operations.put(operation_id, record)

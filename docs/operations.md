@@ -115,15 +115,35 @@ compiler), facts about the cluster you confirmed, so the next install does not
 ask them again. Pass `--remove-spack` to delete the Spack store too,
 `--forget-decisions` to delete the answers, and `--yes` to approve on the
 command line. To forget one answer rather than all of them, use JARVIS's
-`jarvis ppl install --forget <selector>` on the site. It refuses while a job of the site
-still runs. The next call signs in and deploys everything again. Every live
-proof starts with it, so deployment is tested each time.
+`jarvis ppl install --forget <selector>` on the site. The next call signs in
+and deploys everything again. Every live proof starts with it, so deployment is
+tested each time.
+
+Clean removes nothing while one of relay's jobs still runs on the site, since
+its directory is among what goes. It does not trust relay's records alone: it
+asks the site's scheduler (`squeue`, `bjobs`, `flux jobs` or `qstat`) for your
+jobs named `relay-...` and the job ids relay's records hold in any state, so a
+job whose operation already ended, or that another relay started, still counts,
+and the prune on the site checks once more before it deletes. The refusal
+names each job, its operation and its state. Cancel them first, then clean
+again:
+
+```bash
+clio-relay cancel op_3f9c... +json
+```
+
+`cancel` does what the `cancel` tool does: it cancels a job from `run` or stops
+a service from `serve`, withdraws the questions still pending on it, and prints
+the operation as it ends. On an operation that already ended whose job the
+scheduler still lists, it cancels that job and notes it in the operation's
+history.
 
 Over MCP the `site_clean` tool does the same, keeping the Spack store and the
 answers; its `forget_decisions` argument deletes the answers. It asks
 the person on every call, open site or guarded, with a question bound to what
 it will remove; once the person says yes, the same call, or the next one with
-the same site, cleans. It refuses while a job of the site still runs.
+the same site, cleans. It refuses while one of relay's jobs still runs, the
+same way.
 
 ## Stage and remove packages
 

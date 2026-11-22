@@ -3,7 +3,7 @@
 A package job's submit runs ``jarvis ppl submit`` with ``JARVIS_INSTALL_ON_LOAD=check``.
 When the site lacks the software, JARVIS exits 3 before anything reaches the
 scheduler and prints its install report; the adapter raises that as
-:func:`~clio_relay.jarvis_submit.install_needed`. When the site has no JARVIS
+:func:`~clio_relay.jarvis_report.install_needed`. When the site has no JARVIS
 at all, the adapter raises :func:`~clio_relay.jarvis_submit.missing_jarvis`.
 
 Either refusal turns the operation back into asks instead of a failure:
@@ -13,7 +13,11 @@ Either refusal turns the operation back into asks instead of a failure:
   fix fails the operation. Once all are answered, relay submits
   ``jarvis ppl install +submit`` with the answers, follows the install job
   (its ``metadata.install`` progress and the end of ``install/install.log``)
-  for as long as it takes, then submits the run again;
+  for as long as it takes, then submits the run again. When JARVIS names
+  nothing to build, only questions (a package it cannot resolve until one is
+  answered), relay asks only the questions and no approval: JARVIS checks again
+  with the answers (``recheck``), and the run goes ahead when the software is
+  all there, or relay asks to install what that check finds missing;
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
   in the site's CLIO home and submits the run again. The approval is
   site-scoped: operations that find the site without JARVIS at the same time
@@ -35,7 +39,7 @@ JARVIS records each answer in the site's decisions file
 install, of any package, while it is still one of its candidates; it asks again,
 with the earlier answer, when it no longer is. Relay keeps no store of its own:
 it asks only the issues JARVIS leaves open, and the install approval names the
-decisions JARVIS applies (:func:`~clio_relay.jarvis_submit.applied_decisions`).
+decisions JARVIS applies (:func:`~clio_relay.jarvis_report.applied_decisions`).
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ import posixpath
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from clio_relay import install_failures, install_wording, jarvis_submit
+from clio_relay import install_failures, install_wording, jarvis_report, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import approval_covers as approval_covers
@@ -69,7 +73,7 @@ logger = logging.getLogger(__name__)
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
 LOG_TAIL_BYTES = 4096
-MAX_ROUNDS = 3
+MAX_ROUNDS = 4
 """How many installs one operation may go through before relay stops asking."""
 
 START_GRACE = timedelta(hours=6)
@@ -152,37 +156,40 @@ async def ask_install(
     asks: list[Ask] = []
     if kind == "software":
         report = cast(dict[str, Any], refusal.data["install_report"])
-        blocking = jarvis_submit.blocking_issues(report)
+        blocking = jarvis_report.blocking_issues(report)
         if blocking:
             return service.finish(
                 operation_id,
                 OperationState.FAILED,
-                jarvis_submit.install_blocked(blocking, site=site.title),
+                jarvis_report.install_blocked(blocking, site=site.title),
             )
         names = jarvis_submit.package_names(job_of(record).steps())
-        state["summary"] = jarvis_submit.install_summary(report, names)
-        state["report_digest"] = jarvis_submit.report_digest(report)
-        to_ask = jarvis_submit.choice_issues(report)
-        asks.append(
-            await provider.approve(
-                site=site,
-                operation_id=operation_id,
-                message=cast(str | None, refusal.data.get("ask_message"))
-                or install_wording.install_message(
-                    report,
-                    site=site.title,
-                    package=_what(job_of(record)),
-                    names=names,
-                    walltime=cast(str | None, refusal.data.get("install_walltime")),
-                    run=record.kind != "install",
-                ),
-                binding={
-                    **binding,
-                    "kind": SOFTWARE_KIND,
-                    "report_digest": state["report_digest"],
-                },
+        state["summary"] = jarvis_report.install_summary(report, names)
+        state["report_digest"] = jarvis_report.report_digest(report)
+        to_ask = jarvis_report.choice_issues(report)
+        if to_ask and not jarvis_report.software_missing(report):
+            state["recheck"] = True
+        else:
+            asks.append(
+                await provider.approve(
+                    site=site,
+                    operation_id=operation_id,
+                    message=cast(str | None, refusal.data.get("ask_message"))
+                    or install_wording.install_message(
+                        report,
+                        site=site.title,
+                        package=_what(job_of(record)),
+                        names=names,
+                        walltime=cast(str | None, refusal.data.get("install_walltime")),
+                        run=record.kind != "install",
+                    ),
+                    binding={
+                        **binding,
+                        "kind": SOFTWARE_KIND,
+                        "report_digest": state["report_digest"],
+                    },
+                )
             )
-        )
         choices: dict[str, str] = {}
         with service.asks.locked(site_lock_id(site.id)):
             for issue in to_ask:
@@ -238,7 +245,7 @@ def _answers(service: RelayService, state: dict[str, Any]) -> dict[str, Any]:
         value = content.get(CHOICE_FIELD)
         if isinstance(value, str) and value:
             picked[issue_id] = (value, ask_id)
-    return jarvis_submit.answers_document(picked)
+    return jarvis_report.answers_document(picked)
 
 
 def _update(service: RelayService, operation_id: str, **changes: Any) -> OperationRecord:
@@ -265,10 +272,13 @@ async def start_install(
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
-        handle = await adapter.install(
-            job, operation_id=operation_id, answers=_answers(service, state)
-        )
+        answers = _answers(service, state)
+        if state.get("recheck"):
+            answers[jarvis_submit.RECHECK] = True
+        handle = await adapter.install(job, operation_id=operation_id, answers=answers)
     except Refusal as refusal:
+        if jarvis_report.is_installed(refusal):
+            return await _installed(service, operation_id, site, refusal)
         if install_kind(refusal) is not None:
             return await ask_install(service, operation_id, site, refusal)
         return service.finish(operation_id, OperationState.FAILED, refusal)
@@ -295,6 +305,28 @@ async def start_install(
     if cancelled:
         await adapter.cancel(handle)
     return record
+
+
+async def _installed(
+    service: RelayService, operation_id: str, site: SiteEntry, refusal: Refusal
+) -> OperationRecord:
+    """Go ahead after a ``recheck`` found the software all there: nothing is built."""
+    record = service.operation(operation_id)
+    if record.kind != "install":
+        return await _resubmit(service, operation_id, refusal.message)
+    report = cast(dict[str, Any], refusal.data.get("install_report") or {})
+    names = jarvis_submit.package_names(job_of(record).steps())
+    with service.operations.locked(operation_id):
+        record = service.operation(operation_id)
+        if not record.state.final:
+            record.result = {
+                **(record.result or {}),
+                "installed": jarvis_report.install_summary(report, names),
+                "message": f"the software of {_what(job_of(record))} is installed on "
+                f"{site.title}; nothing ran",
+            }
+            service.operations.put(operation_id, record)
+    return service.finish(operation_id, OperationState.COMPLETED, None)
 
 
 async def _resubmit(service: RelayService, operation_id: str, note: str) -> OperationRecord:

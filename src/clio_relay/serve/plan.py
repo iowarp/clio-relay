@@ -245,6 +245,42 @@ def runtime_endpoints(document: dict[str, Any] | None) -> list[tuple[str, int]]:
     return found
 
 
+_LOCAL_HOSTS = frozenset({"", "0.0.0.0", "::", "*", "127.0.0.1", "::1", "localhost"})
+
+
+def runtime_ready_host(document: dict[str, Any] | None, plan: ServePlan) -> str | None:
+    """Return the node JARVIS saw every one of the plan's ports ready on, if it did.
+
+    A package's ready event says it listens, so an ssh forward can go to it
+    without waiting for relay's connector to see the port. Ports on different
+    nodes, or an entry naming no node, give ``None``.
+    """
+    if not document or not plan.ports:
+        return None
+    items: object = document.get("service_endpoints")
+    if not isinstance(items, list):
+        return None
+    hosts: dict[int, str] = {}
+    for item in cast(list[object], items):
+        if not isinstance(item, dict):
+            continue
+        entry = cast(dict[str, Any], item)
+        port = entry.get("port")
+        if not _real_port(port):
+            continue
+        if entry.get("source") == "service_runtime" and entry.get("lifecycle") not in _REACHABLE:
+            continue
+        host = str(entry.get("host") or "")
+        if host in _LOCAL_HOSTS:
+            host = str(entry.get("node") or "")
+        if host and host not in _LOCAL_HOSTS:
+            hosts[cast(int, port)] = host
+    found = {hosts.get(port.remote_port) for port in plan.ports}
+    if len(found) != 1 or None in found:
+        return None
+    return found.pop()
+
+
 def _real_port(port: object) -> bool:
     return isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536
 

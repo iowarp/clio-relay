@@ -41,6 +41,9 @@ flowchart LR
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
    `install` (`surface/install_tool.py`, `surface/install_op.py`) is a run's
    install task on its own, and a task too: it asks JARVIS `ppl install +check`,
+   asks only JARVIS's questions when that is all `+check` reports, then checks
+   again with the answers (the site script's `recheck` mode: exit 7 when
+   everything is installed, so nothing is asked or built),
    takes the run's install path when software is missing (the same asks, then
    `ppl install +submit` as a job on the compute nodes), installs relay's
    jarvis-cd first when the site lacks it, and launches nothing. Operations

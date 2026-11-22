@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import logging
 import shlex
@@ -47,6 +46,7 @@ from clio_relay.serve.plan import (
     plan_ports,
     ports_file,
     runtime_endpoints,
+    runtime_ready_host,
     service_name,
     site_file,
     site_files,
@@ -67,6 +67,15 @@ from clio_relay.serve.report import (
     redact,
     times,
 )
+from clio_relay.serve.runtime_util import (
+    HOST_KEYS_SH,
+    maybe,
+    safe_name,
+    scheduler_job_name,
+    site_id_of,
+    state_dir_of,
+    tunnel_entry,
+)
 from clio_relay.serve.store import PlanStore
 
 logger = logging.getLogger(__name__)
@@ -77,23 +86,10 @@ EXEC_OUTPUT = 65536
 STOP_MARGIN_S = 30.0
 CANCEL_RETRY_S = 60.0
 FOLLOW_FIRST_S = 1.0
-FOLLOW_MAX_S = 10.0
-HOST_KEYS_SH = (
-    'for f in /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2 "$HOME/.ssh/known_hosts"; '
-    'do [ -r "$f" ] && ssh-keygen -F "$1" -f "$f"; done; exit 0'
-)
-"""Print a host's lines from the site's known_hosts files; ``$1`` is the host."""
-
+FOLLOW_MAX_S = 5.0
+FRESH_S = 60.0
+"""How old the follower's latest look may be for a status call to answer with it."""
 _runtime: ServeRuntime | None = None
-
-
-def _safe_name(text: str) -> str:
-    return "".join(char if char.isalnum() or char in "._-" else "_" for char in text) or "site"
-
-
-def _scheduler_job_name(operation_id: str) -> str:
-    """The batch job name relay's adapters give an operation; the hop finds a queued job by it."""
-    return f"relay-{operation_id}"
 
 
 def factory(context: Any) -> ServeRuntime:
@@ -112,37 +108,12 @@ def current() -> ServeRuntime | None:
     return _runtime
 
 
-def _state_dir_of(adapter: Any) -> Path:
-    state_dir = Path(adapter.context.state_dir)
-    if state_dir.parent.parent.name == "sites":
-        return state_dir.parent.parent.parent
-    return state_dir
-
-
 async def start_for(adapter: Any, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
     """Start ``spec`` as a job on ``adapter``'s site. An adapter's ``serve`` calls this."""
     global _runtime
     if _runtime is None:
-        _runtime = ServeRuntime(_state_dir_of(adapter))
+        _runtime = ServeRuntime(state_dir_of(adapter))
     return await _runtime.start_for(adapter, spec, operation_id=operation_id)
-
-
-async def _maybe(value: Any) -> Any:
-    return await value if inspect.isawaitable(value) else value
-
-
-def _site_id(site: Any) -> str:
-    return site if isinstance(site, str) else str(site.id)
-
-
-def _tunnel(operation_id: str, plan: ServePlan, pid: int | None) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "kind": "tunnel",
-        "detail": f"desktop ports of service {operation_id} ({plan.mode})",
-    }
-    if pid:
-        entry["pid"] = pid
-    return entry
 
 
 class ServeRuntime:
@@ -169,6 +140,7 @@ class ServeRuntime:
         self.notes: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._followers: dict[str, asyncio.Task[None]] = {}
+        self._latest: dict[str, tuple[float, JobStatus]] = {}
         self._resumed = False
 
     # The hook
@@ -177,7 +149,7 @@ class ServeRuntime:
         self, site: Any, adapter: Any, spec: ServiceSpec, record: OperationRecord
     ) -> Endpoint | None:
         """Start a service through the adapter's ``serve`` verb."""
-        self.sites[_site_id(site)] = site
+        self.sites[site_id_of(site)] = site
         try:
             await adapter.serve(spec, operation_id=record.operation_id)
         except Refusal as refusal:
@@ -200,6 +172,9 @@ class ServeRuntime:
         """Observe a service, and bring its desktop port up once it answers."""
         await self.resume()
         plan = self._plan(record.operation_id)
+        seen = self._following(plan)
+        if seen is not None:
+            return seen, None
         async with self._lock(plan.operation_id):
             if plan.final is not None:
                 return JobStatus.model_validate(plan.final), None
@@ -318,15 +293,15 @@ class ServeRuntime:
                     pid = forward.pid()
                     await forward.close()
                     if held:
-                        stopped.append(_tunnel(op, plan, pid))
+                        stopped.append(tunnel_entry(op, plan, pid))
                     continue
                 marker = forward_marker(plan, directory)
                 if plan.final is None and plan.ports and kill_recorded(plan.forward_pid, marker):
-                    stopped.append(_tunnel(op, plan, plan.forward_pid))
+                    stopped.append(tunnel_entry(op, plan, plan.forward_pid))
         if adapter is None or hop_plan is None:
             return stopped
         site = hop_plan.site_serve
-        hop_dir = f"{site.hop_dir.rstrip('/')}/{_safe_name(site_id)}"
+        hop_dir = f"{site.hop_dir.rstrip('/')}/{safe_name(site_id)}"
         argv = [site.python, "-c", site_file("hop_proxy.py").decode(), "shutdown", hop_dir, "-"]
         run: Any = getattr(adapter, "hop_exec", None) or adapter.exec
         result = cast(
@@ -442,7 +417,7 @@ class ServeRuntime:
             package=package,
         )
         if mode == "ssh":
-            plan.ssh_argv = [str(part) for part in await _maybe(adapter.ssh_argv())]
+            plan.ssh_argv = [str(part) for part in await maybe(adapter.ssh_argv())]
             plan.login_host = (await self._exec(adapter, plan, ["hostname"])).stdout.strip() or None
         if mode == "frp" and site.hop == "login":
             plan.hop = await self._start_hop(adapter, plan)
@@ -564,7 +539,7 @@ class ServeRuntime:
     async def _hop(self, adapter: Any, plan: ServePlan, mode: str, *args: str) -> ExecResult:
         """Run the login hop's ``mode`` on the site, light (:mod:`clio_relay.login_load`)."""
         site = plan.site_serve
-        hop_dir = f"{site.hop_dir.rstrip('/')}/{_safe_name(plan.site)}"
+        hop_dir = f"{site.hop_dir.rstrip('/')}/{safe_name(plan.site)}"
         argv = [
             site.python,
             "-c",
@@ -607,7 +582,7 @@ class ServeRuntime:
             return
         try:
             await self._hop(
-                adapter, plan, "lease", plan.job_dir, _scheduler_job_name(plan.operation_id)
+                adapter, plan, "lease", plan.job_dir, scheduler_job_name(plan.operation_id)
             )
         except Refusal as refusal:
             # The lease still ends SUBMIT_GRACE_S after the start without a job.
@@ -696,18 +671,19 @@ class ServeRuntime:
             return None
         return frpc_problem(plan, await self._read(plan, adapter, "frpc.log", tail=LOG_TAIL))
 
-    async def _adopt_reported_ports(self, plan: ServePlan, adapter: Any) -> bool:
-        """Take the ports JARVIS recorded for the package service; True while one is unknown.
+    async def _adopt_reported_ports(self, plan: ServePlan, adapter: Any) -> tuple[bool, str | None]:
+        """Take the ports JARVIS recorded for the package service.
 
-        The package binds its own port and reports it in its ready event; relay
-        forwards that port and never injects one. A changed port rewrites the
-        site's frpc settings first, then ``serve/ports``, which the connector
-        rereads.
+        Returns whether a port is still unknown, and the host JARVIS says the
+        service is ready on. The package binds its own port and reports it in
+        its ready event; relay forwards that port and never injects one. A
+        changed port rewrites the site's frpc settings first, then
+        ``serve/ports``, which the connector rereads.
         """
         if not plan.package or plan.handle is None:
-            return False
+            return False, None
         if not getattr(adapter, "reads_service_runtimes", False):
-            return False
+            return False, None
         try:
             document = await adapter.service_runtimes(plan.handle)
         except Refusal as refusal:
@@ -721,14 +697,20 @@ class ServeRuntime:
                     job_path(plan, "frpc.toml"), site_frpc_config(plan), overwrite=True
                 )
             await files.write(job_path(plan, "ports"), ports_file(plan), overwrite=True)
-        return any(port.remote_port == 0 for port in plan.ports)
+        unknown = any(port.remote_port == 0 for port in plan.ports)
+        return unknown, None if unknown else runtime_ready_host(document, plan)
 
     async def _running(
         self, plan: ServePlan, adapter: Any, status: JobStatus
     ) -> tuple[JobStatus, Endpoint | None]:
         if plan.ready_at is None:
-            unknown = await self._adopt_reported_ports(plan, adapter)
-            raw = await self._read(plan, adapter, "ready.json")
+            unknown, ready_host = await self._adopt_reported_ports(plan, adapter)
+            if ready_host is not None and plan.mode == "ssh":
+                # JARVIS saw the package's ready event, so the forward can go to
+                # it now; frp still waits for the connector to register the ports.
+                raw = json.dumps({"host": ready_host}).encode()
+            else:
+                raw = await self._read(plan, adapter, "ready.json")
             if raw is None:
                 log = await self._read(plan, adapter, "service.log", tail=LOG_TAIL)
                 line = last_line(plan, log)
@@ -775,6 +757,19 @@ class ServeRuntime:
         endpoint = plan.endpoint(note=message, connect_command=self.connect_command(plan))
         return status.model_copy(update={"message": message}), endpoint
 
+    def _following(self, plan: ServePlan) -> JobStatus | None:
+        """The follower's fresh latest look at a service coming up, so a task poll does not
+        wait a whole round of site calls for its lock and see readiness a round late."""
+        follower = self._followers.get(plan.operation_id)
+        if follower is None or follower.done():
+            return None
+        if plan.final is not None or plan.ready_at is not None or plan.stop_requested_at:
+            return None
+        seen = self._latest.get(plan.operation_id)
+        if seen is None or time.monotonic() - seen[0] > FRESH_S:
+            return None
+        return seen[1]
+
     def _follow(self, plan: ServePlan, adapter: Any, handle: JobHandle, status: JobStatus) -> None:
         """Keep bringing a running service up until it is served, with no client poll.
 
@@ -784,6 +779,7 @@ class ServeRuntime:
         """
         if plan.operation_id in self._followers:
             return
+        self._latest[plan.operation_id] = (time.monotonic(), status)
 
         async def follow() -> None:
             delay = FOLLOW_FIRST_S
@@ -795,9 +791,11 @@ class ServeRuntime:
                         async with self._lock(plan.operation_id):
                             if plan.final is not None or plan.stop_requested_at is not None:
                                 return
-                            if (await adapter.status(handle)).state != JobState.RUNNING:
+                            current = await adapter.status(handle)
+                            if current.state != JobState.RUNNING:
                                 return
-                            _, endpoint = await self._running(plan, adapter, status)
+                            seen, endpoint = await self._running(plan, adapter, current)
+                            self._latest[plan.operation_id] = (time.monotonic(), seen)
                         if endpoint is not None:
                             return
                     except Exception:
@@ -809,6 +807,7 @@ class ServeRuntime:
                         )
             finally:
                 self._followers.pop(plan.operation_id, None)
+                self._latest.pop(plan.operation_id, None)
 
         with contextlib.suppress(RuntimeError):
             self._followers[plan.operation_id] = asyncio.get_running_loop().create_task(follow())
@@ -830,7 +829,7 @@ class ServeRuntime:
             transport = getattr(adapter, "transport", None)
             environment = getattr(transport, "environment", None)
             if callable(environment):
-                forward.ssh_env = dict(await _maybe(environment()) or {})
+                forward.ssh_env = dict(await maybe(environment()) or {})
         await forward.start()
         return forward
 

@@ -19,6 +19,7 @@ from clio_relay.guard.warm import HOLDER, WARM_EXECUTABLE
 from clio_relay.jarvis_site import archive_package
 from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
+    EXIT_INSTALLED,
     EXIT_MISSING,
     EXIT_NO_JARVIS,
     EXIT_REFUSED,
@@ -43,6 +44,7 @@ pytestmark = pytest.mark.release_platform("posix")
 
 FAKE_JARVIS = """#!/bin/sh
 echo "JARVIS_ROOT=${JARVIS_ROOT:-} $*" >> "$JARVIS_LOG"
+[ -z "${JARVIS_INSTALL_ANSWERS:-}" ] || echo "answers $JARVIS_INSTALL_ANSWERS" >> "$JARVIS_LOG"
 case "$1 $2" in
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
@@ -221,6 +223,24 @@ def test_check_asks_jarvis_what_is_installed_and_submits_nothing(tmp_path: Path,
     assert not (job / SUBMISSION_FILE).exists()
 
 
+@pytest.mark.parametrize(("rc", "code"), [(0, EXIT_INSTALLED), (3, 3)])
+def test_recheck_applies_the_answers_and_builds_nothing(tmp_path: Path, rc: int, code: int) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    satisfied = "true" if rc == 0 else "false"
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_INSTALL_RC=str(rc), JARVIS_SATISFIED=satisfied)
+    answers = '{"sha256:1":{"constraint":"^mpich"}}'
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x-install", answers, mode="recheck")
+    assert done.returncode == code, done.stderr
+    assert (job / "relay.answers.json").read_text().strip() == answers
+    log = (tmp_path / "jarvis.log").read_text()
+    assert f"answers {job}/relay.answers.json" in log
+    assert f"ppl install yaml {job}/{PIPELINE_FILE} +check +json" in log
+    assert "+submit" not in log and "ppl submit" not in log
+    assert json.loads((job / "relay.install-report.json").read_text())["satisfied"] is (rc == 0)
+
+
 def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
@@ -257,7 +277,7 @@ def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> 
         assert "are not <repo>.<package>" in done.stderr
     mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
     assert mode.returncode == EXIT_USAGE
-    assert "mode up is not submit, run, install or check" in mode.stderr
+    assert "mode up is not submit, run, install, check or recheck" in mode.stderr
     unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
     assert unnamed.returncode == EXIT_USAGE
     assert "needs an execution id" in unnamed.stderr

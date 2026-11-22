@@ -55,7 +55,7 @@ implements the JARVIS lifecycle:
 - ``cancel`` and :meth:`~BaseAdapter.stop` run ``jarvis execution cancel`` and
   ``stop``; ``stop`` lets the pipeline run ``ppl stop`` and finish.
 - When ``run`` finds software to install, it raises
-  :func:`clio_relay.jarvis_submit.install_needed`; relay asks the person and calls
+  :func:`clio_relay.jarvis_report.install_needed`; relay asks the person and calls
   :meth:`~BaseAdapter.install` with the answers, then ``run`` again.
 - When the site has no JARVIS, ``run`` raises
   :func:`clio_relay.jarvis_submit.missing_jarvis`; after the person agrees, relay
@@ -305,6 +305,22 @@ class CleansSite(Protocol):
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
         """Remove ``targets`` on the site, sparing ``keep``."""
+        ...
+
+
+@runtime_checkable
+class ListsLiveJobs(Protocol):
+    """An adapter that can ask its site's scheduler which of relay's jobs still run. Optional.
+
+    ``clio-relay site clean`` asks before it removes anything, so a job relay's
+    records no longer show as live (its record ended early, or another relay
+    started it) still stops the clean. ``known`` are native job ids from relay's
+    records; any job named ``relay-...`` counts too. It returns
+    ``[{native_id, name, state}, ...]``.
+    """
+
+    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+        """Return relay's jobs the site's scheduler still lists."""
         ...
 
 

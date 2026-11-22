@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from clio_relay.jarvis_submit import applied_decisions, choice_issues, install_summary
+from clio_relay.jarvis_report import applied_decisions, choice_issues, install_summary
 
 
 def install_message(

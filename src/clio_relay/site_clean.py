@@ -12,9 +12,14 @@ facts about the cluster the person confirmed, so they are kept too unless
 drops relay's local state for the site, so the next call signs in and places
 everything again. It observes the site's open operations first, through JARVIS's
 execution record, so one whose job was cancelled outside relay ends, and it
-refuses while a job of the site still
-runs: its directory is among what goes. Operations still waiting on a person,
-with no job yet, are cancelled with the clean.
+refuses while a job of the site still runs: its directory is among what goes.
+Relay's records are not the only word on that: the site's scheduler is asked too
+(:class:`~clio_relay.adapters.base.ListsLiveJobs`), for jobs named ``relay-...``
+and the job ids relay's records hold in any state, so a job whose record ended
+while it ran, or that another relay started, also stops the clean. The prune
+on the site checks once more before it removes anything. The refusal names each
+job and its operation; cancel them with relay's ``cancel`` first. Operations still
+waiting on a person, with no job yet, are cancelled with the clean.
 """
 
 from __future__ import annotations
@@ -23,8 +28,8 @@ import logging
 import shutil
 from typing import TYPE_CHECKING, Any, cast
 
-from clio_relay.adapters.base import CleansSite, ShutsDown
-from clio_relay.jobs.records import OperationState
+from clio_relay.adapters.base import CleansSite, ListsLiveJobs, ShutsDown
+from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.shutdown import shutdown
 from clio_relay.site_prune import is_decisions, kept
@@ -99,6 +104,101 @@ async def _reconcile(service: RelayService, site_id: str) -> tuple[list[str], li
     return running, waiting
 
 
+def _known_jobs(service: RelayService, site_id: str) -> dict[str, str]:
+    """Native job ids relay's records hold for the site, in any state, and their operations."""
+    known: dict[str, str] = {}
+    for record in service.operations.all():
+        if record.site != site_id:
+            continue
+        for handle in (record.handle, installing.install_handle(record)):
+            if handle is not None and handle.native_id and not handle.native_id.startswith("pid:"):
+                known[handle.native_id] = record.operation_id
+    return known
+
+
+async def _live_on_site(cleaners: list[Any], known: dict[str, str]) -> list[dict[str, str]]:
+    """Ask the site's scheduler, through the first adapter that can, which of relay's jobs run."""
+    for cleaner in cleaners:
+        if isinstance(cleaner, ListsLiveJobs):
+            return await cleaner.live_jobs(sorted(known))
+    return []
+
+
+async def leftover_cancel(service: RelayService, record: OperationRecord) -> OperationRecord:
+    """Cancel the job of an ended operation that the site's scheduler still lists.
+
+    A record can end while its job runs on (a lost connection read as a failure),
+    and site clean then names that job. Relay's cancel ends it all the same, and
+    notes that in the operation's history.
+    """
+    handles = [
+        handle
+        for handle in (record.handle, installing.install_handle(record))
+        if handle is not None and handle.native_id and not handle.native_id.startswith("pid:")
+    ]
+    if not handles:
+        return record
+    try:
+        adapter = service.adapter_named(service.site(record.site), record.adapter)
+        if not isinstance(adapter, ListsLiveJobs):
+            return record
+        listed = await adapter.live_jobs([str(handle.native_id) for handle in handles])
+        live = {job.get("native_id") for job in listed}
+        cancelled: list[str] = []
+        for handle in handles:
+            if handle.native_id in live:
+                await adapter.cancel(handle)
+                cancelled.append(str(handle.native_id))
+    except Refusal as refusal:
+        logger.info("cancel of ended %s: %s", record.operation_id, refusal.message)
+        return record
+    if not cancelled:
+        return record
+    note = f"cancelled job {', '.join(cancelled)}, which still ran after the operation ended"
+    with service.operations.locked(record.operation_id):
+        stored = service.operations.get(record.operation_id) or record
+        stored.history.append(StateChange(state=stored.state, note=note))
+        service.operations.put(record.operation_id, stored)
+    return stored
+
+
+def _job_operation(job: dict[str, str], known: dict[str, str]) -> str | None:
+    operation_id = known.get(job.get("native_id", ""))
+    name = job.get("name", "")
+    if operation_id is None and name.startswith("relay-op_"):
+        operation_id = name.removeprefix("relay-")
+    return operation_id
+
+
+def still_running(
+    site_id: str, running: list[str], live: list[dict[str, str]], known: dict[str, str]
+) -> Refusal:
+    """The refusal while relay's jobs run on the site: each job, its operation, and what to do."""
+    named: list[str] = []
+    jobs: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for job in live:
+        operation_id = _job_operation(job, known)
+        state = (job.get("state") or "").lower() or "live"
+        named.append(
+            f"{operation_id or job.get('name') or 'a job'} (job {job['native_id']}, {state})"
+        )
+        jobs.append({**job, "operation_id": operation_id})
+        if operation_id:
+            seen.add(operation_id)
+    named += [operation_id for operation_id in running if operation_id not in seen]
+    return Refusal(
+        RefusalReason.POLICY_REFUSED,
+        f"relay's jobs still run on {site_id}: {', '.join(named)}. Their directories are "
+        "among what goes, so the clean removes nothing while they run. Cancel them with "
+        "relay's cancel (the cancel tool, or clio-relay cancel OPERATION), or wait for "
+        "them to end, then clean again",
+        site=site_id,
+        operations=sorted({*running, *seen}),
+        jobs=jobs,
+    )
+
+
 async def plan(
     service: RelayService,
     site_id: str,
@@ -113,14 +213,11 @@ async def plan(
     The first adapter that can clean does it, with every cleaning adapter's paths.
     """
     running, waiting = await _reconcile(service, site_id)
-    if running:
-        raise Refusal(
-            RefusalReason.POLICY_REFUSED,
-            f"jobs still run on {site_id}: {', '.join(running)}. Cancel them, or wait, "
-            "before cleaning the site: their directories are among what goes",
-            site=site_id,
-        )
     cleaners, names = _cleaners(service, site_id)
+    known = _known_jobs(service, site_id)
+    live = await _live_on_site(cleaners, known)
+    if running or live:
+        raise still_running(site_id, running, live, known)
     targets: list[str] = []
     keep: list[str] = []
     for cleaner in cleaners:
@@ -193,6 +290,8 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
     )
     stopped = await shutdown(service, {"site": site_id}, spare=spare)
     report = await cleaner.clean(list(planned["targets"]), list(planned["keep"]))
+    if report.get("live"):
+        raise still_running(site_id, [], list(report["live"]), _known_jobs(service, site_id))
     if spare and isinstance(cleaner, ShutsDown):
         try:
             found = await cleaner.shutdown()

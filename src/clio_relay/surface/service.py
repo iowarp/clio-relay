@@ -13,7 +13,7 @@ import logging
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_submit, site_clean
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
@@ -842,7 +842,7 @@ class RelayService:
     async def _cancel(self, operation_id: str) -> OperationRecord:
         record = self.operation(operation_id)
         if record.state.final:
-            return record
+            return await site_clean.leftover_cancel(self, record)
         started = (
             record.state not in (OperationState.AWAITING_INPUT, OperationState.SUBMITTING)
             if record.kind == "serve"
@@ -858,8 +858,7 @@ class RelayService:
         if not started:
             for ask in installing.withdrawable(self, self.outstanding(record), operation_id):
                 self.answer(ask.ask_id, "cancel", by="cancel")
-            record = self.finish(operation_id, OperationState.CANCELLED, None)
-            return record
+            return self.finish(operation_id, OperationState.CANCELLED, None)
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
         if record.kind == "serve":

@@ -249,7 +249,7 @@ Relay calls these when the adapter defines them:
 | `install_check(spec, *, operation_id)` | Run the site script in its `check` mode (`jarvis ppl install +check`) and return JARVIS's install report (`jarvis_exits.checked`). With `install`, it gives the site the `install` tool: the software ahead of any run |
 
 A batch adapter that runs packages turns the site script's typed exits into
-refusals with `jarvis_exits.refuse`. In detail, it refuses with `jarvis_submit.install_needed`
+refusals with `jarvis_exits.refuse`. In detail, it refuses with `jarvis_report.install_needed`
 when the submit exits 3 (with `walltime=jarvis_submit.install_walltime(...)`,
 so the approval says how long the build may take), with
 `jarvis_submit.build_refused` when it exits 4
