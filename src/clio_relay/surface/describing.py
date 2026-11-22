@@ -11,6 +11,7 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface.job_card import site_jobs
 from clio_relay.surface.skills import skill_link, skills
 
 if TYPE_CHECKING:
@@ -87,7 +88,8 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     The site's cluster facts are JARVIS's, not relay's: an adapter that reads
     them reports ``info.facts.resource_graph``, with the graph's path, the
     install decisions JARVIS records, and the net report of ``jarvis rg net
-    show`` (``None`` until the graph has a ``net`` section).
+    show`` (``None`` until the graph has a ``net`` section). ``jobs`` are the
+    site's open jobs and its latest ended ones, each as its job card.
     """
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
@@ -96,6 +98,7 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
             skill_link, site, service.paths.config_dir, with_text=True
         ),
         "packages": await asyncio.to_thread(package_listing, service, site),
+        "jobs": site_jobs(service, site.id),
     }
     try:
         adapter = service.adapter_for(site, "describe")

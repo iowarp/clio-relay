@@ -88,6 +88,9 @@ class Ask(BaseModel):
     url: str | None = None
     binding: dict[str, Any] = Field(default_factory=dict[str, Any])
     binding_digest: str = ""
+    meta: dict[str, Any] | None = Field(
+        default=None, description="Optional typed data the elicitation carries in its _meta"
+    )
     state: AskState = "pending"
     answer: dict[str, Any] | None = None
     answered_by: str | None = None

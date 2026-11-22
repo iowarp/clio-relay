@@ -1,0 +1,259 @@
+"""A job as one typed snapshot: what a host draws as the job's card.
+
+The snapshot is plain JSON at :data:`JOB_META`. Relay sends the whole of it each
+time, never a patch, and ``revision`` rises with every change of the operation,
+so a host keeps the newest one per ``operation_id``. It rides as optional data:
+
+- on the ask that confirms a submit, with phase ``planned``: in the
+  elicitation's ``params._meta`` on an older connection, and on the
+  ``input_required`` result's own ``_meta`` on a ``2026-07-28`` one, whose
+  embedded requests carry no ``_meta``;
+- in the result of ``run``, ``serve`` and ``describe(job=...)`` as
+  ``structuredContent.job``, and ``describe(site=...)`` lists the site's jobs
+  as ``jobs``;
+- in each task status a task-shaped ``run`` or ``serve`` reports, in its ``_meta``.
+
+The text of each message stays the same, so a host that ignores the snapshot
+loses nothing. ``source`` says where the plan came from: ``relay`` here, from the
+job as relay records it. Couplings and the scheduler script are JARVIS's, and are
+empty until JARVIS plans the job.
+
+:data:`CONFIRM_META` is the org-level key for a tool that confirms its own side
+effects with one typed ask. A tool's ``_meta`` declares it; a host that skipped
+its own ask for the call says so in the request's ``params._meta`` with
+:data:`CONFIRM_SERVER`.
+"""
+
+from __future__ import annotations
+
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any, cast
+
+from fastmcp import Context
+from fastmcp_tasks.models import GetTaskResult
+from pydantic import Field
+
+from clio_relay import jarvis_submit
+from clio_relay.adapters.hooks import Charge
+from clio_relay.jobs.records import OperationRecord, OperationState
+from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec
+from clio_relay.surface.endpoints import service_ready
+
+if TYPE_CHECKING:
+    from clio_relay.surface.service import RelayService
+
+JOB_META = "io.iowarp.clio-relay/job"
+CONFIRM_META = "io.iowarp/confirm"
+CONFIRM_TOOL: dict[str, Any] = {"version": 1}
+CONFIRM_SERVER = "server"
+CONFIRM_NOT_NEEDED = "not_needed"
+"""On a result: the call acted only on answers given before it, or only observed."""
+VERSION = 1
+LISTED_ENDED = 20
+"""How many ended jobs of a site ``describe(site=...)`` lists, newest first."""
+
+
+class JobTaskResult(GetTaskResult):
+    """A task status with relay's job snapshot in its ``_meta``."""
+
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+
+
+def flagged(ctx: Context) -> bool:
+    """Say whether the host left this call's confirm to relay."""
+    rc = ctx.request_context
+    meta = getattr(rc, "meta", None) if rc is not None else None
+    if not isinstance(meta, dict):
+        return False
+    return cast(dict[str, Any], meta).get(CONFIRM_META) == CONFIRM_SERVER
+
+
+def not_needed(meta: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a result's ``_meta`` saying this call raised no confirm and needed none."""
+    return {**(meta or {}), CONFIRM_META: CONFIRM_NOT_NEEDED}
+
+
+def _phase(record: OperationRecord) -> str:
+    return {
+        OperationState.AWAITING_INPUT: "planned",
+        OperationState.SUBMITTING: "submitted",
+        OperationState.QUEUED: "queued",
+        OperationState.RUNNING: "running",
+    }.get(record.state, "ended")
+
+
+def _outcome(record: OperationRecord) -> str | None:
+    if record.state == OperationState.COMPLETED:
+        return "succeeded" if record.exit_code in (0, None) else "failed"
+    if record.state == OperationState.FAILED:
+        return "failed"
+    if record.state == OperationState.CANCELLED:
+        return "cancelled"
+    return None
+
+
+def _state(record: OperationRecord, outcome: str | None, *, service: bool) -> str:
+    phase = _phase(record)
+    if phase == "planned":
+        return "planned"
+    if phase in ("submitted", "queued"):
+        return "waiting"
+    if phase == "running":
+        return "starting" if service and not service_ready(record) else "running"
+    return {"succeeded": "done", "failed": "failed"}.get(outcome or "", "cancelled")
+
+
+def _job(record: OperationRecord) -> JobSpec | None:
+    try:
+        if record.kind == "serve":
+            return ServiceSpec.model_validate(record.spec).job
+        if record.kind == "run":
+            return JobSpec.model_validate(record.spec)
+    except ValueError:
+        return None
+    return None
+
+
+def _charge(record: OperationRecord) -> Charge | None:
+    found = (record.result or {}).get("charge")
+    try:
+        return Charge.model_validate(found) if isinstance(found, dict) else None
+    except ValueError:
+        return None
+
+
+def _step_nodes(charge: Charge | None, steps: list[PackageRef], index: int) -> int | None:
+    if charge is None:
+        return None
+    if len(steps) == 1 or not charge.steps:
+        return charge.nodes
+    shares = charge.steps
+    return shares[index].nodes if index < len(shares) else None
+
+
+def _components(
+    record: OperationRecord, job: JobSpec | None, charge: Charge | None, state: str
+) -> list[dict[str, Any]]:
+    held = state in ("running", "starting")
+    serve = record.kind == "serve"
+
+    def component(
+        id_: str, label: str, package: str | None, role: str, nodes: int | None, **extra: Any
+    ) -> dict[str, Any]:
+        running = state == "running"
+        return {
+            "id": id_,
+            "label": label,
+            "package": package,
+            "role": role,
+            "nodes": nodes,
+            "state": state,
+            "nodes_allocated": (nodes or 0) if held else 0,
+            "nodes_running": (nodes or 0) if held and running else 0,
+            "hosts": [],
+            **extra,
+        }
+
+    if record.kind == "install":
+        return [component("install", "Software install", None, "install", 1)]
+    if job is None:
+        return []
+    steps = job.steps()
+    if not steps:
+        name = PurePosixPath(job.executable or "job").name or "job"
+        ranks = charge.ranks if charge else None
+        role = "service" if serve else "compute"
+        return [component("job", name, None, role, charge.nodes if charge else None, ranks=ranks)]
+    names = jarvis_submit.step_names(steps)
+    found: list[dict[str, Any]] = []
+    for index, (step, name) in enumerate(zip(steps, names, strict=True)):
+        role = "service" if step.service or (serve and len(steps) == 1) else "compute"
+        found.append(
+            component(
+                name,
+                step.name.partition(".")[2] or step.name,
+                step.name,
+                role,
+                _step_nodes(charge, steps, index),
+                ranks=charge.ranks if charge and len(steps) == 1 else None,
+                host_slice=step.nodes(),
+            )
+        )
+    return found
+
+
+def _scheduler(service: RelayService, record: OperationRecord) -> str | None:
+    try:
+        config = service.site(record.site).config
+    except Exception:  # noqa: BLE001 - a removed site still has its records
+        return None
+    found = config.get("scheduler")
+    return found if isinstance(found, str) and found not in ("auto", "") else None
+
+
+def _site(service: RelayService, site_id: str) -> dict[str, Any]:
+    try:
+        return {"id": site_id, "label": service.site(site_id).title}
+    except Exception:  # noqa: BLE001 - a removed site still has its records
+        return {"id": site_id, "label": site_id}
+
+
+def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] | None:
+    """Return the operation's job card, or ``None`` for an operation that is not a job."""
+    if record.kind not in ("run", "serve", "install"):
+        return None
+    job = _job(record)
+    charge = _charge(record)
+    phase = _phase(record)
+    outcome = _outcome(record)
+    state = _state(record, outcome, service=record.kind == "serve")
+    queue = cast(dict[str, Any], (record.result or {}).get("queue") or {})
+    started = next((c.at for c in record.history if c.state == OperationState.RUNNING), None)
+    ended = record.history[-1].at if record.state.final and record.history else None
+    walltime = charge.walltime_s if charge else None
+    if walltime is None and job is not None and job.attributes.duration is not None:
+        walltime = job.attributes.duration.total_seconds()
+    return {
+        "version": VERSION,
+        "operation_id": record.operation_id,
+        "kind": record.kind,
+        "job_id": record.handle.native_id if record.handle else None,
+        "revision": int(record.updated_at.timestamp() * 1000),
+        "updated_at": record.updated_at.isoformat(),
+        "source": "relay",
+        "site": _site(service, record.site),
+        "scheduler": _scheduler(service, record),
+        "phase": phase,
+        "outcome": outcome,
+        "partition": (charge.queue if charge else None) or queue.get("partition"),
+        "account": charge.account if charge else None,
+        "qos": None,
+        "time_limit_s": None if walltime is None else int(walltime),
+        "started_at": started.isoformat() if started else None,
+        "ended_at": ended.isoformat() if ended else None,
+        "queue": (
+            {
+                "reason": queue.get("reason"),
+                "position": None,
+                "starts_in_s": queue.get("starts_in_s"),
+            }
+            if phase == "queued" and queue
+            else None
+        ),
+        "components": _components(record, job, charge, state),
+        "couplings": [],
+        "script": None,
+    }
+
+
+def site_jobs(service: RelayService, site_id: str) -> list[dict[str, Any]]:
+    """Return the site's open jobs and its latest ended ones, newest first."""
+    records = sorted(
+        (r for r in service.operations.all() if r.site == site_id),
+        key=lambda r: r.created_at,
+        reverse=True,
+    )
+    shown = [r for r in records if not r.state.final]
+    shown += [r for r in records if r.state.final][:LISTED_ENDED]
+    shown.sort(key=lambda r: r.created_at, reverse=True)
+    return [card for r in shown if (card := snapshot(service, r)) is not None]

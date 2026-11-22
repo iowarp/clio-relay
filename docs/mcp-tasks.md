@@ -85,6 +85,45 @@ connection whose client supports elicitation, relay elicits. Otherwise the
 call returns a typed refusal that names the ask and the page where it can be
 answered, and `clio-relay asks` answers it from a terminal.
 
+## tools that confirm themselves
+
+`run`, `serve` and `exec` confirm their own side effects. Each declares it in
+its tool `_meta` as `io.iowarp/confirm: {"version": 1}`. A host can then skip
+its own permission prompt for such a call and say so in the request's
+`params._meta` with `io.iowarp/confirm: "server"`. For that call relay asks the
+person exactly once, with a typed form:
+
+- `approve`, a choice of approve or decline, and, when another of relay's
+  services still runs on the site, `running_services` (keep or end them when
+  the job is submitted);
+- approval to spend an allocation and a package review fold into the same form;
+  a sign-in stays its own ask, since it is a page, not a choice;
+- `run(cancel=...)` and `serve(stop=...)` get a form of their own, and `exec`
+  asks for that command on a site with no guard. `exec_read` never asks.
+
+A declined form cancels the job before anything is submitted. A client
+without form elicitation gets a `needs_approval` refusal and nothing runs.
+When a flagged call only observes, or acts on answers given earlier, its
+result's `_meta` carries `io.iowarp/confirm: "not_needed"`, so the host knows
+no form was due.
+
+## the job card
+
+Each job also travels as one typed snapshot under `io.iowarp.clio-relay/job`: its
+site, scheduler, phase (`planned`, `submitted`, `queued`, `running`, `ended`),
+outcome, partition, account, wall time, and its components with their node
+counts and state. A host can draw it as the job's card. Relay sends the whole
+snapshot each time, and `revision` rises with each change, so a host keeps the
+newest one per `operation_id`. The text of every message stays as it is, so a
+host that ignores the snapshot loses nothing.
+
+| Where | How |
+| --- | --- |
+| The confirm form | phase `planned`, in the elicitation's `params._meta`; on a `2026-07-28` connection, in the `input_required` result's `_meta` |
+| Task status | each `tasks/get` result's `_meta` |
+| Tool results | `structuredContent.job` on `run`, `serve` and `describe(job=...)` |
+| Job lists | `describe(site=...)` lists the site's jobs under `jobs` |
+
 ## refusals
 
 Every refusal is a tool error whose `structuredContent.refusal` carries a typed

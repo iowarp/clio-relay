@@ -49,14 +49,15 @@ from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
-from clio_relay.surface import install_op, instructions
+from clio_relay.surface import confirm, install_op, instructions, job_card
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
     ask_mode,
     elicit_document,
-    elicit_request,
+    elicit_inline,
     elicitation_modes,
+    input_required,
     modern,
     refusal_result,
     response_parts,
@@ -69,7 +70,6 @@ from clio_relay.surface.endpoints import (
     service_ready,
 )
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
-from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.files_tool import install as install_files_tool
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
@@ -96,25 +96,6 @@ _NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
 _text = text
-
-
-def _plan_needs_person(service: RelayService, ask: Ask) -> ToolResult:
-    refusal = Refusal(
-        RefusalReason.NEEDS_APPROVAL,
-        "the site is guarded, so relay asks the person before it runs a command that is not "
-        "read-only. Open the page, or run `clio-relay asks answer`, then call exec again "
-        "with the same command and plan",
-        ask_id=ask.ask_id,
-        asks=[
-            {
-                "ask_id": ask.ask_id,
-                "kind": ask.kind,
-                "message": ask.message,
-                "page": service.ask_provider.page_address(ask),
-            }
-        ],
-    )
-    return refusal_result(refusal)
 
 
 class RelayTasksExtension(ServerExtension):
@@ -214,10 +195,12 @@ class RelayTasksExtension(ServerExtension):
         return CreateTaskResult(**self._fields(record))
 
     async def task_result(self, record: OperationRecord) -> GetTaskResult:
-        """Project an operation onto a task."""
+        """Project an operation onto a task, with its job card in ``_meta``."""
         fields = self._fields(record)
+        if (card := job_card.snapshot(self.service, record)) is not None:
+            fields["_meta"] = {job_card.JOB_META: card}
         if fields["status"] == "input_required":
-            return GetTaskResult(
+            return job_card.JobTaskResult(
                 **fields,
                 input_requests={
                     ask.ask_id: elicit_document(ask) for ask in self.service.outstanding(record)
@@ -233,10 +216,10 @@ class RelayTasksExtension(ServerExtension):
                     "_meta": result.meta,
                 }
             )
-            return GetTaskResult(
+            return job_card.JobTaskResult(
                 **fields, result=final.model_dump(by_alias=True, mode="json", exclude_none=True)
             )
-        return GetTaskResult(**fields)
+        return job_card.JobTaskResult(**fields)
 
     async def _get(
         self, ctx: ServerRequestContext[Any, Any], params: GetTaskParams
@@ -325,16 +308,7 @@ class RelayServer:
         for ask in self.service.outstanding(record):
             if ask_mode(ask) not in modes:
                 break
-            if ask.kind == "url":
-                response = await ctx.session.elicit_url(
-                    message=ask.message, url=ask.url or "", elicitation_id=ask.ask_id
-                )
-            else:
-                response = await ctx.session.elicit_form(
-                    message=ask.message,
-                    requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
-                )
-            action, content = response_parts(response)
+            action, content = response_parts(await elicit_inline(ctx, ask))
             answered.append(self.service.answer(ask.ask_id, action, content, by="elicitation"))
         if not answered:
             return record
@@ -377,10 +351,7 @@ class RelayServer:
                 modes = elicitation_modes(ctx)
                 if all(ask_mode(ask) in modes for ask in outstanding):
                     return InputRequiredToolResult(
-                        mcp_types.InputRequiredResult(
-                            input_requests={ask.ask_id: elicit_request(ask) for ask in outstanding},
-                            request_state=record.operation_id,
-                        )
+                        input_required(list(outstanding), record.operation_id)
                     )
             elif outstanding:
                 record = await self._ask_inline(ctx, record)
@@ -400,16 +371,16 @@ class RelayServer:
         kind: Literal["run", "install"] = "run",
     ) -> ToolResult | InputRequiredToolResult:
         """The ``run`` verb, and ``install``: the same calls for an install-only operation."""
+        flagged = job_card.flagged(ctx)
         try:
             if cancel is not None:
-                record = await self.service.cancel(cancel)
-                return record_result(self.service, record)
+                return await self._cancel_call(ctx, cancel, "cancel", flagged=flagged)
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if resume is not None:
                 await self.service.same_request(self.service.operation(resume), site, spec)
                 record = await self.service.advance(resume)
-                return await self._deliver(ctx, record, wait_s)
+                return await self._observed(ctx, record, wait_s, flagged=flagged)
             if site is None or spec is None:
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS,
@@ -419,7 +390,9 @@ class RelayServer:
             if kind == "install":
                 record = await install_op.start(self.service, site, spec, task=task)
             else:
-                record = await self.service.start_run(site, spec, task=task)
+                record = await self.service.start_run(site, spec, task=task, confirm=flagged)
+            if flagged and kind == "run" and "form" not in elicitation_modes(ctx):
+                return self._needs_person(record)
             if task:
                 return operation_result(self.service.view(record))
             return await self._deliver(ctx, record, wait_s)
@@ -436,27 +409,65 @@ class RelayServer:
         wait_s: float,
     ) -> ToolResult | InputRequiredToolResult:
         """The ``serve`` verb: start, observe or stop a service."""
+        flagged = job_card.flagged(ctx)
         try:
             if stop is not None:
-                record = await self.service.cancel(self._service_op(stop).operation_id)
-                return record_result(self.service, record)
+                operation_id = self._service_op(stop).operation_id
+                return await self._cancel_call(ctx, operation_id, "stop", flagged=flagged)
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
             if service is not None:
                 record = await self.service.advance(self._service_op(service).operation_id)
-                return await self._deliver(ctx, record, wait_s)
+                return await self._observed(ctx, record, wait_s, flagged=flagged)
             if site is None or spec is None:
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS,
                     "serve needs site and spec, or service, or stop",
                 )
             task = tasks_opted_in(ctx)
-            record = await self.service.start_serve(site, spec, task=task)
+            record = await self.service.start_serve(site, spec, task=task, confirm=flagged)
+            if flagged and "form" not in elicitation_modes(ctx):
+                return self._needs_person(record)
             if task:
                 return record_result(self.service, record)
             return await self._deliver(ctx, record, wait_s)
         except Refusal as refusal:
             return refusal_result(refusal)
+
+    async def _observed(
+        self, ctx: Context, record: OperationRecord, wait_s: float, *, flagged: bool
+    ) -> ToolResult | InputRequiredToolResult:
+        """Deliver a resumed or observed operation; a flagged call with no ask says so."""
+        asked = bool(self.service.outstanding(record))
+        result = await self._deliver(ctx, record, wait_s)
+        if flagged and not asked and not isinstance(result, InputRequiredToolResult):
+            result.meta = job_card.not_needed(result.meta)
+        return result
+
+    async def _cancel_call(
+        self, ctx: Context, operation_id: str, verb: str, *, flagged: bool
+    ) -> ToolResult | InputRequiredToolResult:
+        """Cancel or stop; a flagged call asks the person once first, with the job's card."""
+        record = self.service.operation(operation_id)
+        if not flagged or record.state.final:
+            result = record_result(self.service, await self.service.cancel(operation_id))
+            if flagged:
+                result.meta = job_card.not_needed(result.meta)
+            return result
+        if ctx.request_state and ctx.input_responses is not None:
+            kinds = {confirm.CANCEL_KIND}
+            confirm.answer_round(self.service, ctx.request_state, ctx.input_responses, kinds)
+
+        async def call() -> OperationRecord:
+            ask = await confirm.cancel_confirm(self.service, record, verb)
+            try:
+                return await self.service.cancel(operation_id)
+            finally:
+                confirm.used(self.service, ask)
+
+        again = f"call {'serve with stop' if verb == 'stop' else 'run with cancel'} again"
+        done = await confirm.with_person(ctx, self.service, call, again=again)
+        return record_result(self.service, done) if isinstance(done, OperationRecord) else done
 
     def _service_op(self, operation_id: str) -> OperationRecord:
         record = self.service.operation(operation_id)
@@ -512,6 +523,8 @@ class RelayServer:
             )
             await ctx.report_progress(idle_s, message=note)
 
+        flagged = not read_only and job_card.flagged(ctx)
+
         async def call() -> dict[str, Any]:
             return await self.service.exec(
                 site,
@@ -521,34 +534,16 @@ class RelayServer:
                 on_stall=quiet,
                 plan=plan,
                 read_only=read_only,
+                confirm=flagged,
             )
 
         try:
             if ctx.request_state and ctx.input_responses is not None and not read_only:
                 self._answer_plan(site, ctx.request_state, ctx.input_responses)
-            try:
-                result = await call()
-            except NeedsPerson as waiting:
-                ask = waiting.ask
-                if "form" not in elicitation_modes(ctx):
-                    return _plan_needs_person(self.service, ask)
-                if modern(ctx):
-                    return InputRequiredToolResult(
-                        mcp_types.InputRequiredResult(
-                            input_requests={ask.ask_id: elicit_request(ask)},
-                            request_state=ask.ask_id,
-                        )
-                    )
-                response = await ctx.session.elicit_form(
-                    message=ask.message,
-                    requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
-                )
-                action, content = response_parts(response)
-                self.service.answer(ask.ask_id, action, content, by="elicitation")
-                try:
-                    result = await call()
-                except NeedsPerson as still:
-                    return _plan_needs_person(self.service, still.ask)
+            again = "call exec again with the same command and plan"
+            result = await confirm.with_person(ctx, self.service, call, again=again)
+            if not isinstance(result, dict):
+                return result
         except Refusal as refusal:
             return refusal_result(refusal)
         text = result["stdout"]
@@ -564,12 +559,9 @@ class RelayServer:
     def _answer_plan(self, site: str, ask_id: str, responses: dict[str, Any]) -> None:
         """Record the answer a retried exec call carries, for this site's plan asks only."""
         ask = self.service.asks.get(ask_id)
-        if ask is None or ask_id not in responses or ask.site != site:
-            return
-        if ask.binding.get("kind") != EXEC_PLAN_KIND:
-            return
-        action, content = response_parts(responses[ask_id])
-        self.service.answer(ask_id, action, content, by="input_required")
+        if ask is not None and ask.site == site:
+            kinds = {EXEC_PLAN_KIND, confirm.EXEC_CONFIRM_KIND}
+            confirm.answer_round(self.service, ask_id, responses, kinds)
 
     async def files(
         self, ctx: Context, site: str, args: FilesArgs
@@ -612,13 +604,14 @@ class RelayServer:
             describe(job=...) observes."""
             return await relay.run(ctx, site, spec, cancel, resume, wait_s)
 
-        server.add_tool(_task_optional(run, "run", "Run a job on a site"))
+        server.add_tool(_task_optional(run, "run", "Run a job on a site", confirms=True))
         server.add_tool(_task_optional(install_tool(relay), "install", "Install a package"))
 
         @server.tool(
             name="exec",
             title="Run one short command on a site",
             annotations=_CHANGE,
+            meta={job_card.CONFIRM_META: job_card.CONFIRM_TOOL},
         )
         async def exec_(  # pyright: ignore[reportUnusedFunction]
             site: Annotated[str, Field(description="The site id")],
@@ -711,7 +704,7 @@ class RelayServer:
             endpoint port has an address, host:port: that is what you hand to clients."""
             return await relay.serve(ctx, site, spec, service, stop, wait_s)
 
-        server.add_tool(_task_optional(serve, "serve", "Start a service on a site"))
+        server.add_tool(_task_optional(serve, "serve", "Start a service on a site", confirms=True))
 
         @server.tool(
             name="shutdown",
@@ -769,12 +762,13 @@ class RelayServer:
             await self.service.close()
 
 
-def _task_optional(fn: Any, name: str, title: str) -> FunctionTool:
+def _task_optional(fn: Any, name: str, title: str, *, confirms: bool = False) -> FunctionTool:
     tool = FunctionTool.from_function(
         fn,
         name=name,
         title=title,
         annotations=_START,
+        meta={job_card.CONFIRM_META: job_card.CONFIRM_TOOL} if confirms else None,
         task=TaskConfig(
             mode="optional", poll_interval=timedelta(milliseconds=TASK_POLL_INTERVAL_MS)
         ),

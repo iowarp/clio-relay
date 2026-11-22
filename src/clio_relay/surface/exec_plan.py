@@ -10,6 +10,8 @@ is used once: the next run of the plan asks again. No raw shell is opened:
 the argument list the person approved is the one that runs. The ask is a plain
 confirm: it shows only the call's own command, plan and site, plus relay's own
 limits on it, so a host that confirms a call the person already allowed asks once.
+When the host left the call's confirm to relay (:mod:`clio_relay.surface.confirm`),
+the same ask is typed instead, as it is then the only one.
 """
 
 from __future__ import annotations
@@ -22,12 +24,9 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.adapters.hooks import Ask
-from clio_relay.jobs.handles import utc_now
-from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import canonical_digest
 from clio_relay.login_load import LoginLimits
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface.files_approval import NeedsPerson
+from clio_relay.surface import confirm
 from clio_relay.wording import with_article
 
 if TYPE_CHECKING:
@@ -77,10 +76,16 @@ def _binding(site: SiteEntry, command: list[str], plan: ExecPlan) -> dict[str, o
     }
 
 
-def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
+def shown_command(command: list[str]) -> str:
+    """Return the command as the person reads it, cut at :data:`SHOWN_CHARS`."""
     shown = shlex.join(command)
     if len(shown) > SHOWN_CHARS:
         shown = f"{shown[:SHOWN_CHARS]}... ({len(shown) - SHOWN_CHARS} more characters)"
+    return shown
+
+
+def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
+    shown = shown_command(command)
     if plan.submits:
         question = f"Submit {with_article(plan.kind)} job from {site.title}'s login node?"
         runs = (
@@ -98,42 +103,28 @@ def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
 
 
 async def approve(
-    service: RelayService, site: SiteEntry, command: list[str], plan: ExecPlan
+    service: RelayService,
+    site: SiteEntry,
+    command: list[str],
+    plan: ExecPlan,
+    *,
+    typed: bool = False,
 ) -> Ask:
     """Return the accepted ask for this exact command, asking the person first when there is none.
 
-    Raises :class:`NeedsPerson` while the ask is pending, and refuses with
-    ``policy_refused`` when the person said no.
+    Raises :class:`~clio_relay.surface.files_approval.NeedsPerson` while the ask
+    is pending, and refuses with ``policy_refused`` when the person said no.
+    ``typed`` makes the ask a choice, for a call whose host left the confirm to relay.
     """
-    binding = _binding(site, command, plan)
-    digest = canonical_digest(binding)
-    found = [
-        ask
-        for ask in service.asks.all()
-        if ask.binding_digest == digest and ask.completed_at is None
-    ]
-    if found:
-        ask = found[0]
-    else:
-        ask = await service.ask_provider.approve(
-            site=site, operation_id=None, message=_message(site, command, plan), binding=binding
-        )
-    if ask.state == "pending":
-        raise NeedsPerson(ask)
-    if ask.state != "accepted":
-        used(service, ask)
-        raise Refusal(
-            RefusalReason.POLICY_REFUSED,
-            f"the person did not approve the {plan.kind} plan",
-            site=site.id,
-            ask_id=ask.ask_id,
-        )
-    return ask
+    return await confirm.one_shot(
+        service,
+        site,
+        binding=_binding(site, command, plan),
+        message=_message(site, command, plan),
+        plain=not typed,
+        refused=f"the person did not approve the {plan.kind} plan",
+    )
 
 
-def used(service: RelayService, ask: Ask) -> None:
-    """Mark an approval as spent, so the next run of the plan asks again."""
-    with service.asks.locked(ask.ask_id):
-        current = service.asks.get(ask.ask_id) or ask
-        current.completed_at = utc_now()
-        service.asks.put(ask.ask_id, current)
+used = confirm.used
+"""Mark an approval as spent, so the next run of the plan asks again."""

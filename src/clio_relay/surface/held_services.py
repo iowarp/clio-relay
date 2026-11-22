@@ -39,9 +39,14 @@ def state_of(record: OperationRecord) -> dict[str, Any]:
 
 
 def ask_ids(record: OperationRecord) -> set[str]:
-    """Return the held-services ask; declining it keeps the services and never cancels."""
-    found = state_of(record).get("ask_id")
-    return {found} if isinstance(found, str) else set()
+    """Return the held-services ask; declining it keeps the services and never cancels.
+
+    A choice folded into the job's card (``in_card``) is the card's own ask, and
+    declining the card does cancel the job, so it is not listed.
+    """
+    state = state_of(record)
+    found = state.get("ask_id")
+    return {found} if isinstance(found, str) and not state.get("in_card") else set()
 
 
 def _nodes(record: OperationRecord) -> int | None:
@@ -76,10 +81,10 @@ def _described(record: OperationRecord) -> str:
     return f"{record.operation_id} ({what}{held}, up since {record.created_at:%H:%M} UTC)"
 
 
-async def ask(
+def question(
     service: RelayService, site: SiteEntry, kind: OperationKind, operation_id: str
-) -> tuple[Ask, dict[str, Any]] | None:
-    """Build the ask for a new run or service while others of the site run, if any do."""
+) -> tuple[str, list[str]] | None:
+    """Return the question for a new run or service while others of the site run, and those."""
     if kind == "install":
         return None
     running = [r for r in running_services(service, site.id) if r.operation_id != operation_id]
@@ -94,15 +99,25 @@ async def ask(
         f"End {'it' if one else 'them'} when this job is submitted, or keep "
         f"{'it' if one else 'them'} running, for example to review the results?"
     )
-    found = await service.ask_provider.choose(
+    return message, [r.operation_id for r in running]
+
+
+async def ask(
+    service: RelayService, site: SiteEntry, kind: OperationKind, operation_id: str
+) -> tuple[Ask, dict[str, Any]] | None:
+    """Build the ask for a new run or service while others of the site run, if any do."""
+    found = question(service, site, kind, operation_id)
+    if found is None:
+        return None
+    message, operations = found
+    asked = await service.ask_provider.choose(
         site=site,
         operation_id=operation_id,
         message=message,
         field_name=FIELD,
         options=[END, KEEP],
     )
-    state = {"ask_id": found.ask_id, "operations": [r.operation_id for r in running]}
-    return found, state
+    return asked, {"ask_id": asked.ask_id, "operations": operations}
 
 
 async def end_chosen(service: RelayService, operation_id: str) -> None:

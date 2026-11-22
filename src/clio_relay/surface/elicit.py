@@ -6,7 +6,7 @@ elicitation, and a client with neither gets a typed refusal naming the ask.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import mcp_types
 from fastmcp import Context
@@ -76,8 +76,34 @@ def elicit_request(ask: Ask) -> mcp_types.ElicitRequest:
         params=mcp_types.ElicitRequestFormParams(
             message=ask.message,
             requested_schema=ask.requested_schema or {"type": "object", "properties": {}},
+            _meta=cast("mcp_types.RequestParamsMeta | None", ask.meta),
         )
     )
+
+
+def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequiredResult:
+    """The modern input request for ``asks``, with their ``_meta`` on the result.
+
+    The 2026-07-28 schema gives an embedded input request no ``_meta``, so each
+    ask's typed data (a job card, say) rides on the result's own ``_meta``.
+    """
+    meta: dict[str, Any] = {}
+    for ask in asks:
+        meta.update(ask.meta or {})
+    return mcp_types.InputRequiredResult(
+        input_requests={ask.ask_id: elicit_request(ask) for ask in asks},
+        request_state=request_state,
+        _meta=cast("mcp_types.RequestParamsMeta | None", meta or None),
+    )
+
+
+async def elicit_inline(ctx: Context, ask: Ask) -> mcp_types.ElicitResult:
+    """Put one ask to a legacy client as an elicitation, with the ask's ``_meta``."""
+    if ask.kind == "url":
+        return await ctx.session.elicit_url(
+            message=ask.message, url=ask.url or "", elicitation_id=ask.ask_id
+        )
+    return await ctx.session.send_request(elicit_request(ask), mcp_types.ElicitResult)
 
 
 def elicit_document(ask: Ask) -> dict[str, Any]:

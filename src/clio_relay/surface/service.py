@@ -49,11 +49,12 @@ from clio_relay.packages import (
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
+from clio_relay.surface import confirm as confirm_card
 from clio_relay.surface import exec_plan, held_services, install_op, installing, queue_switch
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
-from clio_relay.surface.guarding import approval_message, review_asks
+from clio_relay.surface.job_card import snapshot as job_snapshot
 from clio_relay.surface.outputs import marked_status, run_provenance, stdout_tail
 from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.settings import RelayPaths
@@ -257,7 +258,7 @@ class RelayService:
         return spec.model_copy(update={"attributes": attributes.model_copy(update=changes)})
 
     async def start_run(
-        self, site_id: str, spec: JobSpec, *, task: bool = False
+        self, site_id: str, spec: JobSpec, *, task: bool = False, confirm: bool = False
     ) -> OperationRecord:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
@@ -265,7 +266,7 @@ class RelayService:
         what = spec.executable or _steps_label(spec) or "a job"
         digest, dumped = spec.digest(), spec.model_dump(mode="json")
         return await self.open_operation(
-            site, "run", spec, dumped, digest, f"Run {what}", task=task
+            site, "run", spec, dumped, digest, f"Run {what}", task=task, confirm=confirm
         )
 
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
@@ -286,7 +287,7 @@ class RelayService:
         return self.prepare_service(site, spec)
 
     async def start_serve(
-        self, site_id: str, spec: ServiceSpec, *, task: bool = False
+        self, site_id: str, spec: ServiceSpec, *, task: bool = False, confirm: bool = False
     ) -> OperationRecord:
         """Check and price a service's job, record it, ask, and start it if nothing must."""
         site = self.site(site_id)
@@ -309,6 +310,7 @@ class RelayService:
             spec.digest(),
             f"Start {what} as a service with port(s) {ports}",
             task=task,
+            confirm=confirm,
         )
 
     async def open_operation(
@@ -321,8 +323,12 @@ class RelayService:
         action: str,
         *,
         task: bool,
+        confirm: bool = False,
     ) -> OperationRecord:
-        """Record a run, serve or install operation, ask what must be asked, and submit."""
+        """Record a run, serve or install operation, ask what must be asked, and submit.
+
+        ``confirm``: the host left the call's confirm to relay, so one typed card asks.
+        """
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
@@ -350,30 +356,17 @@ class RelayService:
             task=task,
             result=result,
         )
-        asks: list[Ask] = []
-        if (need := await adapter.sign_in_needed()) is not None:
-            asks.append(
-                await self.ask_provider.url(site=site, operation_id=operation_id, need=need)
-            )
-        asks.extend(await review_asks(self, site, record, decision))
-        if held := await held_services.ask(self, site, kind, operation_id):
-            asks.append(held[0])
-            record.result = {**(record.result or {}), held_services.KEY: held[1]}
-        if spends and site.spend.needs_approval(charge.node_hours):
-            binding = {
-                "site": site.id,
-                "spec_digest": record.spec_digest,
-                "charge": charge.model_dump(mode="json"),
-            }
-            asks.append(
-                await self.ask_provider.approve(
-                    site=site,
-                    operation_id=operation_id,
-                    message=approval_message(action, site, charge, job.steps()),
-                    binding=binding,
-                    plain=False,
-                )
-            )
+        asks = await confirm_card.operation_asks(
+            self,
+            site,
+            record,
+            job,
+            adapter=adapter,
+            decision=decision,
+            charge=charge,
+            action=action,
+            confirm=confirm,
+        )
         record.asks = [ask.ask_id for ask in asks]
         self.operations.put(operation_id, record)
         if not asks:
@@ -901,12 +894,14 @@ class RelayService:
         on_stall: StallReport | None = None,
         plan: ExecPlan | None = None,
         read_only: bool = False,
+        confirm: bool = False,
     ) -> dict[str, Any]:
         """Run one command (RL9). With no ``timeout_s`` it runs until it ends.
 
         On a guarded site a command that is not read-only runs only with a
         ``plan`` the person approved (:mod:`clio_relay.surface.exec_plan`);
         until then this raises :class:`NeedsPerson`. ``read_only`` runs only reads.
+        ``confirm``: the host left the confirm to relay, so the person is asked anyway.
         """
         site = self.site(site_id)
         if not command:
@@ -918,10 +913,12 @@ class RelayService:
             if plan is None or not guarded or decision.reason != RefusalReason.POLICY_REFUSED:
                 decision.raise_if_refused()
             else:
-                approved = await exec_plan.approve(self, site, command, plan)
+                approved = await exec_plan.approve(self, site, command, plan, typed=confirm)
                 cap = exec_plan.PLAN_TIMEOUT_S
                 timeout_s = min(timeout_s or cap, cap)
         light = approved is not None or bool(decision.data.get("light"))
+        if confirm and approved is None:
+            approved = await confirm_card.exec_confirm(self, site, command)
         name, config, skipped = self.route(site, "exec")
         adapter = self._build(site, name, config)
         argv = light_argv(command, exec_plan.PLAN_LIMITS) if light else command
@@ -973,6 +970,7 @@ class RelayService:
             "result": record.result,
             "error": record.error,
             "spec_digest": record.spec_digest,
+            "job": job_snapshot(self, record),
             "created_at": record.created_at.isoformat(),
             "updated_at": record.updated_at.isoformat(),
         }
