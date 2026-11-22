@@ -516,7 +516,7 @@ class RelayService:
                 continue
             if ask.kind == "approve" and (
                 ask.binding_digest != canonical_digest(ask.binding)
-                or ask.binding.get("spec_digest") != record.spec_digest
+                or not installing.approval_covers(ask.binding, record)
             ):
                 return self.finish(
                     operation_id,
@@ -834,7 +834,7 @@ class RelayService:
         """
         record = await self._cancel(operation_id)
         if record.state.final:
-            for ask in self.operation_asks(record):
+            for ask in installing.withdrawable(self, self.operation_asks(record), operation_id):
                 if ask.state == "pending":
                     self.answer(ask.ask_id, "cancel", by="cancel")
         return record
@@ -856,7 +856,7 @@ class RelayService:
                 return self.finish(operation_id, OperationState.CANCELLED, None)
             return await installing.refresh_install(self, operation_id, adapter, install)
         if not started:
-            for ask in self.outstanding(record):
+            for ask in installing.withdrawable(self, self.outstanding(record), operation_id):
                 self.answer(ask.ask_id, "cancel", by="cancel")
             record = self.finish(operation_id, OperationState.CANCELLED, None)
             return record

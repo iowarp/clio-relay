@@ -42,7 +42,10 @@ flowchart LR
    install task on its own, and a task too: it asks JARVIS `ppl install +check`,
    takes the run's install path when software is missing (the same asks, then
    `ppl install +submit` as a job on the compute nodes), installs relay's
-   jarvis-cd first when the site lacks it, and launches nothing.
+   jarvis-cd first when the site lacks it, and launches nothing. Operations
+   that find a site without jarvis-cd at once share one site-scoped ask
+   (`surface/install_share.py`), and the bootstrap's lock in the site home
+   makes a second install wait for the first and reuse it.
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
    configured sites and the staged packages (`surface/instructions.py`), so an

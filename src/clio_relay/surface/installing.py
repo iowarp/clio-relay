@@ -15,7 +15,10 @@ Either refusal turns the operation back into asks instead of a failure:
   (its ``metadata.install`` progress and the end of ``install/install.log``)
   for as long as it takes, then submits the run again;
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
-  in the site's CLIO home and submits the run again.
+  in the site's CLIO home and submits the run again. The approval is
+  site-scoped: operations that find the site without JARVIS at the same time
+  share it (:mod:`~clio_relay.surface.install_share`), and the install script's site lock makes
+  the later install wait for the first and reuse it.
 
 An ``install`` operation (:mod:`clio_relay.surface.install_op`) is the same flow
 with no run: its submit is ``ppl install +check``, and it completes once JARVIS
@@ -41,12 +44,17 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from clio_relay import install_failures, install_wording, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
+from clio_relay.asks.core import approval_covers as approval_covers
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import queue_switch
+from clio_relay.surface.install_share import JARVIS_KIND as JARVIS_KIND
+from clio_relay.surface.install_share import holders as holders
+from clio_relay.surface.install_share import shared_jarvis_ask, site_lock_id
+from clio_relay.surface.install_share import withdrawable as withdrawable
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -55,7 +63,6 @@ logger = logging.getLogger(__name__)
 
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
-JARVIS_KIND = "jarvis_bootstrap"
 CHOICE_FIELD = "constraint"
 LOG_TAIL_BYTES = 4096
 MAX_ROUNDS = 3
@@ -185,8 +192,8 @@ async def ask_install(
             asks.append(ask)
         state["choices"] = choices
     else:
-        asks.append(
-            await provider.approve(
+        with service.asks.locked(site_lock_id(site.id)):
+            ask = shared_jarvis_ask(service, site.id, operation_id) or await provider.approve(
                 site=site,
                 operation_id=operation_id,
                 message=(
@@ -194,16 +201,31 @@ async def ask_install(
                     f"{jarvis_submit.JARVIS_PIN[:8]} in a virtual environment under the CLIO "
                     "home on the site, which needs the site to reach github.com. Install it?"
                 ),
-                binding={**binding, "kind": JARVIS_KIND, "jarvis": jarvis_submit.JARVIS_PIN},
+                binding={
+                    "site": site.id,
+                    "scope": "site",
+                    "kind": JARVIS_KIND,
+                    "jarvis": jarvis_submit.JARVIS_PIN,
+                },
             )
-        )
+            return _hold(service, operation_id, state, [ask], refusal.message)
+    return _hold(service, operation_id, state, asks, refusal.message)
+
+
+def _hold(
+    service: RelayService,
+    operation_id: str,
+    state: dict[str, Any],
+    asks: list[Ask],
+    message: str,
+) -> OperationRecord:
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)
         if record.state.final:
             return record
-        record.result = {**(record.result or {}), INSTALL_KEY: state, "message": refusal.message}
-        record.asks = [*record.asks, *(ask.ask_id for ask in asks)]
-        record.move(OperationState.AWAITING_INPUT, refusal.message)
+        record.result = {**(record.result or {}), INSTALL_KEY: state, "message": message}
+        record.asks = [*record.asks, *(ask.ask_id for ask in asks if ask.ask_id not in record.asks)]
+        record.move(OperationState.AWAITING_INPUT, message)
         service.operations.put(operation_id, record)
     return record
 

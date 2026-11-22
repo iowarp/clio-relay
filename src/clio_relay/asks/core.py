@@ -65,21 +65,41 @@ def _button(action: str, label: str, extra: str = "") -> str:
     return f"<button name='action' value='{e(action)}'{extra}>{e(label)}</button>"
 
 
+def approval_covers(binding: dict[str, Any], record: OperationRecord) -> bool:
+    """Say whether an approval's binding covers ``record``.
+
+    An approval is bound to one job's digest, except one with ``scope: site``
+    (installing relay's jarvis-cd there, say), which covers every operation on
+    that site, so operations waiting on the same thing share one ask.
+    """
+    if binding.get("scope") == "site":
+        return binding.get("site") == record.site
+    return binding.get("spec_digest") == record.spec_digest
+
+
 def stale_approval(ask: Ask, operations: RecordStore[OperationRecord]) -> str | None:
     """Return why an approval no longer matches its operation, or ``None``.
 
-    An approval is bound to the operation, the job's hash and the charge.
+    An approval is bound to the operation, the job's hash and the charge. A
+    site-scoped one is checked against an operation still waiting on it.
     """
     if canonical_digest(ask.binding) != ask.binding_digest:
         return "The approval's details were changed."
     if not ask.operation_id:
         return None
     record = operations.get(ask.operation_id)
+    if ask.binding.get("scope") == "site":
+        waiting = [
+            other
+            for other in operations.all()
+            if ask.ask_id in other.asks and other.state == OperationState.AWAITING_INPUT
+        ]
+        record = waiting[0] if waiting else record
     if record is None:
         return "The operation is gone."
     if record.state != OperationState.AWAITING_INPUT:
         return f"The operation is already {record.state.value}."
-    if ask.binding.get("spec_digest") != record.spec_digest:
+    if not approval_covers(ask.binding, record):
         return "The job changed since this was asked."
     charge: Any = ask.binding.get("charge")
     if charge is not None and (record.result or {}).get("charge") != charge:

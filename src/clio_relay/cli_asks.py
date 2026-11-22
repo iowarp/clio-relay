@@ -91,11 +91,24 @@ def asks_show(ask_id: str) -> None:
 
 
 def _advance(service: RelayService, ask: Ask) -> None:
-    if ask.operation_id:
-        record = asyncio.run(service.advance(ask.operation_id))
-        _print({"ask": ask.ask_id, "operation": record.operation_id, "state": record.state.value})
-    else:
+    from clio_relay.surface.installing import holders
+
+    held = holders(service, ask)
+    if not held:
         _print({"ask": ask.ask_id, "state": ask.state})
+        return
+    records = [asyncio.run(service.advance(operation_id)) for operation_id in held]
+    shown: dict[str, Any] = {
+        "ask": ask.ask_id,
+        "operation": records[0].operation_id,
+        "state": records[0].state.value,
+    }
+    if len(records) > 1:
+        shown["also"] = [
+            {"operation": record.operation_id, "state": record.state.value}
+            for record in records[1:]
+        ]
+    _print(shown)
 
 
 @app.command("answer")
