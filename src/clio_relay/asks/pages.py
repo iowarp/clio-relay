@@ -22,7 +22,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from filelock import FileLock
 
@@ -238,6 +238,12 @@ def binding_table(ask: Ask) -> str:
     package = ask.binding.get("package_hash")
     if package:
         rows.append(("Package hash", str(package)))
+    listed = ask.binding.get("packages")
+    for item in cast(list[Any], listed) if isinstance(listed, list) else []:
+        if isinstance(item, dict):
+            entry = cast(dict[str, Any], item)
+            name = f"{entry.get('package', '?')} {entry.get('version', '')}".strip()
+            rows.append(("Package", f"{name}, hash {entry.get('package_hash', '?')}"))
     rows.extend(_charge_rows(ask.binding))
     cells = "".join(f"<tr><th>{e(key)}</th><td>{e(value)}</td></tr>" for key, value in rows)
     return f"<table>{cells}</table>"

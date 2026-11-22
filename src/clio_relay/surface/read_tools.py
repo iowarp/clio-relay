@@ -106,8 +106,9 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
     ) -> ToolResult | InputRequiredToolResult:
         """The reads of files, on any site, with no question: list a directory, stat
-        a path, read a file (up to 4 MiB a call; a larger one is reads at increasing
-        offsets) and has, whether the site's content store holds a SHA-256. Writes,
-        deletes and stage are in files."""
+        a path, read a file (up to 4 MiB a call, for content you need to see) and
+        has, whether the site's content store holds a SHA-256. To copy a file to
+        this machine, use files op download with local_path. Writes, deletes,
+        stage, upload and download are in files."""
         arguments = FilesArgs(op=op, path=path, offset=offset, limit=limit, digest=digest)
         return await relay.files(ctx, site, arguments)

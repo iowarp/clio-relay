@@ -14,7 +14,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import mcp_types
 import pytest
+from fastmcp import Client
+from fastmcp_tasks.client import (
+    call_tool_task,  # pyright: ignore[reportUnknownVariableType]
+)
+from fastmcp_tasks.client_models import UpdateTaskRequest, UpdateTaskRequestParams
 
 from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import Ask
@@ -22,6 +28,7 @@ from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.surface import install_op, install_share
+from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
@@ -223,5 +230,58 @@ def test_a_declined_question_cancels_every_holder(relay_paths: RelayPaths, site:
         for operation_id in (first, second):
             assert (await service.advance(operation_id)).state == OperationState.CANCELLED
         await service.close()
+
+    asyncio.run(scenario())
+
+
+def _spec(job: JobSpec) -> dict[str, Any]:
+    return job.model_dump(mode="json", exclude_none=True)
+
+
+def test_an_answer_through_one_task_moves_every_task_holding_the_question(
+    relay_paths: RelayPaths, site: _Site
+) -> None:
+    """``tasks/update`` on one task advances the other holder too, with no poll of it.
+
+    A host that leaves an input_required task alone while its prompt is shown
+    would otherwise ask the person the same question again for the other task.
+    """
+    add_site(relay_paths)
+
+    async def scenario() -> None:
+        async with Client(create_server(relay_paths), mode="auto") as client:
+            first = await call_tool_task(client, "install", {"site": "fx", "spec": _spec(XCOMPACT)})
+            second = await call_tool_task(
+                client, "install", {"site": "fx", "spec": _spec(PVSERVER)}
+            )
+            side = RelayService(relay_paths)
+            (choice,) = _choices(side)
+            _approve_own(side, second.task_id)
+            parked = await first.status()
+            assert parked.status == "input_required"
+            assert parked.input_requests is not None
+            assert choice.ask_id in parked.input_requests
+            responses: dict[str, Any] = {}
+            for ask_id in parked.input_requests:
+                if ask_id == choice.ask_id:
+                    responses[ask_id] = {
+                        "action": "accept",
+                        "content": {"constraint": "^mpich@4.2"},
+                    }
+                else:
+                    responses[ask_id] = {"action": "accept", "content": {"approve": True}}
+            await client.session.send_request(
+                UpdateTaskRequest(
+                    params=UpdateTaskRequestParams(task_id=first.task_id, input_responses=responses)
+                ),
+                mcp_types.Result,
+            )
+            moved = RelayService(relay_paths).operation(second.task_id)
+            assert moved.state != OperationState.AWAITING_INPUT, moved
+            assert site.answers["demo.pvserver"][_issue()["issue_id"]]["ask_id"] == choice.ask_id
+            for task in (first, second):
+                done = (await task.result()).structured_content
+                assert isinstance(done, dict)
+                assert done["state"] == "completed", done
 
     asyncio.run(scenario())

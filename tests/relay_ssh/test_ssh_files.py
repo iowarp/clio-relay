@@ -6,6 +6,7 @@ run: where paths land, chunked writes and their retries, and delete.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from collections.abc import Awaitable
 from pathlib import Path
@@ -18,6 +19,7 @@ from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_proce
 from clio_relay.jobs.file_rules import PART_SUFFIX
 from clio_relay.jobs.handles import StallReport
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.surface.files_transfer import download, upload
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
 
@@ -158,3 +160,21 @@ async def test_delete_follows_the_rules(files: SshFileAccess, home: Path, tmp_pa
     assert (home / "relay").is_dir()
     empty = await refusal(files.delete(""))
     assert empty.reason == RefusalReason.INVALID_ARGUMENTS
+
+
+async def test_a_path_transfer_is_hashed_on_the_site(
+    files: SshFileAccess, home: Path, tmp_path: Path
+) -> None:
+    files.transfer_chunk_bytes = 4
+    source = tmp_path / "src.bin"
+    source.write_bytes(b"0123456789")
+    moved = await upload(files, str(source), "up/x.bin", overwrite=False)
+    assert moved["verified"] == "site"
+    assert (home / "relay" / "up" / "x.bin").read_bytes() == b"0123456789"
+    assert await files.sha256("up/x.bin") == hashlib.sha256(b"0123456789").hexdigest()
+    back = tmp_path / "back.bin"
+    got = await download(files, "up/x.bin", str(back), overwrite=False)
+    assert got["verified"] == "site"
+    assert back.read_bytes() == b"0123456789"
+    missing = await refusal(files.sha256("up/none.bin"))
+    assert missing.reason == RefusalReason.PATH_NOT_FOUND

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shutil
 from datetime import UTC, datetime
@@ -80,6 +81,18 @@ class LocalFileAccess:
                 return handle.read(-1 if limit is None else max(0, limit))
 
         return await asyncio.to_thread(_read)
+
+    async def sha256(self, path: str) -> str:
+        """Hash ``path`` where it is."""
+        target = self.resolve(path)
+
+        def _sum() -> str:
+            if not target.is_file():
+                raise self._missing(path)
+            with target.open("rb") as handle:
+                return hashlib.file_digest(handle, "sha256").hexdigest()
+
+        return await asyncio.to_thread(_sum)
 
     def _exists_refusal(self, path: str) -> Refusal:
         return Refusal(

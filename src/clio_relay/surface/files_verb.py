@@ -1,4 +1,4 @@
-"""The ``files`` verb: small files inline, larger ones in chunks.
+"""The ``files`` verb: small files inline, any file by its local path.
 
 On a guarded site a delete or a replace asks the person first: in the call
 when the client can show a form, else as a ``needs_approval`` refusal.
@@ -34,6 +34,7 @@ from clio_relay.surface.files_approval import (
     approve,
     used,
 )
+from clio_relay.surface.files_transfer import download, upload
 from clio_relay.surface.service import RelayService
 
 MAX_INLINE_BYTES = CHUNK_BYTES
@@ -60,8 +61,8 @@ def _payload(content: str | None, content_base64: str | None) -> bytes:
     if len(data) > MAX_INLINE_BYTES:
         raise Refusal(
             RefusalReason.INVALID_ARGUMENTS,
-            f"inline content is limited to {MAX_INLINE_BYTES} bytes; send larger files "
-            "in chunks with offset and final",
+            f"inline content is limited to {MAX_INLINE_BYTES} bytes; move a larger file "
+            "with op upload and its local_path",
         )
     return data
 
@@ -80,6 +81,7 @@ class FilesArgs:
     final: bool = True
     recursive: bool = False
     digest: str | None = None
+    local_path: str | None = None
 
 
 async def files_call(
@@ -107,16 +109,17 @@ async def _approved(
     service: RelayService, entry: SiteEntry, access: FileAccess, args: FilesArgs
 ) -> Ask | None:
     """On a guarded site, the person's yes this op needs, or None when it needs none."""
-    if args.op not in {"delete", "write"} or not args.path:
+    if args.op not in {"delete", "write", "upload"} or not args.path:
         return None
+    whole = args.op == "upload"
     action = await approval_action(
         entry,
         access,
-        args.op,
+        "write" if whole else args.op,
         args.path,
         overwrite=args.overwrite,
-        offset=args.offset,
-        final=args.final,
+        offset=0 if whole else args.offset,
+        final=True if whole else args.final,
         recursive=args.recursive,
     )
     if action is None:
@@ -144,7 +147,10 @@ async def _dispatch(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any]
             structured["text"] = text
         except UnicodeDecodeError:
             structured["content_base64"] = base64.b64encode(data).decode("ascii")
-            text = f"{len(data)} bytes of binary data, in structuredContent.content_base64"
+            text = (
+                f"{len(data)} bytes of binary data, in structuredContent.content_base64. "
+                "To save a file on this machine, use op download with local_path instead"
+            )
     elif op == "write":
         data = _payload(args.content, args.content_base64)
         written = await access.write(
@@ -164,6 +170,8 @@ async def _dispatch(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any]
         staged = await access.stage(data)
         structured = {"sha256": staged, "size": len(data)}
         text = f"staged {len(data)} bytes as {staged}"
+    elif op in {"upload", "download"}:
+        return await _transfer(access, args)
     elif op == "has":
         present = await access.has(_need(args.digest, "digest"))
         structured = {"sha256": args.digest, "present": present}
@@ -178,6 +186,18 @@ async def _dispatch(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any]
             RefusalReason.VERB_NOT_IMPLEMENTED, f"files op {op!r} is not available yet", op=op
         )
     return structured, text
+
+
+async def _transfer(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any], str]:
+    path = _need(args.path, "path")
+    if args.op == "upload":
+        moved = await upload(access, args.local_path, path, overwrite=args.overwrite)
+        text = f"uploaded {moved['local_path']} to {moved['path']}"
+    else:
+        moved = await download(access, path, args.local_path, overwrite=args.overwrite)
+        text = f"downloaded {moved['path']} to {moved['local_path']}"
+    text += f": {moved['size']} bytes, SHA-256 {moved['sha256']} (checked: {moved['verified']})"
+    return moved, text
 
 
 async def files_tool(

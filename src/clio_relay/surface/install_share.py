@@ -17,6 +17,7 @@ An answer to a shared ask moves on every operation that holds it
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_report, jarvis_submit
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 JARVIS_KIND = "jarvis_bootstrap"
 CHOICE_KIND = "jarvis_choice"
 CHOICE_FIELD = "constraint"
+_log = logging.getLogger(__name__)
 
 
 def _install_state(record: OperationRecord) -> dict[str, Any]:
@@ -144,3 +146,24 @@ def holders(service: RelayService, ask: Ask) -> list[str]:
         if ask.ask_id in other.asks and not other.state.final
     ]
     return live or own
+
+
+async def advance_holders(
+    service: RelayService, operation_id: str, answered: list[Ask]
+) -> OperationRecord:
+    """Advance ``operation_id``, then every other operation an answer in ``answered`` moves on.
+
+    However the answer came (``tasks/update``, an ``input_required`` round, an
+    elicitation), a shared ask moves every holder at once, so no other task is
+    left showing a question that is already answered.
+    """
+    others: list[str] = []
+    for ask in answered:
+        others.extend(held for held in holders(service, ask) if held != operation_id)
+    record = await service.advance(operation_id)
+    for other in dict.fromkeys(others):
+        try:
+            await service.advance(other)
+        except Exception as error:  # noqa: BLE001 - the other operation records its own failure
+            _log.warning("could not advance %s after a shared answer: %s", other, error)
+    return record

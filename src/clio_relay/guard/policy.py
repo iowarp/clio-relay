@@ -4,8 +4,10 @@ It implements the guard hook (RL24 to RL26):
 
 - ``check_run``: an open site runs anything. A guarded site runs only a JARVIS
   package, named with its version and SHA-256, or a pipeline of them. Each
-  package nobody has reviewed on that site comes back allowed with its own
-  review question in ``data["asks"]``, which relay asks before it submits.
+  package nobody has reviewed on that site comes back allowed with a review
+  question in ``data["asks"]``, which relay asks before it submits: one for a
+  package, or one for all of a pipeline's unreviewed packages, whose binding
+  lists them under ``packages``.
   ``data["review"]`` holds a one-package job's review, and ``data["reviews"]``
   holds a pipeline's, one per step. A free-form command is refused with
   ``policy_refused`` and the way to proceed.
@@ -84,11 +86,8 @@ def _source_line(source: dict[str, Any] | None) -> str:
     return line
 
 
-def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, archive: Path) -> str:
-    """Return the review question's text: what the package is, where it came from, its hash."""
+def _package_lines(package: PackageRef, info: ArchiveInfo, archive: Path) -> list[str]:
     lines = [
-        f"Review the JARVIS package {package.name} {package.version} before it runs on "
-        f"{site.title}, a guarded site.",
         f"SHA-256 of the package archive: {package.sha256}",
         _source_line(info.source),
         f"Archive on this relay host: {archive}",
@@ -107,9 +106,38 @@ def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, arch
     if package.parameters:
         shown = ", ".join(f"{key}={value}" for key, value in sorted(package.parameters.items()))
         lines.append(f"Parameters for this run: {shown}")
-    lines.append(
+    return lines
+
+
+def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, archive: Path) -> str:
+    """Return the review question's text: what the package is, where it came from, its hash."""
+    lines = [
+        f"Review the JARVIS package {package.name} {package.version} before it runs on "
+        f"{site.title}, a guarded site.",
+        *_package_lines(package, info, archive),
         "A yes records this hash as reviewed on this site. A changed package has a "
-        "different hash and needs a new review."
+        "different hash and needs a new review.",
+    ]
+    return "\n".join(lines)
+
+
+def reviews_message(site: SiteEntry, packages: list[tuple[PackageRef, ArchiveInfo, Path]]) -> str:
+    """Return one question that reviews several packages of one job at once."""
+    names = ", ".join(f"{package.name} {package.version}" for package, _, _ in packages)
+    lines = [
+        f"Review {len(packages)} JARVIS packages before they run on {site.title}, a guarded "
+        f"site: {names}."
+    ]
+    for package, info, archive in packages:
+        lines.extend(
+            ["", f"{package.name} {package.version}", *_package_lines(package, info, archive)]
+        )
+    lines.extend(
+        [
+            "",
+            "A yes records each of these hashes as reviewed on this site. A changed package "
+            "has a different hash and needs a new review.",
+        ]
     )
     return "\n".join(lines)
 
@@ -218,9 +246,11 @@ class Guard:
                 ),
                 data={"site": site.id, "next_step": "package_parameters"},
             )
-        # Each step of a pipeline is its own package, so each needs its own review.
+        # Each step of a pipeline is its own package with its own review, and the
+        # unreviewed ones of one job are asked as one question.
         reviews: list[dict[str, Any] | None] = []
-        asks: list[dict[str, Any]] = []
+        unreviewed: list[tuple[PackageRef, ArchiveInfo, Path]] = []
+        bindings: list[dict[str, Any]] = []
         asked: set[str] = set()
         for package in steps:
             review = await asyncio.to_thread(self.reviewed, site.id, package)
@@ -230,21 +260,32 @@ class Guard:
                 continue
             asked.add(sha256)
             info = await asyncio.to_thread(read_archive, self.content, package.name, sha256)
-            archive = self.content.path_for(sha256)
-            binding: dict[str, Any] = {
-                "kind": REVIEW_KIND,
-                "package": package.name,
-                "version": version,
-                "package_hash": sha256,
-                "source": info.source,
-                "files": len(info.files),
-            }
-            asks.append(
-                {"message": review_message(site, package, info, archive), "binding": binding}
+            unreviewed.append((package, info, self.content.path_for(sha256)))
+            bindings.append(
+                {
+                    "package": package.name,
+                    "version": version,
+                    "package_hash": sha256,
+                    "source": info.source,
+                    "files": len(info.files),
+                }
             )
         data: dict[str, Any] = {"review": reviews[0]} if len(steps) == 1 else {"reviews": reviews}
-        if asks:
-            data["asks"] = asks
+        if len(unreviewed) == 1:
+            package, info, archive = unreviewed[0]
+            data["asks"] = [
+                {
+                    "message": review_message(site, package, info, archive),
+                    "binding": {"kind": REVIEW_KIND, **bindings[0]},
+                }
+            ]
+        elif unreviewed:
+            data["asks"] = [
+                {
+                    "message": reviews_message(site, unreviewed),
+                    "binding": {"kind": REVIEW_KIND, "packages": bindings},
+                }
+            ]
         return GuardDecision(allowed=True, data=data)
 
     # check_exec

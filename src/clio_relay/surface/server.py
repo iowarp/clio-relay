@@ -70,8 +70,10 @@ from clio_relay.surface.endpoints import (
 )
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
+from clio_relay.surface.files_tool import install as install_files_tool
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
+from clio_relay.surface.install_share import advance_holders
 from clio_relay.surface.install_tool import install_tool
 from clio_relay.surface.progress import latest_note
 from clio_relay.surface.read_tools import install as install_read_tools
@@ -254,12 +256,13 @@ class RelayTasksExtension(ServerExtension):
     ) -> UpdateTaskResult:
         self._require(ctx)
         record = self._record(params.task_id)
+        answered: list[Ask] = []
         for ask_id, response in params.input_responses.items():
             if ask_id not in record.asks:
                 continue
             action, content = response_parts(response)
-            self.service.answer(ask_id, action, content, by="tasks/update")
-        await self.service.advance(params.task_id)
+            answered.append(self.service.answer(ask_id, action, content, by="tasks/update"))
+        await advance_holders(self.service, params.task_id, answered)
         return UpdateTaskResult()
 
     async def _cancel(
@@ -318,9 +321,10 @@ class RelayServer:
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
         modes = elicitation_modes(ctx)
+        answered: list[Ask] = []
         for ask in self.service.outstanding(record):
             if ask_mode(ask) not in modes:
-                return record
+                break
             if ask.kind == "url":
                 response = await ctx.session.elicit_url(
                     message=ask.message, url=ask.url or "", elicitation_id=ask.ask_id
@@ -331,8 +335,10 @@ class RelayServer:
                     requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
                 )
             action, content = response_parts(response)
-            self.service.answer(ask.ask_id, action, content, by="elicitation")
-        return await self.service.advance(record.operation_id)
+            answered.append(self.service.answer(ask.ask_id, action, content, by="elicitation"))
+        if not answered:
+            return record
+        return await advance_holders(self.service, record.operation_id, answered)
 
     def _needs_person(self, record: OperationRecord) -> ToolResult:
         pending = [ask for ask in self.service.operation_asks(record) if ask.state == "pending"]
@@ -472,11 +478,12 @@ class RelayServer:
         operation_id = ctx.request_state or ""
         record = self.service.operation(operation_id)
         await self.service.same_request(record, site, spec)
+        answered: list[Ask] = []
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
                 action, content = response_parts(response)
-                self.service.answer(ask_id, action, content, by="input_required")
-        record = await self.service.advance(operation_id)
+                answered.append(self.service.answer(ask_id, action, content, by="input_required"))
+        record = await advance_holders(self.service, operation_id, answered)
         return await self._deliver(ctx, record, wait_s)
 
     async def exec(
@@ -583,6 +590,7 @@ class RelayServer:
         relay = self
         install_read_tools(server, relay)
         install_site_tools(server, relay)
+        install_files_tool(server, relay)
 
         async def run(
             ctx: Context,
@@ -637,56 +645,6 @@ class RelayServer:
             command that only reads (ls, squeue, jarvis sched info +json and the like)
             runs through exec_read, which never asks."""
             return await relay.exec(ctx, site, command, timeout_s, max_output_bytes, plan)
-
-        @server.tool(
-            name="files",
-            title="List, read, write, delete and stage files on a site",
-            annotations=_CHANGE,
-        )
-        async def files(  # pyright: ignore[reportUnusedFunction]
-            ctx: Context,
-            site: Annotated[str, Field(description="The site id")],
-            op: Literal["list", "stat", "read", "write", "delete", "stage", "has"],
-            path: Annotated[
-                str | None,
-                Field(description="Absolute, ~/ for home, or relative to relay's work directory"),
-            ] = None,
-            content: Annotated[str | None, Field(description="Text to write or stage")] = None,
-            content_base64: Annotated[
-                str | None, Field(description="Bytes to write or stage, base64")
-            ] = None,
-            offset: Annotated[
-                int, Field(ge=0, description="Where a read starts, or where a write chunk goes")
-            ] = 0,
-            limit: Annotated[int | None, Field(ge=1)] = None,
-            overwrite: bool = False,
-            final: Annotated[bool, Field(description="False while more chunks follow")] = True,
-            recursive: Annotated[bool, Field(description="Delete a non-empty directory")] = False,
-            digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
-        ) -> ToolResult | InputRequiredToolResult:
-            """Files up to 4 MiB move inline. A larger upload is chunks of up to 4 MiB:
-            write each at its offset with final=false and the last with final=true; after
-            a dropped link, stat "<path>.relay-part" gives the offset to resume at. A
-            larger download is reads at increasing offsets. stage puts bytes in the
-            site's content store and returns the SHA-256 a JobSpec input names. On a
-            guarded site, delete and a write that replaces a file wait for the person's yes.
-            list, stat, read and has only read: files_read does them and never asks."""
-            return await relay.files(
-                ctx,
-                site,
-                FilesArgs(
-                    op=op,
-                    path=path,
-                    content=content,
-                    content_base64=content_base64,
-                    offset=offset,
-                    limit=limit,
-                    overwrite=overwrite,
-                    final=final,
-                    recursive=recursive,
-                    digest=digest,
-                ),
-            )
 
         @server.tool(
             name="packages",

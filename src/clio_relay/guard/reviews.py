@@ -6,7 +6,9 @@ package's name, version and SHA-256, so a changed archive, a new version or a
 new name is never covered by an old yes. Deleting the file withdraws the review.
 
 Relay asks for a review through an approve ask whose binding has
-``kind: package_review``. The guard turns an accepted one into a record the
+``kind: package_review``: one package's name, version and hash, or a job's
+several unreviewed packages under ``packages``, so one yes reviews them all.
+The guard turns an accepted one into a record the
 next time it looks, while the operation that asked is still open, so a review
 survives a restart and needs no hook into the moment the person answers. The
 answered asks of finished operations are never turned into reviews again.
@@ -120,23 +122,41 @@ class ReviewStore:
         for ask in asks.all():
             if ask.operation_id is None or not is_open(ask.operation_id):
                 continue
-            review = _review_of(ask)
-            if review is None:
-                continue
-            package = PackageRef(name=review.package, version=review.version, sha256=review.sha256)
-            if self.get(review.site, package) is not None:
-                continue
-            self.put(review)
-            added += 1
+            for review in _reviews_of(ask):
+                package = PackageRef(
+                    name=review.package, version=review.version, sha256=review.sha256
+                )
+                if self.get(review.site, package) is not None:
+                    continue
+                self.put(review)
+                added += 1
         return added
 
 
-def _review_of(ask: Ask) -> Review | None:
+def _reviews_of(ask: Ask) -> list[Review]:
+    """Return the reviews an accepted, untampered review ask records: one per package."""
     binding = ask.binding
     if ask.kind != "approve" or ask.state != "accepted" or binding.get("kind") != REVIEW_KIND:
-        return None
+        return []
     if ask.binding_digest != canonical_digest(binding):
-        return None
+        return []
+    site = str(binding.get("site") or ask.site)
+    if site != ask.site or not _SITE_ID.match(site):
+        return []
+    listed = binding.get("packages")
+    items = cast(list[Any], listed) if isinstance(listed, list) else [binding]
+    found: list[Review] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return []
+        review = _review_of(ask, site, cast(dict[str, Any], item))
+        if review is None:
+            return []
+        found.append(review)
+    return found
+
+
+def _review_of(ask: Ask, site: str, binding: dict[str, Any]) -> Review | None:
     try:
         package = PackageRef(
             name=str(binding["package"]),
@@ -145,9 +165,6 @@ def _review_of(ask: Ask) -> Review | None:
         )
         version, sha256 = package.pinned()
     except (KeyError, ValueError):
-        return None
-    site = str(binding.get("site") or ask.site)
-    if site != ask.site or not _SITE_ID.match(site):
         return None
     source = binding.get("source")
     return Review(

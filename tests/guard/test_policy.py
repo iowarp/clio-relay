@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar
@@ -184,6 +185,45 @@ async def test_a_deleted_review_stays_withdrawn_once_its_operation_ended(
     rebound = {**review["binding"], "site": hpc.id}
     answer(guard, "ask-2", hpc.id, review["message"], rebound, operation_id="op-2")
     assert (await guard.check_run(hpc, package_spec(digest))).data["review"]["ask_id"] == "ask-2"
+
+
+@pytest.mark.asyncio
+async def test_a_pipelines_unreviewed_packages_are_one_review_question(
+    guard: Guard, tmp_path: Path
+) -> None:
+    repo = make_repo(tmp_path)
+    hello = stage(guard, repo, "demo.hello")
+    other = stage(guard, repo, "demo.other")
+    hpc = site()
+    pipeline = JobSpec.model_validate(
+        {
+            "packages": [
+                {"name": "demo.hello", "version": "0.1.0", "sha256": hello},
+                {"name": "demo.other", "version": "0.1.0", "sha256": other},
+            ]
+        }
+    )
+    decision = await guard.check_run(hpc, pipeline)
+    [review] = decision.data["asks"]
+    binding = review["binding"]
+    assert binding["kind"] == "package_review"
+    assert [item["package_hash"] for item in binding["packages"]] == [hello, other]
+    assert "Review 2 JARVIS packages" in review["message"]
+    assert hello in review["message"] and other in review["message"]
+    answer(guard, "ask-1", hpc.id, review["message"], {**binding, "site": hpc.id})
+
+    again = await guard.check_run(hpc, pipeline)
+    assert "asks" not in again.data
+    assert [item["ask_id"] for item in again.data["reviews"]] == ["ask-1", "ask-1"]
+    assert sorted(item.sha256 for item in guard.reviews.all(hpc.id)) == sorted([hello, other])
+
+    tampered = answer(
+        guard, "ask-t", "other", review["message"], copy.deepcopy({**binding, "site": "other"})
+    )
+    tampered.binding["packages"][1]["package_hash"] = "f" * 64
+    guard.context.asks.put("ask-t", tampered)
+    assert "asks" in (await guard.check_run(site(site_id="other"), pipeline)).data
+    assert guard.reviews.all("other") == []
 
 
 @pytest.mark.asyncio

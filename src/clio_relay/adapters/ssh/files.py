@@ -115,6 +115,9 @@ def _entry(line: str) -> FileEntry | None:
 class SshFileAccess:
     """Files on one site, through the system ``ssh``."""
 
+    transfer_chunk_bytes = 32 * 1024 * 1024
+    """Each chunk is one ``ssh`` call, so a path transfer moves large ones."""
+
     def __init__(self, transport: SshTransport, *, remote_dir: str, timeout_s: float) -> None:
         self.transport = transport
         self.remote_dir = remote_dir
@@ -278,6 +281,25 @@ class SshFileAccess:
             raise not_empty_refusal(path)
         if result.exit_code != 0 or "done" not in sections:
             raise self._failed("delete", path, result.error_text() or "permission denied")
+
+    async def sha256(self, path: str) -> str | None:
+        """Hash ``path`` on the site, or return ``None`` when it has no sha256 tool."""
+        script = (
+            self._start(path)
+            + '[ -f "$p" ] || { echo "@@missing"; exit 0; }\n'
+            + 'if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum < "$p")\n'
+            + 'elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 < "$p")\n'
+            + 'else echo "@@none"; exit 0; fi\n'
+            + 'echo "@@sum"; echo "${s%% *}"\n'
+        )
+        result = await self.transport.ssh(script, timeout_s=None, what="hashing")
+        sections = parse_sections(result.text())
+        if "missing" in sections:
+            raise self._missing(path)
+        found = next((line.strip() for line in sections.get("sum", []) if line.strip()), None)
+        if result.exit_code != 0 or (found is None and "none" not in sections):
+            raise self._failed("hash", path, result.error_text())
+        return found if found and SHA256_PATTERN.match(found.lower()) else None
 
     def _cas(self, digest: str) -> str:
         digest = digest.lower()

@@ -28,6 +28,8 @@ A job's `OutputRef` paths are absolute, so they can be read back as they are.
 | `delete` | `path`, `recursive` | Deletes a file, a symlink or a directory | `path_not_found`; `invalid_arguments` for a directory that is not empty without `recursive`, and for the work directory, the home directory or `/` |
 | `stage` | `content` or `content_base64` | Puts bytes in the site's content store and returns their SHA-256, which a job input names | |
 | `has` | `digest` | Says whether the content store holds a SHA-256 | |
+| `upload` | `local_path`, `path`, `overwrite` | Copies a file on the relay host to the site and checks its SHA-256 there (see below) | `path_not_found` for a missing local file; `path_exists` without `overwrite` |
+| `download` | `path`, `local_path`, `overwrite` | Copies a site file to the relay host and checks it against the site's SHA-256 | `path_not_found`; `path_exists` for a local file without `overwrite` |
 
 `delete` removes a symlink itself and never follows it. A relative path that
 leaves the work directory refuses with `invalid_arguments` on every op.
@@ -36,9 +38,38 @@ On a guarded site, `delete` and any write that replaces an existing file ask a
 person first, on every adapter; a new file needs no approval. See
 [guarded sites](guarded-sites.md#deleting-and-replacing-files).
 
+## Moving files by path
+
+A file that exists on the machine relay runs on moves with `upload` and
+`download`, at any size. Relay reads or writes `local_path` itself, streams
+the bytes through the adapter's own file access in chunks, and checks the
+SHA-256 where the file landed. The result is metadata only: `path`,
+`local_path`, `size`, `sha256` and `verified`. No file bytes pass through the
+agent, so an agent never sends a file it can name as base64 chunks, and never
+reads one back to check it.
+
+- `local_path` is a path on the relay host: absolute, or under `~`. A relative
+  one refuses with `invalid_arguments`, since relay's working directory is not
+  the agent's.
+- `verified` says how the copy was checked. `site` means the site hashed the
+  file where it is (ssh runs `sha256sum` or `shasum -a 256`, local hashes it in
+  place). `read_back` means the site cannot hash, so relay read the upload back
+  and hashed it. `size` means a download was checked by its size alone. A copy
+  that does not match refuses with `unreachable` and asks for it again.
+- A download writes `<local_path>.relay-part` next to the target and moves it
+  into place only after the check, so a failed one leaves no partial file.
+- On a guarded site, an upload that replaces a file asks the person first, as
+  a replacing `write` does.
+- Relay opens `local_path` with its own process's permissions. A host that
+  runs relay inside a sandbox must let that launch read the files the agent
+  names (for an upload) and write where it saves them (for a download). A path
+  relay cannot reach refuses with `policy_refused` and says so.
+
 ## Large files
 
-One call carries at most 4 MiB. Larger files move in chunks.
+One inline call carries at most 4 MiB. A larger file that exists on the relay
+host moves by path, above. Chunks are for bytes that exist only in the
+conversation.
 
 Upload: write the first chunk at `offset` 0 with `final=false`, each next
 chunk at the offset where the last one ended, and the last chunk with
