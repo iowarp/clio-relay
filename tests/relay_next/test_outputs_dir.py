@@ -66,6 +66,30 @@ def test_the_site_script_links_the_shared_directory_to_the_outputs() -> None:
     script = jarvis_submit.SITE_SCRIPT
     assert "CLIO_RELAY_OUTPUTS" in script
     assert 'ln -sfn "$shared" "$root/shared"' in script
+    assert '> "$job/relay.shared"' in script
+    assert jarvis_submit.SHARED_SCHEMA in script
+    assert jarvis_submit.SHARED_FILE in jarvis_submit.SITE_FILES
+
+
+def test_a_handle_names_the_execution_where_the_outputs_are_not_through_the_link() -> None:
+    printed = (
+        "Loaded pipeline\n"
+        '{"schema_version":"clio-relay.shared.v1","path":"/home/u/clio-relay-runs/op_x/"}\n'
+        '{"schema_version":"jarvis.execution.handle.v1","execution_id":"op_x",'
+        '"pipeline_id":"relay_op_x","scheduler_native_id":"7"}\n'
+    )
+    shared = jarvis_submit.shared_dir(printed)
+    assert shared == "/home/u/clio-relay-runs/op_x"
+    found = jarvis_submit.parse_handle(printed)
+    assert found is not None
+    _native, data = jarvis_submit.handle_data(
+        found, job_dir="/home/u/.clio-relay/jobs/op_x", shared=shared
+    )
+    assert data["execution_dir"] == "/home/u/clio-relay-runs/op_x/relay_op_x/executions/op_x"
+    _native, linked = jarvis_submit.handle_data(found, job_dir="/home/u/.clio-relay/jobs/op_x")
+    assert linked["execution_dir"].startswith("/home/u/.clio-relay/jobs/op_x/.relay-jarvis/shared/")
+    for text in ("", '{"schema_version":"clio-relay.shared.v1","path":"relative"}', '{"x":1}'):
+        assert jarvis_submit.shared_dir(text) is None
 
 
 class _Cleaner:

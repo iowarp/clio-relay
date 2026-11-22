@@ -71,9 +71,26 @@ def _name(path: str) -> str:
     return posixpath.basename(path.rstrip("/"))
 
 
+async def _shared(files: FileAccess, directory: str) -> str:
+    """Return where the job's JARVIS shared directory is: what the site script wrote, if any.
+
+    The site script names the outputs directory there, so outputs are named
+    where they live and never through the job root's link to them.
+    """
+    try:
+        said = (
+            (await files.read(posixpath.join(directory, jarvis_submit.SHARED_FILE), limit=4096))
+            .decode("utf-8", errors="replace")
+            .strip()
+        )
+    except Exception:
+        said = ""
+    return said.rstrip("/") if said.startswith("/") else posixpath.join(directory, JARVIS_SHARED)
+
+
 async def _execution(files: FileAccess, directory: str) -> str | None:
     """Return the newest execution directory under the job's JARVIS root, if any."""
-    shared = posixpath.join(directory, JARVIS_SHARED)
+    shared = await _shared(files, directory)
     newest: tuple[float, str] | None = None
     for pipeline in await files.list(shared):
         if pipeline.kind != "dir":

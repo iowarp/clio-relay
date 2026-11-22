@@ -154,6 +154,10 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
   done
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi
+# Where the outputs really are, so relay names them there, never through the link.
+printf '%s\n' "$shared" > "$job/relay.shared"
+printf '{"schema_version":"clio-relay.shared.v1","path":"%s"}\n' \
+  "$(printf '%s' "$shared" | sed 's/[\\"]/\\&/g')"
 [ -f "$answers" ] && export JARVIS_INSTALL_ANSWERS="$answers"
 keep_report() {
   printf '%s\n' "$1" | tail -n 1 > "$job/relay.install-report.json.tmp"
@@ -354,7 +358,10 @@ it registers one whose archive lists Python requirements
 jarvis-cd ``pip`` (only for relay's own JARVIS, logged in
 ``relay.requirements.log``, under the ``.relay.lock`` the bootstrap holds, so
 two jobs never install into that venv at once), and fails with exit 1 when that
-install fails.
+install fails. It writes where JARVIS's shared directory really is (the site's
+outputs directory when it has one) to ``relay.shared`` and prints it as a
+``clio-relay.shared.v1`` line, so relay names outputs there and never through
+the job root's link (:func:`~clio_relay.jarvis_submit.shared_dir`).
 Relay sets no MPI network: JARVIS's MPI launches apply the one the site's
 resource graph selects. Then it hands the pipeline to JARVIS:
 

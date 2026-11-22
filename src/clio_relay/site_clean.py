@@ -259,7 +259,9 @@ def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list
     A clean leaves these unless the person asks: a case's results are the
     person's, not relay's deployment, even when a run put them inside relay's
     ``targets``. A path inside another listed one is left out, since keeping or
-    removing the outer one does the same to it.
+    removing the outer one does the same to it. An output in a directory named
+    for its operation (the site's outputs directory keeps one per job) is
+    listed as that directory, which holds everything the run wrote there.
     """
     found: dict[str, dict[str, Any]] = {}
     for record in service.operations.all():
@@ -267,15 +269,21 @@ def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list
             continue
         for output in record.outputs:
             path = output.path.rstrip("/")
-            if not path.startswith("/") or path in found:
+            if not path.startswith("/"):
                 continue
             if _in_job_dir(path, record.operation_id, targets):
                 continue
+            own = f"/{record.operation_id}/"
+            size = output.size
+            if own in path:
+                path, size = path[: path.index(own) + len(own) - 1], None
+            if path in found:
+                continue
             found[path] = {
                 "path": path,
-                "name": output.name,
+                "name": output.name if size is not None else record.operation_id,
                 "operation_id": record.operation_id,
-                "size": output.size,
+                "size": size,
             }
     paths = sorted(found)
     return [found[path] for path in paths if not any(path.startswith(o + "/") for o in paths)]

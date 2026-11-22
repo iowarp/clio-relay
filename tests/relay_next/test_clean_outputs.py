@@ -43,6 +43,27 @@ def test_outputs_outside_their_job_directories_are_listed_once() -> None:
     assert found[1]["operation_id"] == "op_run" and found[1]["size"] == 11_000_000_000
 
 
+def test_a_runs_outputs_directory_is_listed_once_for_all_it_holds() -> None:
+    runs = "/home/u/clio-relay-runs/op_run/relay_op_run/executions/op_run"
+    service = _service(
+        _record(
+            "ares",
+            "run",
+            OutputRef(name="environment-input", path=f"{runs}/input/environment.yaml", size=9),
+            OutputRef(name="pipeline-input", path=f"{runs}/input/pipeline.yaml", size=9),
+        ),
+    )
+    found = run_outputs(service, "ares", TARGETS)
+    assert found == [
+        {
+            "path": "/home/u/clio-relay-runs/op_run",
+            "name": "op_run",
+            "operation_id": "op_run",
+            "size": None,
+        }
+    ]
+
+
 def _planned(remove: bool) -> dict[str, Any]:
     return {
         "site": "ares",

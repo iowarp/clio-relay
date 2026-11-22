@@ -84,6 +84,10 @@ ANSWERS_FILE = "relay.answers.json"
 """The person's answers to JARVIS's install questions, ``{issue_id: {constraint, ...}}``."""
 INSTALL_FILE = "relay.install.json"
 """The ``jarvis.execution.handle.v1`` line ``ppl install +submit`` printed."""
+SHARED_FILE = "relay.shared"
+"""Where the job's JARVIS shared directory really is: the outputs directory's, or the root's."""
+SHARED_SCHEMA = "clio-relay.shared.v1"
+"""The line the site script prints with ``path``, the same as :data:`SHARED_FILE`."""
 
 SITE_FILES = (
     PIPELINE_FILE,
@@ -95,6 +99,7 @@ SITE_FILES = (
     INSTALL_REPORT_FILE,
     ANSWERS_FILE,
     INSTALL_FILE,
+    SHARED_FILE,
 )
 """Files the site script keeps in the job directory. They are not outputs."""
 
@@ -348,18 +353,30 @@ def jarvis_root(job_dir: str) -> str:
     return posixpath.join(job_dir, JARVIS_DIR)
 
 
-def execution_dir(job_dir: str, execution_id: str, *, pipeline: str | None = None) -> str:
+def execution_dir(
+    job_dir: str, execution_id: str, *, pipeline: str | None = None, shared: str | None = None
+) -> str:
     """Return the execution directory JARVIS seals for an execution.
 
     ``pipeline`` defaults to the operation's, ``pipeline_id(execution_id)``.
+    ``shared`` is where the site script says the shared directory is
+    (:func:`shared_dir`); without it, the job root's ``shared``.
     """
     return posixpath.join(
-        jarvis_root(job_dir),
-        "shared",
+        shared or posixpath.join(jarvis_root(job_dir), "shared"),
         pipeline or pipeline_id(execution_id),
         "executions",
         execution_id,
     )
+
+
+def shared_dir(text: str) -> str | None:
+    """Return the shared directory a site script's output names, if it names one."""
+    found = parse_document(text, SHARED_SCHEMA)
+    path = found.get("path") if found else None
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    return path.rstrip("/") or "/"
 
 
 def record_path(job_dir: str, execution_id: str, *, pipeline: str | None = None) -> str:
@@ -960,11 +977,14 @@ def parse_handle(text: str) -> dict[str, Any] | None:
     return parse_document(text, HANDLE_SCHEMA)
 
 
-def handle_data(found: Mapping[str, Any], *, job_dir: str) -> tuple[str | None, dict[str, Any]]:
+def handle_data(
+    found: Mapping[str, Any], *, job_dir: str, shared: str | None = None
+) -> tuple[str | None, dict[str, Any]]:
     """Return the native id and the job handle's data for a job ``ppl submit`` accepted.
 
     The data has ``mode: jarvis``, ``scheduler``, ``job_dir``, ``execution_id``,
-    ``pipeline_id`` and ``execution_dir``; the adapter adds its own keys.
+    ``pipeline_id`` and ``execution_dir``, under ``shared`` when the site script
+    named it (:func:`shared_dir`); the adapter adds its own keys.
     """
     execution_id = str(found["execution_id"])
     pipeline = str(found["pipeline_id"])
@@ -975,7 +995,7 @@ def handle_data(found: Mapping[str, Any], *, job_dir: str) -> tuple[str | None, 
         "job_dir": job_dir,
         "execution_id": execution_id,
         "pipeline_id": pipeline,
-        "execution_dir": execution_dir(job_dir, execution_id, pipeline=pipeline),
+        "execution_dir": execution_dir(job_dir, execution_id, pipeline=pipeline, shared=shared),
     }
     return (str(native) if native else None), data
 

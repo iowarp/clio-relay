@@ -543,7 +543,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{submit_output.strip()[-500:] or 'no output'}",
                 scheduler="jarvis",
             )
-        native, jarvis_data = jarvis_submit.handle_data(found, job_dir=str(data["job_dir"]))
+        native, jarvis_data = jarvis_submit.handle_data(
+            found, job_dir=str(data["job_dir"]), shared=jarvis_submit.shared_dir(submit_output)
+        )
         return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
 
     def _jarvis_document(
@@ -1063,7 +1065,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 scheduler="jarvis",
                 exit_code=_int(rc),
             )
-        native, data = jarvis_submit.handle_data(handle, job_dir=str(job_dir))
+        native, data = jarvis_submit.handle_data(
+            handle, job_dir=str(job_dir), shared=jarvis_submit.shared_dir(output)
+        )
         data.update(base)
         return JobHandle(adapter=self.name, native_id=native, data=data)
 

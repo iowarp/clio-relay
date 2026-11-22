@@ -123,7 +123,9 @@ What relay's runs wrote outside its own directories, such as a case's results
 under your home, is yours, so clean keeps it. Runs write under the site's
 `outputs_dir` (`~/clio-relay-runs` unless set), outside relay's directories:
 JARVIS's shared directory for each job lives there, linked from the job
-directory, so a clean removes the link and never the outputs. A run or service
+directory, so a clean removes the link and never the outputs. Relay names a
+run's outputs where they live, under the outputs directory, never through that
+link. A run or service
 whose job names a path inside relay's directories is refused before anything is
 asked, with the outputs directory to use instead. The question names the
 outputs, taken from the operations' records, and the result lists them as

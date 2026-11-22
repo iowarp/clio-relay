@@ -446,7 +446,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         )
 
     def _jarvis_handle(self, found: dict[str, Any], job_dir: Path, operation_id: str) -> JobHandle:
-        native, data = jarvis_submit.handle_data(found, job_dir=job_dir.as_posix())
+        try:
+            said = (job_dir / jarvis_submit.SHARED_FILE).read_text("utf-8").strip()
+        except OSError:
+            said = ""
+        native, data = jarvis_submit.handle_data(
+            found,
+            job_dir=job_dir.as_posix(),
+            shared=Path(said).as_posix() if said and Path(said).is_absolute() else None,
+        )
         data["job_name"] = self.job_name(operation_id)
         return JobHandle(adapter=self.name, native_id=native, data=data)
 

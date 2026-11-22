@@ -141,7 +141,7 @@ def listed_artifacts(plan: ServePlan, listing: bytes | None, seen: set[str]) -> 
         name = name.strip()
         if not name:
             continue
-        path = f"{plan.job_dir.rstrip('/')}/{name}"
+        path = name if name.startswith("/") else f"{plan.job_dir.rstrip('/')}/{name}"
         if path in seen:
             continue
         seen.add(path)
