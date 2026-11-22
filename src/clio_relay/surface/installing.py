@@ -17,8 +17,12 @@ Either refusal turns the operation back into asks instead of a failure:
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
   in the site's CLIO home and submits the run again. The approval is
   site-scoped: operations that find the site without JARVIS at the same time
-  share it (:mod:`~clio_relay.surface.install_share`), and the install script's site lock makes
-  the later install wait for the first and reuse it.
+  share it, and the install script's site lock makes the later install wait
+  for the first and reuse it.
+
+JARVIS's site-scope questions (which MPI) are shared the same way: operations on
+the site that get the same question hold one ask, and one answer moves them all
+(:mod:`~clio_relay.surface.install_share`).
 
 An ``install`` operation (:mod:`clio_relay.surface.install_op`) is the same flow
 with no run: its submit is ``ppl install +check``, and it completes once JARVIS
@@ -51,9 +55,10 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import queue_switch
+from clio_relay.surface.install_share import CHOICE_FIELD as CHOICE_FIELD
 from clio_relay.surface.install_share import JARVIS_KIND as JARVIS_KIND
+from clio_relay.surface.install_share import choice_ask, shared_jarvis_ask, site_lock_id
 from clio_relay.surface.install_share import holders as holders
-from clio_relay.surface.install_share import shared_jarvis_ask, site_lock_id
 from clio_relay.surface.install_share import withdrawable as withdrawable
 
 if TYPE_CHECKING:
@@ -63,7 +68,6 @@ logger = logging.getLogger(__name__)
 
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
-CHOICE_FIELD = "constraint"
 LOG_TAIL_BYTES = 4096
 MAX_ROUNDS = 3
 """How many installs one operation may go through before relay stops asking."""
@@ -180,16 +184,11 @@ async def ask_install(
             )
         )
         choices: dict[str, str] = {}
-        for issue in to_ask:
-            ask = await provider.choose(
-                site=site,
-                operation_id=operation_id,
-                message=jarvis_submit.choice_message(issue),
-                field_name=CHOICE_FIELD,
-                options=jarvis_submit.choice_options(issue),
-            )
-            choices[ask.ask_id] = str(issue.get("issue_id"))
-            asks.append(ask)
+        with service.asks.locked(site_lock_id(site.id)):
+            for issue in to_ask:
+                ask = await choice_ask(service, site, operation_id, issue)
+                choices[ask.ask_id] = str(issue.get("issue_id"))
+                asks.append(ask)
         state["choices"] = choices
     else:
         with service.asks.locked(site_lock_id(site.id)):

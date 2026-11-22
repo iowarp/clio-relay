@@ -3,7 +3,8 @@
 Each has a tool of its own, so a host's question names what the call does
 instead of the tool that started the work. ``site_clean`` is
 ``clio-relay site clean`` over MCP: it keeps the Spack store, as the command
-line does by default, and asks the person first on every site, in the call
+line does by default, and JARVIS's recorded install answers unless
+``forget_decisions`` is set, and asks the person first on every site, in the call
 when the client shows a form, else as a ``needs_approval`` refusal to retry
 after the answer. The yes is bound to the site and to what the clean removes,
 and is used once.
@@ -77,8 +78,8 @@ async def _approve(service: RelayService, planned: dict[str, Any]) -> Ask:
     return ask
 
 
-async def _clean(service: RelayService, site: str) -> dict[str, Any]:
-    planned = await cleaning.plan(service, site)
+async def _clean(service: RelayService, site: str, forget_decisions: bool) -> dict[str, Any]:
+    planned = await cleaning.plan(service, site, forget_decisions=forget_decisions)
     ask = await _approve(service, planned)
     try:
         return await cleaning.clean(service, planned)
@@ -116,14 +117,14 @@ def _needs_person(service: RelayService, ask: Ask) -> ToolResult:
 
 
 async def site_clean_tool(
-    service: RelayService, ctx: Context, site: str
+    service: RelayService, ctx: Context, site: str, forget_decisions: bool = False
 ) -> ToolResult | InputRequiredToolResult:
     """Clean ``site`` once the person says yes."""
     try:
         if ctx.request_state and ctx.input_responses is not None:
             _answer(service, site, ctx.request_state, ctx.input_responses)
         try:
-            cleaned = await _clean(service, site)
+            cleaned = await _clean(service, site, forget_decisions)
         except NeedsPerson as waiting:
             ask = waiting.ask
             if "form" not in elicitation_modes(ctx):
@@ -142,7 +143,7 @@ async def site_clean_tool(
             action, content = response_parts(response)
             service.answer(ask.ask_id, action, content, by="elicitation")
             try:
-                cleaned = await _clean(service, site)
+                cleaned = await _clean(service, site, forget_decisions)
             except NeedsPerson as still:
                 return _needs_person(service, still.ask)
     except Refusal as refusal:
@@ -178,12 +179,21 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
     async def site_clean(  # pyright: ignore[reportUnusedFunction]
         site: Annotated[str, Field(description="The site id")],
         ctx: Context,
+        forget_decisions: Annotated[
+            bool,
+            Field(
+                description="Also delete JARVIS's recorded install answers (which MPI, "
+                "which compiler), so the next install asks them again. Only when the "
+                "person asks to forget them"
+            ),
+        ] = False,
     ) -> ToolResult | InputRequiredToolResult:
         """Remove what relay deployed on a site, so the next use deploys it again:
         relay stops its processes there, then deletes its worker, scripts, job
-        directories and JARVIS bootstrap with JARVIS's site record, and drops its
-        local state for the site. The Spack store stays. It refuses while a job of
+        directories and JARVIS bootstrap, and drops its local state for the site.
+        The Spack store stays, and so do JARVIS's recorded install answers unless
+        forget_decisions is set. It refuses while a job of
         the site runs, cancels operations that wait on a person with no job yet,
         and asks the person first, naming what goes and what stays. The site stays
         registered."""
-        return await site_clean_tool(relay.service, ctx, site)
+        return await site_clean_tool(relay.service, ctx, site, forget_decisions)

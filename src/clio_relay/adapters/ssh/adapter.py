@@ -67,7 +67,7 @@ from clio_relay.jobs.handles import (
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import direct_refused
-from clio_relay.site_prune import parse_report, prune_script, spack_keeps
+from clio_relay.site_prune import parse_report, prune_script, site_keeps
 
 if TYPE_CHECKING:
     from psij import Job
@@ -187,8 +187,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return [stopped]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
-        """Relay's directory on the site, which holds jobs, scripts and JARVIS; Spack stays."""
-        return [self.config.remote_dir], spack_keeps(self.config.remote_dir)
+        """Relay's directory on the site; Spack and JARVIS's recorded answers stay."""
+        return [self.config.remote_dir], site_keeps(self.config.remote_dir)
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
         """Prune over this adapter's own ``ssh``; a prune that fails is refused, never empty."""

@@ -10,13 +10,44 @@ from __future__ import annotations
 import posixpath
 import shlex
 
-from clio_relay.jarvis_submit import SPACK_CONFIG_DIR, SPACK_DIR
+from clio_relay.jarvis_submit import (
+    BOOTSTRAP_DIR,
+    DECISIONS_FILE,
+    SITE_DIR,
+    SPACK_CONFIG_DIR,
+    SPACK_DIR,
+)
+
+DECISIONS_TAIL = posixpath.join(BOOTSTRAP_DIR, SITE_DIR, DECISIONS_FILE)
+"""Where JARVIS records the person's install answers, under a site home."""
 
 
 def spack_keeps(home: str) -> list[str]:
     """The person's Spack store and config under a site home, which clean keeps."""
     base = home.rstrip("/") or "/"
     return [posixpath.join(base, SPACK_DIR), posixpath.join(base, SPACK_CONFIG_DIR)]
+
+
+def site_keeps(home: str) -> list[str]:
+    """What clean keeps under a site home: the Spack store, and JARVIS's recorded answers.
+
+    The answers (which MPI, which compiler) are facts about the cluster the
+    person confirmed; without them the next install asks again.
+    """
+    base = home.rstrip("/") or "/"
+    return [*spack_keeps(home), posixpath.join(base, DECISIONS_TAIL)]
+
+
+def is_decisions(path: str) -> bool:
+    """Say whether a keep is JARVIS's decisions file rather than the Spack store."""
+    return path.endswith("/" + DECISIONS_TAIL)
+
+
+def kept(keep: list[str], *, spack: bool = True, decisions: bool = True) -> list[str]:
+    """Return ``keep`` without the Spack store or the decisions, as asked."""
+    return list(
+        dict.fromkeys(path for path in keep if (decisions if is_decisions(path) else spack))
+    )
 
 
 def prune_script(targets: list[str], keep: list[str]) -> str:
@@ -47,7 +78,14 @@ expand() {{
   esac
 }}
 physical() {{
-  if [ -d "$1" ] && [ ! -L "$1" ]; then (cd "$1" && pwd -P); else printf '%s' "${{1%/}}"; fi
+  if [ -d "$1" ] && [ ! -L "$1" ]; then (cd "$1" && pwd -P); return; fi
+  # A kept file resolves through its directory, so it matches a resolved target.
+  parent=${{1%/*}}
+  if [ -e "$1" ] && [ -n "$parent" ] && [ "$parent" != "$1" ] && [ -d "$parent" ]; then
+    printf '%s/%s' "$(cd "$parent" && pwd -P)" "${{1##*/}}"
+  else
+    printf '%s' "${{1%/}}"
+  fi
 }}
 keeps=()
 for pattern in {quoted_keep}; do

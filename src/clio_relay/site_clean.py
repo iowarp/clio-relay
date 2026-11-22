@@ -2,10 +2,13 @@
 
 It stops relay's processes on the site first (:mod:`clio_relay.shutdown`), then
 removes the worker and its binaries, relay's scripts and job directories, the
-JARVIS bootstrap venv with JARVIS's site record (its resource graph and install
-decisions), and ``~/.clio-relay`` and ``~/.config/clio-relay``. The
-person's Spack store (``<site home>/spack`` and ``<site home>/spack-config``) is
-kept unless ``remove_spack`` says otherwise; rebuilding it takes hours. Then it
+JARVIS bootstrap venv with JARVIS's resource graph, and ``~/.clio-relay`` and
+``~/.config/clio-relay``. The person's Spack store (``<site home>/spack`` and
+``<site home>/spack-config``) is kept unless ``remove_spack`` says otherwise;
+rebuilding it takes hours. JARVIS's recorded install answers
+(``<site home>/jarvis-cd/site/decisions.yaml``: which MPI, which compiler) are
+facts about the cluster the person confirmed, so they are kept too unless
+``forget_decisions`` says otherwise; the next install then asks them again. Then it
 drops relay's local state for the site, so the next call signs in and places
 everything again. It observes the site's open operations first, through JARVIS's
 execution record, so one whose job was cancelled outside relay ends, and it
@@ -24,6 +27,7 @@ from clio_relay.adapters.base import CleansSite, ShutsDown
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.shutdown import shutdown
+from clio_relay.site_prune import is_decisions, kept
 from clio_relay.surface import installing, queue_switch
 
 if TYPE_CHECKING:
@@ -96,7 +100,11 @@ async def _reconcile(service: RelayService, site_id: str) -> tuple[list[str], li
 
 
 async def plan(
-    service: RelayService, site_id: str, *, remove_spack: bool = False
+    service: RelayService,
+    site_id: str,
+    *,
+    remove_spack: bool = False,
+    forget_decisions: bool = False,
 ) -> dict[str, Any]:
     """Return what clean would remove and keep, or refuse while a job of the site runs.
 
@@ -116,16 +124,16 @@ async def plan(
     targets: list[str] = []
     keep: list[str] = []
     for cleaner in cleaners:
-        found, kept = cleaner.clean_targets()
+        found, spared = cleaner.clean_targets()
         targets += found
-        keep += kept
+        keep += spared
     targets = list(dict.fromkeys([*targets, *COMMON_TARGETS, *_hop_dirs(service, site_id)]))
     return {
         "site": site_id,
         "adapter": cleaners[0].name,
         "adapters": names,
         "targets": targets,
-        "keep": [] if remove_spack else list(dict.fromkeys(keep)),
+        "keep": kept(keep, spack=not remove_spack, decisions=not forget_decisions),
         "cancels": waiting,
     }
 
@@ -146,7 +154,12 @@ def _hop_dirs(service: RelayService, site_id: str) -> list[str]:
 
 def describe_plan(planned: dict[str, Any]) -> str:
     """Return the ask's text: what goes and what stays."""
-    kept = ", ".join(planned["keep"]) or "nothing: the Spack store goes too"
+    keeping = ", ".join(planned["keep"]) or "nothing: the Spack store and JARVIS's answers go too"
+    if planned["keep"] and not any(is_decisions(path) for path in planned["keep"]):
+        keeping += (
+            ". JARVIS's recorded install answers (which MPI, which compiler) go, so the "
+            "next install asks them again"
+        )
     cancels = list(planned.get("cancels") or [])
     waiting = (
         f" It cancels {', '.join(cancels)}, which wait on a person and have no job yet."
@@ -155,7 +168,7 @@ def describe_plan(planned: dict[str, Any]) -> str:
     )
     return (
         f"Clean {planned['site']}? Relay stops its processes there, then deletes "
-        f"{', '.join(planned['targets'])} on the site, keeping {kept}. The next use "
+        f"{', '.join(planned['targets'])} on the site, keeping {keeping}. The next use "
         f"places the worker and JARVIS again.{waiting}"
     )
 

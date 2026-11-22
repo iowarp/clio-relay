@@ -1,11 +1,17 @@
-"""One jarvis-cd install per site, however many operations find it missing at once.
+"""One ask per site for what is the site's, however many operations need it at once.
 
 Operations that find a site without JARVIS at the same time share one site-scoped
-approval (its binding names the site and the pin, not one job), and an answer to
-it moves on every operation that holds it. Cancelling one leaves the ask to the
-others. The bootstrap script takes a lock in the site's jarvis-cd home, so a
-second install waits for the first and reuses it
-(:data:`~clio_relay.jarvis_bootstrap.BOOTSTRAP_SCRIPT`).
+approval (its binding names the site and the pin, not one job). The bootstrap
+script takes a lock in the site's jarvis-cd home, so a second install waits for
+the first and reuses it (:data:`~clio_relay.jarvis_bootstrap.BOOTSTRAP_SCRIPT`).
+
+JARVIS's own site-scope questions (which MPI, which compiler) are shared the same
+way: operations on the site that get the same question, the same ``issue_id``
+with the same candidates, hold one ask (:func:`choice_ask`). JARVIS records the
+answer for the site, so it is one answer for every holder.
+
+An answer to a shared ask moves on every operation that holds it
+(:func:`holders`). Cancelling one leaves the ask to the others (:func:`withdrawable`).
 """
 
 from __future__ import annotations
@@ -16,11 +22,14 @@ from typing import TYPE_CHECKING, Any, cast
 from clio_relay import jarvis_submit
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.records import OperationRecord
+from clio_relay.sites.models import SiteEntry
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
 
 JARVIS_KIND = "jarvis_bootstrap"
+CHOICE_KIND = "jarvis_choice"
+CHOICE_FIELD = "constraint"
 
 
 def _install_state(record: OperationRecord) -> dict[str, Any]:
@@ -29,7 +38,7 @@ def _install_state(record: OperationRecord) -> dict[str, Any]:
 
 
 def site_lock_id(site_id: str) -> str:
-    """The record lock relay holds while it asks to install jarvis-cd on ``site_id``."""
+    """The record lock relay holds while it asks a site-scoped question on ``site_id``."""
     return "jarvis-site-" + hashlib.sha256(site_id.encode()).hexdigest()[:24]
 
 
@@ -63,6 +72,57 @@ def shared_jarvis_ask(service: RelayService, site_id: str, operation_id: str) ->
             ):
                 return ask
     return None
+
+
+def choice_binding(site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None:
+    """Return what a site-scope JARVIS question is bound to, or ``None`` for any other.
+
+    JARVIS's ``issue_id`` digests the question with its candidates; the options
+    are bound too, so a question that offers something else is asked on its own.
+    """
+    issue_id = issue.get("issue_id")
+    if issue.get("scope") != "site" or not isinstance(issue_id, str) or not issue_id:
+        return None
+    return {
+        "site": site_id,
+        "scope": "site",
+        "kind": CHOICE_KIND,
+        "issue_id": issue_id,
+        "options": jarvis_submit.choice_options(issue),
+    }
+
+
+async def choice_ask(
+    service: RelayService, site: SiteEntry, operation_id: str, issue: dict[str, Any]
+) -> Ask:
+    """Ask one of JARVIS's questions, or reuse the same site-scope one held elsewhere.
+
+    Another live operation on the site that holds the same question, unanswered
+    or answered, lends it. The caller holds :func:`site_lock_id`.
+    """
+    binding = choice_binding(site.id, issue)
+    if binding is not None:
+        for other in _live_elsewhere(service, operation_id):
+            if other.site != site.id:
+                continue
+            for ask in service.operation_asks(other):
+                if (
+                    ask.kind == "choose"
+                    and ask.binding == binding
+                    and ask.state in ("pending", "accepted")
+                ):
+                    return ask
+    ask = await service.ask_provider.choose(
+        site=site,
+        operation_id=operation_id,
+        message=jarvis_submit.choice_message(issue),
+        field_name=CHOICE_FIELD,
+        options=jarvis_submit.choice_options(issue),
+    )
+    if binding is not None:
+        ask.bind(binding)
+        service.asks.put(ask.ask_id, ask)
+    return ask
 
 
 def withdrawable(service: RelayService, asks: list[Ask], operation_id: str) -> list[Ask]:

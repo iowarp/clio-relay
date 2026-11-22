@@ -30,8 +30,9 @@ flowchart LR
    `shutdown` beside them. Two changes have tools of their own, so a host's
    question names what they do (`surface/site_tools.py`): `cancel` cancels a
    job or stops a service, and `site_clean` removes relay's deployment from a
-   site after the person's yes, keeping the Spack store as `clio-relay site
-   clean` does. The tools that only read, `describe`, `exec_read`
+   site after the person's yes, keeping the Spack store and JARVIS's recorded
+   install answers as `clio-relay site clean` does (`forget_decisions` drops
+   the answers). The tools that only read, `describe`, `exec_read`
    (the read-only command list of [guarded sites](guarded-sites.md#read-only-exec))
    and `files_read` (list, stat, read and has), live in `surface/read_tools.py`;
    the result rendering and the annotations are in `surface/results.py`.
@@ -45,7 +46,10 @@ flowchart LR
    jarvis-cd first when the site lacks it, and launches nothing. Operations
    that find a site without jarvis-cd at once share one site-scoped ask
    (`surface/install_share.py`), and the bootstrap's lock in the site home
-   makes a second install wait for the first and reuse it.
+   makes a second install wait for the first and reuse it. A JARVIS question
+   scoped to the site (which MPI) is shared the same way: operations that get
+   the same `issue_id` with the same candidates hold one ask, and its answer
+   reaches each install.
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
    configured sites and the staged packages (`surface/instructions.py`), so an

@@ -61,7 +61,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import LoginLimits, light_function
 from clio_relay.serve.config import DEFAULT_STUN_SERVER
-from clio_relay.site_prune import parse_report, prune_script, spack_keeps
+from clio_relay.site_prune import parse_report, prune_script, site_keeps
 
 if TYPE_CHECKING:
     from clio_relay.adapters.worker.link import WorkerConnection
@@ -752,11 +752,11 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return [stopped, {"kind": "frpc", "detail": "relay's link visitor to the worker"}]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
-        """The worker's directory and job homes; the Spack store under each home stays."""
+        """The worker's directory and job homes; each home's Spack store and JARVIS answers stay."""
         link = self.load_link()
         remote_dir = link.remote_dir if link is not None and link.remote_dir else self._remote_dir()
         targets = [remote_dir]
-        keep = spack_keeps(posixpath.join(remote_dir, "adapter", "*"))
+        keep = site_keeps(posixpath.join(remote_dir, "adapter", "*"))
         if self.config.work_dir is not None:
             work_dir = self.config.work_dir
             targets += [
@@ -764,7 +764,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 posixpath.join(work_dir, "jobs"),
                 posixpath.join(work_dir, "psij"),
             ]
-            keep += spack_keeps(work_dir)
+            keep += site_keeps(work_dir)
         return targets, keep
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:

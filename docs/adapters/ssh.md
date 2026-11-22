@@ -222,7 +222,9 @@ JARVIS records your answers in the site's decisions file,
 (`JARVIS_SPACK_DECISIONS`), and replays them on later installs of any package
 while they still match what it finds; it asks again, naming the earlier answer,
 when one no longer does. Relay keeps no copy: it asks only what JARVIS leaves
-open, and the install approval names the decisions JARVIS applies.
+open, and the install approval names the decisions JARVIS applies. Operations
+on one site that get the same site-scoped question (the same `issue_id` and
+candidates) share one ask, and its answer reaches each of them.
 
 While the install job or the run waits in the scheduler's queue, the
 operation's `result.queue` and its message carry JARVIS's view of it, the
@@ -284,7 +286,8 @@ decisions file, JARVIS's net report (`jarvis rg net show`), and `collect`, the
 `exec` that submits the collection job. A run that fails on the network carries
 JARVIS's `mpi_network` issue in `result.issues`, naming the graph field to
 change; the person's override is `jarvis rg net set`. `site clean` removes the
-graph and the decisions with the rest of relay's directory.
+graph with the rest of relay's directory and keeps the decisions file, unless
+`--forget-decisions` (`forget_decisions` over MCP) says otherwise.
 Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
 site home, by absolute path for submit, install, check, execution and stop. It
 never runs a `jarvis` found on the site's `PATH`: an older one rejects the

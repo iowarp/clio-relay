@@ -109,12 +109,18 @@ relay's processes there, then removes the worker and its binaries,
 site-serve, relay's scripts and job directories, `~/.clio-relay`,
 `~/.config/clio-relay` and the JARVIS bootstrap venv under the site home. It
 keeps the Spack store (`<site home>/spack`, with every package built there):
-rebuilding ParaView takes hours. Pass `--remove-spack` to delete it too, and
-`--yes` to approve on the command line. It refuses while a job of the site
+rebuilding ParaView takes hours. It also keeps JARVIS's recorded install
+answers (`<site home>/jarvis-cd/site/decisions.yaml`: which MPI, which
+compiler), facts about the cluster you confirmed, so the next install does not
+ask them again. Pass `--remove-spack` to delete the Spack store too,
+`--forget-decisions` to delete the answers, and `--yes` to approve on the
+command line. To forget one answer rather than all of them, use JARVIS's
+`jarvis ppl install --forget <selector>` on the site. It refuses while a job of the site
 still runs. The next call signs in and deploys everything again. Every live
 proof starts with it, so deployment is tested each time.
 
-Over MCP the `site_clean` tool does the same, keeping the Spack store. It asks
+Over MCP the `site_clean` tool does the same, keeping the Spack store and the
+answers; its `forget_decisions` argument deletes the answers. It asks
 the person on every call, open site or guarded, with a question bound to what
 it will remove; once the person says yes, the same call, or the next one with
 the same site, cleans. It refuses while a job of the site still runs.

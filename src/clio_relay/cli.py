@@ -469,11 +469,16 @@ def site_clean(
     remove_spack: Annotated[
         bool, typer.Option(help="Delete the Spack store too; rebuilding it takes hours")
     ] = False,
+    forget_decisions: Annotated[
+        bool,
+        typer.Option(help="Delete JARVIS's recorded install answers; they are asked again"),
+    ] = False,
     wait_s: Annotated[float, typer.Option(help="How long to wait for the answer")] = 600.0,
 ) -> None:
     """Remove relay's deployment on a site, so the next use deploys it again.
 
-    It stops relay's processes there first, and keeps the Spack store unless told.
+    It stops relay's processes there first, and keeps the Spack store and JARVIS's
+    recorded install answers unless told.
     """
     from clio_relay import site_clean as cleaning
     from clio_relay.surface.service import RelayService
@@ -514,7 +519,9 @@ def site_clean(
     async def go() -> dict[str, Any]:
         service = RelayService(_paths())
         try:
-            planned = await cleaning.plan(service, site_id, remove_spack=remove_spack)
+            planned = await cleaning.plan(
+                service, site_id, remove_spack=remove_spack, forget_decisions=forget_decisions
+            )
             if not await approved(service, planned):
                 raise Refusal(RefusalReason.POLICY_REFUSED, f"cleaning {site_id} was not approved")
             return await cleaning.clean(service, planned)
