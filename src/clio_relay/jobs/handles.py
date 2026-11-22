@@ -129,6 +129,14 @@ class JobStatus(BaseModel):
             "desktop, such as host_key_unverified. The job itself runs on"
         ),
     )
+    components: list[dict[str, Any]] = Field(
+        default_factory=list[dict[str, Any]],
+        description=(
+            "For a JARVIS job: each package's latest state as JARVIS records it "
+            "(components.jsonl, jarvis.job.v1): component, package, state (waiting, "
+            "starting, running, done, failed or cancelled), hosts, at and reason"
+        ),
+    )
 
 
 class ExecResult(BaseModel):

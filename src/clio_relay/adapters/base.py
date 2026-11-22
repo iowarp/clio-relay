@@ -392,6 +392,19 @@ class BaseAdapter[ConfigT: BaseModel]:
         """Ask a running job to end cleanly (``jarvis execution stop``), and return its status."""
         raise not_implemented(self.name, "stop")
 
+    async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
+        """Return the plan of the package job :meth:`run` would submit, submitting nothing.
+
+        An adapter that submits through JARVIS returns JARVIS's plan
+        (:func:`clio_relay.jarvis_plan.parse`): the directives, the components,
+        the couplings and the script, with the ``plan_sha256`` a later
+        :meth:`run` of a spec :func:`~clio_relay.jarvis_plan.bound` to it must
+        match. It stages the job's files and runs no Spack and no job. ``None``
+        means there is no plan to show (the default, and any job JARVIS does not
+        submit); the card then shows the job as relay records it.
+        """
+        return None
+
     async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
         """Ask JARVIS whether ``spec``'s software is installed, and launch nothing.
 

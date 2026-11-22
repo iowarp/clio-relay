@@ -117,6 +117,19 @@ snapshot each time, and `revision` rises with each change, so a host keeps the
 newest one per `operation_id`. The text of every message stays as it is, so a
 host that ignores the snapshot loses nothing.
 
+For a package job, the card is JARVIS's own plan of the job
+(`jarvis ppl submit +plan`), made before anything is submitted: the
+directives, each package with its nodes, ranks and node range, the couplings
+between packages, and the batch script. Its `source` is `jarvis`. The yes is
+bound to that plan: relay submits with its `plan_sha256`, and if the job JARVIS
+would submit has changed since (an edited pipeline, a new wall time), JARVIS
+refuses and relay shows the new plan as a second card rather than submitting
+what the person did not see. While the job runs, each component's state comes
+from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
+`cancelled`), with its hosts. A package not yet reviewed, a site whose JARVIS
+cannot plan, and an install job show the card as relay records it, with
+`source: relay`.
+
 | Where | How |
 | --- | --- |
 | The confirm form | phase `planned`, in the elicitation's `params._meta`; on a `2026-07-28` connection, in the `input_required` result's `_meta` |

@@ -74,6 +74,13 @@ case "$1 $2" in
     printf '{"schema_version":"jarvis.pipeline-check.v1","ok":true,'
     printf '"services":[{"nodes":{"first":2,"end":3}}]}\\n' ;;
   "ppl submit")
+    case " $* " in
+      *" +plan "*)
+        if [ -n "${JARVIS_PLAN_RC:-}" ]; then echo "no +plan here" >&2; exit "$JARVIS_PLAN_RC"; fi
+        printf '{"plan_sha256":"%s","schema_version":"jarvis.submit-plan.v1"}\\n' \\
+          "${JARVIS_PLAN_SHA:-ab12}"
+        exit 0 ;;
+    esac
     if [ -n "${JARVIS_SUBMIT_RC:-}" ]; then
       echo "sbatch said no" >&2
       [ "$JARVIS_SUBMIT_RC" != 3 ] \\
@@ -131,7 +138,7 @@ def _site(
     mode: str = "run",
 ) -> subprocess.CompletedProcess[str]:
     steps = f"{package}@{digest}"
-    if "/" not in jarvis and not jarvis.startswith("~"):
+    if jarvis and "/" not in jarvis and not jarvis.startswith("~"):
         # Relay never looks JARVIS up on PATH, so a bare name is the stand-in's full path.
         jarvis = f"{env['PATH'].split(':')[0]}/{jarvis}"
     return subprocess.run(

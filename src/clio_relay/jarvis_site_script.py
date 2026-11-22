@@ -11,8 +11,8 @@ shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
-case $mode in submit|run|install|check|recheck) ;;
-  *) fail 64 "mode $mode is not submit, run, install, check or recheck" ;;
+case $mode in submit|plan|run|install|check|recheck) ;;
+  *) fail 64 "mode $mode is not submit, plan, run, install, check or recheck" ;;
 esac
 printf '%s\n' "$steps" | tr , '\n' \
   | grep -Evq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+@[0-9a-f]{64}$' \
@@ -61,8 +61,9 @@ graph=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
+bind=${CLIO_RELAY_PLAN:-}
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
-unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_OUTPUTS
+unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_OUTPUTS CLIO_RELAY_PLAN
 unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT
 unset JARVIS_ALLOW_LOCAL_BUILD
 # Where checks and builds run is the site's choice: JARVIS asks it (install_placement),
@@ -108,6 +109,9 @@ else
   [ -z "$pin" ] || [ "$got" = "$pin" ] \
     || refuse "$found" ",\"pin\":\"$got\"" "relay's jarvis-cd is at ${got:-no pin}, not $pin"
 fi
+# Only relay's pinned JARVIS is known to plan. An older one ignores an unknown +plan and
+# would submit, so any other JARVIS makes no plan and submits unbound.
+plans=; [ -n "$jarvis" ] || [ -z "$pin" ] || plans=1
 printf '%s\n' "$found" > "$job/relay.jarvis"
 root="$job/.relay-jarvis"
 export JARVIS_ROOT="$root"
@@ -287,6 +291,30 @@ if [ "$mode" = run ]; then
   "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
   exit 0
 fi
+plan() {
+  # JARVIS plans the submit without making it: no Spack, no job and no record. The
+  # same install policy, execution id and directory as the submit, so the shas match.
+  prc=0
+  rm -f "$job/relay.plan.json"
+  [ -n "$plans" ] || { prc=1; return 0; }
+  JARVIS_INSTALL_ON_LOAD=check "$found" ppl submit "$pipeline" --execution-id "$execution" \
+    +plan +json > "$job/relay.plan.json.tmp" || prc=$?
+  if grep -qF '"schema_version":"jarvis.submit-plan.v1"' "$job/relay.plan.json.tmp"; then
+    tail -n 1 "$job/relay.plan.json.tmp" > "$job/relay.plan.json"
+  else
+    rm -f "$job/relay.plan.json"
+  fi
+  rm -f "$job/relay.plan.json.tmp"
+}
+if [ "$mode" = plan ]; then
+  plan
+  if [ -f "$job/relay.plan.json" ]; then
+    cat "$job/relay.plan.json"
+    case $prc in 0|3|4) exit 10 ;; esac
+  fi
+  [ "$prc" -ne 0 ] || prc=1
+  exit "$prc"
+fi
 rc=0
 if [ "$mode" = install ] || [ "$mode" = recheck ]; then
   # Each install round is its own execution, as JARVIS refuses to reuse one.
@@ -321,8 +349,22 @@ print(f if isinstance(f, int) and not isinstance(f, bool) else 0)' \
   else
     printf '0\n' > "$job/relay.service-node"
   fi
+  # The submit is bound to a plan: the one the person said yes to, else the one JARVIS
+  # makes now. A JARVIS that cannot plan submits unbound.
+  sealed=
+  case $bind in
+    sha256:*) sealed=${bind#sha256:} ;;
+    *)
+      plan
+      if [ "$prc" -eq 0 ] && [ -f "$job/relay.plan.json" ]; then
+        sealed=$(sed -n 's/.*"plan_sha256":"\([0-9a-f]*\)".*/\1/p' "$job/relay.plan.json") \
+          || sealed=
+      fi
+      ;;
+  esac
+  [ ! -f "$job/relay.plan.json" ] || cat "$job/relay.plan.json"
   out=$(JARVIS_INSTALL_ON_LOAD=check "$found" ppl submit "$pipeline" \
-    --execution-id "$execution" +json) || rc=$?
+    --execution-id "$execution" ${sealed:+--plan_sha256 "$sealed"} +json) || rc=$?
   saved=relay.submission.json
 fi
 printf '%s\n' "$out"
@@ -371,9 +413,19 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   ``relay.check.json``; when JARVIS refuses the pipeline (exit 5, typed issues)
   it prints that document and exits 5. It writes the first allocation index of
   the first service JARVIS names to ``relay.service-node``, where the connector
-  starts (:func:`connector_command`). Then it runs ``ppl submit`` under
+  starts (:func:`connector_command`). Then it binds the submit to a plan:
+  ``$CLIO_RELAY_PLAN`` (``sha256:<plan_sha256>``, the plan the person said yes
+  to) when it is set, else the plan ``ppl submit +plan +json`` makes now, kept
+  as ``relay.plan.json`` and printed before the submit (a JARVIS that cannot
+  plan, and a JARVIS the site's setting names, which may be older, submits
+  unbound). Then it runs ``ppl submit --plan_sha256`` under
   ``JARVIS_INSTALL_ON_LOAD=check`` (checked in the allocation) and keeps the
-  handle line as ``relay.submission.json``;
+  handle line as ``relay.submission.json``; JARVIS refuses a submit whose
+  script or input changed since the plan (exit 5, ``submission_plan_changed``);
+- ``plan`` runs only ``ppl submit +plan +json``, under the same install policy
+  and execution id as the submit, with no Spack, no job and no record. It keeps
+  and prints the ``jarvis.submit-plan.v1`` document and exits 10 when JARVIS
+  made one (its own exit 0, 3 or 4); otherwise it exits with JARVIS's code;
 - ``install`` (the answers JSON comes first) keeps the answers as
   ``relay.answers.json``. A pipeline YAML given to ``install`` is the
   install job's own (:func:`install_pipeline`), kept as

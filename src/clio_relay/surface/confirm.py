@@ -8,8 +8,10 @@ whatever the site's spend rule or guard says:
 
 - a submit's card folds the package reviews, the charge and the choice about
   the site's running services into one approve ask, with the job's planned
-  snapshot in ``_meta`` (:func:`operation_asks`). A sign-in stays its own URL
-  ask, and JARVIS's install questions come later, from JARVIS;
+  snapshot in ``_meta`` (:func:`operation_asks`). A package run's card shows
+  JARVIS's own plan of the job, and the yes binds the submit to it
+  (:mod:`~clio_relay.surface.plan_card`). A sign-in stays its own URL ask, and
+  JARVIS's install questions come later, from JARVIS;
 - an ``exec`` asks for that exact argv, once (:func:`exec_confirm`);
 - a cancel or stop asks for that operation, once (:func:`cancel_confirm`).
 
@@ -27,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from fastmcp import Context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask, Charge, GuardDecision
 from clio_relay.guard.reviews import REVIEW_KIND
@@ -36,7 +38,7 @@ from clio_relay.jobs.records import OperationKind, OperationRecord
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import held_services, job_card
+from clio_relay.surface import held_services, job_card, plan_card
 from clio_relay.surface.elicit import (
     elicit_inline,
     elicitation_modes,
@@ -84,6 +86,8 @@ async def operation_asks(
             await service.ask_provider.url(site=site, operation_id=record.operation_id, need=need)
         )
     if confirm:
+        if not asks:
+            await plan_card.plan_first(service, site, record, adapter=adapter, decision=decision)
         asks.append(await _card(service, site, record, job, decision, charge, action, spends))
         return asks
     asks.extend(await review_asks(service, site, record, decision))
@@ -129,6 +133,9 @@ async def _card(
     }
     if spends:
         binding["charge"] = charge.model_dump(mode="json")
+    if (plan := plan_card.plan_of(record)) is not None:
+        binding["plan_sha256"] = plan.get("plan_sha256")
+        message += "\n\n" + jarvis_plan.summary(plan)
     reviews: list[dict[str, Any]] = decision.data.get("asks", [])
     if reviews:
         packages: list[dict[str, Any]] = []

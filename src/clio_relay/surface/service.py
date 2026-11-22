@@ -51,6 +51,7 @@ from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface import confirm as confirm_card
 from clio_relay.surface import exec_plan, held_services, install_op, installing, queue_switch
+from clio_relay.surface import plan_card as job_plan
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
@@ -593,9 +594,9 @@ class RelayService:
                 queue_switch.applied(record, JobSpec.model_validate(record.spec)),
                 adapter=adapter,
             )
-            handle = await adapter.run(spec, operation_id=operation_id)
+            handle = await adapter.run(job_plan.bound(spec, record), operation_id=operation_id)
         except Refusal as refusal:
-            return await installing.ask_install(self, operation_id, site, refusal)
+            return await job_plan.refused(self, operation_id, site, refusal)
         except Exception as exc:
             logger.exception("submitting %s failed", operation_id)
             return self.finish(
@@ -809,7 +810,7 @@ class RelayService:
                 result.setdefault("ready_at", status.observed_at.isoformat())
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
-            for key in ("issues", "site_facts", "service_error"):
+            for key in ("issues", "site_facts", "service_error", "components"):
                 result.pop(key, None)
                 if getattr(status, key):
                     result[key] = getattr(status, key)

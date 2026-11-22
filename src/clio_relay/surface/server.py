@@ -304,15 +304,21 @@ class RelayServer:
 
     async def _ask_inline(self, ctx: Context, record: OperationRecord) -> OperationRecord:
         modes = elicitation_modes(ctx)
-        answered: list[Ask] = []
-        for ask in self.service.outstanding(record):
-            if ask_mode(ask) not in modes:
+        asked: set[str] = set()
+        for _ in range(3):  # an answer can raise a new question, e.g. JARVIS's plan changed
+            answered: list[Ask] = []
+            for ask in self.service.outstanding(record):
+                if ask_mode(ask) not in modes or ask.ask_id in asked:
+                    break
+                asked.add(ask.ask_id)
+                action, content = response_parts(await elicit_inline(ctx, ask))
+                answered.append(self.service.answer(ask.ask_id, action, content, by="elicitation"))
+            if not answered:
+                return record
+            record = await advance_holders(self.service, record.operation_id, answered)
+            if record.state != OperationState.AWAITING_INPUT:
                 break
-            action, content = response_parts(await elicit_inline(ctx, ask))
-            answered.append(self.service.answer(ask.ask_id, action, content, by="elicitation"))
-        if not answered:
-            return record
-        return await advance_holders(self.service, record.operation_id, answered)
+        return record
 
     def _needs_person(self, record: OperationRecord) -> ToolResult:
         pending = [ask for ask in self.service.operation_asks(record) if ask.state == "pending"]

@@ -14,9 +14,14 @@ so a host keeps the newest one per ``operation_id``. It rides as optional data:
 - in each task status a task-shaped ``run`` or ``serve`` reports, in its ``_meta``.
 
 The text of each message stays the same, so a host that ignores the snapshot
-loses nothing. ``source`` says where the plan came from: ``relay`` here, from the
-job as relay records it. Couplings and the scheduler script are JARVIS's, and are
-empty until JARVIS plans the job.
+loses nothing. ``source`` says where the plan came from:
+
+- ``jarvis`` for a package job JARVIS planned (:mod:`clio_relay.jarvis_plan`):
+  the directives, components, couplings and script are JARVIS's plan, and each
+  component's state and hosts are the latest line JARVIS wrote for it in
+  ``components.jsonl``, or follow the job's state until JARVIS writes one;
+- ``relay`` otherwise, from the job as relay records it, with no couplings and
+  no script.
 
 :data:`CONFIRM_META` is the org-level key for a tool that confirms its own side
 effects with one typed ask. A tool's ``_meta`` declares it; a host that skipped
@@ -33,7 +38,7 @@ from fastmcp import Context
 from fastmcp_tasks.models import GetTaskResult
 from pydantic import Field
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.hooks import Charge
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec
@@ -182,6 +187,59 @@ def _components(
     return found
 
 
+def _plan(record: OperationRecord) -> dict[str, Any] | None:
+    """The plan JARVIS submitted the job with, else the one its card showed."""
+    found = record.handle.data.get(jarvis_plan.KEY) if record.handle else None
+    found = found or (record.result or {}).get(jarvis_plan.KEY)
+    return cast(dict[str, Any], found) if isinstance(found, dict) else None
+
+
+def _planned(record: OperationRecord, plan: dict[str, Any], state: str) -> list[dict[str, Any]]:
+    """The components of JARVIS's plan, each in the state JARVIS last wrote for it."""
+    held = state in ("running", "starting")
+    lines = {
+        str(line.get("component")): line
+        for line in cast(list[dict[str, Any]], (record.result or {}).get("components") or [])
+    }
+    found: list[dict[str, Any]] = []
+    for item in cast(list[dict[str, Any]], plan.get("components") or []):
+        nodes = item.get("nodes")
+        line = lines.get(str(item.get("id"))) if state != "planned" else None
+        current = str(line.get("state") or state) if line else state
+        if (
+            line
+            and state in ("done", "failed", "cancelled")
+            and current not in jarvis_plan.TERMINAL
+        ):
+            current = state
+        hosts = cast(list[str], (line or {}).get("hosts") or [])
+        allocated = len(hosts) if hosts else (nodes or 0) if held else 0
+        found.append(
+            {
+                "id": item.get("id"),
+                "label": item.get("label") or item.get("package") or item.get("id"),
+                "package": item.get("package"),
+                "role": jarvis_plan.role(plan, item),
+                "nodes": nodes,
+                "ranks": item.get("ranks"),
+                "host_slice": item.get("host_slice"),
+                "node_range": item.get("node_range"),
+                "state": current,
+                "nodes_allocated": allocated,
+                "nodes_running": allocated if current == "running" else 0,
+                "hosts": hosts,
+                "reason": (line or {}).get("reason"),
+            }
+        )
+    return found
+
+
+def _couplings(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    keys = ("from", "to", "kind", "label", "source")
+    couplings = cast(list[dict[str, Any]], plan.get("couplings") or [])
+    return [{key: edge.get(key) for key in keys} for edge in couplings]
+
+
 def _scheduler(service: RelayService, record: OperationRecord) -> str | None:
     try:
         config = service.site(record.site).config
@@ -213,6 +271,8 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     walltime = charge.walltime_s if charge else None
     if walltime is None and job is not None and job.attributes.duration is not None:
         walltime = job.attributes.duration.total_seconds()
+    plan = _plan(record) or {}
+    walltime = plan.get("time_limit_s") or walltime
     return {
         "version": VERSION,
         "operation_id": record.operation_id,
@@ -220,14 +280,16 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         "job_id": record.handle.native_id if record.handle else None,
         "revision": int(record.updated_at.timestamp() * 1000),
         "updated_at": record.updated_at.isoformat(),
-        "source": "relay",
+        "source": "jarvis" if plan else "relay",
         "site": _site(service, record.site),
-        "scheduler": _scheduler(service, record),
+        "scheduler": plan.get("scheduler") or _scheduler(service, record),
         "phase": phase,
         "outcome": outcome,
-        "partition": (charge.queue if charge else None) or queue.get("partition"),
-        "account": charge.account if charge else None,
-        "qos": None,
+        "partition": plan.get("partition")
+        or (charge.queue if charge else None)
+        or queue.get("partition"),
+        "account": plan.get("account") or (charge.account if charge else None),
+        "qos": plan.get("qos"),
         "time_limit_s": None if walltime is None else int(walltime),
         "started_at": started.isoformat() if started else None,
         "ended_at": ended.isoformat() if ended else None,
@@ -240,9 +302,11 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
             if phase == "queued" and queue
             else None
         ),
-        "components": _components(record, job, charge, state),
-        "couplings": [],
-        "script": None,
+        "components": _planned(record, plan, state)
+        if plan
+        else _components(record, job, charge, state),
+        "couplings": _couplings(plan),
+        "script": plan.get("script"),
     }
 
 

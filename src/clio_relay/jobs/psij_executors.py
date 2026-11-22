@@ -13,8 +13,15 @@ from __future__ import annotations
 
 import signal
 import sys
+import threading
 import types
-from typing import Any, NoReturn
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NoReturn
+
+from clio_relay.jobs.refusals import Refusal, RefusalReason
+
+if TYPE_CHECKING:
+    from psij.executors.batch.batch_scheduler_executor import BatchSchedulerExecutor
 
 LOCAL = "psij.executors.local"
 
@@ -33,3 +40,32 @@ def prepare() -> None:
     placeholder = types.ModuleType(LOCAL, "PSI/J's local executor, which this host cannot run")
     placeholder.LocalJobExecutor = _NoLocalExecutor  # pyright: ignore[reportAttributeAccessIssue]
     sys.modules[LOCAL] = placeholder
+
+
+_executors: dict[tuple[str, str], BatchSchedulerExecutor] = {}
+_executors_lock = threading.Lock()
+
+
+def batch_executor(scheduler: str, work_dir: Path) -> BatchSchedulerExecutor:
+    """Return PSI/J's executor for ``scheduler``, one per work directory. It renders and parses."""
+    prepare()
+    from psij import JobExecutor
+    from psij.executors.batch.batch_scheduler_executor import (
+        BatchSchedulerExecutor,
+        BatchSchedulerExecutorConfig,
+    )
+
+    key = (scheduler, str(work_dir))
+    with _executors_lock:
+        found = _executors.get(key)
+        if found is None:
+            config = BatchSchedulerExecutorConfig(work_directory=work_dir)
+            created = JobExecutor.get_instance(scheduler, config=config)
+            if not isinstance(created, BatchSchedulerExecutor):
+                raise Refusal(
+                    RefusalReason.ADAPTER_UNAVAILABLE,
+                    f"psij executor {scheduler!r} is not a batch scheduler executor",
+                )
+            created.work_directory.mkdir(parents=True, exist_ok=True)
+            _executors[key] = found = created
+        return found

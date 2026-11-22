@@ -183,6 +183,8 @@ another way to move the file, such as a transfer service.
   - Name the facility's job after `operation_id`, so `find` can look it up.
 - `status(handle)` maps the facility's state to one of `queued`, `running`,
   `completed`, `failed` or `cancelled`. A finished job lists its output files.
+  A JARVIS job also fills `components` from JARVIS's `components.jsonl`
+  (`jarvis_plan.component_states`), so the card shows each package's state.
 - `cancel(handle)` cancels and returns the status it then observes.
   Cancelling a finished job changes nothing.
 - `find(operation_id)` returns the handle of a job relay submitted but never
@@ -246,6 +248,7 @@ Relay calls these when the adapter defines them:
 | `stop(handle)` | Stop a package service so its package's own stop runs (`jarvis execution stop`) |
 | `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle. Pass the build its own walltime: `jarvis_submit.install_pipeline` of the run's pipeline as `install_command(pipeline=...)` |
 | `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`, with the site's `jarvis_python` setting) |
+| `plan_job(spec, *, operation_id)` | Return JARVIS's plan of the package job `run` would submit, submitting nothing: run the site script in its `plan` mode (`jarvis ppl submit +plan +json`) and parse it with `jarvis_plan.parse`. Relay draws the job card from it and passes the yes back as `jarvis_plan.bound(spec, plan)`, so `run` submits with `--plan_sha256`. `None` (the default) means no plan, and the card shows the job as relay records it |
 | `install_check(spec, *, operation_id)` | Run the site script in its `check` mode (`jarvis ppl install +check`) and return JARVIS's install report (`jarvis_exits.checked`). With `install`, it gives the site the `install` tool: the software ahead of any run |
 
 A batch adapter that runs packages turns the site script's typed exits into

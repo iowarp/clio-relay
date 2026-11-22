@@ -33,15 +33,14 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from clio_relay import jarvis_exits, jarvis_submit, site_outputs
+from clio_relay import jarvis_exits, jarvis_plan, jarvis_submit, site_outputs
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
-from clio_relay.jobs import psij_executors
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -52,12 +51,10 @@ from clio_relay.jobs.handles import (
     OutputRef,
     StallReport,
 )
+from clio_relay.jobs.psij_executors import batch_executor as _executor
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import batch_hints, direct_refused
-
-if TYPE_CHECKING:
-    from psij.executors.batch.batch_scheduler_executor import BatchSchedulerExecutor
 
 SchedulerName = Literal["slurm", "pbs", "lsf", "cobalt"]
 SchedulerChoice = Literal["auto", "none", "slurm", "pbs", "lsf", "cobalt"]
@@ -116,34 +113,6 @@ def mark_script(script: str, scheduler: SchedulerName, job_dir: Path) -> str:
     while at < len(lines) and (not lines[at].strip() or lines[at].startswith("#")):
         at += 1
     return "\n".join([*lines[:at], line, *lines[at:]])
-
-
-_executors: dict[tuple[str, str], BatchSchedulerExecutor] = {}
-_executors_lock = threading.Lock()
-
-
-def _executor(scheduler: SchedulerName, work_dir: Path) -> BatchSchedulerExecutor:
-    psij_executors.prepare()
-    from psij import JobExecutor
-    from psij.executors.batch.batch_scheduler_executor import (
-        BatchSchedulerExecutor,
-        BatchSchedulerExecutorConfig,
-    )
-
-    key = (scheduler, str(work_dir))
-    with _executors_lock:
-        found = _executors.get(key)
-        if found is None:
-            config = BatchSchedulerExecutorConfig(work_directory=work_dir)
-            created = JobExecutor.get_instance(scheduler, config=config)
-            if not isinstance(created, BatchSchedulerExecutor):
-                raise Refusal(
-                    RefusalReason.ADAPTER_UNAVAILABLE,
-                    f"psij executor {scheduler!r} is not a batch scheduler executor",
-                )
-            created.work_directory.mkdir(parents=True, exist_ok=True)
-            _executors[key] = found = created
-        return found
 
 
 def detect_scheduler() -> SchedulerName | None:
@@ -272,9 +241,13 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._start(spec, operation_id, check_only=True))
 
+    async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
+        found = await self._start(spec, operation_id, check_only=False, plan=True)
+        return cast(dict[str, Any] | None, found)
+
     async def _start(
-        self, spec: JobSpec, operation_id: str, *, check_only: bool
-    ) -> JobHandle | dict[str, Any]:
+        self, spec: JobSpec, operation_id: str, *, check_only: bool, plan: bool = False
+    ) -> JobHandle | dict[str, Any] | None:
         job_dir = self._job_dir(operation_id)
         scheduler = self.scheduler()
         if scheduler is None and self.config.scheduler == "auto":
@@ -300,7 +273,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
         if check_only and not jarvis_mode:
             raise jarvis_exits.install_only_refused(scheduler, site=self.context.site_id)
-        if jarvis_mode and not check_only:
+        if plan and not jarvis_mode:
+            return None
+        if jarvis_mode and not check_only and not plan:
             existing = await asyncio.to_thread(self._jarvis_found, job_dir)
             if existing is not None:
                 return existing
@@ -313,7 +288,10 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             (job_dir / "spec.json").write_text, spec.model_dump_json(indent=2), "utf-8"
         )
         if jarvis_mode:
-            result = await self._site_script(spec, job_dir, operation_id, check_only)
+            mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
+            result = await self._site_script(spec, job_dir, operation_id, mode)
+            if plan:
+                return jarvis_plan.planned(str(result.exit_code), result.stdout)
             if check_only:
                 return jarvis_exits.checked(result.stdout)
             found = jarvis_submit.parse_handle(result.stdout)
@@ -351,7 +329,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         )
 
     async def _site_script(
-        self, spec: JobSpec, job_dir: Path, operation_id: str, check: bool
+        self, spec: JobSpec, job_dir: Path, operation_id: str, mode: jarvis_submit.SiteMode
     ) -> ExecResult:
         document = self._jarvis_document(spec, job_dir, operation_id)
 
@@ -361,7 +339,6 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             (job_dir / jarvis_submit.SCRIPT_FILE).write_text(jarvis_submit.SITE_SCRIPT, "utf-8")
 
         await asyncio.to_thread(_write)
-        mode: jarvis_submit.SiteMode = "check" if check else "submit"
         out = site_outputs.with_outputs(spec, self.config.outputs_dir)
         command = jarvis_submit.submit_command(
             out, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home(), mode=mode
@@ -372,11 +349,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             max_output_bytes=1 << 20,
             cwd=job_dir,
         )
+        if mode == "plan":
+            # No plan (JARVIS refused, or cannot plan) is not a refusal: the submit says why.
+            return result
         self._refuse_jarvis_exit(result, spec)
         if result.exit_code != 0:
+            what = "jarvis ppl install +check" if mode == "check" else "jarvis ppl submit"
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
-                f"{'jarvis ppl install +check' if check else 'jarvis ppl submit'} refused the job: "
+                f"{what} refused the job: "
                 f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
                 scheduler="jarvis",
                 exit_code=result.exit_code,
@@ -456,6 +437,10 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             shared=Path(said).as_posix() if said and Path(said).is_absolute() else None,
         )
         data["job_name"] = self.job_name(operation_id)
+        if (
+            planned := jarvis_plan.read(job_dir / jarvis_plan.PLAN_FILE, jarvis_plan.parse)
+        ) is not None:
+            data[jarvis_plan.KEY] = planned
         return JobHandle(adapter=self.name, native_id=native, data=data)
 
     def _jarvis_found(self, job_dir: Path) -> JobHandle | None:
@@ -674,16 +659,20 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 f"jarvis execution get printed no record: {answer.strip()[-500:] or 'no output'}",
             )
         status = jarvis_submit.record_status(record)
+        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
+        execution = str(handle.data.get("execution_dir") or "") or (
+            jarvis_submit.execution_dir(job_dir.as_posix(), execution_id, pipeline=pipeline)
+        )
+        if not handle.data.get("install"):
+            states = Path(execution) / jarvis_plan.STATES_FILE
+            found = await asyncio.to_thread(jarvis_plan.read, states, jarvis_plan.component_states)
+            status.components = found or []
         if not status.state.final or handle.data.get("install"):
             return status
         snapshot = jarvis_submit.parse_document(
             await self._execution(handle, "artifacts"), jarvis_submit.ARTIFACTS_SCHEMA
         )
         if snapshot is not None:
-            execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-            execution = str(handle.data.get("execution_dir") or "") or (
-                jarvis_submit.execution_dir(job_dir.as_posix(), execution_id, pipeline=pipeline)
-            )
             status.outputs = jarvis_submit.artifact_outputs(snapshot, execution=execution)
         await asyncio.to_thread(self._drop_transient, handle)
         return status

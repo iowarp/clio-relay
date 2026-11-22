@@ -110,7 +110,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "acbf43084ed874030b9cba18fbfd73c1ec696508"
+JARVIS_PIN = "3b651c686fc5b191b4d88b1cabd797e172db3066"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -690,7 +690,7 @@ def render_pipeline(document: Mapping[str, object]) -> str:
 
 # The site script (clio_relay.jarvis_site_script)
 
-SiteMode = Literal["submit", "run", "install", "check", "recheck"]
+SiteMode = Literal["submit", "plan", "run", "install", "check", "recheck"]
 
 
 def steps_argument(spec: JobSpec) -> str:

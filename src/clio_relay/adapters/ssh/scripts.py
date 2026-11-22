@@ -342,6 +342,8 @@ def jarvis_status_script(
     job_dir: str,
     execution_id: str,
     pipeline: str | None = None,
+    *,
+    states: str | None = None,
 ) -> str:
     """One poll of a job JARVIS submitted: ``jarvis execution get``, and its artifacts.
 
@@ -349,7 +351,8 @@ def jarvis_status_script(
     so relay keeps no state of its own: a pending job's place in the queue is
     the record's ``metadata.queue``, and a job that left the queue unseen is
     ended by JARVIS. The artifacts are read once the record is terminal.
-    ``pipeline`` is as in :func:`jarvis_submit.execution_argv`.
+    ``pipeline`` is as in :func:`jarvis_submit.execution_argv`. ``states`` is
+    JARVIS's ``components.jsonl``, printed under ``@@components`` after ``get``.
     """
     get = jarvis_submit.execution_shell("get", execution_id, job_dir=job_dir, pipeline=pipeline)
     artifacts = jarvis_submit.execution_shell(
@@ -365,6 +368,7 @@ def jarvis_status_script(
         + '[ -n "$jarvis" ] || { echo "@@nojarvis"; exit 0; }\n'
         + f"out=$({get} 2>&1 </dev/null); rc=$?\n"
         + 'echo "@@getrc $rc"; echo "@@get"; printf "%s\\n" "$out"\n'
+        + (f'echo "@@components"; cat {q(states)} 2>/dev/null; echo\n' if states else "")
         + 'if [ "$rc" -eq 0 ] && printf \'%s\\n\' "$out" | tail -n 1 | grep -qF '
         + "'\"terminal\":true'; then\n"
         + f'  echo "@@artifacts"; {artifacts} 2>/dev/null </dev/null; echo\n'

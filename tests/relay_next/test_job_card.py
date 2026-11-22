@@ -90,11 +90,13 @@ def rounds(monkeypatch: pytest.MonkeyPatch) -> list[mcp_types.InputRequiredResul
 def _job_on(params: Any, mode: str, seen: list[mcp_types.InputRequiredResult]) -> Any:
     """The card's job, from the elicitation's ``_meta`` or, modern, the result's."""
     if mode == "legacy":
-        return (params.meta or {})[job_card.JOB_META]
+        shown: dict[str, Any] = dict(params.meta or {})
+        return shown[job_card.JOB_META]
     (first,) = seen
     assert params.meta is None
     meta: dict[str, Any] = dict(first.meta or {})
-    return meta[job_card.JOB_META]
+    found: Any = meta[job_card.JOB_META]
+    return found
 
 
 def test_the_confirming_tools_say_so(relay_paths: RelayPaths) -> None:

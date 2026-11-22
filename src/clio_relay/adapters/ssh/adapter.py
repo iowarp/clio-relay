@@ -30,14 +30,13 @@ import posixpath
 import re
 import shlex
 import shutil
-import threading
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay import jarvis_exits, jarvis_submit, site_outputs
+from clio_relay import jarvis_exits, jarvis_plan, jarvis_submit, site_outputs
 from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
@@ -54,7 +53,6 @@ from clio_relay.adapters.ssh.files import SshFileAccess
 from clio_relay.adapters.ssh.scripts import parse_sections
 from clio_relay.adapters.ssh.statuses import accounted_status, detached_status, stored_final
 from clio_relay.adapters.ssh.transport import SshTransport
-from clio_relay.jobs import psij_executors
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -65,6 +63,7 @@ from clio_relay.jobs.handles import (
     OutputRef,
     StallReport,
 )
+from clio_relay.jobs.psij_executors import batch_executor as _executor
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import direct_refused
@@ -92,34 +91,6 @@ _PSIJ_STATES = {
 }
 
 _SCHEDULERS: frozenset[str] = frozenset({"slurm", "pbs", "lsf", "cobalt"})
-
-_executors: dict[tuple[str, str], BatchSchedulerExecutor] = {}
-_executors_lock = threading.Lock()
-
-
-def _executor(scheduler: SchedulerName, work_dir: Path) -> BatchSchedulerExecutor:
-    """Return PSI/J's executor for ``scheduler``. It only renders and parses here."""
-    psij_executors.prepare()
-    from psij import JobExecutor
-    from psij.executors.batch.batch_scheduler_executor import (
-        BatchSchedulerExecutor,
-        BatchSchedulerExecutorConfig,
-    )
-
-    key = (scheduler, str(work_dir))
-    with _executors_lock:
-        found = _executors.get(key)
-        if found is None:
-            config = BatchSchedulerExecutorConfig(work_directory=work_dir)
-            created = JobExecutor.get_instance(scheduler, config=config)
-            if not isinstance(created, BatchSchedulerExecutor):
-                raise Refusal(
-                    RefusalReason.ADAPTER_UNAVAILABLE,
-                    f"psij executor {scheduler!r} is not a batch scheduler executor",
-                )
-            created.work_directory.mkdir(parents=True, exist_ok=True)
-            _executors[key] = found = created
-        return found
 
 
 class _SitePath(PurePosixPath):
@@ -345,9 +316,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
     async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._submit(spec, operation_id, check_only=True))
 
+    async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
+        found = await self._submit(spec, operation_id, check_only=False, plan=True)
+        return cast(dict[str, Any] | None, found)
+
     async def _submit(
-        self, spec: JobSpec, operation_id: str, *, check_only: bool
-    ) -> JobHandle | dict[str, Any]:
+        self, spec: JobSpec, operation_id: str, *, check_only: bool, plan: bool = False
+    ) -> JobHandle | dict[str, Any] | None:
         if spec.steps():
             spec = jarvis_submit.with_archive(spec)
         elif spec.executable is None:
@@ -369,7 +344,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{self.config.ssh_profile} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
-        existing = None if check_only else self._existing(check, root, job_dir, name)
+        existing = None if check_only or plan else self._existing(check, root, job_dir, name)
         if existing is not None:
             return existing
         if "ready" not in check:
@@ -412,6 +387,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 raise jarvis_submit.scheduler_refusal(scheduler, site=self.config.ssh_profile)
         if check_only and not jarvis_mode:
             raise jarvis_exits.install_only_refused(scheduler, site=self.config.ssh_profile)
+        if plan and not jarvis_mode:
+            return None
         have = set(check.get("have", []))
         missing = sorted(digests - have)
         blobs: list[Path] = []
@@ -425,7 +402,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
             blobs.append(self.context.content.path_for(digest))
 
         if jarvis_mode:
-            rendered = self._render_jarvis(spec, operation_id, job_dir, name, check_only)
+            mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
+            rendered = self._render_jarvis(spec, operation_id, job_dir, name, mode)
         else:
             if scheduler is not None:
                 _executor(scheduler, self.render_dir)  # import PSI/J on this thread
@@ -466,6 +444,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
             )
         rc = _one(sections, "rc")
         output = "\n".join(sections.get("out", [])).strip()
+        if plan:
+            # No plan (JARVIS refused, or cannot plan) is not a refusal: the submit says why.
+            return jarvis_plan.planned(rc, output)
         if rc != "0":
             error = "\n".join(sections.get("err", [])).strip() or output
             if jarvis_mode:
@@ -546,6 +527,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         native, jarvis_data = jarvis_submit.handle_data(
             found, job_dir=str(data["job_dir"]), shared=jarvis_submit.shared_dir(submit_output)
         )
+        if (plan := jarvis_plan.parse(submit_output)) is not None:
+            jarvis_data[jarvis_plan.KEY] = plan
         return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
 
     def _jarvis_document(
@@ -568,7 +551,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
         )
 
     def _render_jarvis(
-        self, spec: JobSpec, operation_id: str, job_dir: PurePosixPath, name: str, check: bool
+        self,
+        spec: JobSpec,
+        operation_id: str,
+        job_dir: PurePosixPath,
+        name: str,
+        mode: jarvis_submit.SiteMode,
     ) -> _Rendered:
 
         document = self._jarvis_document(spec, operation_id, job_dir, name)
@@ -580,7 +568,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             operation_id=operation_id,
             jarvis=self.config.jarvis,
             home=self.config.remote_dir,
-            mode="check" if check else "submit",
+            mode=mode,
         )
         return rendered
 
@@ -742,9 +730,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
         """Read the job from JARVIS's execution record; relay keeps no state of its own."""
         job_dir = str(handle.data["job_dir"])
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
+        execution = str(handle.data.get("execution_dir") or "") or jarvis_submit.execution_dir(
+            job_dir, execution_id, pipeline=pipeline
+        )
+        states = None if handle.data.get("install") else f"{execution}/{jarvis_plan.STATES_FILE}"
         sections = parse_sections(
             await self._ssh(
-                scripts.jarvis_status_script(job_dir, execution_id, pipeline),
+                scripts.jarvis_status_script(job_dir, execution_id, pipeline, states=states),
                 "status",
             )
         )
@@ -769,13 +761,11 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{answer.strip()[-500:] or 'no output'}",
             )
         status = jarvis_submit.record_status(record)
+        status.components = jarvis_plan.component_states("\n".join(sections.get("components", [])))
         if not status.state.final or handle.data.get("install"):
             return status
         snapshot = jarvis_submit.parse_document(
             "\n".join(sections.get("artifacts", [])), jarvis_submit.ARTIFACTS_SCHEMA
-        )
-        execution = str(handle.data.get("execution_dir") or "") or jarvis_submit.execution_dir(
-            job_dir, execution_id, pipeline=pipeline
         )
         if snapshot is not None:
             status.outputs = jarvis_submit.artifact_outputs(snapshot, execution=execution)
