@@ -26,6 +26,7 @@ TOOLS = {
     "files_read",
     "serve",
     "packages",
+    "packages_read",
     "shutdown",
     "cancel",
     "site_clean",

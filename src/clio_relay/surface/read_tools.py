@@ -3,7 +3,8 @@
 A host that runs only reads, or runs them without a question, can honour that
 per tool: ``describe`` (relay, a site, an operation or a service, the staged
 packages), ``exec_read`` (a command on the guard's read-only list, on every
-site) and ``files_read`` (list, stat, read, has).
+site), ``files_read`` (list, stat, read, has) and ``packages_read`` (relay's
+package catalog).
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         run there. With job, observe one operation, a service from serve included:
         its state, when relay last looked (result.observed_at), the latest step
         (result.progress) and the outputs. With packages=true, list the staged
-        packages, as packages(op="list") does. This only reads."""
+        packages, as packages_read does. This only reads."""
         try:
             if packages:
                 return _shown(await packages_op(relay.service, PackagesArgs(op="list")))
@@ -91,6 +92,17 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         +json, jarvis rg skill show NAME +json) and Spack queries (spack find,
         info, spec). Anything else is refused: use exec."""
         return await relay.exec(ctx, site, command, timeout_s, max_output_bytes, read_only=True)
+
+    @server.tool(name="packages_read", title="List the packages relay can run", annotations=READ)
+    async def packages_read() -> ToolResult:  # pyright: ignore[reportUnusedFunction]
+        """List the JARVIS packages staged in relay's catalog, with their versions,
+        SHA-256s and sources, and relay's package sources. run takes a package by its
+        name from this list. An archive its sources replaced shows superseded_by. To
+        stage or remove one, use packages. This only reads."""
+        try:
+            return _shown(await packages_op(relay.service, PackagesArgs(op="list")))
+        except Refusal as refusal:
+            return refusal_result(refusal)
 
     @server.tool(name="files_read", title="List, stat and read files on a site", annotations=READ)
     async def files_read(  # pyright: ignore[reportUnusedFunction]

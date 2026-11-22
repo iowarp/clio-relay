@@ -154,6 +154,7 @@ def test_stdio_task(relay_paths: RelayPaths) -> None:
                 "files_read",
                 "serve",
                 "packages",
+                "packages_read",
                 "shutdown",
                 "cancel",
                 "site_clean",
@@ -251,6 +252,7 @@ def test_plain_mcp_client_over_stdio(relay_paths: RelayPaths, mode: str) -> None
                 "files",
                 "serve",
                 "packages",
+                "packages_read",
                 "shutdown",
             }
             for site in ("open", "spend", "sso"):

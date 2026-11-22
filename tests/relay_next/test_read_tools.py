@@ -16,7 +16,7 @@ from clio_relay.surface.settings import RelayPaths
 from .a2ui_host import basic_client
 from .conftest import add_site
 
-READS = {"describe", "exec_read", "files_read"}
+READS = {"describe", "exec_read", "files_read", "packages_read"}
 PAGE_ONLY = {surfaces.OPEN_ADD, surfaces.EDIT_SITE, surfaces.CANCEL, surfaces.REMOVE_SITE}
 REPLACES = {
     surfaces.SAVE_SITE,
@@ -116,6 +116,11 @@ def test_files_read_and_describe_packages_only_read(relay_paths: RelayPaths) -> 
             assert wrong.is_error
             staged = await client.call_tool("describe", {"packages": True})
             assert "packages" in _structured(staged)
+            catalog = await client.call_tool("packages_read", {})
+            assert _structured(catalog)["schema"] == "relay.packages.v1"
+            assert _structured(catalog)["packages"] == _structured(staged)["packages"]
+            old = await client.call_tool("packages", {"op": "list"}, raise_on_error=False)
+            assert old.is_error, "listing moved to packages_read"
 
     asyncio.run(scenario())
     assert RelayService(relay_paths).asks.all() == []

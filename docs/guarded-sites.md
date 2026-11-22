@@ -58,10 +58,11 @@ it with relay's `packages` tool:
 - `dir` stages from a directory on the relay machine, such as the person's
   workspace. It is never pushed to any repository: the archive reaches the
   site as a job input, through the site adapter's transfer;
-- `op="list"` shows what is staged, and `op="remove"` takes a package out of
-  the catalog (every version, unless `version` or `sha256` narrows it). Its
-  archive leaves the content store too, unless an unfinished operation still
-  needs it.
+- `op="remove"` takes a package out of the catalog (every version, unless
+  `version` or `sha256` narrows it). Its archive leaves the content store
+  too, unless an unfinished operation still needs it;
+- `packages_read`, a tool of its own, lists what is staged. It only reads, so
+  a host that allows only reads can call it.
 
 Staging runs nothing and touches no site, so it asks nobody; the review below
 is where a guarded site's person decides. From a shell, the same is:

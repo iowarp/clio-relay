@@ -1,7 +1,7 @@
 # Architecture
 
-Relay is an MCP server with twelve tools (the five verbs, `install`, the read tools
-`exec_read` and `files_read`, `packages`, `cancel`, `site_clean` and
+Relay is an MCP server with thirteen tools (the five verbs, `install`, the read tools
+`exec_read`, `files_read` and `packages_read`, `packages`, `cancel`, `site_clean` and
 `shutdown`), a command line, and a
 set of adapters
 that each know one way into a site. This page follows a call from the agent to
@@ -26,7 +26,8 @@ flowchart LR
 
 1. **Surface.** `surface/server.py` serves the verbs `describe`, `run`,
    `exec`, `files` and `serve` over stdio or Streamable HTTP, with `packages`
-   (list, stage and remove the packages `run` takes, `surface/staging.py`) and
+   (stage and remove the packages `run` takes, `surface/staging.py`; the read
+   tool `packages_read` lists them) and
    `shutdown` beside them. Two changes have tools of their own, so a host's
    question names what they do (`surface/site_tools.py`): `cancel` cancels a
    job or stops a service, and `site_clean` removes relay's deployment from a

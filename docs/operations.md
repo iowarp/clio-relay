@@ -162,9 +162,11 @@ deploys nothing. The `packages` tool does it over MCP:
 ```json
 {"op": "stage", "package": "clio_jarvis.xcompact3d"}
 {"op": "stage", "package": "demo.hello", "dir": "/home/me/src/demo"}
-{"op": "list"}
 {"op": "remove", "package": "clio_jarvis.xcompact3d"}
 ```
+
+The `packages_read` tool lists what is staged. It takes no arguments and only
+reads, so a host that allows only reads (a plan mode) can call it.
 
 With only a package name, relay stages it from its package sources: the
 directories `CLIO_RELAY_PACKAGE_SOURCES` names (`os.pathsep` apart), listed in

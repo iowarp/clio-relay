@@ -91,6 +91,7 @@ def test_tools_are_the_verbs_and_operations(relay_paths: RelayPaths) -> None:
                     "files_read",
                     "serve",
                     "packages",
+                    "packages_read",
                     "shutdown",
                     "cancel",
                     "site_clean",

@@ -648,14 +648,12 @@ class RelayServer:
 
         @server.tool(
             name="packages",
-            title="List, stage and remove the packages relay can run",
+            title="Stage and remove the packages relay can run",
             annotations=_CHANGE,
         )
         async def packages(  # pyright: ignore[reportUnusedFunction]
-            op: Literal["list", "stage", "remove"],
-            package: Annotated[
-                str | None, Field(description="<repository>.<package>, for stage and remove")
-            ] = None,
+            op: Literal["stage", "remove"],
+            package: Annotated[str, Field(description="<repository>.<package>")],
             dir: Annotated[  # noqa: A002 - the source is a directory
                 str | None,
                 Field(description="Stage from this absolute directory on the relay host"),
@@ -673,13 +671,13 @@ class RelayServer:
             package's archive on the relay host and adds it to relay's catalog: naming only
             package, from relay's package sources (directories its host installed, listed
             in sources); with dir, from that directory on the relay host, such as a package
-            the person wrote. Staging fetches nothing and runs no git. list shows what is
-            staged; remove takes a package out (version or sha256 narrow it). When the
-            package sources change, a stage or run by name uses their new archive and lists
-            the old one with superseded_by; pin its sha256 to run it. Staging runs
-            nothing: a guarded site reviews the archive by its SHA-256 before its first run
-            there, and the archive reaches the site through relay's own transfer.
-            describe(packages=true) lists them too, as a read."""
+            the person wrote. Staging fetches nothing and runs no git. remove takes a
+            package out (version or sha256 narrow it). When the package sources change, a
+            stage or run by name uses their new archive and lists the old one with
+            superseded_by; pin its sha256 to run it. Staging runs nothing: a guarded site
+            reviews the archive by its SHA-256 before its first run there, and the archive
+            reaches the site through relay's own transfer. To list what is staged, use
+            packages_read, which only reads."""
             args = PackagesArgs(op=op, package=package, dir=dir, version=version, sha256=sha256)
 
             try:
