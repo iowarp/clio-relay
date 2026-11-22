@@ -2,13 +2,15 @@
 
 An ``install`` operation is a run's install task on its own. JARVIS owns it:
 
-1. relay asks JARVIS ``ppl install +check`` on the site, for the same pipeline
-   a run of the package would submit;
-2. when the software is all there, the operation completes, and nothing ran;
-3. when it is not, JARVIS exits 3 with its install report, and the operation
-   takes the run's install path (:mod:`clio_relay.surface.installing`): the
-   same approval and choices, then ``jarvis ppl install +submit`` as a job on
-   the site's compute nodes, then the check again;
+1. relay asks JARVIS's light ``ppl install +check`` on the site, for the same
+   pipeline a run of the package would submit. It runs no Spack on the login
+   host: JARVIS answers from the record of the last check a job made;
+2. when that record says the software is all there, the operation completes;
+3. when it is not, or there is no record yet (``install_unchecked``), JARVIS
+   exits 3 with its install report, and the operation takes the run's install
+   path (:mod:`clio_relay.surface.installing`): a check job when there is no
+   record, the same approval and choices, then ``jarvis ppl install +submit`` as
+   a job on the site's compute nodes, then the light check again;
 4. when the site has no JARVIS, relay asks to install jarvis-cd first, as a run
    does, then checks.
 

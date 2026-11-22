@@ -56,7 +56,7 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/adapters/ssh/adapter.py": 1207,
     "src/clio_relay/adapters/worker/adapter.py": 1053,
     "src/clio_relay/frp_link.py": 812,
-    "src/clio_relay/jarvis_submit.py": 1691,
+    "src/clio_relay/jarvis_submit.py": 1689,
     "src/clio_relay/serve/runtime.py": 947,
     "src/clio_relay/surface/server.py": 815,
     "src/clio_relay/surface/service.py": 979,

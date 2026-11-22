@@ -1,8 +1,10 @@
 """Installing what a package job needs before it runs: its software, or JARVIS itself.
 
-A package job's submit runs ``jarvis ppl submit`` with ``JARVIS_INSTALL_ON_LOAD=check``.
-When the site lacks the software, JARVIS exits 3 before anything reaches the
-scheduler and prints its install report; the adapter raises that as
+A package job's submit first runs JARVIS's light ``ppl install +check`` on the
+login host, which runs no Spack: it answers from the record of the last check a
+job made. When the site lacks the software, needs a decision, or has no matching
+record yet, JARVIS exits 3 before anything reaches the scheduler and prints its
+install report; the adapter raises that as
 :func:`~clio_relay.jarvis_report.install_needed`. When the site has no JARVIS
 at all, the adapter raises :func:`~clio_relay.jarvis_submit.missing_jarvis`.
 
@@ -16,8 +18,12 @@ Either refusal turns the operation back into asks instead of a failure:
   for as long as it takes, then submits the run again. When JARVIS names
   nothing to build, only questions (a package it cannot resolve until one is
   answered), relay asks only the questions and no approval: JARVIS checks again
-  with the answers (``recheck``), and the run goes ahead when the software is
-  all there, or relay asks to install what that check finds missing;
+  with the answers in a job (``recheck``, ``ppl install +check +submit``), and
+  the run goes ahead when that job finds the software all there, or relay asks
+  to install what it finds missing. When JARVIS has no record to answer from
+  (``install_unchecked``), relay asks nothing and runs that check job at once;
+  if the light check still finds no record after a job ended, the operation
+  fails with JARVIS's reason rather than loop;
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
   in the site's CLIO home and submits the run again. The approval is
   site-scoped: operations that find the site without JARVIS at the same time
@@ -29,8 +35,8 @@ the site that get the same question hold one ask, and one answer moves them all
 (:mod:`~clio_relay.surface.install_share`).
 
 An ``install`` operation (:mod:`clio_relay.surface.install_op`) is the same flow
-with no run: its submit is ``ppl install +check``, and it completes once JARVIS
-finds the software all there.
+with no run: its submit is the light ``ppl install +check``, and it completes once
+JARVIS's record says the software is all there.
 
 The state lives in ``record.result["install"]``.
 
@@ -73,8 +79,9 @@ logger = logging.getLogger(__name__)
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
 LOG_TAIL_BYTES = 4096
-MAX_ROUNDS = 4
-"""How many installs one operation may go through before relay stops asking."""
+MAX_ROUNDS = 6
+"""How many install rounds (check jobs, questions, installs) one operation may go through
+before relay stops asking."""
 
 START_GRACE = timedelta(hours=6)
 """How long installing jarvis-cd or submitting the install job may hold ``submitting``."""
@@ -167,7 +174,20 @@ async def ask_install(
         state["summary"] = jarvis_report.install_summary(report, names)
         state["report_digest"] = jarvis_report.report_digest(report)
         to_ask = jarvis_report.choice_issues(report)
-        if to_ask and not jarvis_report.software_missing(report):
+        missing = jarvis_report.software_missing(report)
+        unchecked = jarvis_report.unchecked(report)
+        if unchecked and not to_ask and not missing:
+            if state_of(record).get("job_ended"):
+                return service.finish(
+                    operation_id,
+                    OperationState.FAILED,
+                    jarvis_report.check_unrecorded(unchecked, site=site.title),
+                )
+            # Nobody answers this: JARVIS checks in a job, which writes the record.
+            state["recheck"] = True
+            _hold(service, operation_id, state, [], refusal.message)
+            return await service.advance(operation_id)
+        if to_ask and not missing:
             state["recheck"] = True
         else:
             asks.append(
@@ -277,8 +297,6 @@ async def start_install(
             answers[jarvis_submit.RECHECK] = True
         handle = await adapter.install(job, operation_id=operation_id, answers=answers)
     except Refusal as refusal:
-        if jarvis_report.is_installed(refusal):
-            return await _installed(service, operation_id, site, refusal)
         if install_kind(refusal) is not None:
             return await ask_install(service, operation_id, site, refusal)
         return service.finish(operation_id, OperationState.FAILED, refusal)
@@ -297,7 +315,11 @@ async def start_install(
             "handle": handle.model_dump(mode="json"),
             "log_offset": 0,
         }
-        message = "installing the package's software as a job on the site"
+        message = (
+            "JARVIS checks the package's software in a job on the site"
+            if state.get("recheck")
+            else "installing the package's software as a job on the site"
+        )
         record.result = {**(record.result or {}), INSTALL_KEY: state, "message": message}
         cancelled = record.state == OperationState.CANCELLED
         record.move(OperationState.QUEUED, message)
@@ -305,28 +327,6 @@ async def start_install(
     if cancelled:
         await adapter.cancel(handle)
     return record
-
-
-async def _installed(
-    service: RelayService, operation_id: str, site: SiteEntry, refusal: Refusal
-) -> OperationRecord:
-    """Go ahead after a ``recheck`` found the software all there: nothing is built."""
-    record = service.operation(operation_id)
-    if record.kind != "install":
-        return await _resubmit(service, operation_id, refusal.message)
-    report = cast(dict[str, Any], refusal.data.get("install_report") or {})
-    names = jarvis_submit.package_names(job_of(record).steps())
-    with service.operations.locked(operation_id):
-        record = service.operation(operation_id)
-        if not record.state.final:
-            record.result = {
-                **(record.result or {}),
-                "installed": jarvis_report.install_summary(report, names),
-                "message": f"the software of {_what(job_of(record))} is installed on "
-                f"{site.title}; nothing ran",
-            }
-            service.operations.put(operation_id, record)
-    return service.finish(operation_id, OperationState.COMPLETED, None)
 
 
 async def _resubmit(service: RelayService, operation_id: str, note: str) -> OperationRecord:
@@ -384,13 +384,17 @@ async def refresh_install(
     state = state_of(service.operation(operation_id))
     tail, offset = await _log_tail(adapter, handle, int(state.get("log_offset") or 0))
     if status.state == JobState.COMPLETED:
-        _update(service, operation_id, stage="done", log_offset=offset, log_tail=tail)
+        checked = bool(state.get("recheck"))
+        _update(
+            service, operation_id, stage="done", job_ended=True, log_offset=offset, log_tail=tail
+        )
         then = (
             "JARVIS checks it"
             if service.operation(operation_id).kind == "install"
             else "submitting the run"
         )
-        return await _resubmit(service, operation_id, f"the install finished; {then}")
+        done = "the check job finished" if checked else "the install finished"
+        return await _resubmit(service, operation_id, f"{done}; {then}")
     if status.state.final:
         return await _ended(
             service, operation_id, status, (adapter, handle), tail or state.get("log_tail")
@@ -450,8 +454,9 @@ async def _ended(
     if status.state == JobState.CANCELLED:
         return service.finish(operation_id, OperationState.CANCELLED, None)
     if status.exit_code == jarvis_submit.EXIT_DECISION:
-        # The job found a question (a compiler the build host lacks): JARVIS's check
-        # on the login node reads what the job recorded and asks it.
+        # The job found a question (which MPI, a compiler the build host lacks) and
+        # recorded it: the light check on the login host reads that record and asks it.
+        _update(service, operation_id, stage="done", job_ended=True)
         return await _resubmit(
             service, operation_id, "the install job needs a decision; JARVIS checks again"
         )

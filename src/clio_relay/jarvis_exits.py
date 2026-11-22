@@ -3,10 +3,9 @@
 The site script (:data:`~clio_relay.jarvis_submit.SITE_SCRIPT`) exits 69 when
 relay's JARVIS is missing, 3 when JARVIS needs software installed or a choice,
 4 when JARVIS refused to build outside an allocation, 5 when JARVIS refused the
-pipeline and 6 for a typed install failure. Its ``check`` mode
-(``ppl install +check``) exits 0 with JARVIS's install report when the
-package's software is all there; its ``recheck`` mode exits 7 with the report
-then, which is raised as :func:`~clio_relay.jarvis_report.software_installed`.
+pipeline and 6 for a typed install failure. Its ``check`` mode (the light
+``ppl install +check``) exits 0 with JARVIS's install report when JARVIS's
+record says the package's software is all there.
 """
 
 from __future__ import annotations
@@ -45,10 +44,6 @@ def refuse(
             )
         raise jarvis_report.install_needed(
             report, site=site, walltime=jarvis_submit.install_walltime(spec, install_walltime_s)
-        )
-    if code == jarvis_submit.EXIT_INSTALLED:
-        raise jarvis_report.software_installed(
-            jarvis_report.parse_install_report(output) or {}, site=site
         )
     if code == jarvis_submit.EXIT_BUILD_REFUSED:
         raise jarvis_submit.build_refused(both, site=site)

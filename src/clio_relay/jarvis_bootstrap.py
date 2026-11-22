@@ -1,5 +1,7 @@
 """The script that installs relay's jarvis-cd on a site, kept apart from its callers."""
 
+import re
+
 BOOTSTRAP_SCRIPT = r"""set -eu
 home=$1 pin=$2 source=$3 want=${4:-}
 case $home in
@@ -185,3 +187,26 @@ already at the pin (its ``pin``, ``jarvis`` and ``pip`` in place) is reused, and
 the script prints the same line with ``"from": "reused"``. The site script takes
 the same lock around installing a package's Python requirements into that venv.
 """
+
+PYTHON_SETTING_HELP = (
+    "The Python 3.11 or newer relay builds its jarvis-cd from: a path, ~/..., a name on "
+    "PATH, or module:<name> for an environment module. Leave empty: relay tries python3, "
+    "then python3.<minor> on PATH, then the site's python modules, newest first"
+)
+"""The description of an adapter's ``jarvis_python`` setting (:func:`explicit_python`)."""
+
+_MODULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
+
+
+def explicit_python(value: str) -> str:
+    """Check an adapter's ``jarvis_python`` setting; empty means relay finds one."""
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("module:"):
+        if _MODULE.fullmatch(value.removeprefix("module:")) is None:
+            raise ValueError(f"jarvis_python {value!r} must name a module, as module:<name>")
+        return value
+    if value.startswith("-") or any(ch.isspace() for ch in value):
+        raise ValueError(f"jarvis_python {value!r} must be one program, or module:<name>")
+    return value

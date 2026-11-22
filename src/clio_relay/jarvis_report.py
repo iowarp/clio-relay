@@ -57,16 +57,30 @@ def choice_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
 def blocking_issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Return the issues no answer fixes: no recipe, or answerable with no candidates.
 
-    ``not_installed`` is not blocking: the install itself fixes it.
+    ``not_installed`` is not blocking: the install itself fixes it. Nor is
+    ``install_unchecked``: a check in a job (:func:`unchecked`) answers it.
     """
     blocking: list[dict[str, Any]] = []
     for issue in _issues(report):
-        if issue.get("kind") == "not_installed":
+        if issue.get("kind") in ("not_installed", UNCHECKED):
             continue
         if issue in choice_issues(report):
             continue
         blocking.append(issue)
     return blocking
+
+
+UNCHECKED = "install_unchecked"
+"""JARVIS's issue when the submitting host has no matching record of a job's check."""
+
+
+def unchecked(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return the ``install_unchecked`` issues: JARVIS must check in a job, nobody is asked.
+
+    The light check on a scheduled pipeline's submitting host runs no Spack; it
+    answers from ``install-check.json``, which only a check in a job writes.
+    """
+    return [issue for issue in _issues(report) if issue.get("kind") == UNCHECKED]
 
 
 REUSED_STATUSES = frozenset({"satisfied", "installed"})
@@ -122,25 +136,6 @@ def software_missing(report: Mapping[str, Any]) -> bool:
     if install_summary(report)["build"]:
         return True
     return any(issue.get("kind") == "not_installed" for issue in _issues(report))
-
-
-def software_installed(report: Mapping[str, Any], *, site: str) -> Refusal:
-    """What a ``recheck`` that exited ``EXIT_INSTALLED`` raises: nothing to build.
-
-    It is not a failure; :func:`is_installed` tells the caller to go ahead.
-    """
-    return Refusal(
-        RefusalReason.SUBMIT_FAILED,
-        f"the software is installed on {site} once JARVIS applies the answers; "
-        "nothing has to be built",
-        installed=True,
-        install_report=dict(report),
-    )
-
-
-def is_installed(refusal: Refusal) -> bool:
-    """Say whether ``refusal`` is :func:`software_installed`'s."""
-    return refusal.data.get("installed") is True
 
 
 def applied_decisions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -233,6 +228,11 @@ def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None
     if not summary["build"] and choice_issues(report):
         kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})
         message = f"JARVIS needs a choice on {site} before the run ({', '.join(kinds)})"
+    elif not summary["build"] and not software_missing(report) and unchecked(report):
+        message = (
+            f"JARVIS has no check of the package's software on {site} yet; "
+            "it checks in a job before the run"
+        )
     extra: dict[str, Any] = {"install_walltime": walltime} if walltime else {}
     return Refusal(
         RefusalReason.NEEDS_APPROVAL,
@@ -241,6 +241,30 @@ def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None
         install_report=dict(report),
         summary=summary,
         **extra,
+    )
+
+
+def check_unrecorded(issues: list[dict[str, Any]], *, site: str) -> Refusal:
+    """The refusal when a check job ended and the login host still finds no record of it.
+
+    JARVIS's ``install_unchecked`` says why (``inputs_changed``, ``answers_pending``,
+    ...); relay does not loop on another job.
+    """
+    first = issues[0]
+    reason = first.get("reason") or first.get("detail") or "no matching record"
+    hint = first.get("hint")
+    message = (
+        f"JARVIS checked the package's software in a job on {site}, but the check on the "
+        f"login host still finds no matching record of it ({reason})"
+    )
+    if isinstance(hint, str) and hint:
+        message = f"{message}. {hint}"
+    return Refusal(
+        RefusalReason.SUBMIT_FAILED,
+        message,
+        issues=issues,
+        record=first.get("record"),
+        needs=NEEDS_INSTALL,
     )
 
 

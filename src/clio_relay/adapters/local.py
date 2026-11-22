@@ -411,7 +411,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 jarvis=self.config.jarvis,
                 answers=answers,
                 pipeline=jarvis_submit.install_pipeline(
-                    document, spec, walltime_s=self.config.install_walltime_s
+                    document, spec, self.config.install_walltime_s, answers
                 ),
                 home=self._home(),
             )

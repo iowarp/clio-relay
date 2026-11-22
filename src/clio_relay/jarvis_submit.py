@@ -15,14 +15,17 @@ script hands it to JARVIS:
 - ``install`` runs ``jarvis ppl install yaml <pipeline> --answers <file>
   +submit --execution-id <op>-install +json``: JARVIS installs what the
   pipeline's packages need, as a job of its own; a later round is <op>-install-2 on.
+  ``recheck`` adds ``+check``: JARVIS only checks in that job.
 
-A submit loads the pipeline with ``JARVIS_INSTALL_ON_LOAD=check``. When a
-package's software is missing or needs a decision, JARVIS exits 3 before it
-calls ``sbatch``; the script then writes JARVIS's ``jarvis.install-report.v1``
-to ``relay.install-report.json`` and exits 3 too. Relay asks the person to
-approve the install and to answer each ambiguous question
-(:func:`install_needed`), runs ``install`` with the answers, follows the
-install job's log and progress, and then submits the run again.
+The login host runs no Spack: for a pipeline with a ``scheduler:`` block,
+JARVIS's ``ppl install +check`` there reads the ``install-check.json`` record
+a job's check wrote. A submit asks that light check first. When software is
+missing, needs a decision, or has no matching record (``install_unchecked``),
+the script writes JARVIS's ``jarvis.install-report.v1`` to
+``relay.install-report.json`` and exits 3, before any ``sbatch``. Relay asks
+the person to approve the install and answer each question
+(:func:`install_needed`), or asks nothing and runs ``recheck`` for
+``install_unchecked``, follows that job, and then submits the run again.
 
 Either way the job's JARVIS root is ``<job dir>/.relay-jarvis``, private to the
 job, so the person's own pipelines are never read or changed. Status, outputs,
@@ -53,6 +56,8 @@ from typing import Any, Literal, cast
 import yaml
 
 from clio_relay.jarvis_bootstrap import BOOTSTRAP_SCRIPT as BOOTSTRAP_SCRIPT
+from clio_relay.jarvis_bootstrap import PYTHON_SETTING_HELP as PYTHON_SETTING_HELP
+from clio_relay.jarvis_bootstrap import explicit_python as explicit_python
 from clio_relay.jobs.handles import VIEW_METADATA, JobProgress, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
@@ -99,7 +104,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "5a58ab8218e510ba0fb60b0b85e76ebcaf868e48"
+JARVIS_PIN = "0fa2b3128885acc8e5be438096bee52c5c2cfaa2"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -153,11 +158,9 @@ EXIT_NO_JARVIS = 69
 EXIT_REFUSED = 5
 """JARVIS refused with a ``jarvis.refusal.v1`` document of typed issues (``ppl check``,
 ``execution move``)."""
-EXIT_INSTALLED = 7
-"""A ``recheck`` found the software all there once the answers applied: nothing to build."""
 RECHECK = "clio_relay_recheck"
-"""The key in :func:`install_command`'s answers that makes it a ``recheck``: JARVIS checks
-the software again with the person's answers, and nothing is built."""
+"""The key in :func:`install_command`'s answers that makes it a ``recheck``: a job in
+which JARVIS checks the software with the person's answers, and builds nothing."""
 
 REFUSAL_SCHEMA = "jarvis.refusal.v1"
 CHECK_SCHEMA = "jarvis.pipeline-check.v1"
@@ -810,30 +813,32 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi
 [ -f "$answers" ] && export JARVIS_INSTALL_ANSWERS="$answers"
-report() {
+keep_report() {
+  printf '%s\n' "$1" | tail -n 1 > "$job/relay.install-report.json.tmp"
+  mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
+}
+light() {
   rc=0
   out=$("$found" ppl install yaml "$pipeline" +check +json) || rc=$?
+  keep_report "$out"
+  [ "$mode" = check ] || [ "$rc" -ne 0 ] || return 0
   printf '%s\n' "$out"
-  printf '%s\n' "$out" | tail -n 1 > "$job/relay.install-report.json.tmp"
-  mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
-  [ "$mode" != check ] || exit "$rc"
-  [ "$mode" != recheck ] || [ "$rc" -ne 0 ] || exit 7
-  exit 3
+  exit "$rc"
 }
-[ "$mode" != check ] && [ "$mode" != recheck ] || report
+[ "$mode" != check ] && [ "$mode" != submit ] || light
 if [ "$mode" = run ]; then
   "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
   exit 0
 fi
 rc=0
-if [ "$mode" = install ]; then
+if [ "$mode" = install ] || [ "$mode" = recheck ]; then
   # Each install round is its own execution, as JARVIS refuses to reuse one.
   base=$execution n=1
   while ls -d "$root"/shared/*/executions/"$execution" >/dev/null 2>&1; do
     n=$((n + 1)); execution=$base-$n
   done
-  out=$("$found" ppl install yaml "$pipeline" --answers "$answers" \
+  check=; [ "$mode" = install ] || check=+check
+  out=$("$found" ppl install yaml "$pipeline" --answers "$answers" $check \
     +submit --execution-id "$execution" +json) || rc=$?
   saved=relay.install.json
 else
@@ -864,7 +869,8 @@ print(f if isinstance(f, int) and not isinstance(f, bool) else 0)' \
   saved=relay.submission.json
 fi
 printf '%s\n' "$out"
-[ "$rc" -ne 3 ] || report
+# Exit 3 stopped JARVIS before sbatch: its stdout is the jarvis.install report.
+if [ "$rc" -eq 3 ]; then keep_report "$out"; exit 3; fi
 [ "$rc" -eq 0 ] || exit "$rc"
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
@@ -897,30 +903,32 @@ install fails.
 Relay sets no MPI network: JARVIS's MPI launches apply the one the site's
 resource graph selects. Then it hands the pipeline to JARVIS:
 
-- ``submit`` first runs ``ppl check +json`` and keeps its document as
+- ``submit`` first runs the light ``ppl install +check`` and stops as below
+  unless it says the software is all there. Then it runs ``ppl check +json``
+  and keeps its document as
   ``relay.check.json``; when JARVIS refuses the pipeline (exit 5, typed issues)
   it prints that document and exits 5. It writes the first allocation index of
   the first service JARVIS names to ``relay.service-node``, where the connector
   starts (:func:`connector_command`). Then it runs ``ppl submit`` under
-  ``JARVIS_INSTALL_ON_LOAD=check`` and keeps the handle line as
-  ``relay.submission.json``;
+  ``JARVIS_INSTALL_ON_LOAD=check`` (checked in the allocation) and keeps the
+  handle line as ``relay.submission.json``;
 - ``install`` (the answers JSON comes first) keeps the answers as
   ``relay.answers.json``, runs ``ppl install ... +submit`` and keeps the handle
   line as ``relay.install.json``. A pipeline YAML given to ``install`` is the
   install job's own (:func:`install_pipeline`), kept as
   ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was;
+  ``recheck`` is ``install`` with ``+check``: the job only checks;
 - ``run`` runs ``ppl run`` in place;
-- ``check`` runs only ``ppl install +check``, for an install ahead of any run: it
-  exits 0 with the report when the software is all there, else 3 as below;
-- ``recheck`` keeps the answers as ``install`` does, then runs only
-  ``ppl install +check`` with them, for a round that only answered JARVIS's
-  questions: it exits 7 with the report when the software is all there (nothing
-  to build), else 3 as below.
+- ``check`` runs only the light ``ppl install +check``, for an install ahead of
+  any run: it exits 0 with the report when the software is all there, else 3.
 
-When JARVIS exits 3 (software to install, or a question), the script writes
-the ``ppl install +check`` report to ``relay.install-report.json``, prints it
-and exits 3; a site where JARVIS finds no Spack is one of those questions
-(``spack_missing``, whose candidates are the site's Spacks JARVIS found).
+The light check runs no Spack: JARVIS answers from the ``install-check.json``
+record a job's check wrote, while its inputs match, else ``install_unchecked``.
+When it exits 3 (software to install, a question, or no record), the script
+writes its report to ``relay.install-report.json``, prints it and exits 3; a
+site where JARVIS finds no Spack is one of those questions (``spack_missing``,
+whose candidates are the site's Spacks JARVIS found). ``ppl submit``'s own
+exit 3 prints the same report, kept the same way.
 Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build outside an
 allocation) passes through unchanged; relay reports it with
@@ -997,6 +1005,14 @@ INSTALL_WALLTIME_HELP = (
 INSTALL_PIPELINE_FILE = "relay.install-pipeline.yaml"
 """The pipeline the install job builds with, beside the run's :data:`PIPELINE_FILE`."""
 
+INSTALL_CHECK_WALLTIME_S = 3600
+"""The longest walltime of a ``recheck`` job: JARVIS only checks there, which takes minutes."""
+
+
+def is_recheck(answers: Mapping[str, Any]) -> bool:
+    """Say whether :func:`install_command`'s ``answers`` make it a ``recheck``."""
+    return bool(answers.get(RECHECK))
+
 
 def install_walltime(spec: JobSpec, walltime_s: int) -> str:
     """Return the install job's Slurm walltime: ``walltime_s``, or the run's when longer."""
@@ -1007,14 +1023,18 @@ def install_walltime(spec: JobSpec, walltime_s: int) -> str:
     return slurm_time(walltime)
 
 
-def install_pipeline(document: Mapping[str, object], spec: JobSpec, *, walltime_s: int) -> str:
+def install_pipeline(
+    document: Mapping[str, object], spec: JobSpec, walltime_s: int, answers: Mapping[str, Any]
+) -> str:
     """Render the pipeline the install job builds with, from the run's ``document``.
 
     JARVIS sizes its own build job (``ppl install +submit``: one node, one task,
     the whole node). Relay only drops its own ``pre_cmds`` (the install job
     serves nothing, so a package service's connector does not start in it) and
     gives the site's install walltime as ``scheduler.install.time``
-    (:func:`install_walltime`), which JARVIS applies to install jobs only.
+    (:func:`install_walltime`), which JARVIS applies to install jobs only. A
+    check job (``answers`` make it a ``recheck``) builds nothing, so its walltime
+    is the shorter of ``walltime_s`` and :data:`INSTALL_CHECK_WALLTIME_S`.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
@@ -1024,7 +1044,9 @@ def install_pipeline(document: Mapping[str, object], spec: JobSpec, *, walltime_
     }
     install = scheduler.get("install")
     own = dict(cast(Mapping[str, object], install)) if isinstance(install, Mapping) else {}
-    own.setdefault("time", install_walltime(spec, walltime_s))
+    check = timedelta(seconds=min(walltime_s, INSTALL_CHECK_WALLTIME_S))
+    walltime = slurm_time(check) if is_recheck(answers) else install_walltime(spec, walltime_s)
+    own.setdefault("time", walltime)
     scheduler["install"] = own
     return render_pipeline({**document, "scheduler": scheduler})
 
@@ -1047,44 +1069,20 @@ def install_command(
     is the YAML of :func:`install_pipeline`, which the site script keeps as
     :data:`INSTALL_PIPELINE_FILE`; without it the install builds with the run's.
 
-    Answers with :data:`RECHECK` set make it a ``recheck`` instead: JARVIS checks
-    the run's pipeline again with the answers, submits nothing, and the site
-    script exits :data:`EXIT_INSTALLED` when nothing is left to build.
+    Answers with :data:`RECHECK` set make it a ``recheck`` instead: a job in which
+    JARVIS checks the software with the answers (``+check +submit``) and builds
+    nothing.
     """
-    recheck = bool(answers.get(RECHECK))
+    recheck = is_recheck(answers)
     arguments = site_arguments(
         spec,
         mode="recheck" if recheck else "install",
         jarvis=jarvis,
         execution=install_execution_id(operation_id),
         answers={key: value for key, value in answers.items() if key != RECHECK},
-        pipeline=None if recheck else pipeline,
+        pipeline=pipeline,
     )
     return _site_command(spec, arguments, script=script, home=home)
-
-
-PYTHON_SETTING_HELP = (
-    "The Python 3.11 or newer relay builds its jarvis-cd from: a path, ~/..., a name on "
-    "PATH, or module:<name> for an environment module. Leave empty: relay tries python3, "
-    "then python3.<minor> on PATH, then the site's python modules, newest first"
-)
-"""The description of an adapter's ``jarvis_python`` setting (:func:`explicit_python`)."""
-
-_MODULE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/-]*")
-
-
-def explicit_python(value: str) -> str:
-    """Check an adapter's ``jarvis_python`` setting; empty means relay finds one."""
-    value = value.strip()
-    if not value:
-        return ""
-    if value.startswith("module:"):
-        if _MODULE.fullmatch(value.removeprefix("module:")) is None:
-            raise ValueError(f"jarvis_python {value!r} must name a module, as module:<name>")
-        return value
-    if value.startswith("-") or any(ch.isspace() for ch in value):
-        raise ValueError(f"jarvis_python {value!r} must be one program, or module:<name>")
-    return value
 
 
 def bootstrap_arguments(home: str, python: str = "") -> list[str]:

@@ -40,13 +40,19 @@ flowchart LR
    service's endpoint and readiness (`job=<service>`). `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
    `install` (`surface/install_tool.py`, `surface/install_op.py`) is a run's
-   install task on its own, and a task too: it asks JARVIS `ppl install +check`,
-   asks only JARVIS's questions when that is all `+check` reports, then checks
-   again with the answers (the site script's `recheck` mode: exit 7 when
-   everything is installed, so nothing is asked or built),
+   install task on its own, and a task too: it asks JARVIS's light
+   `ppl install +check`, which runs no Spack on the login host and answers
+   from the record (`install-check.json`) of the last check a job made. With no
+   matching record (`install_unchecked`) relay asks nothing and submits a
+   check job (the site script's `recheck` mode, `ppl install +check +submit`).
+   When JARVIS reports only questions, relay asks them, then runs that check
+   job with the answers, so nothing is asked or built when everything is
+   installed. It
    takes the run's install path when software is missing (the same asks, then
    `ppl install +submit` as a job on the compute nodes), installs relay's
-   jarvis-cd first when the site lacks it, and launches nothing. Operations
+   jarvis-cd first when the site lacks it, and launches nothing. A run's
+   submit asks the same light check before `ppl submit`, so the person is
+   still asked before any job of the run is submitted. Operations
    that find a site without jarvis-cd at once share one site-scoped ask
    (`surface/install_share.py`), and the bootstrap's lock in the site home
    makes a second install wait for the first and reuse it. A JARVIS question

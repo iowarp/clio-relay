@@ -19,7 +19,6 @@ from clio_relay.guard.warm import HOLDER, WARM_EXECUTABLE
 from clio_relay.jarvis_site import archive_package
 from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
-    EXIT_INSTALLED,
     EXIT_MISSING,
     EXIT_NO_JARVIS,
     EXIT_REFUSED,
@@ -50,7 +49,12 @@ case "$1 $2" in
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
   "ppl install")
-    printf '{"schema_version":"jarvis.install-report.v1","satisfied":%s}\\n' \
+    case " $* " in
+      *" +submit "*)
+        printf '{"execution_id":"install","schema_version":"jarvis.execution.handle.v1"}\\n'
+        exit 0 ;;
+    esac
+    printf '{"schema_version":"jarvis.install-report.v1","satisfied":%s}\\n' \\
       "${JARVIS_SATISFIED:-true}"
     exit "${JARVIS_INSTALL_RC:-0}" ;;
   "ppl check")
@@ -63,7 +67,12 @@ case "$1 $2" in
     printf '{"schema_version":"jarvis.pipeline-check.v1","ok":true,'
     printf '"services":[{"nodes":{"first":2,"end":3}}]}\\n' ;;
   "ppl submit")
-    if [ -n "${JARVIS_SUBMIT_RC:-}" ]; then echo "sbatch said no" >&2; exit "$JARVIS_SUBMIT_RC"; fi
+    if [ -n "${JARVIS_SUBMIT_RC:-}" ]; then
+      echo "sbatch said no" >&2
+      [ "$JARVIS_SUBMIT_RC" != 3 ] \\
+        || printf '{"schema_version":"jarvis.install-report.v1","submitted":false}\\n'
+      exit "$JARVIS_SUBMIT_RC"
+    fi
     echo "submitting $3"
     printf '{"execution_id":"%s","schema_version":"jarvis.execution.handle.v1"}\\n' "$5" ;;
 esac
@@ -154,6 +163,7 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert log == [
         f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
         f"JARVIS_ROOT={root} repo add {root}/src/demo",
+        f"JARVIS_ROOT={root} ppl install yaml {job}/{PIPELINE_FILE} +check +json",
         f"JARVIS_ROOT={root} ppl check yaml {job}/{PIPELINE_FILE} +json",
         f"JARVIS_ROOT={root} ppl submit {job}/{PIPELINE_FILE} --execution-id op_x +json",
     ]
@@ -178,6 +188,24 @@ def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> Non
     assert "sbatch said no" in done.stderr
     assert not (job / SUBMISSION_FILE).exists()
     assert (job / EXITCODE_FILE).read_text() == "3\n"
+    # JARVIS stopped before sbatch: its stdout is the install report, kept as such.
+    report = json.loads((job / "relay.install-report.json").read_text())
+    assert report["submitted"] is False
+
+
+def test_submit_asks_the_light_check_first_and_stops_on_its_exit_3(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_INSTALL_RC="3", JARVIS_SATISFIED="false")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 3, done.stderr
+    log = (tmp_path / "jarvis.log").read_text()
+    assert f"ppl install yaml {job}/{PIPELINE_FILE} +check +json" in log
+    assert "ppl check" not in log and "ppl submit" not in log
+    assert json.loads((job / "relay.install-report.json").read_text())["satisfied"] is False
+    assert json.loads(done.stdout.strip().splitlines()[-1])["satisfied"] is False
+    assert not (job / SUBMISSION_FILE).exists()
 
 
 def test_the_connector_node_is_the_one_jarvis_names(tmp_path: Path) -> None:
@@ -223,22 +251,28 @@ def test_check_asks_jarvis_what_is_installed_and_submits_nothing(tmp_path: Path,
     assert not (job / SUBMISSION_FILE).exists()
 
 
-@pytest.mark.parametrize(("rc", "code"), [(0, EXIT_INSTALLED), (3, 3)])
-def test_recheck_applies_the_answers_and_builds_nothing(tmp_path: Path, rc: int, code: int) -> None:
+def test_recheck_is_a_check_job_with_the_answers(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
     (job / PIPELINE_FILE).write_text(PIPELINE)
-    satisfied = "true" if rc == 0 else "false"
-    env = _env(tmp_path, tmp_path / "bin", JARVIS_INSTALL_RC=str(rc), JARVIS_SATISFIED=satisfied)
+    env = _env(tmp_path, tmp_path / "bin")
     answers = '{"sha256:1":{"constraint":"^mpich"}}'
-    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x-install", answers, mode="recheck")
-    assert done.returncode == code, done.stderr
+    install = "name: relay_op_x_install\n"
+    done = _site(
+        job, env, digest, "demo.hello", "jarvis", "op_x-install", answers, install, mode="recheck"
+    )
+    assert done.returncode == 0, done.stderr
     assert (job / "relay.answers.json").read_text().strip() == answers
+    assert (job / "relay.install-pipeline.yaml").read_text() == install
     log = (tmp_path / "jarvis.log").read_text()
     assert f"answers {job}/relay.answers.json" in log
-    assert f"ppl install yaml {job}/{PIPELINE_FILE} +check +json" in log
-    assert "+submit" not in log and "ppl submit" not in log
-    assert json.loads((job / "relay.install-report.json").read_text())["satisfied"] is (rc == 0)
+    assert (
+        f"ppl install yaml {job}/relay.install-pipeline.yaml --answers {job}/relay.answers.json "
+        "+check +submit --execution-id op_x-install +json"
+    ) in log
+    assert "ppl submit" not in log
+    handle = parse_handle((job / "relay.install.json").read_text())
+    assert handle is not None and handle["execution_id"] == "install"
 
 
 def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
