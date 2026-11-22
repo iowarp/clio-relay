@@ -247,6 +247,28 @@ A no submits nothing. A question nobody answers leaves the operation waiting,
 with nothing submitted, until someone answers it. An approval covers exactly
 the job you saw: a changed job needs a new approval.
 
+## Plain and typed questions
+
+A host may answer a plain yes/no for you once you have allowed the call that
+raised it, and show its text as a note. So relay's plain questions (one yes/no
+field) say nothing you have not already seen in the call's arguments: the
+`exec` plan's command and a file delete or replace are plain. Anything that adds
+a fact or a choice of relay's or JARVIS's, such as a cost, a package review, a
+JARVIS install question or decision, or what `site clean` deletes and keeps, is
+a typed question: a titled choice (`approve` or `decline`) or JARVIS's options.
+A host still shows those to you.
+
+## Services still running when a new job starts
+
+A service keeps its nodes while it is up, including a viewer kept up after its
+program finished so you can review the results. When a run or another service
+is opened on a site where one of relay's services still runs, relay asks once,
+with the job's other questions: end those services when this job is submitted,
+or keep them running. It names each one, what it runs and how many nodes it
+holds. Relay never ends one on its own: keep them, a no, or no answer leaves
+them running. If you choose to end them, they are cancelled when the new job is
+submitted, not before, so you keep the review until then.
+
 ## Warm allocations
 
 When the agent needs a few quick checks on compute nodes, it can ask for a

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from clio_relay import jarvis_exits, jarvis_submit
+from clio_relay import jarvis_exits, jarvis_submit, site_outputs
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
@@ -175,9 +175,9 @@ class LocalConfig(BaseModel):
         ),
     )
     work_dir: str | None = Field(
-        default=None,
-        description="Where job directories go. Defaults to relay's state directory",
+        default=None, description="Where job directories go. Defaults to relay's state directory"
     )
+    outputs_dir: str | None = Field(default=None, description=site_outputs.HELP)
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
@@ -253,6 +253,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 "cpus": os.cpu_count(),
                 "python": platform.python_version(),
                 "work_dir": str(self.work_dir),
+                "outputs_dir": self.config.outputs_dir,
             },
             verbs=sorted(self.implements),
         )
@@ -284,7 +285,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         if spec.steps():
             if scheduler is None:
                 spec = jarvis_submit.direct_job(
-                    spec,
+                    site_outputs.with_outputs(spec, self.config.outputs_dir),
                     jarvis=self.config.jarvis,
                     job_dir=job_dir.as_posix(),
                     home=self._home(),
@@ -361,8 +362,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
         await asyncio.to_thread(_write)
         mode: jarvis_submit.SiteMode = "check" if check else "submit"
+        out = site_outputs.with_outputs(spec, self.config.outputs_dir)
         command = jarvis_submit.submit_command(
-            spec, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home(), mode=mode
+            out, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home(), mode=mode
         )
         result = await run_bounded(
             shlex.split(command),
@@ -402,7 +404,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         document = self._jarvis_document(spec, job_dir, operation_id)
         argv = shlex.split(
             jarvis_submit.install_command(
-                spec,
+                site_outputs.with_outputs(spec, self.config.outputs_dir),
                 operation_id=operation_id,
                 jarvis=self.config.jarvis,
                 answers=answers,
@@ -485,10 +487,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
         argv = await asyncio.to_thread(_render)
         result = await run_bounded(
-            argv,
-            timeout_s=self.config.submit_timeout_s,
-            max_output_bytes=65536,
-            cwd=job_dir,
+            argv, timeout_s=self.config.submit_timeout_s, max_output_bytes=65536, cwd=job_dir
         )
         if result.exit_code != 0:
             raise Refusal(

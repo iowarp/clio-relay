@@ -13,7 +13,7 @@ import logging
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay import jarvis_submit, site_clean
+from clio_relay import jarvis_submit, relay_state, site_clean
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
@@ -24,6 +24,7 @@ from clio_relay.adapters.hooks import (
     ServeHook,
     Transport,
     hook_factory,
+    said_yes,
 )
 from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
@@ -48,7 +49,7 @@ from clio_relay.packages import (
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface import exec_plan, install_op, installing, queue_switch
+from clio_relay.surface import exec_plan, held_services, install_op, installing, queue_switch
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
@@ -262,14 +263,9 @@ class RelayService:
         site = self.site(site_id)
         spec = await self.prepared_run(site, spec)
         what = spec.executable or _steps_label(spec) or "a job"
+        digest, dumped = spec.digest(), spec.model_dump(mode="json")
         return await self.open_operation(
-            site,
-            "run",
-            spec,
-            spec.model_dump(mode="json"),
-            spec.digest(),
-            f"Run {what}",
-            task=task,
+            site, "run", spec, dumped, digest, f"Run {what}", task=task
         )
 
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
@@ -330,6 +326,7 @@ class RelayService:
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
+        relay_state.refuse_relay_state(adapter, job, site.id)
         if job.steps() and not adapter.runs_packages:
             raise not_run_here(adapter_name)
         decision = await self.guard.check_run(site, job)
@@ -354,12 +351,14 @@ class RelayService:
             result=result,
         )
         asks: list[Ask] = []
-        need = await adapter.sign_in_needed()
-        if need is not None:
+        if (need := await adapter.sign_in_needed()) is not None:
             asks.append(
                 await self.ask_provider.url(site=site, operation_id=operation_id, need=need)
             )
         asks.extend(await review_asks(self, site, record, decision))
+        if held := await held_services.ask(self, site, kind, operation_id):
+            asks.append(held[0])
+            record.result = {**(record.result or {}), held_services.KEY: held[1]}
         if spends and site.spend.needs_approval(charge.node_hours):
             binding = {
                 "site": site.id,
@@ -372,6 +371,7 @@ class RelayService:
                     operation_id=operation_id,
                     message=approval_message(action, site, charge, job.steps()),
                     binding=binding,
+                    plain=False,
                 )
             )
         record.asks = [ask.ask_id for ask in asks]
@@ -422,10 +422,8 @@ class RelayService:
                     RefusalReason.ASK_NOT_FOUND, f"there is no ask {ask_id!r}", ask_id=ask_id
                 )
             if action == "accept":
-                if ask.kind == "approve" and not bool((content or {}).get("approve")):
-                    ask.resolve("declined", {"action": "accept", "content": content}, by)
-                else:
-                    ask.resolve("accepted", {"action": "accept", "content": content}, by)
+                state = "accepted" if ask.kind != "approve" or said_yes(content) else "declined"
+                ask.resolve(state, {"action": "accept", "content": content}, by)
             elif action == "decline":
                 ask.resolve("declined", {"action": "decline"}, by)
             else:
@@ -497,10 +495,10 @@ class RelayService:
             phase = queue_switch.state_of(record).get("phase")
             handle = installing.install_handle(record) if phase == "install" else record.handle
             return await queue_switch.advance(self, operation_id, handle)
-        relayed = queue_switch.ask_ids(record)
+        relayed, kept = queue_switch.ask_ids(record), held_services.ask_ids(record)
         waiting = False
         for ask in self.operation_asks(record):
-            if ask.ask_id in relayed:
+            if ask.ask_id in relayed or (ask.ask_id in kept and ask.state != "pending"):
                 continue
             if ask.state in ("declined", "cancelled"):
                 message = f"the person declined: {ask.message}"
@@ -590,6 +588,7 @@ class RelayService:
                 OperationState.SUBMITTING, None if job_name is None else f"job name {job_name}"
             )
             self.operations.put(operation_id, record)
+        await held_services.end_chosen(self, operation_id)
         if record.kind == "serve":
             return await self._start_service(operation_id, site, adapter, record)
         if record.kind == "install":

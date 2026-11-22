@@ -36,7 +36,8 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `ssh_profile` | (required) | A `Host` from `~/.ssh/config`, or `user@host` |
 | `ssh_config` | `~/.ssh/config` | Another ssh_config file to use |
 | `ssh_options` | none | Extra `Key=Value` options, passed with `-o` |
-| `remote_dir` | `.clio-relay` | Relay's directory on the site, under your home unless absolute |
+| `remote_dir` | `.clio-relay` | Relay's own directory on the site, under your home unless absolute. `site clean` deletes it, so no run's outputs belong there |
+| `outputs_dir` | `clio-relay-runs` | Where runs write: JARVIS's shared directory for each job, and where a case's `run_dir` belongs. Under your home unless absolute; it must be outside `remote_dir`. `site clean` keeps it unless you ask. `describe` shows it as `info.facts.outputs_dir` |
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |

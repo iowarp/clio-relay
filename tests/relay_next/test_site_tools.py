@@ -36,7 +36,7 @@ def _structured(result: Any) -> dict[str, Any]:
 
 async def _approve(message: str, response_type: Any, params: Any, context: Any) -> Any:
     assert "keeping ~/spack, ~/spack-config" in message
-    return {"approve": True}
+    return {"approve": "approve"}
 
 
 async def _decline(message: str, response_type: Any, params: Any, context: Any) -> Any:

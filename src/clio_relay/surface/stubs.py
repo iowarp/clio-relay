@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from clio_relay.adapters.base import BaseAdapter, SignInNeed
-from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, HookContext
+from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, HookContext, approve_schema
 from clio_relay.jobs.handles import Endpoint, JobStatus
 from clio_relay.jobs.records import OperationRecord, new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -25,13 +25,7 @@ if TYPE_CHECKING:
 
     from clio_relay.surface.changes import ServerChanges
 
-APPROVE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "approve": {"type": "boolean", "title": "Approve", "default": False},
-    },
-    "required": ["approve"],
-}
+APPROVE_SCHEMA: dict[str, Any] = approve_schema()
 
 
 class StubAskProvider:
@@ -77,6 +71,7 @@ class StubAskProvider:
         operation_id: str | None,
         message: str,
         binding: dict[str, Any],
+        plain: bool = True,
     ) -> Ask:
         ask = Ask(
             ask_id=new_id("ask"),
@@ -84,7 +79,7 @@ class StubAskProvider:
             site=site.id,
             operation_id=operation_id,
             message=message,
-            requested_schema=APPROVE_SCHEMA,
+            requested_schema=approve_schema(plain=plain),
         )
         ask.bind(binding)
         return self._store(ask)

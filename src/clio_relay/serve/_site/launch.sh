@@ -127,9 +127,10 @@ finish() {
     extra=${3:-}
     : > "$S/artifacts.txt.tmp"
     # The package runner's archive and JARVIS tree are relay's own; package
-    # outputs land in .relay-jarvis/shared. The adapter's own records and the
+    # outputs land in .relay-jarvis/shared, which may link to the site's outputs
+    # directory (find -L follows it). The adapter's own records and the
     # scheduler's <job id>.* files are not the program's.
-    (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
+    (cd "$JOB" && find -L . -type f -newer "$S/started" ! -path './serve/*' \
         ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
         ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
         ! -name stdout ! -name stderr ! -name state.json ! -name job.json \

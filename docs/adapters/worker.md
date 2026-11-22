@@ -82,6 +82,7 @@ picks those.
 | `work_dir` | in the worker directory | Where job directories go on the cluster |
 | `rendezvous` | relay's `CLIO_RELAY_FRPS_ADDR` and `CLIO_RELAY_FRP_TOKEN` | The frps server, as below |
 | `remote_dir` | `~/.local/share/clio-relay/worker/<site>` | The worker's directory on the cluster |
+| `outputs_dir` | `clio-relay-runs` | Where runs write, outside relay's directories, as in the [ssh adapter](ssh.md#settings) |
 | `relay_wheel` | none | A local clio-relay wheel to install instead of the PyPI release |
 | `relay_requirement` | `clio-relay==<this version>` | What `uv` installs on the cluster |
 | `site_frpc` | upload relay's frpc | An frpc already on the cluster |

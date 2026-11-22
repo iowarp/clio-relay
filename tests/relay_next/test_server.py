@@ -210,15 +210,15 @@ def test_task_asks_with_input_required_and_takes_tasks_update(relay_paths: Relay
             (ask_id,) = parked.input_requests
             request = parked.input_requests[ask_id]
             dumped = _dumped(request)
-            assert dumped["params"]["requestedSchema"]["properties"]["approve"]["type"] == (
-                "boolean"
-            )
+            answer = dumped["params"]["requestedSchema"]["properties"]["approve"]
+            assert answer["type"] == "string"
+            assert [item["const"] for item in answer["oneOf"]] == ["approve", "decline"]
             await client.session.send_request(
                 UpdateTaskRequest(
                     params=UpdateTaskRequestParams(
                         task_id=task.task_id,
                         input_responses={
-                            ask_id: {"action": "accept", "content": {"approve": True}}
+                            ask_id: {"action": "accept", "content": {"approve": "approve"}}
                         },
                     )
                 ),

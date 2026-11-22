@@ -190,6 +190,7 @@ async def review_asks(
                 "site": site.id,
                 "spec_digest": record.spec_digest,
             },
+            plain=False,
         )
         for review in reviews
     ]

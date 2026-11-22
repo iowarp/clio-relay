@@ -60,8 +60,9 @@ decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
 graph=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
+outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
-unset CLIO_RELAY_JARVIS_GRAPH
+unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_OUTPUTS
 unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT
 unset JARVIS_ALLOW_LOCAL_BUILD
 # Where checks and builds run is the site's choice: JARVIS asks it (install_placement),
@@ -110,12 +111,17 @@ fi
 printf '%s\n' "$found" > "$job/relay.jarvis"
 root="$job/.relay-jarvis"
 export JARVIS_ROOT="$root"
+# What the pipeline writes (JARVIS's shared directory) lives in the site's outputs
+# directory, outside relay's own: a site clean removes the link, never the outputs.
+shared="$root/shared"
+[ -z "$outputs" ] || shared="$outputs/${job##*/}"
 # Set up once per set of archives: the root keeps the install records and executions.
 # Archives of one repository unpack into one tree, which JARVIS registers once.
 if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
   rm -rf "$root"
-  mkdir -p "$root/src"
-  "$found" init "$root/config" "$root/private" "$root/shared" >/dev/null
+  mkdir -p "$root/src" "$shared"
+  [ "$shared" = "$root/shared" ] || ln -sfn "$shared" "$root/shared"
+  "$found" init "$root/config" "$root/private" "$shared" >/dev/null
   repos=" "
   for step in $(printf '%s' "$steps" | tr , ' '); do
     name=${step%@*} digest=${step##*@}

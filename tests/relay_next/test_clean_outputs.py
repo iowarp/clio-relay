@@ -20,23 +20,27 @@ def _service(*records: Any) -> Any:
     return SimpleNamespace(operations=SimpleNamespace(all=lambda: list(records)))
 
 
-def test_outputs_outside_relays_directories_are_listed_once() -> None:
+def test_outputs_outside_their_job_directories_are_listed_once() -> None:
     service = _service(
         _record(
             "ares",
             "run",
             OutputRef(name="case", path="/home/u/clio-cases/tgv/", size=11_000_000_000),
             OutputRef(name="field", path="/home/u/clio-cases/tgv/data.bp"),
-            OutputRef(name="log", path="/home/u/clio/site/jobs/1/out.log"),
-            OutputRef(name="state", path="/home/u/.clio-relay/x"),
+            OutputRef(name="log", path="/home/u/clio/site/jobs/op_run/out.log"),
+            OutputRef(name="state", path="/home/u/.clio-relay/naca_production"),
             OutputRef(name="relative", path="out.txt"),
         ),
         _record("other", "run", OutputRef(name="o", path="/elsewhere/o")),
         _record("ares", "install", OutputRef(name="i", path="/home/u/spack-build")),
     )
     found = run_outputs(service, "ares", TARGETS)
-    assert [item["path"] for item in found] == ["/home/u/clio-cases/tgv"]
-    assert found[0]["operation_id"] == "op_run" and found[0]["size"] == 11_000_000_000
+    # A case a run wrote inside relay's state is still the person's: it is listed and kept.
+    assert [item["path"] for item in found] == [
+        "/home/u/.clio-relay/naca_production",
+        "/home/u/clio-cases/tgv",
+    ]
+    assert found[1]["operation_id"] == "op_run" and found[1]["size"] == 11_000_000_000
 
 
 def _planned(remove: bool) -> dict[str, Any]:

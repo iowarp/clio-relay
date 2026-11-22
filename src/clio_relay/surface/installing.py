@@ -222,6 +222,7 @@ async def ask_install(
                         "kind": SOFTWARE_KIND,
                         "report_digest": state["report_digest"],
                     },
+                    plain=False,
                 )
             )
         choices: dict[str, str] = {}
@@ -254,6 +255,7 @@ async def ask_install(
                     "kind": JARVIS_KIND,
                     "jarvis": jarvis_submit.JARVIS_PIN,
                 },
+                plain=False,
             )
             return _hold(service, operation_id, state, [ask], refusal.message)
     return _hold(service, operation_id, state, asks, refusal.message)

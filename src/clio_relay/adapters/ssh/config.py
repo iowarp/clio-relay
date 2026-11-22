@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_submit, site_outputs
 
 SchedulerName = Literal["slurm", "pbs", "lsf", "cobalt"]
 SchedulerChoice = Literal["auto", "none", "slurm", "pbs", "lsf", "cobalt"]
@@ -35,8 +35,12 @@ class SshConfig(BaseModel):
     )
     remote_dir: str = Field(
         default=".clio-relay",
-        description="Relay's directory on the site, relative to the home directory or absolute",
+        description=(
+            "Relay's own directory on the site, relative to the home directory or absolute. "
+            "Site clean deletes it, so no run's outputs belong there"
+        ),
     )
+    outputs_dir: str = Field(default=site_outputs.OUTPUTS_DIR, description=site_outputs.HELP)
     scheduler: SchedulerChoice = Field(
         default="auto",
         description=(
@@ -93,3 +97,8 @@ class SshConfig(BaseModel):
     @classmethod
     def _jarvis_python(cls, value: str) -> str:
         return jarvis_submit.explicit_python(value)
+
+    @model_validator(mode="after")
+    def _outputs_outside(self) -> SshConfig:
+        site_outputs.check_outputs_dir(self.outputs_dir, self.remote_dir)
+        return self

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay import jarvis_exits, jarvis_submit
+from clio_relay import jarvis_exits, jarvis_submit, site_outputs
 from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
@@ -301,7 +301,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "machine": first("machine"),
                 "cpus": int(cpus) if cpus and cpus.isdigit() else None,
                 "home": first("home"),
-                "remote_dir": self.config.remote_dir,
+                **site_outputs.dir_facts(self.config.remote_dir, self.config.outputs_dir),
                 "resource_graph": graph,
                 "sched": self._sched_facts(sched, sections, sched_text),
                 "jarvis": self._jarvis_facts(),
@@ -400,7 +400,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if spec.steps():
             if scheduler is None:
                 spec = jarvis_submit.direct_job(
-                    spec,
+                    site_outputs.with_outputs(spec, self.config.outputs_dir),
                     jarvis=self.config.jarvis,
                     job_dir=str(job_dir),
                     home=self.config.remote_dir,
@@ -574,7 +574,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         rendered.files[jarvis_submit.PIPELINE_FILE] = jarvis_submit.render_pipeline(document)
         rendered.files[jarvis_submit.SCRIPT_FILE] = jarvis_submit.SITE_SCRIPT
         rendered.submit_command = jarvis_submit.submit_command(
-            spec,
+            site_outputs.with_outputs(spec, self.config.outputs_dir),
             operation_id=operation_id,
             jarvis=self.config.jarvis,
             home=self.config.remote_dir,
@@ -1028,7 +1028,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         spec = jarvis_submit.with_archive(spec)
         document = self._jarvis_document(spec, operation_id, job_dir, job_name(operation_id))
         command = jarvis_submit.install_command(
-            spec,
+            site_outputs.with_outputs(spec, self.config.outputs_dir),
             operation_id=operation_id,
             jarvis=self.config.jarvis,
             answers=answers,

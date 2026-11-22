@@ -120,10 +120,19 @@ and deploys everything again. Every live proof starts with it, so deployment is
 tested each time.
 
 What relay's runs wrote outside its own directories, such as a case's results
-under your home, is yours, so clean keeps it. The question names those outputs,
-taken from the operations' records, and the result lists them as
+under your home, is yours, so clean keeps it. Runs write under the site's
+`outputs_dir` (`~/clio-relay-runs` unless set), outside relay's directories:
+JARVIS's shared directory for each job lives there, linked from the job
+directory, so a clean removes the link and never the outputs. A run or service
+whose job names a path inside relay's directories is refused before anything is
+asked, with the outputs directory to use instead. The question names the
+outputs, taken from the operations' records, and the result lists them as
 `outputs_kept`. Pass `--remove-outputs` (`remove_outputs` over MCP) to delete
 them with the rest; the question then says it deletes them.
+
+A clean keeps JARVIS's recorded answers unless you pass `--forget-decisions`, and
+its question says so. A take that must start from nothing, asking which MPI and
+where installs run again, cleans with `--forget-decisions`.
 
 Clean removes nothing while one of relay's jobs still runs on the site, since
 its directory is among what goes. It does not trust relay's records alone: it

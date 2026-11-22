@@ -63,6 +63,7 @@ async def _approve(service: RelayService, planned: dict[str, Any]) -> Ask:
             operation_id=None,
             message=cleaning.describe_plan(planned),
             binding=binding,
+            plain=False,
         )
         if service.asks.get(ask.ask_id) is None:
             service.asks.put(ask.ask_id, ask)

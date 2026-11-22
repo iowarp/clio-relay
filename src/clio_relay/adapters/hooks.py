@@ -38,6 +38,38 @@ AskKind = Literal["choose", "approve", "url"]
 AskState = Literal["pending", "accepted", "declined", "cancelled"]
 Transport = Literal["stdio", "http", "memory"]
 
+APPROVE_YES = "approve"
+APPROVE_NO = "decline"
+
+
+def approve_schema(*, plain: bool = True) -> dict[str, Any]:
+    """Return an approval's form: one boolean when ``plain``, else a titled choice.
+
+    A plain approval only confirms what the call's own arguments already say, so a
+    host that answers a plain confirm itself for a call the person allowed loses
+    nothing. An approval that names facts the arguments do not (a cost, a gap in
+    the site's software, what a clean removes) is a choice, which such a host
+    still puts to the person.
+    """
+    if plain:
+        answer: dict[str, Any] = {"type": "boolean", "title": "Approve", "default": False}
+    else:
+        answer = {
+            "type": "string",
+            "title": "Answer",
+            "oneOf": [
+                {"const": APPROVE_YES, "title": "Approve"},
+                {"const": APPROVE_NO, "title": "Decline"},
+            ],
+        }
+    return {"type": "object", "properties": {"approve": answer}, "required": ["approve"]}
+
+
+def said_yes(content: dict[str, Any] | None) -> bool:
+    """Say whether an approval's answer content is a yes, in either form."""
+    value = (content or {}).get("approve")
+    return value is True or value == APPROVE_YES
+
 
 class Ask(BaseModel):
     """A question for the person, durable so any path can answer it.
@@ -116,8 +148,13 @@ class AskProvider(Protocol):
         operation_id: str | None,
         message: str,
         binding: dict[str, Any],
+        plain: bool = True,
     ) -> Ask:
-        """Build a form ask for a yes or no bound to ``binding``."""
+        """Build a form ask for a yes or no bound to ``binding``.
+
+        ``plain=False`` when the message names facts the call's arguments do
+        not: the form is then a choice (:func:`approve_schema`).
+        """
         ...
 
     async def url(self, *, site: SiteEntry, operation_id: str | None, need: SignInNeed) -> Ask:

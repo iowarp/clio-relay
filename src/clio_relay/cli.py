@@ -521,6 +521,7 @@ def site_clean(
             operation_id=None,
             message=cleaning.describe_plan(planned),
             binding={"action": "site_clean", **planned},
+            plain=False,
         )
         if service.asks.get(ask.ask_id) is None:
             service.asks.put(ask.ask_id, ask)

@@ -7,7 +7,9 @@ asks the person once, bound to the site, the plan's kind and the digest of the
 argument list, and runs that list only after a yes, lightly
 (:func:`clio_relay.login_load.light_argv`) and with a capped timeout. The yes
 is used once: the next run of the plan asks again. No raw shell is opened:
-the argument list the person approved is the one that runs.
+the argument list the person approved is the one that runs. The ask is a plain
+confirm: it shows only the call's own command, plan and site, plus relay's own
+limits on it, so a host that confirms a call the person already allowed asks once.
 """
 
 from __future__ import annotations

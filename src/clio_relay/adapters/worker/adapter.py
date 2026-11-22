@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from clio_relay import jarvis_submit, programs
+from clio_relay import jarvis_submit, programs, site_outputs
 from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.worker.batch_ssh import batch_ssh
@@ -127,6 +127,7 @@ class WorkerConfig(BaseModel):
         description="auto picks the scheduler whose submit command is on the site's PATH",
     )
     work_dir: str | None = Field(default=None, description="Where job directories go on the site")
+    outputs_dir: str = Field(default=site_outputs.OUTPUTS_DIR, description=site_outputs.HELP)
     rendezvous: Rendezvous | None = Field(
         default=None,
         description="Defaults to relay's CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN",
@@ -140,12 +141,10 @@ class WorkerConfig(BaseModel):
         default=None, description="A local clio-relay wheel to install on the site"
     )
     relay_requirement: str | None = Field(
-        default=None,
-        description="What uv installs on the site instead, such as clio-relay==1.7.0",
+        default=None, description="What uv installs on the site instead, such as clio-relay==1.7.0"
     )
     site_frpc: str | None = Field(
-        default=None,
-        description="frpc on the site. When unset relay uploads its own frpc",
+        default=None, description="frpc on the site. When unset relay uploads its own frpc"
     )
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
@@ -795,6 +794,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             "scheduler": self.config.scheduler,
             "submit_timeout_s": self.config.submit_timeout_s,
             "jarvis": self.config.jarvis,
+            "outputs_dir": self.config.outputs_dir,
         }
         if self.config.jarvis_python:
             config["jarvis_python"] = self.config.jarvis_python

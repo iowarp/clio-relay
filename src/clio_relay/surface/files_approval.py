@@ -3,7 +3,9 @@
 docs/guarded-sites.md: ``files delete`` and a ``write`` that would replace an
 existing file need the person's yes. Writing a new file does not. The yes is
 bound to the site, the op, the path and ``recursive``, and it is used once:
-by the delete, or by the last chunk of the upload it approved.
+by the delete, or by the last chunk of the upload it approved. The ask is a
+plain confirm: it names only the op and path the call itself carries, so a host
+that confirms a call the person already allowed loses nothing.
 """
 
 from __future__ import annotations
@@ -49,13 +51,12 @@ async def approval_action(
     if op != "write" or not overwrite or (offset and not final):
         return None
     try:
-        entry = await access.stat(path)
+        await access.stat(path)
     except Refusal as refusal:
         if refusal.reason == RefusalReason.PATH_NOT_FOUND:
             return None
         raise
-    size = "" if entry.size is None else f" ({entry.size} bytes)"
-    return f"Replace {path}{size}"
+    return f"Replace {path}"
 
 
 def _binding(site: SiteEntry, op: str, path: str, recursive: bool) -> dict[str, object]:

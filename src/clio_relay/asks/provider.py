@@ -26,7 +26,7 @@ import httpx
 
 from clio_relay import identity
 from clio_relay.adapters.base import SignInNeed
-from clio_relay.adapters.hooks import Ask, AskState, HookContext
+from clio_relay.adapters.hooks import Ask, AskState, HookContext, approve_schema
 from clio_relay.asks import askpass
 from clio_relay.asks.core import PageCore
 from clio_relay.asks.loopback import LoopbackServer
@@ -41,7 +41,6 @@ from clio_relay.jobs.records import OperationRecord, RecordStore, new_id, write_
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.settings import RelayPaths
-from clio_relay.surface.stubs import APPROVE_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +243,7 @@ class RelayAskProvider:
         operation_id: str | None,
         message: str,
         binding: dict[str, Any],
+        plain: bool = True,
     ) -> Ask:
         ask = Ask(
             ask_id=new_id("ask"),
@@ -251,7 +251,7 @@ class RelayAskProvider:
             site=site.id,
             operation_id=operation_id,
             message=message,
-            requested_schema=APPROVE_SCHEMA,
+            requested_schema=approve_schema(plain=plain),
         )
         ask.bind(binding)
         return self._put(ask)
