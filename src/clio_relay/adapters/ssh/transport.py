@@ -6,6 +6,9 @@ nothing is held open between calls. A site that asks for a code on every
 connection is the one exception: with ``interactive_sign_in`` the person signs
 in once through an ask, and later calls reuse that connection's master. The
 master ends with the relay process that started it.
+
+A call ends when its script exits on the site, not when ssh lets go: the script
+reports its exit code on stderr behind a marker (``ends_with_marker``).
 """
 
 from __future__ import annotations
@@ -16,8 +19,10 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal
+import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -36,6 +41,8 @@ logger = logging.getLogger(__name__)
 POSIX = os.name == "posix"
 MAX_STALL_STEP_S = 600.0
 MAX_RETRY_WAIT_S = 30.0
+EXIT_GRACE_S = 5.0
+"""After the remote command exits, how long ssh gets to end by itself."""
 
 # ``ssh -N -f`` leaves the master in its own session, so it would outlive relay.
 # This watcher, detached too, stops it once the relay process that started it ends.
@@ -57,6 +64,8 @@ class Completed:
     stderr_truncated: bool = False
     timed_out: bool = False
     duration_s: float = 0.0
+    remote_exit: bool = False
+    """The remote command's exit was seen (its marker), so it ran to its end."""
 
     def text(self) -> str:
         """Return stdout as text."""
@@ -81,31 +90,96 @@ class Completed:
 
 
 class _Sink:
-    def __init__(self, limit: int | None) -> None:
+    """One output stream, held to ``limit`` bytes, that may carry relay's exit marker.
+
+    With a ``marker``, the stream's last bytes are held back until it is clear they
+    are not the marker, so the marker never reaches ``data``. Seeing it records the
+    remote exit code and sets ``exited``.
+    """
+
+    def __init__(self, limit: int | None, marker: bytes | None = None) -> None:
         self.limit = limit
         self.data = bytearray()
         self.truncated = False
         self.last = time.monotonic()
+        self.marker = marker
+        self.exit_code: int | None = None
+        self.exited = asyncio.Event()
+        self._held = b""
+        self._pattern = (
+            re.compile(rb"(?:\r?\n)?" + re.escape(marker) + rb"(\d{1,3})\r?\n") if marker else None
+        )
 
     async def pump(self, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(65536):
             self.last = time.monotonic()
-            if self.limit is None:
-                self.data += chunk
-                continue
-            room = self.limit - len(self.data)
-            if room > 0:
-                self.data += chunk[:room]
-            if len(chunk) > room:
-                self.truncated = True
+            self._take(chunk)
+        self._keep(self._held)
+        self._held = b""
+
+    def _take(self, chunk: bytes) -> None:
+        if self.marker is None or self._pattern is None or self.exited.is_set():
+            self._keep(chunk)
+            return
+        buffer = self._held + chunk
+        found = self._pattern.search(buffer)
+        if found is not None:
+            self._keep(buffer[: found.start()])
+            self._keep(buffer[found.end() :])
+            self._held = b""
+            self.exit_code = int(found.group(1))
+            self.exited.set()
+            return
+        hold = len(self.marker) + 8
+        self._keep(buffer[:-hold])
+        self._held = buffer[-hold:]
+
+    def _keep(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if self.limit is None:
+            self.data += chunk
+            return
+        room = self.limit - len(self.data)
+        if room > 0:
+            self.data += chunk[:room]
+        if len(chunk) > room:
+            self.truncated = True
+
+
+def exit_marker() -> bytes:
+    """Return a marker no command's output holds: a fresh random token per call."""
+    return f"clio-relay-exit:{secrets.token_hex(16)}:".encode()
+
+
+def ends_with_marker(script: str, marker: bytes) -> str:
+    """Return ``script`` run in a subshell, then the marker and its exit code on stderr.
+
+    The marker says the script ended, whatever still holds the session's output or
+    keeps ssh up afterwards: a background child, a jump host's proxy, a wrapper.
+    """
+    return (
+        f"(\n{script.rstrip(chr(10))}\n)\n"
+        "rc=$?\n"
+        f"printf '\\n%s%d\\n' '{marker.decode()}' \"$rc\" >&2\n"
+        'exit "$rc"\n'
+    )
 
 
 def _kill(process: asyncio.subprocess.Process) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         if POSIX:
             os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+            return
+        # The whole tree: a wrapper's ssh and ssh's ProxyCommand outlive the wrapper.
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        process.kill()
 
 
 async def run_process(
@@ -118,6 +192,7 @@ async def run_process(
     hold_stdin: bool = False,
     on_stall: StallReport | None = None,
     stall_s: float = STALL_S,
+    marker: bytes | None = None,
 ) -> Completed:
     """Run ``argv`` with no shell. ``timeout_s=None`` waits as long as it takes.
 
@@ -125,11 +200,15 @@ async def run_process(
     other end sees it close only then. While the process is quiet for
     ``stall_s``, ``on_stall`` is called, then again after waits that double up
     to ``MAX_STALL_STEP_S``. Cancelling the caller kills the process group.
+
+    With a ``marker`` (see ``ends_with_marker``), the call ends when the marker
+    shows on stderr: the remote command has exited, with the code it carries.
+    The process gets ``EXIT_GRACE_S`` to end by itself and is then stopped.
     """
     command = list(argv)
     started = time.monotonic()
     out = _Sink(max_output_bytes)
-    err = _Sink(max_output_bytes)
+    err = _Sink(max_output_bytes, marker)
     piped = stdin is not None or hold_stdin
     program = programs.resolved(command, env)
     if program is None:
@@ -162,6 +241,7 @@ async def run_process(
     work = asyncio.ensure_future(
         asyncio.gather(out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait())
     )
+    exited = asyncio.ensure_future(err.exited.wait())
     timed_out = False
     deadline = None if timeout_s is None else started + timeout_s
     report_at = stall_s
@@ -175,8 +255,23 @@ async def run_process(
             if deadline is not None:
                 left = max(deadline - now, 0.0)
                 wait = left if wait is None else min(wait, left)
-            done, _ = await asyncio.wait({work}, timeout=wait)
-            if done:
+            done, _ = await asyncio.wait(
+                {work, exited}, timeout=wait, return_when=asyncio.FIRST_COMPLETED
+            )
+            if work in done:
+                break
+            if exited in done:
+                # The remote command has exited; whatever holds ssh up now is not it.
+                done, _ = await asyncio.wait({work}, timeout=EXIT_GRACE_S)
+                if not done:
+                    logger.info(
+                        "%s: the remote command exited, but ssh stayed up; stopping it",
+                        command[0],
+                    )
+                    _kill(process)
+                    done, _ = await asyncio.wait({work}, timeout=10)
+                    if not done:
+                        work.cancel()
                 break
             now = time.monotonic()
             if deadline is not None and now >= deadline:
@@ -198,21 +293,24 @@ async def run_process(
         work.cancel()
         raise
     finally:
+        exited.cancel()
         if process.stdin is not None:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
                 process.stdin.close()
         transport = getattr(process, "_transport", None)
         if transport is not None:
             transport.close()
+    remote = err.exited.is_set()
     return Completed(
         argv=command,
-        exit_code=None if timed_out else process.returncode,
+        exit_code=err.exit_code if remote else None if timed_out else process.returncode,
         stdout=bytes(out.data),
         stderr=bytes(err.data),
         stdout_truncated=out.truncated,
         stderr_truncated=err.truncated,
-        timed_out=timed_out,
+        timed_out=timed_out and not remote,
         duration_s=time.monotonic() - started,
+        remote_exit=remote,
     )
 
 
@@ -316,15 +414,18 @@ class SshTransport:
         ``hold_stdin`` keeps open until the command ends. A call whose connection
         failed or dropped runs again, up to ``retries`` times. Without ``retry``
         the script must not run twice, so it runs again only when the connection
-        never opened.
+        never opened. The call ends when the script does, even if something
+        keeps ssh up after it (see ``ends_with_marker``).
         """
+        marker = exit_marker()
+        wrapped = ends_with_marker(script, marker)
         if data is None and not hold_stdin:
             argv = [*self.ssh_argv(), "sh -s"]
             # sh reads a group whole before it runs any of it, so a stream cut
             # short by a dropped connection runs nothing rather than a part.
-            stdin = ("{\n" + script.rstrip("\n") + "\n}\n").encode()
+            stdin = ("{\n" + wrapped.rstrip("\n") + "\n}\n").encode()
         else:
-            argv = [*self.ssh_argv(), f"sh -c {shlex.quote(script)}"]
+            argv = [*self.ssh_argv(), f"sh -c {shlex.quote(wrapped)}"]
             stdin = data or b""
 
         async def once() -> Completed:
@@ -336,6 +437,7 @@ class SshTransport:
                 env=self.environment(),
                 hold_stdin=hold_stdin,
                 on_stall=on_stall,
+                marker=marker,
             )
 
         result = await self.retrying(once, what, once=not retry)
@@ -362,8 +464,10 @@ class SshTransport:
             code = result.exit_code
             if scp and code:
                 code = 255  # scp exits 1 and passes on ssh's own message
-            if attempt >= self.config.retries or not errors.retryable(
-                result.error_text(), code, once=once
+            if (
+                result.remote_exit
+                or attempt >= self.config.retries
+                or not errors.retryable(result.error_text(), code, once=once)
             ):
                 return result
             attempt += 1

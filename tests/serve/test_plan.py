@@ -190,6 +190,15 @@ def test_endpoint_and_service_env_carry_no_secret(tmp_path: Path) -> None:
     assert "shared-key-value" not in dumped
 
 
+def test_an_ssh_forward_is_durable_unless_it_rides_the_sign_in_master(tmp_path: Path) -> None:
+    plan = frp_plan(tmp_path)
+    plan.mode = "ssh"
+    plan.ssh_argv = ["ssh", "-o", "BatchMode=yes", "ares"]
+    assert plan.endpoint(note=None, connect_command=None).durable
+    plan.ssh_argv = ["ssh", "-o", "ControlPath=/s/master", "-o", "ControlMaster=no", "ares"]
+    assert not plan.endpoint(note=None, connect_command=None).durable
+
+
 def test_site_secrets_carry_the_frp_token_key_and_hop_token(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     plan.hop = HopState(pid=1, host="login1", port=3128, token="hop-token")

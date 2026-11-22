@@ -156,7 +156,9 @@ class ServePlan(BaseModel):
                 )
                 for port in self.ports
             ],
-            durable=self.mode == "frp" or os.name != "nt",
+            # A forward outlives relay unless it rides the sign-in master, which does not.
+            durable=self.mode == "frp"
+            or not any(arg.startswith("ControlPath=") for arg in self.ssh_argv),
             connect_command=connect_command,
             note=note,
         )

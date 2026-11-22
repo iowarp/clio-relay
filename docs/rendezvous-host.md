@@ -13,8 +13,11 @@ bound to `127.0.0.1` on your desktop. Nothing is exposed publicly.
 You don't need a rendezvous host for a site you reach over `ssh`. Without one,
 relay holds a single `ssh -L` forward for each service. A rendezvous host is
 better when the desktop sleeps or changes networks, because frp reconnects on
-its own. On Windows, the `ssh -L` forward also doesn't survive relay
-restarting, so `describe` marks that endpoint as not durable.
+its own. The `ssh -L` forward outlives relay restarting: a new relay adopts it,
+or starts it again at once when it has died. A site that signs in
+interactively is the exception, since its forward rides the sign-in
+connection, which ends with relay, so `describe` marks that endpoint as not
+durable.
 
 ## What you need
 

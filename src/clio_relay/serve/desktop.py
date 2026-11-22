@@ -86,7 +86,7 @@ async def hold(plan: ServePlan, directory: Path) -> None:
             shown = count
             print(f"the forward dropped and holds the same port again ({count})", file=sys.stderr)
 
-    forward = Forward(plan, directory, restarted)
+    forward = Forward(plan, directory, restarted, detached=False)
     stop = asyncio.Event()
     if os.name != "nt":
         loop = asyncio.get_running_loop()

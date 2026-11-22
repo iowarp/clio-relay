@@ -5,6 +5,11 @@ Relay watches its process and starts it again on the same port when it dies,
 counting each restart so the person can see it. Whether the port is bound is
 read by trying to bind it, never by connecting, because some services (a
 ``pvserver``) give themselves to the first client that connects.
+
+The forward's process is started apart from relay's (see ``detach``): a host
+may restart relay's MCP server at any time, and the desktop port stays up through
+it. The next relay process finds the ports bound and adopts the forward rather
+than starting a second one.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from pathlib import Path
 
 from clio_relay import programs
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.serve import frp
+from clio_relay.serve import detach, frp
 from clio_relay.serve.plan import ServePlan
 
 MAX_BACKOFF_S = 30.0
@@ -176,6 +181,13 @@ def _is_ours(pid: int, marker: str) -> bool:
     return marker in result.stdout
 
 
+def forward_marker(plan: ServePlan, directory: Path) -> str:
+    """Return what a forward's command line holds, to tell it from another process."""
+    if plan.mode == "frp":
+        return str(directory)
+    return f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
+
+
 def kill_recorded(pid: int | None, marker: str) -> bool:
     """Stop a forward a previous relay process left behind, if it is still ours.
 
@@ -203,11 +215,14 @@ class Forward:
         plan: ServePlan,
         directory: Path,
         on_restart: Callable[[int, int | None], None],
+        *,
+        detached: bool = True,
     ) -> None:
         self.plan = plan
         self.directory = directory
         self.on_restart = on_restart
-        self.process: asyncio.subprocess.Process | None = None
+        self.detached = detached
+        self.process: detach.Process | None = None
         self.task: asyncio.Task[None] | None = None
         self.restarts = 0
         self.rebound = 0
@@ -215,11 +230,11 @@ class Forward:
         self._respawned = False
         self.closing = False
         self.ssh_env: dict[str, str] = {}
-        self.marker = (
-            str(directory)
-            if plan.mode == "frp"
-            else f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
-        )
+        self.marker = forward_marker(plan, directory)
+
+    def alive(self) -> bool:
+        """Return whether this relay process started the forward and it still runs."""
+        return self.process is not None and self.process.poll() is None
 
     @property
     def log_path(self) -> Path:
@@ -265,33 +280,45 @@ class Forward:
         if program is None:
             raise Refusal(RefusalReason.UNREACHABLE, programs.missing(argv[0]), command=argv[0])
         self.directory.mkdir(parents=True, exist_ok=True)
-        log = self.log_path.open("ab")
         try:
-            self.process = await asyncio.create_subprocess_exec(
-                *program,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=log,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-                cwd=str(self.directory),
-            )
+            if self.detached:
+                self.process = await asyncio.to_thread(
+                    detach.spawn, program, env, self.directory, self.log_path
+                )
+                return
+            with self.log_path.open("ab") as log:
+                self.process = subprocess.Popen(
+                    program,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=str(self.directory),
+                )
         except OSError as exc:
             raise Refusal(
-                RefusalReason.INVALID_CONFIG, programs.start_failed(argv[0], exc), command=argv[0]
+                RefusalReason.INVALID_CONFIG,
+                programs.start_failed(argv[0], exc),
+                command=argv[0],
             ) from exc
-        finally:
-            log.close()
 
     async def start(self) -> None:
-        """Start the forward unless one already holds the ports."""
+        """Start the forward unless one already holds the ports, which it then adopts."""
         if self.task is not None:
             return
         if self.bound():
             self.held = True
+            self._log(f"the ports are already bound; adopting that forward (pid {self.pid()})")
         else:
             await self._spawn()
             self.on_restart(self.rebound, self.process.pid if self.process else None)
         self.task = asyncio.create_task(self._watch())
+
+    def pid(self) -> int | None:
+        """Return the forward's process id: this process's child, else the one recorded."""
+        if self.alive() and self.process is not None:
+            return self.process.pid
+        return self.plan.forward_pid
 
     async def _watch(self) -> None:
         backoff = 1.0
@@ -299,9 +326,13 @@ class Forward:
             await asyncio.sleep(POLL_S)
             if self.closing:
                 return
-            alive = self.process is not None and self.process.returncode is None
-            if alive or (self.process is None and self.bound()):
-                if alive and self.bound():
+            alive = self.alive()
+            bound = self.bound()
+            if alive or bound:
+                if not alive:
+                    # Another relay process's forward holds the ports: adopt it.
+                    self.process = None
+                elif bound:
                     backoff = 1.0
                     if not self.held:
                         # The first hold is a bind, not a rebind, even after failed tries.
@@ -336,23 +367,32 @@ class Forward:
         with contextlib.suppress(OSError), self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"relay: {line}\n")
 
-    async def close(self) -> None:
-        """Close the desktop ports at once."""
+    async def _stop_watching(self) -> None:
         self.closing = True
         if self.task is not None:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.task
             self.task = None
+
+    async def release(self) -> None:
+        """Stop watching and leave the forward up, for the next relay process to adopt."""
+        await self._stop_watching()
+        if self.alive():
+            self._log(f"relay is stopping; the forward stays up (pid {self.pid()})")
+
+    async def close(self) -> None:
+        """Close the desktop ports at once."""
+        await self._stop_watching()
         process = self.process
-        if process is not None and process.returncode is None:
+        if process is not None and process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
                 process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), 5)
-            except TimeoutError:
+                await asyncio.to_thread(process.wait, 5)
+            except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-                await process.wait()
+                await asyncio.to_thread(process.wait)
         elif self.bound():
             kill_recorded(self.plan.forward_pid, self.marker)

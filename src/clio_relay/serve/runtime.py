@@ -35,7 +35,7 @@ from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve.config import Rendezvous, SiteServe, frp_unusable
-from clio_relay.serve.forward import CLOSED_MARKER, Forward, kill_recorded
+from clio_relay.serve.forward import CLOSED_MARKER, Forward, forward_marker, kill_recorded
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
     HopState,
@@ -276,12 +276,15 @@ class ServeRuntime:
             delay = min(delay * 1.5, 10.0)
 
     async def close(self) -> None:
-        """Release the desktop ports and mounted sessions. Services keep running."""
+        """Release the mounted sessions. Services and their desktop ports keep running.
+
+        A host may restart relay's MCP server while a service runs; the next relay
+        process adopts the forwards left up, at its start (``resume``)."""
         for follower in list(self._followers.values()):
             follower.cancel()
         self._followers.clear()
         for forward in list(self.forwards.values()):
-            await forward.close()
+            await forward.release()
         self.forwards.clear()
         await self.mounter.close()
 
@@ -311,22 +314,15 @@ class ServeRuntime:
                 forward = self.forwards.pop(op, None)
                 await self.mounter.unmount(op)
                 if forward is not None:
-                    process = forward.process
-                    live = process is not None and process.returncode is None
-                    held = live or forward.bound()
-                    pid = process.pid if live and process is not None else plan.forward_pid
+                    held = forward.alive() or forward.bound()
+                    pid = forward.pid()
                     await forward.close()
                     if held:
                         stopped.append(_tunnel(op, plan, pid))
                     continue
-                if plan.final is None and plan.forward_pid and plan.ports:
-                    marker = (
-                        str(directory)
-                        if plan.mode == "frp"
-                        else f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
-                    )
-                    if kill_recorded(plan.forward_pid, marker):
-                        stopped.append(_tunnel(op, plan, plan.forward_pid))
+                marker = forward_marker(plan, directory)
+                if plan.final is None and plan.ports and kill_recorded(plan.forward_pid, marker):
+                    stopped.append(_tunnel(op, plan, plan.forward_pid))
         if adapter is None or hop_plan is None:
             return stopped
         site = hop_plan.site_serve
@@ -385,7 +381,7 @@ class ServeRuntime:
         return {"ports": ports} if ports else None
 
     async def resume(self) -> None:
-        """Bring back the desktop ports of services that were ready when relay stopped."""
+        """At relay's start: adopt the desktop ports left up for ready services, or bind them."""
         if self._resumed:
             return
         self._resumed = True
@@ -877,6 +873,10 @@ class ServeRuntime:
         forward = self.forwards.pop(plan.operation_id, None)
         if forward is not None:
             await forward.close()
+        elif plan.forward_pid and plan.ports:
+            # A forward an earlier relay process left up, for a service that has ended.
+            directory = self.state_dir / "serve" / "forwards" / plan.operation_id
+            kill_recorded(plan.forward_pid, forward_marker(plan, directory))
         await self.mounter.unmount(plan.operation_id)
 
     async def _idle(self, plan: ServePlan, adapter: Any, handle: JobHandle) -> bool:

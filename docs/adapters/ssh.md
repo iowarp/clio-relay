@@ -361,6 +361,24 @@ your PATH, and the node gets the user and key your ssh config gives the login
 node (read with `ssh -G`). Relay reads the node's host key from the login
 node's `known_hosts` files, so you don't need the node in your own.
 
+The forward is its own process, not a child of relay's, so it lives through
+relay restarting, however the host stops relay: a signal to its group, a kill
+of its tree, or on Windows the close of the job object relay runs in (relay
+starts it through the WMI service there, outside every job). A relay that
+starts while the service is live adopts the forward still holding the port, or
+starts it again at once if it has died, before any call. The forward ends when
+the job does, or when you stop the service or clean the site. On a site that
+signs in interactively, the forward rides the sign-in master and ends with it.
+
+## When a command ends
+
+A call ends when its command on the site exits, even when something keeps the
+ssh session open after it, such as a background process the command left
+holding its output. Relay runs each command so that its exit code is reported
+on the session's error stream, with a token unique to the call, and drops that
+line from what you see. Once it arrives, ssh gets 5 seconds to end by itself,
+then relay stops it and returns the command's own exit code.
+
 ## When the connection drops
 
 Every call is its own ssh run, so a dropped link costs only the call it hit.
@@ -374,7 +392,8 @@ the link is down.
 Three calls are repeated only when the connection never opened, because the
 command may already have run: `exec`, a whole `files` write that may not
 overwrite, and `files` delete. Such a call fails with `unreachable` and the
-caller decides. Chunks of a `files` write are always repeated.
+caller decides. Chunks of a `files` write are always repeated. A call whose
+command reported its exit is never repeated, whatever ssh said after.
 
 A failed login, an unknown or changed host key and a missing key are not
 repeated: trying again would give the same answer.

@@ -691,9 +691,16 @@ def exec_script(command: Sequence[str], remote_dir: str | None = None, jarvis: s
         '  "$@" </dev/null 3<&- &\n'
         "fi\n"
         "c=$!\n"
-        '( cat <&3 >/dev/null 2>&1; kill -TERM -"$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null\n'
-        '  sleep 2; kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null ) '
-        ">/dev/null 2>&1 &\n"
+        # The watchdog's cat holds the session's stdin; its trap takes the cat down
+        # with it, so nothing of relay's lingers in the session after the command.
+        "(\n"
+        "  trap 'kill \"$k\" 2>/dev/null; exit 0' TERM\n"
+        "  cat <&3 >/dev/null 2>&1 &\n"
+        "  k=$!\n"
+        '  wait "$k"\n'
+        '  kill -TERM -"$c" 2>/dev/null || kill -TERM "$c" 2>/dev/null\n'
+        '  sleep 2; kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null\n'
+        ") >/dev/null 2>&1 &\n"
         "w=$!\n"
         "exec 3<&-\n"
         'wait "$c"; rc=$?\n'
