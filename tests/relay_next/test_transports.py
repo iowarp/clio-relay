@@ -147,6 +147,7 @@ def test_stdio_task(relay_paths: RelayPaths) -> None:
             assert tools == {
                 "describe",
                 "run",
+                "install",
                 "exec",
                 "exec_read",
                 "files",

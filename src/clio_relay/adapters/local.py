@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from clio_relay import install_failures, jarvis_submit
+from clio_relay import jarvis_exits, jarvis_submit
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
@@ -266,6 +266,14 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return f"relay-{operation_id}"
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
+        return cast(JobHandle, await self._start(spec, operation_id, check_only=False))
+
+    async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
+        return cast(dict[str, Any], await self._start(spec, operation_id, check_only=True))
+
+    async def _start(
+        self, spec: JobSpec, operation_id: str, *, check_only: bool
+    ) -> JobHandle | dict[str, Any]:
         job_dir = self._job_dir(operation_id)
         scheduler = self.scheduler()
         if scheduler is None and self.config.scheduler == "auto":
@@ -289,7 +297,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 raise jarvis_submit.scheduler_refusal(scheduler, site=self.context.site_id)
         elif spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
-        if jarvis_mode:
+        if check_only and not jarvis_mode:
+            raise jarvis_exits.install_only_refused(scheduler, site=self.context.site_id)
+        if jarvis_mode and not check_only:
             existing = await asyncio.to_thread(self._jarvis_found, job_dir)
             if existing is not None:
                 return existing
@@ -302,7 +312,18 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             (job_dir / "spec.json").write_text, spec.model_dump_json(indent=2), "utf-8"
         )
         if jarvis_mode:
-            return await self._submit_jarvis(spec, job_dir, operation_id)
+            result = await self._site_script(spec, job_dir, operation_id, check_only)
+            if check_only:
+                return jarvis_exits.checked(result.stdout)
+            found = jarvis_submit.parse_handle(result.stdout)
+            if found is None:
+                raise Refusal(
+                    RefusalReason.SUBMIT_FAILED,
+                    "jarvis ppl submit printed no execution handle: "
+                    f"{result.stdout.strip()[-500:] or 'no output'}",
+                    scheduler="jarvis",
+                )
+            return self._jarvis_handle(found, job_dir, operation_id)
         if scheduler is None:
             return await self._start_supervised(spec, job_dir)
         return await self._submit_batch(scheduler, spec, job_dir, operation_id)
@@ -328,8 +349,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             job_dir=directory,
         )
 
-    async def _submit_jarvis(self, spec: JobSpec, job_dir: Path, operation_id: str) -> JobHandle:
-        """Hand a package job to ``jarvis ppl submit``, which writes and submits the batch job."""
+    async def _site_script(
+        self, spec: JobSpec, job_dir: Path, operation_id: str, check: bool
+    ) -> ExecResult:
         document = self._jarvis_document(spec, job_dir, operation_id)
 
         def _write() -> None:
@@ -338,13 +360,12 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             (job_dir / jarvis_submit.SCRIPT_FILE).write_text(jarvis_submit.SITE_SCRIPT, "utf-8")
 
         await asyncio.to_thread(_write)
-        argv = shlex.split(
-            jarvis_submit.submit_command(
-                spec, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home()
-            )
+        mode: jarvis_submit.SiteMode = "check" if check else "submit"
+        command = jarvis_submit.submit_command(
+            spec, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home(), mode=mode
         )
         result = await run_bounded(
-            argv,
+            shlex.split(command),
             timeout_s=self.config.submit_timeout_s,
             max_output_bytes=1 << 20,
             cwd=job_dir,
@@ -353,45 +374,23 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
-                "jarvis ppl submit refused the job: "
+                f"{'jarvis ppl install +check' if check else 'jarvis ppl submit'} refused the job: "
                 f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
                 scheduler="jarvis",
                 exit_code=result.exit_code,
             )
-        found = jarvis_submit.parse_handle(result.stdout)
-        if found is None:
-            raise Refusal(
-                RefusalReason.SUBMIT_FAILED,
-                "jarvis ppl submit printed no execution handle: "
-                f"{result.stdout.strip()[-500:] or 'no output'}",
-                scheduler="jarvis",
-            )
-        return self._jarvis_handle(found, job_dir, operation_id)
+        return result
 
     def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
         """Raise the refusal for the site script's typed exits (69, 3, 4, 5 and 6)."""
-        site = self.context.site_id
-        if result.exit_code == jarvis_submit.EXIT_NO_JARVIS:
-            raise jarvis_submit.missing_jarvis(result.stderr, site=site)
-        install_failures.raise_for(result.exit_code, f"{result.stdout}\n{result.stderr}", site=site)
-        if result.exit_code == jarvis_submit.EXIT_BUILD_REFUSED:
-            raise jarvis_submit.build_refused(result.stdout + "\n" + result.stderr, site=site)
-        if result.exit_code == jarvis_submit.EXIT_REFUSED:
-            raise jarvis_submit.jarvis_refused(result.stdout + "\n" + result.stderr, site=site)
-        if result.exit_code == jarvis_submit.EXIT_DECISION:
-            report = jarvis_submit.parse_install_report(result.stdout)
-            if report is None:
-                raise Refusal(
-                    RefusalReason.SUBMIT_FAILED,
-                    "JARVIS needs to install the package's software and printed no install "
-                    f"report: {(result.stderr.strip() or result.stdout.strip())[-500:]}",
-                    needs=jarvis_submit.NEEDS_INSTALL,
-                )
-            raise jarvis_submit.install_needed(
-                report,
-                site=site,
-                walltime=jarvis_submit.install_walltime(spec, self.config.install_walltime_s),
-            )
+        jarvis_exits.refuse(
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+            spec=spec,
+            site=self.context.site_id,
+            install_walltime_s=self.config.install_walltime_s,
+        )
 
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]

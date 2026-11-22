@@ -109,6 +109,24 @@ def _handle(body: dict[str, Any]) -> JobHandle:
         raise Refusal(RefusalReason.INVALID_ARGUMENTS, f"handle is not valid: {exc}") from exc
 
 
+def _staged(ctx: SiteContext, body: dict[str, Any]) -> tuple[LocalAdapter, JobSpec]:
+    """Return the site's adapter and the body's job, once all its inputs are staged here."""
+    try:
+        spec = JobSpec.model_validate(body.get("spec"))
+    except ValidationError as exc:
+        raise Refusal(RefusalReason.INVALID_SPEC, str(exc)) from exc
+    adapter = _site_adapter(ctx, body)
+    for item in spec.inputs:
+        if not adapter.context.content.has(item.sha256):
+            raise Refusal(
+                RefusalReason.INPUT_MISSING,
+                f"input {item.name} ({item.sha256}) is not staged on the site",
+                name=item.name,
+                sha256=item.sha256,
+            )
+    return adapter, spec
+
+
 async def _answer(action: Callable[[], Awaitable[Any]]) -> dict[str, Any]:
     try:
         return {"ok": await action()}
@@ -181,21 +199,17 @@ def register_adapter_routes(
     @app.post(f"{prefix}/run", dependencies=[auth_dependency])
     async def adapter_run(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:
-            try:
-                spec = JobSpec.model_validate(body.get("spec"))
-            except ValidationError as exc:
-                raise Refusal(RefusalReason.INVALID_SPEC, str(exc)) from exc
-            adapter = _site_adapter(ctx, body)
-            for item in spec.inputs:
-                if not adapter.context.content.has(item.sha256):
-                    raise Refusal(
-                        RefusalReason.INPUT_MISSING,
-                        f"input {item.name} ({item.sha256}) is not staged on the site",
-                        name=item.name,
-                        sha256=item.sha256,
-                    )
+            adapter, spec = _staged(ctx, body)
             handle = await adapter.run(spec, operation_id=_text(body, "operation_id"))
             return handle.model_dump(mode="json")
+
+        return await _answer(action)
+
+    @app.post(f"{prefix}/install-check", dependencies=[auth_dependency])
+    async def adapter_install_check(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            adapter, spec = _staged(ctx, body)
+            return await adapter.install_check(spec, operation_id=_text(body, "operation_id"))
 
         return await _answer(action)
 

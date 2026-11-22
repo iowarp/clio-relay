@@ -913,15 +913,20 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return found if isinstance(found, str) and found else None
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
-        if spec.steps():
-            spec = jarvis_submit.with_archive(spec)  # stage the reviewed archives too
-        await self._stage(spec)
-        reported = await self.call(
-            "/run",
-            {"spec": spec.model_dump(mode="json"), "operation_id": operation_id},
-            timeout_s=self.config.submit_timeout_s + 120,
-        )
-        return self._wrap(JobHandle.model_validate(reported))
+        return self._wrap(JobHandle.model_validate(await self._submit("/run", spec, operation_id)))
+
+    async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
+        return cast(dict[str, Any], await self._submit("/install-check", spec, operation_id))
+
+    async def _submit(
+        self, route: str, spec: JobSpec, operation_id: str, *, stage: bool = True, **extra: Any
+    ) -> Any:
+        if stage:
+            if spec.steps():
+                spec = jarvis_submit.with_archive(spec)  # stage the reviewed archives too
+            await self._stage(spec)
+        body = {"spec": spec.model_dump(mode="json"), "operation_id": operation_id, **extra}
+        return await self.call(route, body, timeout_s=self.config.submit_timeout_s + 120)
 
     async def _stage(self, spec: JobSpec) -> None:
         for item in spec.inputs:
@@ -963,15 +968,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
     ) -> JobHandle:
-        reported = await self.call(
-            "/install",
-            {
-                "spec": spec.model_dump(mode="json"),
-                "operation_id": operation_id,
-                "answers": answers,
-            },
-            timeout_s=self.config.submit_timeout_s + 120,
-        )
+        reported = await self._submit("/install", spec, operation_id, stage=False, answers=answers)
         return self._wrap(JobHandle.model_validate(reported))
 
     async def install_jarvis(self) -> str:

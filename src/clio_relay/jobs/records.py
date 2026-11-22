@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from clio_relay.jobs.handles import JobHandle, OutputRef, utc_now
 
-OperationKind = Literal["run", "serve", "files"]
+OperationKind = Literal["run", "serve", "files", "install"]
 
 
 class OperationState(StrEnum):

@@ -84,6 +84,7 @@ def test_tools_are_the_verbs_and_operations(relay_paths: RelayPaths) -> None:
                 assert set(tools) == {
                     "describe",
                     "run",
+                    "install",
                     "exec",
                     "exec_read",
                     "files",

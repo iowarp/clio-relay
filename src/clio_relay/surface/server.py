@@ -1,12 +1,11 @@
 """Relay's MCP server: five verbs over a standard MCP server (RL1, RL2).
 
 Any MCP client can use it. On protocol ``2026-07-28`` a client that opts into
-``io.modelcontextprotocol/tasks`` gets a task for ``run``; asks then arrive as
-``input_required`` and are answered with ``tasks/update``. Without tasks,
-``run`` waits a bounded time and returns the operation's handle, which
-``describe(job=...)`` and ``run(resume=...)`` pick up (RL2a). Asks go out as
-multi-round-trip input requests on a modern connection, as elicitation on a
-legacy one, and otherwise as a typed refusal that names the ask and its page.
+``io.modelcontextprotocol/tasks`` gets a task for ``run``, ``serve`` and ``install``, and its
+asks arrive as ``input_required``, answered with ``tasks/update``. Without tasks, ``run`` waits
+a bounded time and returns the operation's handle, which ``describe(job=...)`` and
+``run(resume=...)`` pick up (RL2a). Asks go out as multi-round-trip input requests on a modern
+connection, as elicitation on a legacy one, else as a typed refusal naming the ask and its page.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
-from clio_relay.surface import instructions
+from clio_relay.surface import install_op, instructions
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
@@ -73,6 +72,7 @@ from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
 from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
+from clio_relay.surface.install_tool import install_tool
 from clio_relay.surface.progress import latest_note
 from clio_relay.surface.read_tools import install as install_read_tools
 from clio_relay.surface.results import CHANGE as _CHANGE
@@ -89,7 +89,7 @@ from clio_relay.wording import with_article
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
 TASK_POLL_INTERVAL_MS = 2000
-TASK_TOOLS = frozenset({"run", "serve"})
+TASK_TOOLS = frozenset({"run", "serve", "install"})
 _NOT_A_START = ("cancel", "resume", "service", "stop")
 
 _TASK_VERSIONS = frozenset(MODERN_PROTOCOL_VERSIONS)
@@ -351,7 +351,7 @@ class RelayServer:
         again = (
             "call serve with service set to the operation id"
             if record.kind == "serve"
-            else "call run with resume set to the operation id"
+            else f"call {record.kind} with resume set to the operation id"
         )
         refusal = Refusal(
             RefusalReason.NEEDS_SIGN_IN if url_only else RefusalReason.NEEDS_APPROVAL,
@@ -391,8 +391,9 @@ class RelayServer:
         cancel: str | None,
         resume: str | None,
         wait_s: float,
+        kind: Literal["run", "install"] = "run",
     ) -> ToolResult | InputRequiredToolResult:
-        """The ``run`` verb."""
+        """The ``run`` verb, and ``install``: the same calls for an install-only operation."""
         try:
             if cancel is not None:
                 record = await self.service.cancel(cancel)
@@ -406,10 +407,13 @@ class RelayServer:
             if site is None or spec is None:
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS,
-                    "run needs site and spec, or cancel, or resume",
+                    f"{kind} needs site and spec, or cancel, or resume",
                 )
             task = tasks_opted_in(ctx)
-            record = await self.service.start_run(site, spec, task=task)
+            if kind == "install":
+                record = await install_op.start(self.service, site, spec, task=task)
+            else:
+                record = await self.service.start_run(site, spec, task=task)
             if task:
                 return operation_result(self.service.view(record))
             return await self._deliver(ctx, record, wait_s)
@@ -601,6 +605,7 @@ class RelayServer:
             return await relay.run(ctx, site, spec, cancel, resume, wait_s)
 
         server.add_tool(_task_optional(run, "run", "Run a job on a site"))
+        server.add_tool(_task_optional(install_tool(relay), "install", "Install a package"))
 
         @server.tool(
             name="exec",
@@ -717,15 +722,10 @@ class RelayServer:
             nothing: a guarded site reviews the archive by its SHA-256 before its first run
             there, and the archive reaches the site through relay's own transfer.
             describe(packages=true) lists them too, as a read."""
-            arguments = PackagesArgs(
-                op=op,
-                package=package,
-                dir=dir,
-                version=version,
-                sha256=sha256,
-            )
+            args = PackagesArgs(op=op, package=package, dir=dir, version=version, sha256=sha256)
+
             try:
-                result = await packages_op(relay.service, arguments)
+                result = await packages_op(relay.service, args)
             except Refusal as refusal:
                 return refusal_result(refusal)
             return ToolResult(

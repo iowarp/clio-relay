@@ -246,8 +246,10 @@ Relay calls these when the adapter defines them:
 | `stop(handle)` | Stop a package service so its package's own stop runs (`jarvis execution stop`) |
 | `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle. Pass the build its own walltime: `jarvis_submit.install_pipeline` of the run's pipeline as `install_command(pipeline=...)` |
 | `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`, with the site's `jarvis_python` setting) |
+| `install_check(spec, *, operation_id)` | Run the site script in its `check` mode (`jarvis ppl install +check`) and return JARVIS's install report (`jarvis_exits.checked`). With `install`, it gives the site the `install` tool: the software ahead of any run |
 
-A batch adapter that runs packages refuses with `jarvis_submit.install_needed`
+A batch adapter that runs packages turns the site script's typed exits into
+refusals with `jarvis_exits.refuse`. In detail, it refuses with `jarvis_submit.install_needed`
 when the submit exits 3 (with `walltime=jarvis_submit.install_walltime(...)`,
 so the approval says how long the build may take), with
 `jarvis_submit.build_refused` when it exits 4
@@ -258,7 +260,9 @@ missing or at another pin. Before those, it calls
 JARVIS's typed Spack failure (exit 6) and a blocking `site_fact_uncertain`
 question (exit 3), both with JARVIS's issues untouched. Relay turns the rest into the install question and
 calls `install` or `install_jarvis` itself. A missing Spack is JARVIS's own
-`spack_missing` question (exit 3), asked like any other choice.
+`spack_missing` question (exit 3), asked like any other choice. The `install`
+tool's check takes the same path: exit 0 means the software is all there, and
+relay completes the operation without launching anything.
 
 An adapter whose site runs JARVIS fills `SiteInfo.partitions` (a
 `PartitionInfo` per partition: nodes, CPUs per node, memory, max time and idle

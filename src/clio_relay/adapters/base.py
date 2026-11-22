@@ -376,6 +376,17 @@ class BaseAdapter[ConfigT: BaseModel]:
         """Ask a running job to end cleanly (``jarvis execution stop``), and return its status."""
         raise not_implemented(self.name, "stop")
 
+    async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
+        """Ask JARVIS whether ``spec``'s software is installed, and launch nothing.
+
+        Runs the site's ``ppl install +check`` for the pipeline :meth:`run` would
+        submit, and returns JARVIS's install report when the software is all
+        there. Otherwise it raises what :meth:`run` raises: ``install_needed``
+        (exit 3) with the report, ``missing_jarvis`` when the site has no JARVIS,
+        or JARVIS's own refusal.
+        """
+        raise not_implemented(self.name, "install_check")
+
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
     ) -> JobHandle:

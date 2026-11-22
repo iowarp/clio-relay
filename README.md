@@ -28,6 +28,8 @@ answers the same five verbs:
 the client gets progress on the task, can leave and come back, and answers
 questions (a one-time code, a spend approval) through the task. A client
 without tasks gets an operation id instead, which `describe(job=...)` follows.
+`install` installs a package's software on a site ahead of any run, with the
+same questions as a run's install, and launches nothing.
 See [MCP tasks](docs/mcp-tasks.md). `files` behaves the same on every site; see
 [files](docs/files.md).
 

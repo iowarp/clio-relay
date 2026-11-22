@@ -668,7 +668,9 @@ shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
-case $mode in submit|run|install) ;; *) fail 64 "mode $mode is not submit, run or install" ;; esac
+case $mode in submit|run|install|check) ;;
+  *) fail 64 "mode $mode is not submit, run, install or check" ;;
+esac
 printf '%s\n' "$steps" | tr , '\n' \
   | grep -Evq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+@[0-9a-f]{64}$' \
   && fail 64 "the steps $steps are not <repo>.<package>@<sha256>,..."
@@ -804,8 +806,10 @@ report() {
   printf '%s\n' "$out" | tail -n 1 > "$job/relay.install-report.json.tmp"
   mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
   [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+  [ "$mode" != check ] || exit "$rc"
   exit 3
 }
+[ "$mode" != check ] || report
 if [ "$mode" = run ]; then
   "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
   exit 0
@@ -891,7 +895,9 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   line as ``relay.install.json``. A pipeline YAML given to ``install`` is the
   install job's own (:func:`install_pipeline`), kept as
   ``relay.install-pipeline.yaml``, so the run's pipeline stays as it was;
-- ``run`` runs ``ppl run`` in place.
+- ``run`` runs ``ppl run`` in place;
+- ``check`` runs only ``ppl install +check``, for an install ahead of any run: it
+  exits 0 with the report when the software is all there, else 3 as below.
 
 When JARVIS exits 3 (software to install, or a question), the script writes
 the ``ppl install +check`` report to ``relay.install-report.json``, prints it
@@ -904,7 +910,7 @@ allocation) passes through unchanged; relay reports it with
 ``relay.exitcode``.
 """
 
-SiteMode = Literal["submit", "run", "install"]
+SiteMode = Literal["submit", "run", "install", "check"]
 
 
 def steps_argument(spec: JobSpec) -> str:
@@ -947,6 +953,7 @@ def submit_command(
     jarvis: str,
     script: str = SCRIPT_FILE,
     home: str | None = None,
+    mode: SiteMode = "submit",
 ) -> str:
     """Return the shell command that submits ``spec`` from its job directory.
 
@@ -954,8 +961,9 @@ def submit_command(
     pipeline it seals. ``home`` is the CLIO site home, for
     :func:`site_environment`: the JARVIS relay installed there is used when
     ``jarvis`` points to nothing, and the person's install answers are kept there.
+    ``mode="check"`` checks the software instead, for an install ahead of a run.
     """
-    arguments = site_arguments(spec, mode="submit", jarvis=jarvis, execution=operation_id)
+    arguments = site_arguments(spec, mode=mode, jarvis=jarvis, execution=operation_id)
     return _site_command(spec, arguments, script=script, home=home)
 
 
@@ -1911,63 +1919,6 @@ def applied_decisions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
         for item in (_dict(raw) for raw in listed)
         if item.get("source") == "decisions_file" and item.get("constraint")
     ]
-
-
-def install_message(
-    report: Mapping[str, Any],
-    *,
-    site: str,
-    package: str,
-    names: Mapping[str, str] | None = None,
-    walltime: str | None = None,
-) -> str:
-    """Return the approval question for installing the package's software on the site.
-
-    ``walltime`` is the install job's, when the adapter reported it. The choices
-    JARVIS replays from its decisions record (:func:`applied_decisions`) are
-    named, so the person sees what is reused without being asked again.
-    """
-    summary = install_summary(report, names)
-    applied = applied_decisions(report)
-    asked = len(choice_issues(report))
-    built: list[str] = []
-    for item in summary["build"]:
-        detail = item["spec"] or item["package"]
-        if item["missing"]:
-            detail = f"{detail} ({item['missing']} missing)"
-        built.append(detail)
-    reuse = ""
-    if applied:
-        named = ", ".join(
-            f"{item.get('subject') or item.get('package') or 'a choice'} {item['constraint']}"
-            for item in applied
-        )
-        where = report.get("decisions_path")
-        kept = f" in {where}" if isinstance(where, str) and where else ""
-        reuse = f" JARVIS applies the {named} chosen for {site} before (kept{kept})."
-    if not built and asked:
-        return (
-            f"JARVIS needs {asked} choice(s) from you before {package} "
-            f"runs on {site}; nothing has to be built. It applies your answers in a short "
-            f"job on the site, then the run goes ahead.{reuse} Go ahead?"
-        )
-    if not built:
-        return (
-            f"JARVIS applies its recorded choices for {site} in a short job before "
-            f"{package} runs; nothing has to be built.{reuse} Go ahead?"
-        )
-    parts = [f"{package} needs software that {site} does not have yet."]
-    if summary["reuse"]:
-        parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
-    if built:
-        parts.append("Built: " + ", ".join(built) + ".")
-    if asked:
-        parts.append(f"JARVIS has {asked} question(s) for you after this.")
-    if reuse:
-        parts.append(reuse.strip())
-    job = f"an install job of up to {walltime}" if walltime else "an install job"
-    parts.append(f"JARVIS installs it as {job} on the site before the run. Install it?")
-    return " ".join(parts)
 
 
 def choice_options(issue: Mapping[str, Any]) -> list[str]:

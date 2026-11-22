@@ -149,7 +149,7 @@ def _package_spec(**update: object) -> JobSpec:
 def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path, jarvis="~/jv/bin/jarvis")
     job_dir = PurePosixPath("/home/u/.clio-relay/jobs/op_x")
-    rendered = adapter._render_jarvis(_package_spec(), "op_x", job_dir, "relay-op_x")  # pyright: ignore[reportPrivateUsage]
+    rendered = adapter._render_jarvis(_package_spec(), "op_x", job_dir, "relay-op_x", False)  # pyright: ignore[reportPrivateUsage]
     pipeline = rendered.files["relay.pipeline.yaml"]
     assert pipeline.splitlines()[:10] == [
         "name: relay_op_x",

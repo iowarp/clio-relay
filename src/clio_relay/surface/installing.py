@@ -17,6 +17,10 @@ Either refusal turns the operation back into asks instead of a failure:
 - JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
   in the site's CLIO home and submits the run again.
 
+An ``install`` operation (:mod:`clio_relay.surface.install_op`) is the same flow
+with no run: its submit is ``ppl install +check``, and it completes once JARVIS
+finds the software all there.
+
 The state lives in ``record.result["install"]``.
 
 JARVIS records each answer in the site's decisions file
@@ -34,7 +38,7 @@ import posixpath
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from clio_relay import install_failures, jarvis_submit
+from clio_relay import install_failures, install_wording, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
@@ -153,12 +157,13 @@ async def ask_install(
                 site=site,
                 operation_id=operation_id,
                 message=cast(str | None, refusal.data.get("ask_message"))
-                or jarvis_submit.install_message(
+                or install_wording.install_message(
                     report,
                     site=site.title,
                     package=_what(job_of(record)),
                     names=names,
                     walltime=cast(str | None, refusal.data.get("install_walltime")),
+                    run=record.kind != "install",
                 ),
                 binding={
                     **binding,
@@ -327,7 +332,12 @@ async def refresh_install(
     tail, offset = await _log_tail(adapter, handle, int(state.get("log_offset") or 0))
     if status.state == JobState.COMPLETED:
         _update(service, operation_id, stage="done", log_offset=offset, log_tail=tail)
-        return await _resubmit(service, operation_id, "the install finished; submitting the run")
+        then = (
+            "JARVIS checks it"
+            if service.operation(operation_id).kind == "install"
+            else "submitting the run"
+        )
+        return await _resubmit(service, operation_id, f"the install finished; {then}")
     if status.state.final:
         return await _ended(
             service, operation_id, status, (adapter, handle), tail or state.get("log_tail")

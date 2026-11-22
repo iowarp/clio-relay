@@ -19,6 +19,7 @@ from clio_relay.surface.settings import RelayPaths
 TOOLS = {
     "describe",
     "run",
+    "install",
     "exec",
     "exec_read",
     "files",

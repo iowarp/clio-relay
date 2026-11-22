@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def transient_digests(record: OperationRecord) -> set[str]:
     """Return the digests of the inputs an operation's spec marks transient."""
-    if record.kind == "run":
+    if record.kind in ("run", "install"):
         job = JobSpec.model_validate(record.spec)
     elif record.kind == "serve":
         job = ServiceSpec.model_validate(record.spec).job

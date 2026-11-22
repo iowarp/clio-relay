@@ -47,6 +47,10 @@ case "$1 $2" in
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
+  "ppl install")
+    printf '{"schema_version":"jarvis.install-report.v1","satisfied":%s}\\n' \
+      "${JARVIS_SATISFIED:-true}"
+    exit "${JARVIS_INSTALL_RC:-0}" ;;
   "ppl check")
     if [ -n "${JARVIS_CHECK_RC:-}" ]; then
       printf '{"schema_version":"jarvis.pipeline-check.v1","ok":false,"errors":'
@@ -200,6 +204,23 @@ def test_a_pipeline_jarvis_refuses_is_never_submitted(tmp_path: Path) -> None:
     assert "the slices overlap" in refusal.message
 
 
+@pytest.mark.parametrize("rc", [0, 3])
+def test_check_asks_jarvis_what_is_installed_and_submits_nothing(tmp_path: Path, rc: int) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    satisfied = "true" if rc == 0 else "false"
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_INSTALL_RC=str(rc), JARVIS_SATISFIED=satisfied)
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="check")
+    assert done.returncode == rc, done.stderr
+    report = json.loads((job / "relay.install-report.json").read_text())
+    assert report["satisfied"] is (rc == 0)
+    last = (tmp_path / "jarvis.log").read_text().splitlines()[-1]
+    assert last.endswith(f"ppl install yaml {job}/{PIPELINE_FILE} +check +json")
+    assert "ppl submit" not in (tmp_path / "jarvis.log").read_text()
+    assert not (job / SUBMISSION_FILE).exists()
+
+
 def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
@@ -236,7 +257,7 @@ def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> 
         assert "are not <repo>.<package>" in done.stderr
     mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
     assert mode.returncode == EXIT_USAGE
-    assert "mode up is not submit, run or install" in mode.stderr
+    assert "mode up is not submit, run, install or check" in mode.stderr
     unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
     assert unnamed.returncode == EXIT_USAGE
     assert "needs an execution id" in unnamed.stderr

@@ -65,7 +65,11 @@ async def _reconcile(service: RelayService, site_id: str) -> tuple[list[str], li
     waiting on answered asks is not refreshed: that would submit it.
     """
     for record in service.operations.all():
-        if record.site != site_id or record.kind not in ("run", "serve") or record.state.final:
+        if (
+            record.site != site_id
+            or record.kind not in ("run", "serve", "install")
+            or record.state.final
+        ):
             continue
         if record.state == OperationState.AWAITING_INPUT and not queue_switch.asking(record):
             continue
@@ -76,7 +80,11 @@ async def _reconcile(service: RelayService, site_id: str) -> tuple[list[str], li
     running: list[str] = []
     waiting: list[str] = []
     for record in service.operations.all():
-        if record.site != site_id or record.kind not in ("run", "serve") or record.state.final:
+        if (
+            record.site != site_id
+            or record.kind not in ("run", "serve", "install")
+            or record.state.final
+        ):
             continue
         has_job = (
             record.handle is not None

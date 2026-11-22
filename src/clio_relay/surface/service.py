@@ -15,12 +15,7 @@ from typing import Any, cast
 
 from clio_relay import jarvis_submit
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import (
-    AdapterContext,
-    BaseAdapter,
-    SiteAdded,
-    Verb,
-)
+from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
     Ask,
     AskProvider,
@@ -53,7 +48,7 @@ from clio_relay.packages import (
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface import exec_plan, installing, queue_switch
+from clio_relay.surface import exec_plan, install_op, installing, queue_switch
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
@@ -89,10 +84,8 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
 def _steps_label(spec: JobSpec) -> str | None:
     """Name a package job: its package, or its pipeline's steps in order."""
     names = [step.name for step in spec.steps()]
-    if not names:
-        return None
-    if len(names) == 1:
-        return names[0]
+    if len(names) <= 1:
+        return names[0] if names else None
     return "the pipeline " + " then ".join(names)
 
 
@@ -269,7 +262,7 @@ class RelayService:
         site = self.site(site_id)
         spec = await self.prepared_run(site, spec)
         what = spec.executable or _steps_label(spec) or "a job"
-        return await self._open(
+        return await self.open_operation(
             site,
             "run",
             spec,
@@ -312,7 +305,7 @@ class RelayService:
         spec = await self.prepared_serve(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
         what = spec.job.executable or _steps_label(spec.job) or "a service"
-        return await self._open(
+        return await self.open_operation(
             site,
             "serve",
             spec.job,
@@ -322,7 +315,7 @@ class RelayService:
             task=task,
         )
 
-    async def _open(
+    async def open_operation(
         self,
         site: SiteEntry,
         kind: OperationKind,
@@ -333,6 +326,7 @@ class RelayService:
         *,
         task: bool,
     ) -> OperationRecord:
+        """Record a run, serve or install operation, ask what must be asked, and submit."""
         verb: Verb = "serve" if kind == "serve" else "run"
         adapter_name, config, skipped = self.route(site, verb)
         adapter = self._build(site, adapter_name, config)
@@ -342,7 +336,8 @@ class RelayService:
         decision.raise_if_refused()
         charge = (await self.guard.price(site, job)).with_layout(job)
         operation_id = new_id("op")
-        result: dict[str, Any] = {"charge": charge.model_dump(mode="json")}
+        spends = kind != "install"  # JARVIS sizes the install job, and its own ask names it
+        result: dict[str, Any] = {"charge": charge.model_dump(mode="json")} if spends else {}
         if skipped:
             result["skipped"] = [item.model_dump() for item in skipped]
         record = OperationRecord(
@@ -365,7 +360,7 @@ class RelayService:
                 await self.ask_provider.url(site=site, operation_id=operation_id, need=need)
             )
         asks.extend(await review_asks(self.ask_provider, site, record, decision))
-        if site.spend.needs_approval(charge.node_hours):
+        if spends and site.spend.needs_approval(charge.node_hours):
             binding = {
                 "site": site.id,
                 "spec_digest": record.spec_digest,
@@ -597,6 +592,8 @@ class RelayService:
             self.operations.put(operation_id, record)
         if record.kind == "serve":
             return await self._start_service(operation_id, site, adapter, record)
+        if record.kind == "install":
+            return await install_op.check(self, operation_id, site, adapter)
         try:
             # The guard may rewrite what is submitted; record.spec stays what was approved.
             spec = await self.guard.prepare(
@@ -691,6 +688,8 @@ class RelayService:
             )
         if record.kind == "serve":
             return await self._refresh_service(operation_id, site, adapter, record)
+        if record.kind == "install":
+            return install_op.refresh(self, operation_id, record)
         handle = record.handle
         if handle is None:
             found = await adapter.find(operation_id)

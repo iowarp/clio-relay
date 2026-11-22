@@ -1,13 +1,13 @@
 # MCP tasks
 
-Relay is a standard MCP server. `run` and `serve` can take a long time, so they
+Relay is a standard MCP server. `run`, `install` and `serve` can take a long time, so they
 support the `io.modelcontextprotocol/tasks` extension of MCP protocol
 `2026-07-28`. Task support is optional: a client that does not opt in still
 gets everything, through an operation id it follows with `describe`.
 
 ## with tasks
 
-A client that declares the tasks extension and calls `run` or `serve` gets a
+A client that declares the tasks extension and calls `run`, `install` or `serve` gets a
 task back as soon as relay has accepted the work. The task id is relay's
 operation id, so the same work can be followed through either.
 

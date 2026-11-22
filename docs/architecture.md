@@ -1,6 +1,6 @@
 # Architecture
 
-Relay is an MCP server with eleven tools (the five verbs, the read tools
+Relay is an MCP server with twelve tools (the five verbs, `install`, the read tools
 `exec_read` and `files_read`, `packages`, `cancel`, `site_clean` and
 `shutdown`), a command line, and a
 set of adapters
@@ -38,6 +38,11 @@ flowchart LR
    `describe` also lists the staged packages (`packages=true`) and gives a
    service's endpoint and readiness (`job=<service>`). `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
+   `install` (`surface/install_tool.py`, `surface/install_op.py`) is a run's
+   install task on its own, and a task too: it asks JARVIS `ppl install +check`,
+   takes the run's install path when software is missing (the same asks, then
+   `ppl install +submit` as a job on the compute nodes), installs relay's
+   jarvis-cd first when the site lacks it, and launches nothing.
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
    configured sites and the staged packages (`surface/instructions.py`), so an
