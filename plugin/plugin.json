@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "clio-relay",
-  "version": "1.6.45",
+  "version": "1.6.46",
   "description": "Relay: run jobs, commands, file transfers and services on your compute endpoints, and manage those endpoints on the Compute page.",
   "author": {
     "name": "IoWarp Team"
