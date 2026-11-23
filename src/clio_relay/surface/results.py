@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import mcp_types
 from fastmcp.tools import ToolResult
 
+from clio_relay.jarvis_plan import TERMINAL
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.surface.endpoints import address
 from clio_relay.surface.progress import observation_line
@@ -56,6 +57,7 @@ def _summary(view: dict[str, Any]) -> str:
             f"\nThe service is ready and keeps running until cancel(operation="
             f"{view['operation_id']!r}) or its job ends; describe(job=...) follows it."
         )
+        line += _computing(view)
     tail: str | None = result.get("stdout_tail")
     if tail:
         line += f"\n\nstdout (tail):\n{tail}"
@@ -68,6 +70,24 @@ def _summary(view: dict[str, Any]) -> str:
     if view.get("error"):
         line += f"\n\n{view['error'].get('reason')}: {view['error'].get('message')}"
     return line
+
+
+def _computing(view: dict[str, Any]) -> str:
+    """Name the compute steps still running beside a ready service, and how to wait for them."""
+    card: dict[str, Any] = view.get("job") or {}
+    items: list[dict[str, Any]] = card.get("components") or []
+    running = [
+        str(item.get("label") or item.get("id"))
+        for item in items
+        if item.get("role") == "compute" and item.get("state") not in TERMINAL
+    ]
+    if not running or "until" in view:
+        return ""
+    return (
+        f"\nIts compute steps ({', '.join(running)}) still run; serve(service="
+        f"{view['operation_id']!r}, until='steps') waits for them to end, as a task, "
+        "and returns their result."
+    )
 
 
 def operation_result(view: dict[str, Any]) -> ToolResult:

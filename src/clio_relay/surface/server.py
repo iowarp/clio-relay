@@ -11,7 +11,6 @@ connection, as elicitation on a legacy one, else as a typed refusal naming the a
 from __future__ import annotations
 
 import asyncio
-import hmac
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -19,7 +18,7 @@ from typing import Annotated, Any, Literal
 
 import mcp_types
 from fastmcp import Context, FastMCP
-from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.extensions import (
     MethodBinding,
     ServerExtension,
@@ -49,8 +48,9 @@ from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
-from clio_relay.surface import confirm, install_op, instructions, job_card, job_watch
+from clio_relay.surface import confirm, install_op, instructions, job_card, job_watch, step_wait
 from clio_relay.surface.a2ui import install as install_compute_tab
+from clio_relay.surface.bearer import RelayBearer
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
     ask_mode,
@@ -226,6 +226,8 @@ class RelayTasksExtension(ServerExtension):
         self, ctx: ServerRequestContext[Any, Any], params: GetTaskParams
     ) -> GetTaskResult:
         self._require(ctx)
+        if step_wait.operation_of(params.task_id) is not None:
+            return await step_wait.get(self.service, params.task_id)
         self._record(params.task_id)
         try:
             record = await self.service.refresh(params.task_id)
@@ -253,6 +255,8 @@ class RelayTasksExtension(ServerExtension):
         self, ctx: ServerRequestContext[Any, Any], params: CancelTaskParams
     ) -> CancelTaskResult:
         self._require(ctx)
+        if step_wait.operation_of(params.task_id) is not None:
+            return step_wait.cancel(self.service, params.task_id)
         self._record(params.task_id)
         await self.service.cancel(params.task_id)
         return CancelTaskResult()
@@ -268,9 +272,11 @@ class RelayTasksExtension(ServerExtension):
         if params.name not in TASK_TOOLS or not tasks_opted_in(context):
             return outcome
         arguments = params.arguments or {}
-        if any(arguments.get(name) is not None for name in _NOT_A_START):
-            return outcome
         if not isinstance(outcome, ToolResult) or isinstance(outcome, InputRequiredToolResult):
+            return outcome
+        if (waiting := step_wait.intercepted(self.service, arguments, outcome)) is not None:
+            return waiting
+        if any(arguments.get(name) is not None for name in _NOT_A_START):
             return outcome
         operation_id = (outcome.meta or {}).get(OPERATION_META)
         if not isinstance(operation_id, str):
@@ -279,19 +285,6 @@ class RelayTasksExtension(ServerExtension):
         if record is None or not record.task:
             return outcome
         return self.create_result(record)
-
-
-class RelayBearer(TokenVerifier):
-    """Accept one bearer token, compared in constant time."""
-
-    def __init__(self, token: str, *, base_url: str) -> None:
-        super().__init__(base_url=base_url, resource_base_url=base_url)
-        self._token = token
-
-    async def verify_token(self, token: str) -> AccessToken | None:
-        if not hmac.compare_digest(token, self._token):
-            return None
-        return AccessToken(token=token, client_id="clio-relay", scopes=[], subject="clio-relay")
 
 
 class RelayServer:
@@ -414,8 +407,9 @@ class RelayServer:
         service: str | None,
         stop: str | None,
         wait_s: float,
+        until: str | None = None,
     ) -> ToolResult | InputRequiredToolResult:
-        """The ``serve`` verb: start, observe or stop a service."""
+        """The ``serve`` verb: start, observe or stop a service, or wait for its compute steps."""
         flagged = job_card.flagged(ctx)
         try:
             if stop is not None:
@@ -423,6 +417,9 @@ class RelayServer:
                 return await self._cancel_call(ctx, operation_id, "stop", flagged=flagged)
             if ctx.request_state and ctx.input_responses is not None:
                 return await self._resume_round(ctx, site, spec, wait_s)
+            if service is not None and until is not None:
+                op = self._service_op(service).operation_id
+                return await step_wait.call(self.service, op, tasks_opted_in(ctx), wait_s)
             if service is not None:
                 record = await self.service.advance(self._service_op(service).operation_id)
                 return await self._observed(ctx, record, wait_s, flagged=flagged)
@@ -700,12 +697,15 @@ class RelayServer:
             wait_s: Annotated[
                 float, Field(ge=0, le=300, description="Seconds to wait without a task")
             ] = 20,
+            until: step_wait.Until = None,
         ) -> ToolResult | InputRequiredToolResult:
             """Start a job with ports and return how to reach it. With tasks this returns
             a task whose status names the endpoint; without, it waits up to wait_s for
             the service to be ready. service observes one; stop ends it, as cancel does. Each
-            endpoint port has an address, host:port: that is what you hand to clients."""
-            return await relay.serve(ctx, site, spec, service, stop, wait_s)
+            endpoint port has an address, host:port: that is what you hand to clients. A job
+            computing beside its service runs on after ready: service with until="steps"
+            waits, as a task, for its compute steps to end and returns their result."""
+            return await relay.serve(ctx, site, spec, service, stop, wait_s, until)
 
         server.add_tool(_task_optional(serve, "serve", "Start a service on a site", confirms=True))
 

@@ -186,6 +186,31 @@ confirm's text repeats each advisory's message.
 | Job lists | `describe(site=...)` lists the site's jobs under `jobs` |
 | Job resource | `relay://jobs/{operation_id}`, announced updated on each change |
 
+## waiting for a service's compute steps
+
+A `serve` task completes at readiness, and its job runs on. A job that also
+computes, such as a solver beside the viewer that watches it, has a second
+moment the agent waits for: its compute steps ending. The ready result names
+the steps still running and the call that waits for them:
+`serve(service=<operation_id>, until="steps")`.
+
+With tasks, that call is a task of its own, `<operation_id>.steps`. It stays
+`working` while a compute step runs, its status message names each step's
+state, and it completes when every compute step has ended or the job has. The
+completion is the wake, so the agent waits on the task rather than polling the
+job's files or the scheduler. The result carries each step's state, reason,
+hosts and time under `structuredContent.until`, then the operation as `serve`
+shows it, with the job's outputs and its card. It is an error when a step
+failed. Without tasks, the call waits up to `wait_s` (at most 300 s) and
+returns the same result; `until.ended` says whether the steps have ended, and
+the agent calls again while it is false.
+
+The compute steps are the card's `compute` components. A JARVIS job's step
+ends when JARVIS records it, and a job without steps ends with the job, so the
+same call works on every site and access means. The task's state is read from
+the operation's record, so it survives a relay restart. Cancelling the task
+stops the waiting, not the job; `serve(stop=...)` stops the job.
+
 ## refusals
 
 Every refusal is a tool error whose `structuredContent.refusal` carries a typed
