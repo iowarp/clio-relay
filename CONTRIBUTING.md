@@ -39,6 +39,15 @@ The repository also keeps two ratchets: `scripts/check_file_size.py` (a file
 stays under 800 lines) and `scripts/check_pyright_ratchet.py` (the count of
 pyright errors only goes down).
 
+CI also runs the conformance kit against the adapter template, the way its
+README tells a newcomer to, so a change to the adapter contract that breaks an
+outside adapter fails here first:
+
+```bash
+cd examples/adapter-template
+uv run pytest
+```
+
 ## Layout
 
 Read it top-down: an MCP call enters at `surface`, the guard checks it, and an
@@ -46,7 +55,7 @@ adapter carries it to the site.
 
 | Path | What it holds |
 | --- | --- |
-| `src/clio_relay/surface/` | The MCP server and its tools (the five verbs, the read tools `exec_read` and `files_read`, `packages`, `cancel`, `site_clean`, `shutdown`), the service behind them, and the Compute tab |
+| `src/clio_relay/surface/` | The MCP server and its thirteen tools (the five verbs, `install`, the read tools `exec_read`, `files_read` and `packages_read`, `packages`, `cancel`, `site_clean`, `shutdown`), the service behind them, and the Compute tab |
 | `src/clio_relay/guard/` | Open and guarded sites: package review, read-only exec, spend questions |
 | `src/clio_relay/adapters/base.py` | The adapter contract |
 | `src/clio_relay/adapters/<name>/` | One adapter each: `ssh`, `tapis`, `globus`, `iri`, `sky`, `worker` |
@@ -57,6 +66,7 @@ adapter carries it to the site.
 | `src/clio_relay/asks/`, `identity/` | Questions for the person, and sign-ins |
 | `src/clio_relay/serve/` | The `serve` verb: services and port forwarding |
 | `src/clio_relay/testing/conformance/` | The conformance kit every adapter passes |
+| `src/clio_relay/testing/fixture_adapter.py` | A simulated site for relay's own tests; `tests/conftest.py` registers it, since it is not a shipped entry point |
 | `tests/` | Tests, one directory per area |
 | `docs/` | The documentation people read; `docs/design/` holds the design record |
 

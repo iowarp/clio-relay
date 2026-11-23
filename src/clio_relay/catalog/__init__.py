@@ -8,7 +8,6 @@ person's ``sites.yaml``.
 
 from __future__ import annotations
 
-import json
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from typing import Any
@@ -38,11 +37,6 @@ def _dir(name: str) -> Traversable | None:
 def schema() -> dict[str, Any]:
     """Return the JSON Schema a catalog site file follows."""
     return CatalogEntry.model_json_schema()
-
-
-def schema_json() -> str:
-    """Return :func:`schema` as text."""
-    return json.dumps(schema(), indent=2, sort_keys=True)
 
 
 def sites() -> list[CatalogEntry]:

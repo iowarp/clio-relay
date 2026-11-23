@@ -1,0 +1,15 @@
+[project]
+name = "clio-relay-server"
+version = "2.0.0a1"
+description = "The clio-relay plugin's MCP server, locked to a released clio-relay wheel"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "clio-relay[tapis] @ https://github.com/iowarp/clio-relay/releases/download/v2.0.0a1/clio_relay-2.0.0a1-py3-none-any.whl",
+]
+
+[tool.uv]
+package = false
+prerelease = "allow"
+no-build = true
+# atomicwrites 1.4.1 (from tapipy) ships only an sdist; 1.4.0 has a wheel.
+constraint-dependencies = ["atomicwrites==1.4.0"]

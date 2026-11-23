@@ -36,12 +36,12 @@ from clio_relay.jobs.file_rules import CHUNK_BYTES
 from clio_relay.surface.http_limits import MAX_HTTP_BODY_BYTES
 from clio_relay.surface.settings import RelayPaths
 
-from .conftest import add_site, answer_page
+from .conftest import RELAY_ENTRY, add_site, answer_page
 
 pytestmark = pytest.mark.release_platform("posix")
 
 ECHO: dict[str, Any] = {"executable": "echo", "arguments": ["over-the-wire"]}
-ENTRY = "from clio_relay.cli import main; main()"
+ENTRY = RELAY_ENTRY
 MODES = ["legacy", "auto"]
 
 

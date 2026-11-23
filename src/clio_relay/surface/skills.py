@@ -1,10 +1,13 @@
 """Site skills, served as MCP resources (RL34).
 
-A skill is Markdown that tells an agent how to use a site well. Relay ships one
-for each catalog site in ``catalog/skills/<name>.md``. A person adds a skill, or
-replaces a shipped one, by putting ``<name>.md`` in ``<config_dir>/skills/``.
-A site links its skill with its ``skill`` field: a skill name, or the path of a
-Markdown file (a relative path is read from the config directory).
+A skill is Markdown that tells an agent how to use a site well. A site's own
+facts and guide come from the site through ``describe`` (JARVIS's
+``facts.sched``); relay's catalog still ships a few in
+``catalog/skills/<name>.md`` for sites that do not publish one yet. A person adds
+a skill, or replaces a shipped one, by putting ``<name>.md`` in
+``<config_dir>/skills/``. A site links its skill with its ``skill`` field: a skill
+name, or the path of a Markdown file (a relative path is read from the config
+directory).
 
 ``relay://skills/{name}`` serves each skill and ``relay://sites/{site}/skill``
 serves the skill a site links. Skills are optional: a site without one has no

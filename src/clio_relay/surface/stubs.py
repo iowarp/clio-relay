@@ -25,8 +25,6 @@ if TYPE_CHECKING:
 
     from clio_relay.surface.changes import ServerChanges
 
-APPROVE_SCHEMA: dict[str, Any] = approve_schema()
-
 
 class StubAskProvider:
     """Builds durable asks. URL asks without a provider page use relay's own page."""

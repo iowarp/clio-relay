@@ -18,7 +18,7 @@ from clio_relay.surface import instructions
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
-from .conftest import add_site
+from .conftest import RELAY_ENTRY, add_site
 
 SUMMARY = (
     "Xcompact3d (Incompact3d v5.0) incompressible flow simulation. Give it an STL file "
@@ -108,7 +108,7 @@ def test_a_plain_client_reads_them_when_it_connects(relay_paths: RelayPaths, mod
     env["CLIO_RELAY_STATE_DIR"] = str(relay_paths.state_dir)
     server = StdioServerParameters(
         command=sys.executable,
-        args=["-c", "from clio_relay.cli import main; main()", "serve"],
+        args=["-c", RELAY_ENTRY, "serve"],
         env=env,
     )
 

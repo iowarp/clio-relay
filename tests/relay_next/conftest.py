@@ -20,6 +20,17 @@ from clio_relay.surface.stubs import DefaultGuard
 # The Slurm suite needs a directory the compute nodes share; without one it is not collected.
 collect_ignore = [] if os.environ.get("RELAY_TEST_SLURM_DIR") else ["test_conformance_slurm.py"]
 
+RELAY_ENTRY = (
+    "from clio_relay.adapters import registry; "
+    "from clio_relay.testing.fixture_adapter import FixtureAdapter; "
+    "registry.register(FixtureAdapter); "
+    "from clio_relay.cli import main; main()"
+)
+"""``python -c`` text that runs relay's CLI with the fixture adapter registered.
+
+The fixture adapter is test-only, not an entry point, so a relay subprocess
+whose sites use it starts through this."""
+
 
 @pytest.fixture
 def relay_paths(tmp_path: Path) -> RelayPaths:
