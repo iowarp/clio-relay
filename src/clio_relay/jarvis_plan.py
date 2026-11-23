@@ -336,6 +336,9 @@ def _advisory(item: object) -> dict[str, Any] | None:
     pick = details.get("pick")
     pick = cast(dict[str, Any], pick) if isinstance(pick, dict) else {}
     line, guidance = _split_message(issue, details, message)
+    settled = _settled_at_launch(details)
+    if settled and line and not (issue.get("person_message") or details.get("person_message")):
+        line = f"{line} {SETTLED_AT_LAUNCH}"
     probes = details.get("probes")
     return {
         "issue_id": issue.get("issue_id"),
@@ -350,7 +353,31 @@ def _advisory(item: object) -> dict[str, Any] | None:
         "remedy": issue.get("remedy"),
         "agent_guidance": guidance,
         "probes": list(cast(list[Any], probes)) if isinstance(probes, list) else [],
+        "settled_at_launch": settled,
     }
+
+
+SETTLED_AT_LAUNCH = (
+    "JARVIS checks this on the job's own nodes when it starts and uses what it finds there."
+)
+"""The person's line for an advisory JARVIS settles itself once the job's nodes are known."""
+
+
+def _settled_at_launch(details: Mapping[str, Any]) -> bool:
+    """Whether JARVIS settles every reason of an issue at launch (``plan: collect_at_launch``).
+
+    At check time JARVIS does not know the job's hosts, so a job larger than the
+    graph's sample is told as ``hosts_not_in_graph``; the launch then collects
+    the facts on its own hosts, merges them into the site graph and supersedes
+    the advisory (``metadata.site_facts.superseded_by_launch``).
+    """
+    reasons = details.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        return False
+    return all(
+        isinstance(reason, dict) and cast(dict[str, Any], reason).get("plan") == "collect_at_launch"
+        for reason in cast(list[object], reasons)
+    )
 
 
 def _split_message(

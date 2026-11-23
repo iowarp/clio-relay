@@ -49,6 +49,7 @@ def test_advisories_are_jarvis_warnings_without_their_evidence() -> None:
         "remedy": "jarvis rg facts answer sha256:aa --value accept --reason <why>",
         "agent_guidance": None,
         "probes": [{"command": "ucx_info -d", "why": "x"}],
+        "settled_at_launch": False,
     }
     assert plain["message"] == "a plain warning" and plain["issue_id"] is None
     assert jarvis_plan.summary(plan).splitlines()[1:] == [
@@ -76,6 +77,29 @@ def test_the_person_sees_no_instruction_meant_for_the_agent() -> None:
     split = {**told, "person_message": "TCP for now", "agent_guidance": "check ucx_info"}
     (given,) = jarvis_plan.advisories(_document(warnings=[split]))
     assert (given["message"], given["agent_guidance"]) == ("TCP for now", "check ucx_info")
+
+
+def test_an_advisory_jarvis_settles_at_launch_says_so_to_the_person() -> None:
+    larger = _advisory(
+        "sha256:aa",
+        "The MPI launch network rests on uncertain cluster facts: the job asks 3 nodes but "
+        "the graph was collected on 2. Investigate with details.probes, propose a value, "
+        "and have the person confirm it.",
+    )
+    larger["reason_codes"] = ["hosts_not_in_graph"]
+    larger["details"]["reasons"] = [
+        {"code": "hosts_not_in_graph", "plan": "collect_at_launch", "severity": "advisory"}
+    ]
+    (advisory,) = jarvis_plan.advisories(_document(warnings=[larger]))
+    assert advisory["settled_at_launch"] is True
+    assert advisory["message"] == (
+        "The MPI launch network rests on uncertain cluster facts: the job asks 3 nodes but "
+        f"the graph was collected on 2. {jarvis_plan.SETTLED_AT_LAUNCH}"
+    )
+    larger["details"]["reasons"].append({"code": "ucx_device_unusable"})
+    (mixed,) = jarvis_plan.advisories(_document(warnings=[larger]))
+    assert mixed["settled_at_launch"] is False
+    assert jarvis_plan.SETTLED_AT_LAUNCH not in mixed["message"]
 
 
 def test_once_submitted_the_record_says_which_advisories_stand() -> None:

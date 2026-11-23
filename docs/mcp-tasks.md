@@ -173,7 +173,13 @@ JARVIS's `issue_id`, `reason_codes`, `message`, `pick`,
 JARVIS tells the agent goes in `agent_guidance`, with the read-only `probes`
 JARVIS suggests: any sentence that names one of the issue's own fields, such
 as "Investigate with details.probes", or JARVIS's own `agent_guidance` when
-it sends `person_message`. None of them holds the job: the person
+it sends `person_message`. `settled_at_launch` is true when JARVIS settles
+every reason of the issue itself once the job's nodes are known (each reason's
+`plan` is `collect_at_launch`), such as `hosts_not_in_graph` for a job larger
+than the nodes the graph was collected on: the launch collects the facts on
+its own hosts, merges them into the site graph and supersedes the advisory.
+The person's line then ends by saying JARVIS checks it on the job's own nodes
+when it starts. None of them holds the job: the person
 accepts one later with `jarvis rg facts answer <issue_id> --value accept`
 through relay's JARVIS exec, or overrides it with `jarvis rg net set`. The
 confirm's text repeats each advisory's message.
