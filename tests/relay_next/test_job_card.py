@@ -307,6 +307,8 @@ def test_the_card_folds_the_running_services_choice(relay_paths: RelayPaths) -> 
         assert "op_pilot" in ask.message
         schema = ask.requested_schema or {}
         assert schema["properties"][held_services.FIELD]["default"] == held_services.KEEP
+        # The card shows in place of the message, so the field itself names the service.
+        assert "op_pilot" in schema["properties"][held_services.FIELD]["description"]
         assert held_services.ask_ids(service.operation(record.operation_id)) == set()
         content = {"approve": "approve", held_services.FIELD: held_services.END}
         service.answer(ask.ask_id, "accept", content, by="test")

@@ -34,7 +34,7 @@ from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask, Charge, GuardDecision
 from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.handles import utc_now
-from clio_relay.jobs.records import OperationKind, OperationRecord
+from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
@@ -166,6 +166,8 @@ async def _card(
         properties[held_services.FIELD] = {
             "type": "string",
             "title": "The site's running services",
+            # A job card shows in place of the message, so the field says which services.
+            "description": held[0],
             "enum": [held_services.END, held_services.KEEP],
             "default": held_services.KEEP,
         }
@@ -248,10 +250,18 @@ async def cancel_confirm(service: RelayService, record: OperationRecord, verb: s
         else ""
     )
     binding = {"kind": CANCEL_KIND, "operation_id": record.operation_id, "verb": verb}
-    message = (
-        f"{verb.capitalize()} {record.operation_id} on {site.title}{native}? "
-        f"It is {record.state.value}.\n\n{_LEFT_TO_RELAY}"
-    )
+    if record.kind == "serve" and record.state == OperationState.RUNNING:
+        # The one offer to end a service: it says what ends and what the person gets back.
+        message = (
+            f"{verb.capitalize()} the service {held_services.described(record)} on "
+            f"{site.title}{native}? Its programs end and its nodes are released.\n\n"
+            f"{_LEFT_TO_RELAY}"
+        )
+    else:
+        message = (
+            f"{verb.capitalize()} {record.operation_id} on {site.title}{native}? "
+            f"It is {record.state.value}.\n\n{_LEFT_TO_RELAY}"
+        )
     snapshot = job_card.snapshot(service, record)
     return await one_shot(
         service,

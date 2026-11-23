@@ -70,7 +70,8 @@ async def running_services(service: RelayService, site_id: str) -> list[Operatio
     return sorted(found, key=lambda record: record.created_at)
 
 
-def _described(record: OperationRecord) -> str:
+def described(record: OperationRecord) -> str:
+    """Name a service for the person: its packages, the nodes it holds and since when."""
     job = cast(dict[str, Any], record.spec.get("job") or {})
     steps = [
         str(cast(dict[str, Any], step).get("name"))
@@ -96,7 +97,7 @@ async def question(
     running = [r for r in running if r.operation_id != operation_id]
     if not running:
         return None
-    named = "; ".join(_described(record) for record in running)
+    named = "; ".join(described(record) for record in running)
     one = len(running) == 1
     message = (
         f"{'A service' if one else 'Services'} of relay's still "
