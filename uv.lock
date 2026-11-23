@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -317,7 +317,7 @@ wheels = [
 
 [[package]]
 name = "clio-relay"
-version = "2.0.0a1"
+version = "2.0.0a2"
 source = { editable = "." }
 dependencies = [
     { name = "clio-schemas" },
