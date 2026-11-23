@@ -8,8 +8,9 @@ advisories and the script. The submit is bound to it
 (:func:`~clio_relay.jarvis_plan.bound`). A serve's job is the one its start
 submits, connector and all (:class:`~clio_relay.adapters.hooks.PlansServices`),
 and the start keeps what that plan chose. When JARVIS refuses the submit because
-the plan changed since the yes, :func:`refused` plans again and asks once more
-with the new plan.
+the plan changed since the yes, :func:`refused` plans again: a plan the person
+sees no change in is bound and submitted without asking, and otherwise the
+person is asked once more, with what changed.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from clio_relay import jarvis_plan
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import SERVICE_CHOICES, Ask, GuardDecision, PlansServices
 from clio_relay.jobs.records import OperationRecord, OperationState
-from clio_relay.jobs.refusals import Refusal
+from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import installing, job_card
@@ -33,7 +34,18 @@ logger = logging.getLogger(__name__)
 
 ROUNDS = "plan_rounds"
 MAX_ROUNDS = 2
+REBINDS = "plan_rebinds"
+"""The new plans a submit was bound to with no ask, as the person saw no change in them."""
+MAX_REBINDS = 3
+CHANGES = "plan_changes"
+"""What the person saw change in JARVIS's plan, as the last ask listed it."""
 CHANGED = "JARVIS's plan changed since your yes, so relay asks again with the new plan."
+REBOUND = (
+    "JARVIS's plan changed since your yes only in the input it seals, which the card does "
+    "not show (such as the environment a software check since filled in): the directives, "
+    "components and batch script are the same, so relay submits under the new plan without "
+    "asking again"
+)
 UNBOUND = frozenset({"plan_sha256", "script"})
 """What a serve's plan leaves out when its serve hook cannot say which job its
 start submits: the start adds a connector the plan did not see, so the yes binds
@@ -124,25 +136,46 @@ def bound(spec: JobSpec, record: OperationRecord) -> JobSpec:
 async def refused(
     service: RelayService, operation_id: str, site: SiteEntry, refusal: Refusal
 ) -> OperationRecord:
-    """Ask again when JARVIS's plan changed since the yes; hand any other refusal on."""
+    """Plan again when JARVIS's plan changed since the yes; hand any other refusal on.
+
+    JARVIS refuses a submit whose script or sealed input differ from the plan
+    the yes named. Relay plans again and compares the plans as the person sees
+    them (:func:`~clio_relay.jarvis_plan.changes`). When nothing they see
+    changed, as when a software check JARVIS ran since filled in the
+    environment it loads, relay binds the new plan and submits without asking,
+    up to :data:`MAX_REBINDS` times. When something did, it asks again, once
+    more at most, and the ask says what changed. When JARVIS plans the very
+    plan it refused, it cannot keep its own plan, and the operation fails.
+    """
     record = service.operation(operation_id)
-    rounds = int((record.result or {}).get(ROUNDS) or 0)
     card = _card_of(service, record)
-    if not jarvis_plan.changed(refusal) or plan_of(record) is None or card is None:
+    old = plan_of(record)
+    if not jarvis_plan.changed(refusal) or old is None or card is None:
         return await installing.ask_install(service, operation_id, site, refusal)
-    if rounds >= MAX_ROUNDS:
-        return service.finish(operation_id, OperationState.FAILED, refusal)
     adapter = service.adapter_named(site, record.adapter)
     plan, kept = await _plan(service, site, record, adapter)
     if plan is None:
         return service.finish(operation_id, OperationState.FAILED, refusal)
-    old = plan_of(record) or {}
+    submitted = jarvis_plan.refused_digests(refusal)
+    if not plan.get("plan_sha256"):
+        return service.finish(operation_id, OperationState.FAILED, refusal)
+    if plan.get("plan_sha256") == old.get("plan_sha256"):
+        return service.finish(operation_id, OperationState.FAILED, _unkept(site, plan, submitted))
+    what = jarvis_plan.changes(old, plan)
+    if not what:
+        return await _rebind(service, operation_id, refusal, (old, plan, kept), submitted)
+    rounds = int((record.result or {}).get(ROUNDS) or 0)
+    if rounds >= MAX_ROUNDS:
+        return service.finish(operation_id, OperationState.FAILED, refusal)
     message = card.message.replace(jarvis_plan.summary(old), jarvis_plan.summary(plan))
+    listed = "\n".join(
+        f"  - {line.strip()}" if line.startswith("  ") else f"- {line}" for line in what
+    )
     binding = {**card.binding, "plan_sha256": plan.get("plan_sha256")}
     ask = await service.ask_provider.approve(
         site=site,
         operation_id=operation_id,
-        message=f"{CHANGED}\n\n{message}",
+        message=f"{CHANGED}\n\nWhat changed:\n{listed}\n\n{message}",
         binding=binding,
         plain=False,
     )
@@ -155,6 +188,7 @@ async def refused(
             jarvis_plan.KEY: plan,
             **kept,
             ROUNDS: rounds + 1,
+            CHANGES: what,
         }
         record.asks = [*record.asks, ask.ask_id]
         record.move(OperationState.AWAITING_INPUT, CHANGED)
@@ -162,6 +196,55 @@ async def refused(
         service.asks.put(ask.ask_id, ask)
         service.operations.put(operation_id, record)
     return record
+
+
+async def _rebind(
+    service: RelayService,
+    operation_id: str,
+    refusal: Refusal,
+    plans: tuple[dict[str, Any], dict[str, Any], dict[str, Any]],
+    submitted: dict[str, Any],
+) -> OperationRecord:
+    """Bind the new plan the person sees no change in, and submit it without asking."""
+    old, plan, kept = plans
+    record = service.operation(operation_id)
+    rebinds = list((record.result or {}).get(REBINDS) or [])
+    if len(rebinds) >= MAX_REBINDS:
+        return service.finish(operation_id, OperationState.FAILED, refusal)
+    rebinds.append(
+        {
+            "from": old.get("plan_sha256"),
+            "to": plan.get("plan_sha256"),
+            "input_sha256": {"was": old.get("input_sha256"), "now": plan.get("input_sha256")},
+            "script_sha256": jarvis_plan.script_sha(plan),
+            "submit_rendered": submitted,
+        }
+    )
+    with service.operations.locked(operation_id):
+        record = service.operation(operation_id)
+        if record.state.final:
+            return record
+        record.result = {**(record.result or {}), jarvis_plan.KEY: plan, **kept, REBINDS: rebinds}
+        record.move(OperationState.AWAITING_INPUT, REBOUND)
+        service.operations.put(operation_id, record)
+    return await service.submit(operation_id)
+
+
+def _unkept(site: SiteEntry, plan: dict[str, Any], submitted: dict[str, Any]) -> Refusal:
+    """The refusal when JARVIS refuses a submit off the plan it makes again unchanged."""
+    return Refusal(
+        RefusalReason.SUBMIT_FAILED,
+        f"JARVIS on {site.title} refused the submit as off its plan, yet planning again "
+        f"gives that same plan (sha256 {str(plan.get('plan_sha256'))[:12]}): its plan and "
+        "its submit render the job differently, so relay stops rather than ask again. "
+        "This is JARVIS's to fix.",
+        kinds=[jarvis_plan.PLAN_CHANGED],
+        plan_sha256=plan.get("plan_sha256"),
+        plan_input_sha256=plan.get("input_sha256"),
+        plan_script_sha256=jarvis_plan.script_sha(plan),
+        submit_rendered=submitted,
+        retry=False,
+    )
 
 
 def _card_of(service: RelayService, record: OperationRecord) -> Ask | None:

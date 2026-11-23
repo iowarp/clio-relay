@@ -12,7 +12,9 @@ reads the script for it.
   the site script's ``plan`` mode, which exits :data:`EXIT_PLANNED`), so the card
   carries JARVIS's plan. The person's yes binds the submit to that plan
   (:func:`bound`, ``--plan_sha256``); JARVIS refuses a submit whose script or
-  input changed since (:data:`PLAN_CHANGED`), and relay asks again with the new plan.
+  input changed since (:data:`PLAN_CHANGED`). Relay plans again and compares the
+  plans as the person sees them (:func:`changes`): it asks again, saying what
+  changed, only when something they see did.
 - Every other package submit plans in the same call and is bound to that plan,
   so a running job's card shows what JARVIS submitted (:func:`parse`).
 
@@ -23,6 +25,7 @@ terminal line of a component winning.
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -74,7 +77,34 @@ _KEPT = (
     "component_states",
     "warnings",
     "exit_code",
+    "input_sha256",
 )
+_SHOWN = (
+    ("action", "Action"),
+    ("scheduler", "Scheduler"),
+    ("partition", "Partition"),
+    ("account", "Account"),
+    ("qos", "QOS"),
+    ("time", "Walltime"),
+    ("nodes", "Nodes"),
+    ("job_name", "Job name"),
+)
+"""The directives of a plan the card shows, with the name the person reads."""
+_COMPONENT_SHOWN = (
+    ("label", "name"),
+    ("package", "package"),
+    ("role", "role"),
+    ("starts", "start"),
+    ("after_steps", "start order"),
+    ("nodes", "nodes"),
+    ("node_range", "node range"),
+    ("host_slice", "hosts"),
+    ("ranks", "ranks"),
+    ("ports", "ports"),
+    ("readiness", "readiness"),
+)
+_SCRIPT_LINES = 4
+"""The most changed batch-script lines one change list quotes."""
 
 
 def read[T](path: Path, reader: Callable[[str], T]) -> T | None:
@@ -123,6 +153,121 @@ def changed(refusal: Refusal) -> bool:
     """Say whether JARVIS refused the submit because its plan changed since the yes."""
     kinds = refusal.data.get("kinds")
     return isinstance(kinds, list) and PLAN_CHANGED in kinds
+
+
+def script_sha(plan: Mapping[str, Any]) -> str | None:
+    """The sha256 of the batch script ``plan`` carries, if any."""
+    script = plan.get("script")
+    found = cast(dict[str, Any], script).get("sha256") if isinstance(script, dict) else None
+    return found if isinstance(found, str) else None
+
+
+def refused_digests(refusal: Refusal) -> dict[str, Any]:
+    """The digests of JARVIS's :data:`PLAN_CHANGED` issue: the sha the yes named and the submit's.
+
+    ``expected_plan_sha256`` is the plan the yes bound; ``plan_sha256``,
+    ``script_sha256`` and ``input_sha256`` are what the submit rendered.
+    """
+    for issue in _listed(refusal.data.get("issues")):
+        if isinstance(issue, dict) and cast(dict[str, Any], issue).get("kind") == PLAN_CHANGED:
+            details = cast(dict[str, Any], issue).get("details")
+            if isinstance(details, dict):
+                return {
+                    key: value
+                    for key, value in cast(dict[str, Any], details).items()
+                    if key.endswith("_sha256") and isinstance(value, str)
+                }
+    return {}
+
+
+def changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
+    """What the person would see differ between two of JARVIS's plans of one job, a line each.
+
+    The directives, each component, the couplings, a note JARVIS added and the
+    batch script count. Empty when the plans differ only in JARVIS's sealed
+    input (``input_sha256``: the pipeline relay rendered from the approved spec,
+    which the yes fixed, and the environment JARVIS loads, which a software
+    check it ran since can fill in) or in a note JARVIS dropped. A changed batch
+    script's quoted lines follow its line, each indented by two spaces.
+    """
+    lines = [
+        f"{name}: {_shown(old.get(key))}, now {_shown(new.get(key))}"
+        for key, name in _SHOWN
+        if old.get(key) != new.get(key)
+    ]
+    lines += _component_changes(old, new)
+    if (old.get("couplings") or []) != (new.get("couplings") or []):
+        lines.append("The couplings between the components changed")
+    before = {a["message"] for a in advisories(old) if a.get("message")}
+    lines += [
+        f"JARVIS now notes: {a['message']}"
+        for a in advisories(new)
+        if a.get("message") and a["message"] not in before
+    ]
+    return lines + _script_changes(old.get("script"), new.get("script"))
+
+
+def _shown(value: object) -> str:
+    if value is None or value == "":
+        return "the site default"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True)
+    return str(value)
+
+
+def _component_changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
+    def keyed(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        for index, item in enumerate(_listed(plan.get("components"))):
+            if isinstance(item, dict):
+                component = cast(dict[str, Any], item)
+                found[str(component.get("id") or index)] = component
+        return found
+
+    before, after = keyed(old), keyed(new)
+    lines: list[str] = []
+    for key, component in after.items():
+        label = component.get("label") or key
+        was = before.get(key)
+        if was is None:
+            lines.append(f"New component: {label} on {_nodes(component.get('nodes'))}")
+            continue
+        lines += [
+            f"{label} {name}: {_shown(was.get(field))}, now {_shown(component.get(field))}"
+            for field, name in _COMPONENT_SHOWN
+            if was.get(field) != component.get(field)
+        ]
+    lines += [
+        f"Component gone: {component.get('label') or key}"
+        for key, component in before.items()
+        if key not in after
+    ]
+    return lines
+
+
+def _script_changes(old: object, new: object) -> list[str]:
+    was = cast(dict[str, Any], old) if isinstance(old, dict) else {}
+    now = cast(dict[str, Any], new) if isinstance(new, dict) else {}
+    if was.get("sha256") == now.get("sha256"):
+        return []
+    line = (
+        f"The batch script changed (sha256 {str(was.get('sha256'))[:12]}, "
+        f"now {str(now.get('sha256'))[:12]})"
+    )
+    texts = was.get("text"), now.get("text")
+    if not all(isinstance(text, str) for text in texts):
+        return [line]
+    diff = difflib.unified_diff(
+        str(texts[0]).splitlines(), str(texts[1]).splitlines(), lineterm="", n=0
+    )
+    quoted = [
+        f"  {'was' if text[0] == '-' else 'now'}: {text[1:].strip()[:160]}"
+        for text in diff
+        if text[:1] in "+-" and not text.startswith(("+++", "---"))
+    ]
+    more = len(quoted) - _SCRIPT_LINES
+    tail = [f"  and {more} more changed line{'s' if more > 1 else ''}"] if more > 0 else []
+    return [line, *quoted[:_SCRIPT_LINES], *tail]
 
 
 def component_states(text: str) -> list[dict[str, Any]]:

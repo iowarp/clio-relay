@@ -125,7 +125,14 @@ between packages, and the batch script. Its `source` is `jarvis`. The yes is
 bound to that plan: relay submits with its `plan_sha256`, and if the job JARVIS
 would submit has changed since (an edited pipeline, a new wall time), JARVIS
 refuses and relay shows the new plan as a second card rather than submitting
-what the person did not see. While the job runs, each component's state comes
+what the person did not see. That card opens with what changed: each directive
+with its old and new value, each component's changed field, new couplings or
+notes, and the batch script's changed lines. When JARVIS's plan changed only in
+the input it seals and the card does not show, such as the environment a
+software check filled in after the yes, the directives, components and script
+are the same, so relay submits under the new plan without asking again and
+records the step in the operation's `plan_rebinds`. While the job runs, each
+component's state comes
 from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 `cancelled`), with its hosts. A package not yet reviewed, a site whose JARVIS
 cannot plan, and an install job show the card as relay records it, with
