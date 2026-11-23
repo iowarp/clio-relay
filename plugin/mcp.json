@@ -3,17 +3,21 @@
   "mcpServers": {
     "relay": {
       "type": "stdio",
-      "command": "uvx",
+      "command": "uv",
       "args": [
-        "--from",
-        "clio-relay[tapis] @ git+https://github.com/iowarp/clio-relay@b8d4859155d949c05c3f36e9dc432f49bdb98e03",
+        "run",
+        "--project",
+        "${PLUGIN_ROOT}/server",
+        "--frozen",
+        "--no-dev",
         "clio-relay",
         "serve"
       ],
       "env": {
         "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
         "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
-        "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}"
+        "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}",
+        "CLIO_RELAY_PACKAGE_SOURCES": "${PLUGIN_ROOT}/packages"
       }
     }
   }
