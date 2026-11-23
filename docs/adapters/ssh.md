@@ -400,6 +400,16 @@ on the session's error stream, with a token unique to the call, and drops that
 line from what you see. Once it arrives, ssh gets 5 seconds to end by itself,
 then relay stops it and returns the command's own exit code.
 
+Win32-OpenSSH (the `ssh.exe` Windows ships) can hang for good when a session
+ends while its standard input is a plain pipe that is still open, as relay's
+is for an `exec`: it waits, with no timeout, for a read it failed to cancel,
+and never writes the output it holds. So when the program relay runs is
+Win32-OpenSSH (its binary carries the `POSIX_FD_STATE` name), relay gives it an
+overlapped pipe and declares it in that variable, which Win32-OpenSSH closes
+without the wait. Any other ssh, a wrapper such as CLIO's fence (which does the
+same for the ssh it starts), or an environment that already sets the variable,
+keeps the plain pipe.
+
 ## When the connection drops
 
 Every call is its own ssh run, so a dropped link costs only the call it hit.

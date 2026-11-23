@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from clio_relay import programs
-from clio_relay.adapters.ssh import errors
+from clio_relay.adapters.ssh import errors, overlapped_stdin
 from clio_relay.adapters.ssh.config import SshConfig
 from clio_relay.asks import askpass
 from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
@@ -217,30 +217,42 @@ async def run_process(
     program = programs.resolved(command, env)
     if program is None:
         return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
+    # Win32-OpenSSH gets an overlapped stdin, or a held one can hang it at the end.
+    overlapped = await overlapped_stdin.open_for(program[0], env) if piped else None
+    child_stdin = asyncio.subprocess.PIPE if piped else asyncio.subprocess.DEVNULL
+    if overlapped is not None and overlapped.child is not None:
+        child_stdin = overlapped.child
     try:
         process = await asyncio.create_subprocess_exec(
             *program,
-            stdin=asyncio.subprocess.PIPE if piped else asyncio.subprocess.DEVNULL,
+            stdin=child_stdin,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=dict(env) if env is not None else None,
+            env=overlapped.env if overlapped else dict(env) if env is not None else None,
             start_new_session=POSIX,
         )
-    except FileNotFoundError:
-        return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
+    except BaseException as exc:
+        if overlapped is not None:
+            overlapped.close()
+        if isinstance(exc, FileNotFoundError):
+            return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
+        raise
+    if overlapped is not None:
+        overlapped.spawned()
+    sink = overlapped.writer if overlapped is not None else process.stdin
     assert process.stdout is not None and process.stderr is not None
 
     async def _feed() -> None:
-        if process.stdin is None:
+        if sink is None:
             return
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             if stdin:
-                process.stdin.write(stdin)
-                await process.stdin.drain()
+                sink.write(stdin)
+                await sink.drain()
         if hold_stdin:
             return
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            process.stdin.close()
+            sink.close()
 
     work = asyncio.ensure_future(
         asyncio.gather(out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait())
@@ -298,9 +310,9 @@ async def run_process(
         raise
     finally:
         exited.cancel()
-        if process.stdin is not None:
+        if sink is not None:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
-                process.stdin.close()
+                sink.close()
         transport = getattr(process, "_transport", None)
         if transport is not None:
             transport.close()
