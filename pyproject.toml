@@ -1,7 +1,7 @@
 [project]
 name = "clio-relay"
 version = "2.0.0a1"
-description = "Cluster relay endpoints backed by clio-core and JARVIS-CD."
+description = "An MCP server and command line that runs jobs, commands, files and services on your compute sites."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = { text = "MIT" }
@@ -109,19 +109,6 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
 ignore = ["ANN401"]
-
-[tool.ruff.lint.per-file-ignores]
-# bootstrap_journal runs on the TARGET cluster's system interpreter, before
-# any relay-managed Python exists -- not on this project's 3.12. pyupgrade
-# rewrites `timezone.utc` to the `datetime.UTC` alias for a py312 target, and
-# that alias is 3.11+, which broke first-install bootstrap on Ubuntu 22.04
-# (system python 3.10) with an ImportError partway through the remote run
-# (clio-relay#158). The exemption keeps the portable spelling from being
-# "upgraded" back into a defect; tests/test_bootstrap_journal_portability.py
-# guards the module's floor.
-"src/clio_relay/adapters/worker/bootstrap_journal.py" = ["UP017"]
-# The guard test deliberately exercises the portable spelling it protects.
-"tests/test_bootstrap_journal_portability.py" = ["UP017"]
 
 [tool.pyright]
 pythonVersion = "3.12"
