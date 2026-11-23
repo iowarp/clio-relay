@@ -1,12 +1,13 @@
-"""JARVIS's plan on a run's one card, and the card again when the plan changed.
+"""JARVIS's plan on a run's or serve's one card, and a run's card again when the plan changed.
 
-Before the one ask of a ``run`` whose host left the confirm to relay,
+Before the one ask of a ``run`` or ``serve`` whose host left the confirm to relay,
 :func:`plan_first` has the adapter plan the job JARVIS would submit
 (:meth:`~clio_relay.adapters.base.BaseAdapter.plan_job`), and keeps that plan on
-the record, so the card shows JARVIS's directives, components, couplings and
-script. The submit is bound to it (:func:`~clio_relay.jarvis_plan.bound`). When
-JARVIS refuses the submit because the plan changed since the yes,
-:func:`refused` plans again and asks once more with the new plan.
+the record, so the card shows JARVIS's directives, components, couplings,
+advisories and, for a run, the script. A run's submit is bound to it
+(:func:`~clio_relay.jarvis_plan.bound`). When JARVIS refuses the submit because
+the plan changed since the yes, :func:`refused` plans again and asks once more
+with the new plan. A serve's plan is shown only: its start rewrites the job.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import installing, job_card, queue_switch
+from clio_relay.surface import installing, job_card
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -31,6 +32,14 @@ logger = logging.getLogger(__name__)
 ROUNDS = "plan_rounds"
 MAX_ROUNDS = 2
 CHANGED = "JARVIS's plan changed since your yes, so relay asks again with the new plan."
+UNBOUND = frozenset({"plan_sha256", "script"})
+"""What a serve's plan leaves out. The service's start adds its connector, its
+secrets and its staged files to the job, so JARVIS's script then is not the one
+planned here, and the yes binds no plan."""
+SERVICE_NOTE = (
+    "Relay adds the service's connector to this job when it starts it, so the "
+    "batch script is made then."
+)
 
 
 async def plan_first(
@@ -43,12 +52,14 @@ async def plan_first(
 ) -> dict[str, Any] | None:
     """Keep on ``record`` the plan of the package job its card asks about, when there is one.
 
-    Only a package run whose card is the first ask plans here: a package
-    review comes before JARVIS may load the package. A site with no JARVIS yet
-    makes no plan, and its card shows the job as relay records it.
+    Only a package run or serve whose card is the first ask plans here: a
+    package review comes before JARVIS may load the package. A site with no
+    JARVIS yet makes no plan, and its card shows the job as relay records it.
+    A serve's plan is shown, not bound (:data:`UNBOUND`).
     """
-    job = JobSpec.model_validate(record.spec)
-    if record.kind != "run" or not job.steps() or decision.data.get("asks"):
+    if record.kind not in ("run", "serve") or decision.data.get("asks"):
+        return None
+    if not installing.job_of(record).steps():
         return None
     plan = await _plan(service, site, record, adapter)
     if plan is not None:
@@ -59,16 +70,29 @@ async def plan_first(
 async def _plan(
     service: RelayService, site: SiteEntry, record: OperationRecord, adapter: BaseAdapter[Any]
 ) -> dict[str, Any] | None:
+    serve = record.kind == "serve"
     try:
-        spec = await service.guard.prepare(
-            site, queue_switch.applied(record, JobSpec.model_validate(record.spec)), adapter=adapter
-        )
-        return await adapter.plan_job(spec, operation_id=record.operation_id)
+        job = installing.job_of(record)
+        job = _as_service(job) if serve else job
+        spec = await service.guard.prepare(site, job, adapter=adapter, service=serve)
+        plan = await adapter.plan_job(spec, operation_id=record.operation_id)
     except Exception:
         # No plan is not a refusal: the card shows the job as relay records it,
         # and the submit says what JARVIS refused.
         logger.info("planning %s found no plan", record.operation_id, exc_info=True)
         return None
+    if plan is None or not serve:
+        return plan
+    return {key: value for key, value in plan.items() if key not in UNBOUND}
+
+
+def _as_service(job: JobSpec) -> JobSpec:
+    """The service's package job with its serving step marked, as its start marks it."""
+    marked = any(step.service for step in job.steps())
+    steps = [
+        step.model_copy(update={"service": step.service or not marked}) for step in job.steps()
+    ]
+    return job.with_steps(steps)
 
 
 def plan_of(record: OperationRecord) -> dict[str, Any] | None:

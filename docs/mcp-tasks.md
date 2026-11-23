@@ -130,6 +130,12 @@ from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 cannot plan, and an install job show the card as relay records it, with
 `source: relay`.
 
+A service's card is JARVIS's plan of the service's job too, with the same
+directives, components, couplings and advisories, but no `script` and no
+binding. Relay adds the service's connector and its per-start secrets to the
+job when it starts it, so the batch script only exists then, and the confirm
+text says so.
+
 `started_at` is when the job itself started on its nodes, not when the
 operation did: the scheduler's start when the site reports one, else the
 first state JARVIS wrote from inside the allocation, else the start of the

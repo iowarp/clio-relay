@@ -134,8 +134,11 @@ async def _card(
     if spends:
         binding["charge"] = charge.model_dump(mode="json")
     if (plan := plan_card.plan_of(record)) is not None:
-        binding["plan_sha256"] = plan.get("plan_sha256")
+        if plan.get("plan_sha256"):
+            binding["plan_sha256"] = plan["plan_sha256"]
         message += "\n\n" + jarvis_plan.summary(plan)
+        if record.kind == "serve":
+            message += "\n" + plan_card.SERVICE_NOTE
     reviews: list[dict[str, Any]] = decision.data.get("asks", [])
     if reviews:
         packages: list[dict[str, Any]] = []
