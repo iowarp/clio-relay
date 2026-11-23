@@ -39,6 +39,15 @@ The repository also keeps two ratchets: `scripts/check_file_size.py` (a file
 stays under 800 lines) and `scripts/check_pyright_ratchet.py` (the count of
 pyright errors only goes down).
 
+CI also runs the conformance kit against the adapter template, the way its
+README tells a newcomer to, so a change to the adapter contract that breaks an
+outside adapter fails here first:
+
+```bash
+cd examples/adapter-template
+uv run pytest
+```
+
 ## Layout
 
 Read it top-down: an MCP call enters at `surface`, the guard checks it, and an
