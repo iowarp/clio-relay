@@ -327,6 +327,7 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     return {
         "version": VERSION,
         "operation_id": record.operation_id,
+        "resource": job_uri(record.operation_id),
         "kind": record.kind,
         "job_id": record.handle.native_id if record.handle else None,
         "revision": int(record.updated_at.timestamp() * 1000),

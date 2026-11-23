@@ -136,9 +136,10 @@ readiness, but the service's job runs on, and a host stops polling a finished
 task. So relay looks at each open job itself every 30 s, unless a poll looked
 in that time. When the card changes, for example when the service's job ends,
 relay announces the resource `relay://jobs/{operation_id}` updated. That
-resource holds the newest card as JSON. A host that keeps a card after the
-task ends either subscribes to that resource or reads it again (or
-`describe(job=...)`) on the announcement.
+resource holds the newest card as JSON, and every card names it in `resource`,
+so a host reads the URI from the card (or the task's `_meta`) and does not
+build it. A host that keeps a card after the task ends either subscribes to
+that resource or reads it again (or `describe(job=...)`) on the announcement.
 
 A service's card is JARVIS's plan of the job its start submits, connector and
 all: the directives, components, couplings and advisories, the batch script,
