@@ -1,10 +1,10 @@
 [project]
 name = "clio-relay-server"
-version = "2.0.0a2"
+version = "2.0.0a3"
 description = "The clio-relay plugin's MCP server, locked to a released clio-relay wheel"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "clio-relay[tapis] @ https://github.com/iowarp/clio-relay/releases/download/v2.0.0a2/clio_relay-2.0.0a2-py3-none-any.whl",
+    "clio-relay[tapis] @ https://github.com/iowarp/clio-relay/releases/download/v2.0.0a3/clio_relay-2.0.0a3-py3-none-any.whl",
 ]
 
 [tool.uv]
