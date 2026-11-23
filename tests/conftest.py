@@ -7,6 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay.adapters import registry
+from clio_relay.testing.fixture_adapter import FixtureAdapter
+
+# The fixture adapter is not an entry point of the shipped distribution, so the
+# suite registers it in process. A test that starts relay as a subprocess uses
+# ``tests.relay_next.conftest.RELAY_ENTRY``, which registers it there too.
+registry.register(FixtureAdapter)
+
 _FIXTURES_ENV = Path(
     os.environ.get(
         "CLIO_RELAY_FIXTURES_ENV",

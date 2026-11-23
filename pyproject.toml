@@ -69,7 +69,6 @@ globus = "clio_relay.adapters.globus:GlobusAdapter"
 iri = "clio_relay.adapters.iri:IriAdapter"
 sky = "clio_relay.adapters.sky:SkyAdapter"
 worker = "clio_relay.adapters.worker:WorkerAdapter"
-fixture = "clio_relay.testing.fixture_adapter:FixtureAdapter"
 
 [project.entry-points."clio_relay.hooks"]
 asks = "clio_relay.asks:create_provider"
