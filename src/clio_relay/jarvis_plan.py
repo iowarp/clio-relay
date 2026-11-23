@@ -24,6 +24,7 @@ terminal line of a component winning.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -38,6 +39,8 @@ PLAN_FILE = "relay.plan.json"
 """The plan the site script keeps in the job directory, and prints before a submit."""
 STATES_FILE = "components.jsonl"
 """JARVIS's component states, in the execution directory."""
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+_FIELD_NAME = re.compile(r"\bdetails\.[a-z_]+")
 BIND_ENV = "CLIO_RELAY_PLAN"
 """``sha256:<plan_sha256>``: the plan the person said yes to, which the submit must match.
 
@@ -187,18 +190,47 @@ def _advisory(item: object) -> dict[str, Any] | None:
         return None
     pick = details.get("pick")
     pick = cast(dict[str, Any], pick) if isinstance(pick, dict) else {}
+    line, guidance = _split_message(issue, details, message)
+    probes = details.get("probes")
     return {
         "issue_id": issue.get("issue_id"),
         "kind": issue.get("kind"),
         "subject": issue.get("subject"),
         "fact": details.get("fact") or issue.get("field"),
         "reason_codes": issue.get("reason_codes") or [],
-        "message": message,
+        "message": line,
         "pick": {key: value for key, value in pick.items() if key != "consequence_if_wrong"}
         or None,
         "consequence_if_wrong": pick.get("consequence_if_wrong") or [],
         "remedy": issue.get("remedy"),
+        "agent_guidance": guidance,
+        "probes": list(cast(list[Any], probes)) if isinstance(probes, list) else [],
     }
+
+
+def _split_message(
+    issue: Mapping[str, Any], details: Mapping[str, Any], message: object
+) -> tuple[str | None, str | None]:
+    """Split an issue's message into the person's line and the agent's guidance.
+
+    JARVIS may give both (``person_message`` and ``agent_guidance``). Otherwise a
+    sentence that names one of the issue's own fields (``details.probes``) is
+    guidance for the agent, which can read those fields; the person sees the rest.
+    """
+    text = str(message) if message else ""
+    person = issue.get("person_message") or details.get("person_message")
+    guidance = issue.get("agent_guidance") or details.get("agent_guidance")
+    if person:
+        return str(person), str(guidance) if guidance else None
+    sentences = _SENTENCE_END.split(text.strip()) if text.strip() else []
+    kept = [s for s in sentences if not _FIELD_NAME.search(s)]
+    agent = [s for s in sentences if _FIELD_NAME.search(s)]
+    if guidance:
+        agent.append(str(guidance))
+    line = " ".join(kept) or None
+    if line and agent and line[-1] not in ".!?":
+        line += "."
+    return line, " ".join(agent) or None
 
 
 def _ids(found: object) -> set[str]:

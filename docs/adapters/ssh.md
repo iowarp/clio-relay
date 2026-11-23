@@ -436,4 +436,5 @@ repeated: trying again would give the same answer.
 | `key_refused` | The site took no key relay offered. Add the key to your agent (`ssh-add`) or name it with `IdentityFile`; the message names key files it could not read |
 | `unknown_host` | The host name does not resolve. Check the name and your VPN |
 | `network` | The connection failed or dropped after the retries. Check the network and VPN |
+| `connection_lost` | The ssh session ended before the command reported its end, and ssh gave no clearer reason (on Windows its exit is often -1). The command may have run in part, so check before you run a command that changes things again |
 | `ssh` | Any other ssh failure. The message carries ssh's last line |

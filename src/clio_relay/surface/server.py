@@ -49,7 +49,7 @@ from clio_relay.adapters.hooks import Ask, MountsPages, Transport
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
-from clio_relay.surface import confirm, install_op, instructions, job_card
+from clio_relay.surface import confirm, install_op, instructions, job_card, job_watch
 from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
@@ -70,6 +70,7 @@ from clio_relay.surface.endpoints import (
     service_ready,
 )
 from clio_relay.surface.exec_plan import EXEC_PLAN_KIND, ExecPlan
+from clio_relay.surface.exec_quiet import QuietReports
 from clio_relay.surface.files_tool import install as install_files_tool
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_tool
 from clio_relay.surface.http_limits import allow_chunk_bodies
@@ -522,13 +523,7 @@ class RelayServer:
         ``needs_approval`` refusal to retry after the answer. With ``read_only``
         (``exec_read``) only a read-only command runs, and nothing asks."""
 
-        async def quiet(idle_s: float, next_s: float) -> None:
-            note = (
-                f"no output for {idle_s:.0f} s; the command is still running; relay checks "
-                f"again in {next_s:.0f} s; cancel the call to stop it"
-            )
-            await ctx.report_progress(idle_s, message=note)
-
+        quiet = QuietReports(ctx, read_only=read_only)
         flagged = not read_only and job_card.flagged(ctx)
 
         async def call() -> dict[str, Any]:
@@ -552,6 +547,8 @@ class RelayServer:
                 return result
         except Refusal as refusal:
             return refusal_result(refusal)
+        if (stretches := quiet.summary()) is not None:
+            result["quiet"] = stretches
         text = result["stdout"]
         if result["stderr"]:
             text += f"\n[stderr]\n{result['stderr']}"
@@ -747,6 +744,7 @@ class RelayServer:
         self.changes.install(server)
         self.service.serve_hook.attach(server, self.changes)
         install_compute_tab(server, self.service, self.changes)
+        job_watch.install(server, self.service, self.changes)
         return server
 
     @asynccontextmanager
@@ -757,13 +755,15 @@ class RelayServer:
         observing = asyncio.create_task(self.service.observe_open_services())
         watching = asyncio.create_task(self.skills.watch(self.changes))
         refreshing = asyncio.create_task(instructions.keep_current(server, self.service))
+        jobs = asyncio.create_task(job_watch.watch(self.service))
         try:
             yield {}
         finally:
             observing.cancel()
             watching.cancel()
             refreshing.cancel()
-            await asyncio.gather(observing, watching, refreshing, return_exceptions=True)
+            jobs.cancel()
+            await asyncio.gather(observing, watching, refreshing, jobs, return_exceptions=True)
             self.changes.close()
             await self.service.close()
 

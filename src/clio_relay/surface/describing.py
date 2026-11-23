@@ -11,6 +11,7 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface import job_watch
 from clio_relay.surface.job_card import site_jobs
 from clio_relay.surface.skills import skill_link, skills
 
@@ -89,8 +90,10 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     them reports ``info.facts.resource_graph``, with the graph's path, the
     install decisions JARVIS records, and the net report of ``jarvis rg net
     show`` (``None`` until the graph has a ``net`` section). ``jobs`` are the
-    site's open jobs and its latest ended ones, each as its job card.
+    site's open jobs and its latest ended ones, each as its job card, observed
+    in the last 30 s (:func:`job_watch.current`).
     """
+    await job_watch.current(service, site.id)
     described: dict[str, Any] = {
         "site": site.model_dump(mode="json"),
         "routes": [item.model_dump(mode="json") for item in service.site_routes(site)],

@@ -154,7 +154,7 @@ async def _card(
         if bootstraps_jarvis(service, site, record.adapter):
             binding["jarvis"] = jarvis_submit.JARVIS_PIN
             message += "\n" + jarvis_line(site)
-    held = held_services.question(service, site, record.kind, record.operation_id)
+    held = await held_services.question(service, site, record.kind, record.operation_id)
     if held is not None:
         message += "\n\n" + held[0]
     message += "\n\n" + _LEFT_TO_RELAY

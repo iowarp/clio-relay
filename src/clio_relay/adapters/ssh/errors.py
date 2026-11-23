@@ -1,7 +1,8 @@
 """What an ``ssh`` failure means, and what the person can do about it.
 
-``ssh`` exits with 255 when it fails itself, and says why on stderr. Each
-refusal carries a ``cause`` so a client can tell the cases apart:
+``ssh`` exits with 255 when it fails itself (Windows' OpenSSH sometimes with
+-1), and says why on stderr. Each refusal carries a ``cause`` so a client can
+tell the cases apart:
 
 - ``key_refused``: the site accepted none of the person's keys;
 - ``host_key_unknown``: there is no host key on record, and relay never accepts
@@ -9,6 +10,8 @@ refusal carries a ``cause`` so a client can tell the cases apart:
 - ``host_key_changed``: the host key differs from the one on record;
 - ``unknown_host``: the profile is neither a ``Host`` nor a name DNS knows;
 - ``network``: the connection could not be made or dropped, so a retry may work;
+- ``connection_lost``: the session ended before the remote command reported its
+  end, and ssh said nothing clearer (:func:`lost`);
 - ``ssh``: anything else ``ssh`` reported.
 
 A site that wants a code or password refuses with ``needs_sign_in`` or
@@ -22,6 +25,8 @@ import re
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 _INTERACTIVE_METHODS = ("keyboard-interactive", "password")
+SSH_FAILED = (255, -1)
+"""The exits of ssh failing itself; Windows' OpenSSH may exit -1, read signed."""
 _NETWORK_MARKERS = (
     "connection timed out",
     "connection refused",
@@ -57,7 +62,7 @@ _UNREADABLE_KEY = re.compile(
 
 def cause(stderr: str, exit_code: int | None) -> str | None:
     """Return why ``ssh`` itself failed, or ``None`` when the remote command did."""
-    if exit_code != 255:
+    if exit_code not in SSH_FAILED:
         return None
     text = stderr.lower()
     if "remote host identification has changed" in text or re.search(
@@ -94,6 +99,26 @@ def retryable(stderr: str, exit_code: int | None, *, once: bool = False) -> bool
     if cause(stderr, exit_code) != "network":
         return False
     return not once or _BEFORE_SESSION.search(stderr.lower()) is not None
+
+
+def lost(stderr: str, exit_code: int | None, *, profile: str, site: str, what: str) -> Refusal:
+    """Return the refusal for a session that ended before the remote command reported its end.
+
+    The script always reports its end through relay's marker, so its absence
+    means the connection went, whatever ssh's exit was.
+    """
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    said = f" ssh said: {lines[-1]}." if lines else ""
+    return Refusal(
+        RefusalReason.UNREACHABLE,
+        (
+            f"the ssh connection to {profile} was lost during {what}, before the command "
+            f"reported its end (ssh exited {exit_code}).{said} The command may have run in "
+            "part, so check before running one that changes things again."
+        ),
+        site=site,
+        cause="connection_lost",
+    )
 
 
 def refusal(

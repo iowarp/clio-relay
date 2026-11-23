@@ -14,7 +14,6 @@ from clio_relay import programs
 from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
 
 POSIX = os.name == "posix"
-MAX_STALL_STEP_S = 600.0
 
 
 class _Sink:
@@ -73,8 +72,8 @@ async def run_bounded(
     With ``timeout_s`` the whole process group is killed at that limit and the
     output read so far is returned with ``timed_out`` set. Without it the command
     runs until it ends; after ``stall_s`` with no output, ``on_stall`` is called,
-    then again after waits that double (capped at ``MAX_STALL_STEP_S``) while it
-    stays quiet. Cancelling the caller kills the process group. A missing
+    then again every ``stall_s`` while it stays quiet, so the status never goes
+    stale. Cancelling the caller kills the process group. A missing
     executable is exit code 127.
     """
     started = time.monotonic()
@@ -158,7 +157,7 @@ async def run_bounded(
                 break
             idle = now - max(stdout.last, stderr.last)
             if idle >= report_at:
-                report_at += min(report_at, MAX_STALL_STEP_S)
+                report_at += stall_s
                 if on_stall is not None:
                     await on_stall(idle, report_at - idle)
         for step in work:

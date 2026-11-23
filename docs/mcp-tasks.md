@@ -33,7 +33,8 @@ site: while relay brings the service up, it answers with the latest state it
 saw, so the task completes within seconds of the service being ready, not a
 whole check later. The service keeps running after that, until
 `cancel(operation=<task id>)`, `serve(stop=<task id>)`, `tasks/cancel` or its
-job's end;
+job's end. Relay keeps watching it after the task ends, so the record and its
+card reach the job's end without anyone asking (see the job card below);
 `describe(job=<task id>)` and `serve(service=<task id>)` follow it. Questions
 relay asks after the service is ready reach the person through relay's page and
 `clio-relay asks`, not as `input_required` on the finished task.
@@ -130,6 +131,15 @@ from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 cannot plan, and an install job show the card as relay records it, with
 `source: relay`.
 
+A card stays current after its task ends. A `serve` task completes at
+readiness, but the service's job runs on, and a host stops polling a finished
+task. So relay looks at each open job itself every 30 s, unless a poll looked
+in that time. When the card changes, for example when the service's job ends,
+relay announces the resource `relay://jobs/{operation_id}` updated. That
+resource holds the newest card as JSON. A host that keeps a card after the
+task ends either subscribes to that resource or reads it again (or
+`describe(job=...)`) on the announcement.
+
 A service's card is JARVIS's plan of the job its start submits, connector and
 all: the directives, components, couplings and advisories, the batch script,
 and the binding. Relay plans that whole job before the ask, with the
@@ -151,7 +161,11 @@ job's latest running stretch, after any install job before it. `advisories`
 lists the picks JARVIS went ahead with but that the person should see, such as
 a launch over TCP because UCX could not be verified on a node. Each has
 JARVIS's `issue_id`, `reason_codes`, `message`, `pick`,
-`consequence_if_wrong` and `remedy`. None of them holds the job: the person
+`consequence_if_wrong` and `remedy`. `message` is the person's line. What
+JARVIS tells the agent goes in `agent_guidance`, with the read-only `probes`
+JARVIS suggests: any sentence that names one of the issue's own fields, such
+as "Investigate with details.probes", or JARVIS's own `agent_guidance` when
+it sends `person_message`. None of them holds the job: the person
 accepts one later with `jarvis rg facts answer <issue_id> --value accept`
 through relay's JARVIS exec, or overrides it with `jarvis rg net set`. The
 confirm's text repeats each advisory's message.
@@ -162,6 +176,7 @@ confirm's text repeats each advisory's message.
 | Task status | each `tasks/get` result's `_meta` |
 | Tool results | `structuredContent.job` on `run`, `serve` and `describe(job=...)` |
 | Job lists | `describe(site=...)` lists the site's jobs under `jobs` |
+| Job resource | `relay://jobs/{operation_id}`, announced updated on each change |
 
 ## refusals
 

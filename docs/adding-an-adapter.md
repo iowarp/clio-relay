@@ -208,8 +208,9 @@ command on the site and returns an `ExecResult` once it ends.
 - With no `timeout_s` the command runs until it ends. While it prints nothing,
   call `await on_stall(idle_s, next_s)`: the seconds since its last output,
   and the seconds until you will report again. Start after `STALL_S` (30 s)
-  of quiet and double the wait each time. The command keeps running; the
-  report lets relay tell the person it is still going.
+  of quiet and report again every `STALL_S` while it stays quiet, so the
+  status never goes stale. The command keeps running; the report lets relay
+  tell the person it is still going.
 - The person may cancel the call. Relay then cancels your coroutine, so stop
   the command on the site in an `except asyncio.CancelledError` or `finally`
   block, and let the cancellation go on.

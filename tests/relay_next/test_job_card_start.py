@@ -47,12 +47,35 @@ def test_advisories_are_jarvis_warnings_without_their_evidence() -> None:
         "pick": {"data": "10.0.0.0/24"},
         "consequence_if_wrong": ["slower MPI"],
         "remedy": "jarvis rg facts answer sha256:aa --value accept --reason <why>",
+        "agent_guidance": None,
+        "probes": [{"command": "ucx_info -d", "why": "x"}],
     }
     assert plain["message"] == "a plain warning" and plain["issue_id"] is None
     assert jarvis_plan.summary(plan).splitlines()[1:] == [
         "JARVIS notes: launching over TCP",
         "JARVIS notes: a plain warning",
     ]
+
+
+def test_the_person_sees_no_instruction_meant_for_the_agent() -> None:
+    told = _advisory(
+        "sha256:aa",
+        "The MPI launch network rests on uncertain cluster facts: data 10.0.0.0/24 has "
+        "an RDMA device that is not ACTIVE on every node, so UCX_NET_DEVICES is not set. "
+        "Investigate with details.probes, propose a value, and have the person confirm it.",
+    )
+    (advisory,) = jarvis_plan.advisories(_document(warnings=[told]))
+    assert advisory["message"] == (
+        "The MPI launch network rests on uncertain cluster facts: data 10.0.0.0/24 has "
+        "an RDMA device that is not ACTIVE on every node, so UCX_NET_DEVICES is not set."
+    )
+    assert advisory["agent_guidance"] == (
+        "Investigate with details.probes, propose a value, and have the person confirm it."
+    )
+    assert "details.probes" not in jarvis_plan.summary(_document(warnings=[told]))
+    split = {**told, "person_message": "TCP for now", "agent_guidance": "check ucx_info"}
+    (given,) = jarvis_plan.advisories(_document(warnings=[split]))
+    assert (given["message"], given["agent_guidance"]) == ("TCP for now", "check ucx_info")
 
 
 def test_once_submitted_the_record_says_which_advisories_stand() -> None:
@@ -134,3 +157,5 @@ def test_the_card_starts_with_the_job_not_with_an_install_before_it() -> None:
     assert started(_record(*after_install, components=inside, started_at=scheduler)) == _at(23)
     assert started(_record(*after_install, started_at="not a time")) == _at(25)
     assert started(_record((OperationState.QUEUED, 1))) is None
+    ended = (*after_install, (OperationState.COMPLETED, 40))
+    assert started(_record(*ended)) == _at(25)

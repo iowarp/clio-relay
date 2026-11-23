@@ -20,6 +20,7 @@ from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface import job_watch
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -56,8 +57,9 @@ def _nodes(record: OperationRecord) -> int | None:
         return None
 
 
-def running_services(service: RelayService, site_id: str) -> list[OperationRecord]:
-    """Return the site's services that are up now, oldest first."""
+async def running_services(service: RelayService, site_id: str) -> list[OperationRecord]:
+    """Return the site's services that are up now, oldest first, as just observed."""
+    await job_watch.current(service, site_id)
     found = [
         record
         for record in service.operations.all()
@@ -78,16 +80,20 @@ def _described(record: OperationRecord) -> str:
     what = ", ".join(steps) or str(job.get("executable") or "a service")
     nodes = _nodes(record)
     held = f", holding {nodes} node{'s' if nodes != 1 else ''}" if nodes else ""
+    result = record.result or {}
+    if str(result.get("observation_failed_at") or "") > str(result.get("observed_at") or ""):
+        held += ", though relay could not check it just now"
     return f"{record.operation_id} ({what}{held}, up since {record.created_at:%H:%M} UTC)"
 
 
-def question(
+async def question(
     service: RelayService, site: SiteEntry, kind: OperationKind, operation_id: str
 ) -> tuple[str, list[str]] | None:
     """Return the question for a new run or service while others of the site run, and those."""
     if kind == "install":
         return None
-    running = [r for r in running_services(service, site.id) if r.operation_id != operation_id]
+    running = await running_services(service, site.id)
+    running = [r for r in running if r.operation_id != operation_id]
     if not running:
         return None
     named = "; ".join(_described(record) for record in running)
@@ -106,7 +112,7 @@ async def ask(
     service: RelayService, site: SiteEntry, kind: OperationKind, operation_id: str
 ) -> tuple[Ask, dict[str, Any]] | None:
     """Build the ask for a new run or service while others of the site run, if any do."""
-    found = question(service, site, kind, operation_id)
+    found = await question(service, site, kind, operation_id)
     if found is None:
         return None
     message, operations = found

@@ -77,10 +77,11 @@ async def test_no_limit_runs_to_the_end_and_reports_quiet_stretches() -> None:
     assert result.exit_code == 0
     assert not result.timed_out
     assert "end" in result.stdout
-    # Reported at 0.3 s, then after waits that double: 0.6, 1.2.
-    assert 2 <= len(reports) <= 4, reports
+    # Reported at 0.3 s, then every 0.3 s while it stays quiet.
+    assert 3 <= len(reports) <= 6, reports
     assert all(idle >= 0.3 for idle, _ in reports)
-    assert reports[1][1] > reports[0][1]
+    assert all(next_s <= 0.3 for _, next_s in reports), reports
+    assert [idle for idle, _ in reports] == sorted(idle for idle, _ in reports)
 
 
 @pytest.mark.asyncio

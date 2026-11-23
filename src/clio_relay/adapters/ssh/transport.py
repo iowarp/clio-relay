@@ -39,7 +39,6 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 logger = logging.getLogger(__name__)
 
 POSIX = os.name == "posix"
-MAX_STALL_STEP_S = 600.0
 MAX_RETRY_WAIT_S = 30.0
 EXIT_GRACE_S = 5.0
 """After the remote command exits, how long ssh gets to end by itself."""
@@ -166,6 +165,11 @@ def ends_with_marker(script: str, marker: bytes) -> str:
     )
 
 
+def _signed(code: int | None) -> int | None:
+    """Return an exit code as POSIX reads it; Windows reports -1 as 4294967295."""
+    return code - 2**32 if code is not None and code >= 2**31 else code
+
+
 def _kill(process: asyncio.subprocess.Process) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         if POSIX:
@@ -198,8 +202,8 @@ async def run_process(
 
     With ``hold_stdin``, standard input stays open until the process ends, so the
     other end sees it close only then. While the process is quiet for
-    ``stall_s``, ``on_stall`` is called, then again after waits that double up
-    to ``MAX_STALL_STEP_S``. Cancelling the caller kills the process group.
+    ``stall_s``, ``on_stall`` is called, then again every ``stall_s`` while it
+    stays quiet. Cancelling the caller kills the process group.
 
     With a ``marker`` (see ``ends_with_marker``), the call ends when the marker
     shows on stderr: the remote command has exited, with the code it carries.
@@ -284,7 +288,7 @@ async def run_process(
                 break
             idle = now - max(out.last, err.last)
             if on_stall is not None and idle >= report_at:
-                report_at += min(report_at, MAX_STALL_STEP_S)
+                report_at += stall_s
                 await on_stall(idle, report_at - idle)
         with contextlib.suppress(asyncio.CancelledError):
             await work
@@ -303,7 +307,7 @@ async def run_process(
     remote = err.exited.is_set()
     return Completed(
         argv=command,
-        exit_code=err.exit_code if remote else None if timed_out else process.returncode,
+        exit_code=err.exit_code if remote else None if timed_out else _signed(process.returncode),
         stdout=bytes(out.data),
         stderr=bytes(err.data),
         stdout_truncated=out.truncated,
@@ -444,6 +448,14 @@ class SshTransport:
         if result.timed_out and not check_timeout:
             return result
         self.raise_for_failure(result, what)
+        if not result.remote_exit and not result.timed_out:
+            raise errors.lost(
+                result.error_text(),
+                result.exit_code,
+                profile=self.config.ssh_profile,
+                site=self.site_id,
+                what=what,
+            )
         return result
 
     async def retrying(

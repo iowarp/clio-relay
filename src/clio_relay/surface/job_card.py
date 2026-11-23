@@ -11,7 +11,11 @@ so a host keeps the newest one per ``operation_id``. It rides as optional data:
 - in the result of ``run``, ``serve`` and ``describe(job=...)`` as
   ``structuredContent.job``, and ``describe(site=...)`` lists the site's jobs
   as ``jobs``;
-- in each task status a task-shaped ``run`` or ``serve`` reports, in its ``_meta``.
+- in each task status a task-shaped ``run`` or ``serve`` reports, in its ``_meta``;
+- as the resource :data:`JOB_URI`. A ``serve`` task ends at readiness, so a
+  host that keeps a service's card follows it there: relay looks at every open
+  job itself and announces the resource updated when its card changes
+  (``notifications/resources/updated``, or the ``subscriptions/listen`` stream).
 
 The text of each message stays the same, so a host that ignores the snapshot
 loses nothing. ``source`` says where the plan came from:
@@ -57,6 +61,13 @@ CONFIRM_NOT_NEEDED = "not_needed"
 VERSION = 1
 LISTED_ENDED = 20
 """How many ended jobs of a site ``describe(site=...)`` lists, newest first."""
+JOB_URI = "relay://jobs/{operation_id}"
+"""A resource holding one job's newest card; relay announces it updated on each change."""
+
+
+def job_uri(operation_id: str) -> str:
+    """Return the resource URI of one job's card."""
+    return JOB_URI.format(operation_id=operation_id)
 
 
 class JobTaskResult(GetTaskResult):
@@ -288,7 +299,11 @@ def _started(record: OperationRecord) -> datetime | None:
         return None
     running: datetime | None = None
     for change in record.history:
-        running = (running or change.at) if change.state == OperationState.RUNNING else None
+        if change.state == OperationState.RUNNING:
+            running = running or change.at
+        elif not change.state.final:
+            # Waiting again (an install job before it, a requeue): a later stretch counts.
+            running = None
     return running
 
 
