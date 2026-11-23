@@ -40,7 +40,7 @@ Decisions use the prefix `RL` for relay and `HS` for host semantics. Qualificati
 
 ## Amendments
 
-The execution plan (`relay-rework-execution.md`) amends this contract. The amendments are written here so that code and contract change together. Where an amendment and the text below disagree, the amendment wins. The full wording of each is in the execution plan, under "Principle zero" and its tables.
+The execution plan (`relay-rework-execution.md`) amends this contract. The amendments are written here so that code and contract change together. Where an amendment and the text below disagree, the amendment wins. The full wording of each is in the execution plan, under "Principle zero" and its tables, except the last three rows, whose wording is in the ledger entry each names.
 
 | Id | Amends | Summary |
 | --- | --- | --- |
@@ -57,6 +57,9 @@ The execution plan (`relay-rework-execution.md`) amends this contract. The amend
 | LQ42 | Qualification | The same client without tasks and elicitation finishes every long operation through the RL2a handle path, and the RL25a approval rules hold |
 | LQ43 | Qualification | The task path end to end: task-augmented `run`, progress on `tasks/get`, the spend gate as `input_required` answered through `tasks/update`, `tasks/cancel`, the result read again on a fresh connection, the same job visible through `describe` |
 | LQ-L18 | Qualification | A person adds relay to a third-party agent host with its documented `mcp add` command and runs "submit hostname to Ares and tell me the node" |
+| Tools beside the verbs | RL1, LQ1 | Beside the five verbs, relay serves `install`, the read tools `exec_read`, `files_read` and `packages_read`, `packages`, `cancel`, `site_clean` and `shutdown`. A host titles and confirms per tool, so a read that never asks and a change that always asks need tools of their own. From the ledger entries on `exec_read` and "cancel and site_clean tools"; the list is in `docs/architecture.md` |
+| Relay is the middle man | Out of scope (jarvis-cd), RL40, "Design: clio-jarvis" | JARVIS owns deployment and installation: install, Spack, decisions, scheduler submit, queue and cancel, MPI launch and network, the resource graph, coupling and config rules. Every package job, on an open or a guarded site, goes through `jarvis ppl submit`; "on an open site the agent deploys directly" no longer holds for packages. Changes to jarvis-cd are in scope and ship with a pin bump. From the ledger entry "Relay is the middle man" |
+| Site facts are the site's | RL34, the `skill` defaults | A site's facts and skill come from JARVIS on the site through `describe` (`facts.sched`, `jarvis rg skill set`), not from relay's catalog. The Ares and Polaris skills left the catalog; the rest follow. A person's own skills stay in `<config_dir>/skills/` or their own plugin. From the ledger entry "Site facts left relay's catalog" |
 
 ## Rules
 
