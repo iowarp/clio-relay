@@ -61,7 +61,6 @@ if TYPE_CHECKING:
 CARD_KIND = "job_card"
 EXEC_CONFIRM_KIND = "exec_confirm"
 CANCEL_KIND = "cancel_confirm"
-ONE_SHOT_KINDS = frozenset({EXEC_CONFIRM_KIND, CANCEL_KIND})
 _LEFT_TO_RELAY = "Your host left this call's confirm to relay: this is the one question for it."
 
 
