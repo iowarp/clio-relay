@@ -14,7 +14,6 @@ mapping the adapter's ``Config`` validates.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -229,14 +228,6 @@ def parse(fields: tuple[Field, ...], values: dict[str, Any]) -> dict[str, Any]:
             continue
         config[item.key] = value
     return config
-
-
-_ID = re.compile(r"[^a-z0-9_-]+")
-
-
-def suggest_id(name: str) -> str:
-    """Return a site id made from a display name."""
-    return _ID.sub("-", name.lower()).strip("-")[:63]
 
 
 # Components for a form's fields
