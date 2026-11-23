@@ -8,7 +8,6 @@ already render. Only a client that lists relay's catalog gets the table.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 COMPONENTS = frozenset(
@@ -29,11 +28,6 @@ COMPONENTS = frozenset(
 TABLE = "clio.choice-table.v1"
 
 Component = dict[str, Any]
-
-
-def slug(value: str) -> str:
-    """Return ``value`` as a safe piece of a component id."""
-    return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-") or "x"
 
 
 class Tree:
