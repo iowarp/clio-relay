@@ -2,8 +2,11 @@
 
 A release is a tag. Pushing a `v<version>` tag runs `release.yml`, which
 checks that the tag matches the package version, builds the wheel and source
-distribution once, and publishes them to PyPI through trusted publishing and
-the `pypi` environment. Nothing else gates publication.
+distribution once, and records their `SHA256SUMS`. It attaches all three to
+a GitHub Release for the tag. A final version also goes to PyPI through
+trusted publishing and the `pypi` environment. A pre-release version (PEP
+440, such as `2.0.0a1` or `2.0.0rc1`) does not: its GitHub Release is marked
+a pre-release and is never the latest. Nothing else gates publication.
 
 `ci.yml` runs on pull requests, on `main` and on tags. It runs ruff, pyright
 (held to the error count in `scripts/check_pyright_ratchet.py`), the file
@@ -36,9 +39,9 @@ requires a commit, a clean tree and the exact `v<project.version>` tag. An
 untagged, differently tagged or dirty tree fails the build. Ordinary builds
 outside a release do not set it and still work.
 
-If you want a GitHub Release page, create it from the same tag afterwards and
-attach the wheel and source distribution from the `dist` artifact of the
-release run.
+A pre-release can be tagged from a branch other than `main`. A plugin that
+needs a fixed build can depend on the release's wheel by URL; its lock records
+the wheel's hash, which matches the release's `SHA256SUMS`.
 
 ## After publication
 

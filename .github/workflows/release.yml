@@ -15,6 +15,9 @@ jobs:
   build:
     name: build the tagged distributions
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: check out the tagged commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -25,6 +28,7 @@ jobs:
         with:
           version: "0.11.28"
       - name: check the tag matches the package version
+        id: version
         env:
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
@@ -32,10 +36,22 @@ jobs:
           set -euo pipefail
           version="$(uv version --short)"
           test "$TAG_NAME" = "v$version"
+          prerelease="$(uv run --no-project --with packaging==24.2 python -c \
+            'import sys; from packaging.version import Version; print(str(Version(sys.argv[1]).is_prerelease).lower())' \
+            "$version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
       - name: build
         env:
           CLIO_RELAY_RELEASE_BUILD: "1"
         run: uv build
+      - name: record the checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- *.whl *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
       - name: upload the distributions
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -43,10 +59,44 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  github-release:
+    name: attach the distributions to a GitHub Release
+    needs: build
+    if: github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: download the distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags=(--prerelease --latest=false)
+          fi
+          gh release create "$TAG_NAME" dist/* --verify-tag \
+            --title "clio-relay $VERSION" --notes-file - "${flags[@]}" <<EOF
+          clio-relay $VERSION, built from $TAG_NAME ($GITHUB_SHA).
+          Check a download against SHA256SUMS: \`sha256sum --check SHA256SUMS\`.
+          EOF
+
   publish:
     name: publish to PyPI
     needs: build
-    if: github.repository == 'iowarp/clio-relay'
+    if: github.repository == 'iowarp/clio-relay' && needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -59,6 +109,8 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: keep only the distributions
+        run: rm dist/SHA256SUMS
       - name: publish
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
