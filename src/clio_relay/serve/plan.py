@@ -9,7 +9,10 @@ content-addressed inputs (RL16). Secrets travel only in
 ``serve/secrets.env``, which the wrapper deletes once read, so they are in no
 argument list, environment block of a batch script, record or log. That input
 is marked transient, so relay and the site drop their stored copies when the
-job ends.
+job ends. A package service's job is planned before its start
+(:func:`package_service_job` with no staged file and no secret), and its start
+keeps the plan's ports (:func:`port_choices`), so JARVIS seals the job the
+person said yes to.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import os
 import re
 import secrets
 import socket
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from importlib import resources
 from pathlib import Path
@@ -192,13 +196,48 @@ class ServePlan(BaseModel):
         return env
 
 
-def plan_ports(spec: ServiceSpec, *, adopt: bool = False) -> list[PortPlan]:
+def loopback_free(port: int) -> bool:
+    """Return whether nothing listens on loopback ``port`` now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def port_choices(plan: ServePlan) -> dict[str, Any]:
+    """The ports a planned service's start keeps, so its job is the one planned.
+
+    ``{"ports": {name: [site port, desktop port]}}``. They reach the job's
+    environment and any ``${CLIO_RELAY_...}`` in its parameters, which JARVIS
+    seals; the secrets do not, so they are not kept.
+    """
+    return {"ports": {port.name: [port.remote_port, port.local_port] for port in plan.ports}}
+
+
+def _kept(choices: Mapping[str, Any] | None, name: str) -> tuple[int, int] | None:
+    found = (choices or {}).get("ports")
+    pair = found.get(name) if isinstance(found, Mapping) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    if not isinstance(pair, list | tuple) or len(pair) != 2:  # pyright: ignore[reportUnknownArgumentType]
+        return None
+    remote, local = cast(Sequence[object], pair)
+    if not isinstance(remote, int) or not isinstance(local, int):
+        return None
+    return remote, local
+
+
+def plan_ports(
+    spec: ServiceSpec, *, adopt: bool = False, choices: Mapping[str, Any] | None = None
+) -> list[PortPlan]:
     """Choose the ports and the per-port secrets of a new service.
 
     With ``adopt``, a port the request does not fix stays 0: the service is a
     package that binds its own port and reports it to JARVIS, and relay
     forwards the port JARVIS records (:func:`adopt_ports`). Relay chooses a
-    port only for a service that reports none.
+    port only for a service that reports none. ``choices`` are the ports its
+    plan chose (:func:`port_choices`): the start keeps them, and takes a new
+    desktop port only when the kept one is in use by then.
     """
     ports: list[PortPlan] = []
     seen: set[str] = set()
@@ -214,12 +253,15 @@ def plan_ports(spec: ServiceSpec, *, adopt: bool = False) -> list[PortPlan]:
                     RefusalReason.INVALID_SPEC,
                     f"port {port.name!r}: {port.protection!r} names no environment variable",
                 )
+        kept = _kept(choices, port.name)
+        remote = kept[0] if kept is not None else 0 if adopt else remote_port_choice()
+        local = kept[1] if kept is not None and loopback_free(kept[1]) else free_loopback_port()
         ports.append(
             PortPlan(
                 name=port.name,
                 protocol=port.protocol,
-                remote_port=port.port or (0 if adopt else remote_port_choice()),
-                local_port=free_loopback_port(),
+                remote_port=port.port or remote,
+                local_port=local,
                 health_path=port.health_path,
                 protection=port.protection,
                 secret_env=secret_env,

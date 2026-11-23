@@ -626,11 +626,12 @@ class RelayService:
             job = await self.guard.prepare(
                 site, queue_switch.applied(record, service.job), adapter=adapter, service=True
             )
+            job = job_plan.bound(job, record)
             endpoint = await self.serve_hook.start(
                 site, adapter, service.model_copy(update={"job": job}), record
             )
         except Refusal as refusal:
-            return await installing.ask_install(self, operation_id, site, refusal)
+            return await job_plan.refused(self, operation_id, site, refusal)
         except Exception as exc:
             logger.exception("starting service %s failed", operation_id)
             return self.finish(

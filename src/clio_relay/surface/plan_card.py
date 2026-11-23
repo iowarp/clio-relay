@@ -1,13 +1,15 @@
-"""JARVIS's plan on a run's or serve's one card, and a run's card again when the plan changed.
+"""JARVIS's plan on a run's or serve's one card, and the card again when the plan changed.
 
 Before the one ask of a ``run`` or ``serve`` whose host left the confirm to relay,
 :func:`plan_first` has the adapter plan the job JARVIS would submit
 (:meth:`~clio_relay.adapters.base.BaseAdapter.plan_job`), and keeps that plan on
 the record, so the card shows JARVIS's directives, components, couplings,
-advisories and, for a run, the script. A run's submit is bound to it
-(:func:`~clio_relay.jarvis_plan.bound`). When JARVIS refuses the submit because
+advisories and the script. The submit is bound to it
+(:func:`~clio_relay.jarvis_plan.bound`). A serve's job is the one its start
+submits, connector and all (:class:`~clio_relay.adapters.hooks.PlansServices`),
+and the start keeps what that plan chose. When JARVIS refuses the submit because
 the plan changed since the yes, :func:`refused` plans again and asks once more
-with the new plan. A serve's plan is shown only: its start rewrites the job.
+with the new plan.
 """
 
 from __future__ import annotations
@@ -17,10 +19,10 @@ from typing import TYPE_CHECKING, Any
 
 from clio_relay import jarvis_plan
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import Ask, GuardDecision
+from clio_relay.adapters.hooks import SERVICE_CHOICES, Ask, GuardDecision, PlansServices
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
-from clio_relay.jobs.spec import JobSpec
+from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import installing, job_card
 
@@ -33,9 +35,9 @@ ROUNDS = "plan_rounds"
 MAX_ROUNDS = 2
 CHANGED = "JARVIS's plan changed since your yes, so relay asks again with the new plan."
 UNBOUND = frozenset({"plan_sha256", "script"})
-"""What a serve's plan leaves out. The service's start adds its connector, its
-secrets and its staged files to the job, so JARVIS's script then is not the one
-planned here, and the yes binds no plan."""
+"""What a serve's plan leaves out when its serve hook cannot say which job its
+start submits: the start adds a connector the plan did not see, so the yes binds
+no plan."""
 SERVICE_NOTE = (
     "Relay adds the service's connector to this job when it starts it, so the "
     "batch script is made then."
@@ -55,35 +57,48 @@ async def plan_first(
     Only a package run or serve whose card is the first ask plans here: a
     package review comes before JARVIS may load the package. A site with no
     JARVIS yet makes no plan, and its card shows the job as relay records it.
-    A serve's plan is shown, not bound (:data:`UNBOUND`).
     """
     if record.kind not in ("run", "serve") or decision.data.get("asks"):
         return None
     if not installing.job_of(record).steps():
         return None
-    plan = await _plan(service, site, record, adapter)
+    plan, kept = await _plan(service, site, record, adapter)
     if plan is not None:
-        record.result = {**(record.result or {}), jarvis_plan.KEY: plan}
+        record.result = {**(record.result or {}), jarvis_plan.KEY: plan, **kept}
     return plan
 
 
 async def _plan(
     service: RelayService, site: SiteEntry, record: OperationRecord, adapter: BaseAdapter[Any]
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """JARVIS's plan of the job the record submits, and what its start keeps."""
     serve = record.kind == "serve"
+    kept: dict[str, Any] = {}
     try:
         job = installing.job_of(record)
         job = _as_service(job) if serve else job
         spec = await service.guard.prepare(site, job, adapter=adapter, service=serve)
+        hook = service.serve_hook
+        bound = not serve
+        if serve and isinstance(hook, PlansServices):
+            whole = ServiceSpec.model_validate(record.spec).model_copy(update={"job": spec})
+            planned = await hook.plan_job(site, adapter, whole, record)
+            if planned is not None:
+                spec, kept, bound = planned[0], {SERVICE_CHOICES: planned[1]}, True
         plan = await adapter.plan_job(spec, operation_id=record.operation_id)
     except Exception:
         # No plan is not a refusal: the card shows the job as relay records it,
         # and the submit says what JARVIS refused.
         logger.info("planning %s found no plan", record.operation_id, exc_info=True)
-        return None
-    if plan is None or not serve:
-        return plan
-    return {key: value for key, value in plan.items() if key not in UNBOUND}
+        return None, {}
+    if plan is None or bound:
+        return plan, kept
+    return {key: value for key, value in plan.items() if key not in UNBOUND}, {}
+
+
+def unbound(plan: dict[str, Any]) -> bool:
+    """Say whether a serve's plan binds nothing (:data:`UNBOUND`)."""
+    return not plan.get("plan_sha256")
 
 
 def _as_service(job: JobSpec) -> JobSpec:
@@ -118,7 +133,7 @@ async def refused(
     if rounds >= MAX_ROUNDS:
         return service.finish(operation_id, OperationState.FAILED, refusal)
     adapter = service.adapter_named(site, record.adapter)
-    plan = await _plan(service, site, record, adapter)
+    plan, kept = await _plan(service, site, record, adapter)
     if plan is None:
         return service.finish(operation_id, OperationState.FAILED, refusal)
     old = plan_of(record) or {}
@@ -135,7 +150,12 @@ async def refused(
         record = service.operation(operation_id)
         if record.state.final:
             return record
-        record.result = {**(record.result or {}), jarvis_plan.KEY: plan, ROUNDS: rounds + 1}
+        record.result = {
+            **(record.result or {}),
+            jarvis_plan.KEY: plan,
+            **kept,
+            ROUNDS: rounds + 1,
+        }
         record.asks = [*record.asks, ask.ask_id]
         record.move(OperationState.AWAITING_INPUT, CHANGED)
         ask.meta = {job_card.JOB_META: job_card.snapshot(service, record)}

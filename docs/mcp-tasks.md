@@ -130,11 +130,19 @@ from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 cannot plan, and an install job show the card as relay records it, with
 `source: relay`.
 
-A service's card is JARVIS's plan of the service's job too, with the same
-directives, components, couplings and advisories, but no `script` and no
-binding. Relay adds the service's connector and its per-start secrets to the
-job when it starts it, so the batch script only exists then, and the confirm
-text says so.
+A service's card is JARVIS's plan of the job its start submits, connector and
+all: the directives, components, couplings and advisories, the batch script,
+and the binding. Relay plans that whole job before the ask, with the
+connector's settings and the ports it chose, and the start keeps those ports,
+so JARVIS seals the job the person said yes to. The per-start secrets (the
+rendezvous token, the frp key and any per-port secret) are never in it: they
+travel only in the staged `serve/secrets.env`, which JARVIS does not seal and
+the connector deletes once read. If the job has changed by the start (a
+desktop port taken meanwhile, a new path to the site), JARVIS refuses and
+relay shows the new plan as a second card. A service that is not a package
+job, or a serve runtime that cannot say which job it submits, keeps a card
+with no script and no binding, and the confirm text says relay makes the batch
+script when it starts the service.
 
 `started_at` is when the job itself started on its nodes, not when the
 operation did: the scheduler's start when the site reports one, else the

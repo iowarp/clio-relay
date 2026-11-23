@@ -137,7 +137,7 @@ async def _card(
         if plan.get("plan_sha256"):
             binding["plan_sha256"] = plan["plan_sha256"]
         message += "\n\n" + jarvis_plan.summary(plan)
-        if record.kind == "serve":
+        if record.kind == "serve" and plan_card.unbound(plan):
             message += "\n" + plan_card.SERVICE_NOTE
     reviews: list[dict[str, Any]] = decision.data.get("asks", [])
     if reviews:

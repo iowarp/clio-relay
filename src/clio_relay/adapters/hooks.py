@@ -14,7 +14,7 @@ from datetime import datetime
 from importlib.metadata import EntryPoint, entry_points
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -360,6 +360,35 @@ class ServeHook(Protocol):
 
     async def close(self) -> None:
         """Release held forwards and sessions."""
+        ...
+
+
+SERVICE_CHOICES = "service_choices"
+"""The ``record.result`` key of what a planned service's start keeps (its ports)."""
+
+
+def service_choices(record: OperationRecord) -> dict[str, Any] | None:
+    """Return the choices a service's plan stored on ``record``, if any."""
+    found = (record.result or {}).get(SERVICE_CHOICES)
+    return cast(dict[str, Any], found) if isinstance(found, dict) else None
+
+
+@runtime_checkable
+class PlansServices(Protocol):
+    """A serve hook that can say which package job a service's start submits.
+
+    Relay asks JARVIS to plan that job before the person's yes, and binds the
+    start to it. A serve hook without it gets an unbound service card.
+    """
+
+    async def plan_job(
+        self,
+        site: SiteEntry,
+        adapter: BaseAdapter[Any],
+        spec: ServiceSpec,
+        record: OperationRecord,
+    ) -> tuple[JobSpec, dict[str, Any]] | None:
+        """Return the job and what its start keeps, or ``None`` for no package job."""
         ...
 
 

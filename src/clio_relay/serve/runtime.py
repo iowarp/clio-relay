@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-from clio_relay import jarvis_submit
+from clio_relay.adapters.hooks import service_choices as choices_of
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -30,10 +30,10 @@ from clio_relay.jobs.handles import (
 )
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import ServiceSpec
+from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
-from clio_relay.serve.config import Rendezvous, SiteServe, frp_unusable
+from clio_relay.serve import planning
 from clio_relay.serve.forward import CLOSED_MARKER, Forward, forward_marker, kill_recorded
 from clio_relay.serve.keys import ForwardCare
 from clio_relay.serve.mount import Mounter, tool_prefix
@@ -41,10 +41,9 @@ from clio_relay.serve.plan import (
     HopState,
     ServePlan,
     adopt_ports,
-    check_wrappable,
     new_secret,
     package_service_job,
-    plan_ports,
+    port_choices,
     ports_file,
     runtime_endpoints,
     runtime_ready_host,
@@ -142,6 +141,7 @@ class ServeRuntime(ForwardCare):
         self._followers: dict[str, asyncio.Task[None]] = {}
         self._latest: dict[str, tuple[float, JobStatus]] = {}
         self._adapters: dict[str, Any] = {}
+        self._choices: dict[str, dict[str, Any]] = {}
         self._resumed = False
 
     # The hook
@@ -151,12 +151,17 @@ class ServeRuntime(ForwardCare):
     ) -> Endpoint | None:
         """Start a service through the adapter's ``serve`` verb."""
         self.sites[site_id_of(site)] = site
+        choices = choices_of(record)
+        if choices is not None:
+            self._choices[record.operation_id] = choices
         try:
             await adapter.serve(spec, operation_id=record.operation_id)
         except Refusal as refusal:
             if refusal.reason != RefusalReason.VERB_NOT_IMPLEMENTED:
                 raise
             await self.start_for(adapter, spec, operation_id=record.operation_id)
+        finally:
+            self._choices.pop(record.operation_id, None)
         status, endpoint = await self.status(site, adapter, record)
         if status.state.final:
             raise Refusal(
@@ -382,6 +387,31 @@ class ServeRuntime(ForwardCare):
 
     # Starting
 
+    async def plan_job(
+        self, site: Any, adapter: Any, spec: ServiceSpec, record: OperationRecord
+    ) -> tuple[JobSpec, dict[str, Any]] | None:
+        """The package job a start of ``spec`` submits, for JARVIS to plan, and what it keeps.
+
+        It is :func:`package_service_job` with the connector, its settings and the
+        service's environment, as the start builds it. The start stages the
+        ``serve/`` files, the secrets among them, as inputs, which JARVIS does not
+        seal, so none is made here. The start keeps the returned port choices
+        (``record.result[SERVICE_CHOICES]``), so its job is this one. A service
+        that is not a package job has no JARVIS plan (``None``).
+        """
+        self.sites[site_id_of(site)] = site
+        plan = planning.serve_plan(
+            adapter,
+            spec,
+            operation_id=record.operation_id,
+            settings_file=self.settings_file,
+            entry=self.sites.get(str(adapter.context.site_id)),
+            choices=choices_of(record),
+        )
+        if not plan.package:
+            return None
+        return package_service_job(spec, plan, {}), port_choices(plan)
+
     async def start_for(self, adapter: Any, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
         """Plan the service, stage its files and submit the wrapped job."""
         existing = self._cached(operation_id)
@@ -389,40 +419,23 @@ class ServeRuntime(ForwardCare):
             return existing.endpoint(
                 note="starting", connect_command=self.connect_command(existing)
             )
-        site_id = str(adapter.context.site_id)
-        loaded = serve_settings.load(self.settings_file)
-        entry = self.sites.get(site_id)
-        site = serve_settings.site_serve(loaded, site_id, getattr(entry, "serve", None))
-        check_wrappable(spec)
-        package = bool(spec.job.steps())
-        if package and not getattr(adapter, "runs_packages", False):
-            raise jarvis_submit.not_run_here(str(adapter.name))
-        mode = self._mode(adapter, site, loaded.rendezvous)
-        ports = plan_ports(
-            spec, adopt=package and bool(getattr(adapter, "reads_service_runtimes", False))
+        plan = planning.serve_plan(
+            adapter,
+            spec,
+            operation_id=operation_id,
+            settings_file=self.settings_file,
+            entry=self.sites.get(str(adapter.context.site_id)),
+            choices=self._choices.pop(operation_id, None),
         )
+        site_id, mode, ports, package = plan.site, plan.mode, plan.ports, plan.package
         if any(port.protocol == "mcp" for port in ports):
             self._refuse_a_second_mount(site_id, service_name(spec), operation_id)
-        idle = spec.lifetime.idle_release
-        plan = ServePlan(
-            operation_id=operation_id,
-            site=site_id,
-            adapter=str(adapter.name),
-            service=service_name(spec),
-            mode=mode,
-            ports=ports,
-            secret_key=new_secret() if mode == "frp" else "",
-            secrets={port.secret_env: new_secret() for port in ports if port.secret_env},
-            rendezvous=loaded.rendezvous if mode == "frp" else None,
-            site_serve=site,
-            bound_to=spec.lifetime.bound_to,
-            idle_release_s=idle.total_seconds() if idle else None,
-            package=package,
-        )
+        plan.secret_key = new_secret() if mode == "frp" else ""
+        plan.secrets = {port.secret_env: new_secret() for port in ports if port.secret_env}
         if mode == "ssh":
             plan.ssh_argv = [str(part) for part in await maybe(adapter.ssh_argv())]
             plan.login_host = (await self._exec(adapter, plan, ["hostname"])).stdout.strip() or None
-        if mode == "frp" and site.hop == "login":
+        if mode == "frp" and plan.site_serve.hop == "login":
             plan.hop = await self._start_hop(adapter, plan)
         self._save(plan)
         try:
@@ -469,39 +482,6 @@ class ServeRuntime(ForwardCare):
                 site=site_id,
                 operation_id=other.operation_id,
             )
-
-    def _mode(self, adapter: Any, site: SiteServe, rendezvous: Rendezvous | None) -> Any:
-        """Pick frp or ssh. ``auto`` takes frp only when it can work, and else ssh."""
-        has_ssh = callable(getattr(adapter, "ssh_argv", None))
-        site_id = str(adapter.context.site_id)
-        if site.path == "frp":
-            if rendezvous is None:
-                raise Refusal(
-                    RefusalReason.INVALID_CONFIG,
-                    "no rendezvous host is set; see docs/rendezvous-host.md",
-                )
-            return "frp"
-        if site.path == "auto" and rendezvous is not None:
-            unusable = frp_unusable(site, rendezvous)
-            if unusable is None:
-                return "frp"
-            if not has_ssh:
-                raise Refusal(
-                    RefusalReason.INVALID_CONFIG,
-                    f"frp cannot carry a port from {site_id}: {unusable}, and its adapter "
-                    "has no ssh to forward one",
-                    site=site_id,
-                )
-            logger.info("serve on %s: ssh, because frp %s", site_id, unusable)
-            return "ssh"
-        if has_ssh:
-            return "ssh"
-        raise Refusal(
-            RefusalReason.INVALID_CONFIG,
-            f"site {site_id!r} has no way to carry a port: set a rendezvous host "
-            "(docs/rendezvous-host.md), or reach the site through an adapter that uses ssh",
-            site=site_id,
-        )
 
     async def _exec(
         self, adapter: Any, plan: ServePlan, argv: list[str], *, check: bool = True
