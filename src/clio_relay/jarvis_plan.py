@@ -174,8 +174,76 @@ def _nodes(count: object) -> str:
     return "1 node" if count == 1 else f"{count} nodes"
 
 
+def _advisory(item: object) -> dict[str, Any] | None:
+    if isinstance(item, str):
+        return _advisory({"message": item}) if item.strip() else None
+    if not isinstance(item, dict):
+        return None
+    issue = cast(dict[str, Any], item)
+    details = issue.get("details")
+    details = cast(dict[str, Any], details) if isinstance(details, dict) else {}
+    message = issue.get("message") or details.get("message")
+    if not message and not issue.get("issue_id"):
+        return None
+    pick = details.get("pick")
+    pick = cast(dict[str, Any], pick) if isinstance(pick, dict) else {}
+    return {
+        "issue_id": issue.get("issue_id"),
+        "kind": issue.get("kind"),
+        "subject": issue.get("subject"),
+        "fact": details.get("fact") or issue.get("field"),
+        "reason_codes": issue.get("reason_codes") or [],
+        "message": message,
+        "pick": {key: value for key, value in pick.items() if key != "consequence_if_wrong"}
+        or None,
+        "consequence_if_wrong": pick.get("consequence_if_wrong") or [],
+        "remedy": issue.get("remedy"),
+    }
+
+
+def _ids(found: object) -> set[str]:
+    ids: set[str] = set()
+    for item in _listed(found):
+        if isinstance(item, dict):
+            item = cast(dict[str, Any], item).get("issue_id")
+        if isinstance(item, str):
+            ids.add(item)
+    return ids
+
+
+def _listed(found: object) -> list[object]:
+    return list(cast(list[object], found)) if isinstance(found, list) else []
+
+
+def advisories(
+    plan: Mapping[str, Any] | None, site_facts: Mapping[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """JARVIS's warnings on the job, once each: the picks it went ahead with.
+
+    They come from the plan's ``warnings[]`` and, once submitted, the record's
+    ``metadata.site_facts`` ``advisories[]`` (less the ones the person
+    confirmed or a launch's own evaluation replaced), such as a
+    ``site_fact_uncertain`` saying JARVIS launches over TCP because it could not
+    verify UCX. Each is a proposal the person sees and can answer later
+    (``jarvis rg facts answer``, or ``rg net set``); none holds the job.
+    """
+    facts = site_facts or {}
+    dropped = _ids(facts.get("confirmed")) | _ids(facts.get("superseded_by_launch"))
+    items = _listed(facts.get("advisories")) if facts else _listed((plan or {}).get("warnings"))
+    found: dict[str, dict[str, Any]] = {}
+    for item in items:
+        advisory = _advisory(item)
+        if advisory is None or advisory.get("issue_id") in dropped:
+            continue
+        found.setdefault(str(advisory.get("issue_id") or advisory["message"]), advisory)
+    return list(found.values())
+
+
 def summary(plan: Mapping[str, Any]) -> str:
-    """The plan in one line, for a host that shows only the ask's text."""
+    """The plan in one line, for a host that shows only the ask's text.
+
+    Each of JARVIS's warnings follows on a line of its own.
+    """
     parts = [
         f"partition {plan.get('partition') or 'the site default'}",
         f"account {plan.get('account') or 'the site default'}",
@@ -187,4 +255,6 @@ def summary(plan: Mapping[str, Any]) -> str:
         f"{c.get('label') or c.get('id')} on {_nodes(c.get('nodes'))}" for c in components
     )
     line = "JARVIS's plan: " + ", ".join(parts)
-    return f"{line}; {shown}" if shown else line
+    line = f"{line}; {shown}" if shown else line
+    notes = [f"JARVIS notes: {a['message']}" for a in advisories(plan) if a.get("message")]
+    return "\n".join([line, *notes])

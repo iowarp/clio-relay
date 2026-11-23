@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -367,11 +368,14 @@ def test_the_card_fills_from_jarvis_component_states(
             ]
         )
         jarvis.status = JobStatus(
-            state=JobState.RUNNING, components=jarvis_plan.component_states(lines)
+            state=JobState.RUNNING,
+            components=jarvis_plan.component_states(lines),
+            started_at=datetime(2026, 11, 20, 9, 59, 30, tzinfo=UTC),
         )
         record = await service.refresh(record.operation_id)
         card = job_card.snapshot(service, record) or {}
         assert card["phase"] == "running" and card["source"] == "jarvis"
+        assert card["started_at"] == "2026-11-20T09:59:30+00:00"
         solver, viewer = card["components"]
         assert (solver["state"], solver["nodes_allocated"], solver["nodes_running"]) == (
             "running",
@@ -390,6 +394,7 @@ def test_the_card_fills_from_jarvis_component_states(
             components=jarvis_plan.component_states(
                 lines + "\n" + _state("solver", "done", ["n1", "n2"], reason="returned")
             ),
+            started_at=datetime(2026, 11, 20, 9, 59, 30, tzinfo=UTC),
         )
         record = await service.refresh(record.operation_id)
         ended = job_card.snapshot(service, record) or {}
@@ -397,6 +402,7 @@ def test_the_card_fills_from_jarvis_component_states(
         assert [c["state"] for c in ended["components"]] == ["done", "done"]
         assert ended["components"][0]["reason"] == "returned"
         assert ended["revision"] > card["revision"]
+        assert ended["started_at"] == card["started_at"] and ended["advisories"] == []
         await service.close()
 
     asyncio.run(scenario())

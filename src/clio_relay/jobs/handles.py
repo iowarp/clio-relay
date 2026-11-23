@@ -129,6 +129,13 @@ class JobStatus(BaseModel):
             "desktop, such as host_key_unverified. The job itself runs on"
         ),
     )
+    started_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the scheduler started the job, as its scheduler or JARVIS reports it; "
+            "None while it waits or when the scheduler does not say"
+        ),
+    )
     components: list[dict[str, Any]] = Field(
         default_factory=list[dict[str, Any]],
         description=(

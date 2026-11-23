@@ -130,6 +130,18 @@ from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 cannot plan, and an install job show the card as relay records it, with
 `source: relay`.
 
+`started_at` is when the job itself started on its nodes, not when the
+operation did: the scheduler's start when the site reports one, else the
+first state JARVIS wrote from inside the allocation, else the start of the
+job's latest running stretch, after any install job before it. `advisories`
+lists the picks JARVIS went ahead with but that the person should see, such as
+a launch over TCP because UCX could not be verified on a node. Each has
+JARVIS's `issue_id`, `reason_codes`, `message`, `pick`,
+`consequence_if_wrong` and `remedy`. None of them holds the job: the person
+accepts one later with `jarvis rg facts answer <issue_id> --value accept`
+through relay's JARVIS exec, or overrides it with `jarvis rg net set`. The
+confirm's text repeats each advisory's message.
+
 | Where | How |
 | --- | --- |
 | The confirm form | phase `planned`, in the elicitation's `params._meta`; on a `2026-07-28` connection, in the `input_required` result's `_meta` |

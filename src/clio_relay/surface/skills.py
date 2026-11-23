@@ -113,6 +113,8 @@ def skill_link(
     if not site.skill:
         return None
     skill = site_skill(site, config_dir, known)
+    if skill is None and site.skill in catalog.RETIRED_SKILLS:
+        return None
     if skill is None:
         return {
             "linked": site.skill,

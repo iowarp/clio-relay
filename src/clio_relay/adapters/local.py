@@ -658,7 +658,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 RefusalReason.UNREACHABLE,
                 f"jarvis execution get printed no record: {answer.strip()[-500:] or 'no output'}",
             )
-        status = jarvis_submit.record_status(record)
+        status = jarvis_submit.record_status(record, job_id=handle.native_id)
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         execution = str(handle.data.get("execution_dir") or "") or (
             jarvis_submit.execution_dir(job_dir.as_posix(), execution_id, pipeline=pipeline)

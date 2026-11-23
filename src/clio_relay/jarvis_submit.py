@@ -58,8 +58,9 @@ import yaml
 from clio_relay.jarvis_bootstrap import BOOTSTRAP_SCRIPT as BOOTSTRAP_SCRIPT
 from clio_relay.jarvis_bootstrap import PYTHON_SETTING_HELP as PYTHON_SETTING_HELP
 from clio_relay.jarvis_bootstrap import explicit_python as explicit_python
+from clio_relay.jarvis_record import install_progress, scheduler_start
 from clio_relay.jarvis_site_script import SITE_SCRIPT as SITE_SCRIPT
-from clio_relay.jobs.handles import VIEW_METADATA, JobProgress, JobState, JobStatus, OutputRef
+from clio_relay.jobs.handles import VIEW_METADATA, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
 
@@ -110,7 +111,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "3b651c686fc5b191b4d88b1cabd797e172db3066"
+JARVIS_PIN = "a28999b1655f18a89b84a2599331bf48f5275d6e"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
@@ -1043,47 +1044,9 @@ def _control_message(control: Mapping[str, Any] | None, state: JobState) -> str 
     return None
 
 
-WAITING_ENV_LOCK = "waiting_env_lock"
-"""The install phase while another install holds the shared Spack environment's lock."""
-BUILD_REFUSED_PHASE = "refused"
-"""The install phase when JARVIS refused to build outside an allocation (exit 4)."""
-
-
-def install_progress(record: Mapping[str, Any]) -> JobProgress | None:
-    """Return an install job's ``metadata.install`` (``jarvis.install.progress.v1``) as progress."""
-    metadata = _dict(record.get("metadata"))
-    if metadata.get("action") != "install":
-        return None
-    install = _dict(metadata.get("install"))
-    if not install:
-        return JobProgress(message="installing: waiting for the install job to start")
-    phase = str(install.get("phase") or "installing")
-    current = install.get("current_package")
-    if phase == WAITING_ENV_LOCK:
-        message = (
-            "waiting for another install into the same Spack environment; "
-            "it then reuses that install"
-        )
-    elif phase == BUILD_REFUSED_PHASE:
-        message = "refused: JARVIS would not build outside an allocation; relay does not retry"
-    elif isinstance(current, str) and current:
-        message = f"{phase}: {current}"
-    else:
-        message = phase
-    data = {
-        key: install[key]
-        for key in ("phase", "missing", "issue_count", "error", "log", "refused")
-        if install.get(key) is not None
-    }
-    return JobProgress(
-        step=_int(install.get("packages_done")),
-        total=_int(install.get("packages_total")),
-        message=message,
-        data=data,
-    )
-
-
-def record_status(record: Mapping[str, Any], *, last: JobState | None = None) -> JobStatus:
+def record_status(
+    record: Mapping[str, Any], *, last: JobState | None = None, job_id: str | None = None
+) -> JobStatus:
     """Map a ``jarvis.execution.record.v1`` onto relay's job states.
 
     ``unknown`` (JARVIS cannot see the scheduler's job right now) keeps ``last``,
@@ -1092,7 +1055,8 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
     comes from ``metadata.install``. ``queue`` is JARVIS's
     ``metadata.queue`` while the job waits in the queue, and ``issues`` are the
     record's typed ``metadata.issues``, and ``site_facts`` its ``metadata.site_facts``,
-    both untouched. Relay reads the scheduler only through JARVIS.
+    both untouched. ``started_at`` is :func:`scheduler_start` for ``job_id``.
+    Relay reads the scheduler only through JARVIS.
     """
     native = str(record.get("state") or "unknown")
     code = record.get("return_code")
@@ -1111,6 +1075,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
             progress=progress,
             issues=issues,
             site_facts=_dict(metadata.get("site_facts")) or None,
+            started_at=scheduler_start(record, job_id),
         )
     state = _STATES[native]
     queue = _dict(metadata.get("queue"))
@@ -1135,6 +1100,7 @@ def record_status(record: Mapping[str, Any], *, last: JobState | None = None) ->
         queue=queue if waiting and queue else None,
         issues=issues,
         site_facts=_dict(metadata.get("site_facts")) or None,
+        started_at=scheduler_start(record, job_id),
     )
 
 

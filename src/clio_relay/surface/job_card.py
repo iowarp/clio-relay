@@ -31,6 +31,7 @@ its own ask for the call says so in the request's ``params._meta`` with
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
@@ -256,6 +257,41 @@ def _site(service: RelayService, site_id: str) -> dict[str, Any]:
         return {"id": site_id, "label": site_id}
 
 
+def _when(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        found = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return found if found.tzinfo else found.replace(tzinfo=UTC)
+
+
+def _started(record: OperationRecord) -> datetime | None:
+    """When the job itself started, not the operation.
+
+    The scheduler's start for this job, as its adapter reported it (``started_at``
+    in the result, set only for the handle's own job id), comes first;
+    then the first state JARVIS wrote from inside the allocation (a component
+    line with hosts); then the start of relay's latest running stretch, after
+    any install job or requeue before it.
+    """
+    result = record.result or {}
+    found = _when(result.get("started_at"))
+    if found is not None:
+        return found
+    lines = cast(list[dict[str, Any]], result.get("components") or [])
+    inside = [at for line in lines if line.get("hosts") and (at := _when(line.get("at")))]
+    if inside:
+        return min(inside)
+    if record.handle is None:
+        return None
+    running: datetime | None = None
+    for change in record.history:
+        running = (running or change.at) if change.state == OperationState.RUNNING else None
+    return running
+
+
 def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] | None:
     """Return the operation's job card, or ``None`` for an operation that is not a job."""
     if record.kind not in ("run", "serve", "install"):
@@ -266,7 +302,7 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     outcome = _outcome(record)
     state = _state(record, outcome, service=record.kind == "serve")
     queue = cast(dict[str, Any], (record.result or {}).get("queue") or {})
-    started = next((c.at for c in record.history if c.state == OperationState.RUNNING), None)
+    started = _started(record)
     ended = record.history[-1].at if record.state.final and record.history else None
     walltime = charge.walltime_s if charge else None
     if walltime is None and job is not None and job.attributes.duration is not None:
@@ -306,6 +342,9 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         if plan
         else _components(record, job, charge, state),
         "couplings": _couplings(plan),
+        "advisories": jarvis_plan.advisories(
+            plan, cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
+        ),
         "script": plan.get("script"),
     }
 

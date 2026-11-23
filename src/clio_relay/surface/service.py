@@ -810,10 +810,10 @@ class RelayService:
                 result.setdefault("ready_at", status.observed_at.isoformat())
             if status.state.final and tail is not None:
                 result["stdout_tail"] = tail
-            for key in ("issues", "site_facts", "service_error", "components"):
+            for key in ("issues", "site_facts", "service_error", "components", "started_at"):
                 result.pop(key, None)
                 if getattr(status, key):
-                    result[key] = getattr(status, key)
+                    result[key] = status.model_dump(mode="json", include={key})[key]
             record.result = result
             self.operations.put(operation_id, record)
             drop_transient(self.content, self.operations, record)

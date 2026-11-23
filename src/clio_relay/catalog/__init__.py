@@ -21,6 +21,14 @@ from clio_relay.sites.models import CatalogEntry
 
 _ROOT = files(__package__ or "clio_relay.catalog")
 
+RETIRED_SKILLS = frozenset({"ares", "alcf-polaris"})
+"""Skills the catalog once shipped and no longer does.
+
+A site's facts are JARVIS's now (``jarvis rg skill set``, ``describe``'s
+``facts.sched``), so these left the catalog. A site added while the catalog
+still linked one keeps the name in its ``skill`` field; relay treats that link
+as no link unless the person has their own skill of that name."""
+
 
 def _dir(name: str) -> Traversable | None:
     path = _ROOT / name

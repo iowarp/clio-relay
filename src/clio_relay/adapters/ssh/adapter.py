@@ -760,7 +760,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"jarvis execution get did not answer on {self.config.ssh_profile}: "
                 f"{answer.strip()[-500:] or 'no output'}",
             )
-        status = jarvis_submit.record_status(record)
+        status = jarvis_submit.record_status(record, job_id=handle.native_id)
         status.components = jarvis_plan.component_states("\n".join(sections.get("components", [])))
         if not status.state.final or handle.data.get("install"):
             return status

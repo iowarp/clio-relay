@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from clio_relay import catalog
 from clio_relay.adapters.globus.adapter import GlobusConfig
+from clio_relay.surface.skills import skill_link
 
 
 @pytest.mark.parametrize("site_id", ["polaris", "aurora", "deltaai"])
@@ -44,3 +47,19 @@ def test_polaris_alternatives_name_iri_and_worker() -> None:
     entry = catalog.site("polaris")
     assert list(entry.alternatives) == ["iri", "worker"]
     assert entry.alternatives["iri"]["base_url"] == "https://api.alcf.anl.gov"
+
+
+@pytest.mark.parametrize("site_id", ["ares", "polaris"])
+def test_a_site_added_while_the_catalog_linked_a_skill_keeps_no_broken_link(
+    site_id: str, tmp_path: Path
+) -> None:
+    entry = catalog.site(site_id).to_site()
+    retired = "ares" if site_id == "ares" else "alcf-polaris"
+    assert retired in catalog.RETIRED_SKILLS and retired not in catalog.skills()
+    stale = entry.model_copy(update={"skill": retired})
+    assert skill_link(stale, tmp_path) is None
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / f"{retired}.md").write_text("# Mine\n", "utf-8")
+    assert (skill_link(stale, tmp_path) or {})["title"] == "Mine"
+    lost = entry.model_copy(update={"skill": "no-such-skill"})
+    assert (skill_link(lost, tmp_path) or {})["uri"] is None
