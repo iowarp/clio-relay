@@ -31,8 +31,18 @@ else
   trap 'rmdir "$lock.d" 2>/dev/null || true' EXIT
 fi
 log="$dir/install.log"
+# jarvis-cd's wheel ships its builtin repository as a top-level package beside jarvis_cd.
+# Relay never uses it, so its environment never keeps it, and JARVIS finds no builtin.
+drop_builtin() {
+  local b
+  for b in "$dir"/venv/lib/python3*/site-packages/builtin; do
+    if [ -f "$b/builtin/__init__.py" ]; then rm -rf "$b" || return 1; fi
+  done
+  return 0
+}
 if [ "$(tr -cd '0-9a-f' 2>/dev/null < "$dir/pin")" = "$pin" ] && [ -x "$dir/jarvis" ] \
   && [ -x "$dir/pip" ]; then
+  drop_builtin || { echo "relay could not remove jarvis-cd's builtin from $dir/venv" >&2; exit 1; }
   python=$(cat "$dir/python" 2>/dev/null) || python=
   printf '{"jarvis":"%s","pin":"%s","log":"%s","python":"%s","from":"reused"}\n' \
     "$dir/jarvis" "$pin" "$log" "$python"
@@ -128,7 +138,7 @@ target="$dir/venv/bin/jarvis"
 if ! { "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install --upgrade pip >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; } \
-  || [ ! -x "$target" ]; then
+  || [ ! -x "$target" ] || ! drop_builtin; then
   tail -n 40 "$log" >&2
   exit 1
 fi
@@ -163,9 +173,11 @@ environment module to load. Otherwise it tries ``python3``, then each
 sets modules up.
 
 It makes a fresh virtual environment from that interpreter and installs
-jarvis-cd at the pinned commit's source archive into it, never into the user's
-own site-packages. The archive has no git metadata, so the build gets the
-version ``0+g<pin>``. JARVIS's jobs run the venv's interpreter, so they use the
+jarvis-cd's pinned release wheel into it, never into the user's own
+site-packages. The wheel's top-level ``builtin`` repository is removed from that
+environment right after, and from a reused one too: relay never installs,
+registers or runs jarvis-cd's builtin packages. JARVIS's jobs run the venv's
+interpreter, so they use the
 same Python. A module's interpreter that runs only with the module's libraries
 gets ``<home>/jarvis-cd/jarvis`` as a wrapper that exports them; otherwise that
 is a link to the venv's ``jarvis`` (:func:`bootstrap_path`). Beside it,

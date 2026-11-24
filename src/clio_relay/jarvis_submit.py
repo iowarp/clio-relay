@@ -58,6 +58,7 @@ import yaml
 from clio_relay.jarvis_bootstrap import BOOTSTRAP_SCRIPT as BOOTSTRAP_SCRIPT
 from clio_relay.jarvis_bootstrap import PYTHON_SETTING_HELP as PYTHON_SETTING_HELP
 from clio_relay.jarvis_bootstrap import explicit_python as explicit_python
+from clio_relay.jarvis_graph import PKG_TYPE as GRAPH_PKG_TYPE
 from clio_relay.jarvis_record import install_progress, scheduler_start
 from clio_relay.jarvis_site_script import SITE_SCRIPT as SITE_SCRIPT
 from clio_relay.jobs.handles import VIEW_METADATA, JobState, JobStatus, OutputRef
@@ -293,15 +294,15 @@ GRAPH_SCHEMA = "jarvis.resource-graph.net-report.v1"
 
 
 def graph_pipeline(scheduler: str, *, nodes: int = 2, time: str = "00:05:00") -> dict[str, Any]:
-    """Return JARVIS's pipeline that collects the graph's ``net`` section on compute nodes.
+    """Return the pipeline of relay's network collection on compute nodes.
 
-    It is JARVIS's ``builtin.resource_graph`` package (``net_only`` by default),
+    It is relay's own package (:mod:`clio_relay.jarvis_graph`, ``net_only``),
     submitted as a job of ``nodes`` nodes on the site's scheduler, which JARVIS
     detects, so the networks are the compute nodes' and never a login host's.
     """
     document: dict[str, Any] = {
         "name": "site_net",
-        "pkgs": [{"pkg_type": "builtin.resource_graph"}],
+        "pkgs": [{"pkg_type": GRAPH_PKG_TYPE}],
     }
     if scheduler not in ("", "none"):
         document["scheduler"] = {"nodes": nodes, "time": time}

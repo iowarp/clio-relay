@@ -160,6 +160,8 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
   done
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi
+# jarvis init lists jarvis-cd's builtin repository; the job's root never keeps it.
+! grep -qs builtin "$root/repos.yaml" || "$found" repo remove builtin >/dev/null 2>&1 || :
 # Where the outputs really are, so relay names them there, never through the link.
 printf '%s\n' "$shared" > "$job/relay.shared"
 printf '{"schema_version":"clio-relay.shared.v1","path":"%s"}\n' \

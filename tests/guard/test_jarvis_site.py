@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay import jarvis_graph
 from clio_relay.adapters.sched_info import SCHEMA as SCHED_SCHEMA
 from clio_relay.adapters.sched_info import partitions as sched_partitions
 from clio_relay.adapters.sched_info import report as sched_report
@@ -305,10 +306,25 @@ def test_a_refusal_keeps_jarvis_typed_issues_even_pretty_printed() -> None:
 def test_the_graph_collection_runs_on_compute_nodes() -> None:
     assert graph_pipeline("slurm") == {
         "name": "site_net",
-        "pkgs": [{"pkg_type": "builtin.resource_graph"}],
+        "pkgs": [{"pkg_type": "clio_relay_site.net_graph"}],
         "scheduler": {"nodes": 2, "time": "00:05:00"},
     }
     assert "scheduler" not in graph_pipeline("none")
+
+
+def test_the_graph_collection_is_relays_own_package_never_jarvis_builtin() -> None:
+    """The user: builtins "should not even be installed for relay to use"."""
+    script = graph_collect_command("/home/me/.clio-relay", "slurm")[2]
+    assert "builtin." not in script
+    write = script.index("/net_graph/pkg.py")
+    register = script.index('"$JB" repo add "$P" +force')
+    assert script.index('P="$S"/clio_relay_site') < write < register
+    assert register < script.index('ppl submit "$S/site_net.yaml"')
+    code = compile(jarvis_graph.PKG_SOURCE, "pkg.py", "exec")
+    assert "NetGraph" in code.co_names
+    # JARVIS loads <repo>.<package>.pkg and the PascalCase of the package's name.
+    assert "".join(w.capitalize() for w in jarvis_graph.PACKAGE.split("_")) == "NetGraph"
+    assert "net_only=True" in jarvis_graph.PKG_SOURCE
 
 
 def test_the_graph_report_is_jarvis_json_or_none() -> None:
@@ -482,5 +498,7 @@ def test_site_level_jarvis_calls_initialize_the_site_root_once() -> None:
         assert guard in script, name
         assert '"$R/config" "$R/private" "$R/shared"' in script, name
         assert script.index(guard) < script.rindex('"$JB"'), name
+        drop = 'JARVIS_ROOT="$R" "$JB" repo remove builtin'
+        assert script.index(guard) < script.index(drop) < script.rindex('"$JB"'), name
     assert 'ppl submit "$S/site_net.yaml" +json' in scripts["collect"]
     assert 'ppl run yaml "$S/site_net.yaml" +json' in graph_collect_command(home, "none")[2]

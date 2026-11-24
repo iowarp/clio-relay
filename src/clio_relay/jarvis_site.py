@@ -81,11 +81,13 @@ def split_name(name: str) -> tuple[str, str]:
 
 
 JARVIS_BUILTIN = "builtin"
-"""jarvis-cd's own repository, whose packages relay never stages, lists or runs.
+"""jarvis-cd's own repository, which relay never installs, registers, stages, lists or runs.
 
-They hardcode a case or a site's setup, so they are a reference for writing a
-generic package, not packages to run. JARVIS's own steps relay asks for
-(``builtin.resource_graph``) are JARVIS's machinery, not staged packages.
+They hardcode a case or a site's setup and are meant for a person to drive, so
+they are a reference for writing a generic package, not packages to run. The
+bootstrap removes them from relay's jarvis-cd environment, every JARVIS root
+relay sets up drops the repository ``jarvis init`` lists, and relay collects the
+site's networks with its own package (:mod:`clio_relay.jarvis_graph`).
 """
 
 

@@ -31,7 +31,7 @@ import shlex
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_graph, jarvis_submit
 from clio_relay.adapters.ssh import store
 from clio_relay.login_load import BATCH_HINT_SH
 
@@ -512,13 +512,14 @@ def graph_script(remote_dir: str, jarvis: str = "") -> str:
 
 
 def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> list[str]:
-    """Return the ``exec`` argv that submits JARVIS's graph collection on ``scheduler``.
+    """Return the ``exec`` argv that submits relay's network collection on ``scheduler``.
 
-    It writes :func:`jarvis_submit.graph_pipeline` beside the site graph and
-    runs ``jarvis ppl submit`` (``ppl run`` with no scheduler), with the site
-    graph and a site-level JARVIS root, printing JARVIS's handle as JSON. An
-    argument after the argv's own (``$1``) is the queue the job goes to; with
-    none, the scheduler's default.
+    It writes relay's collection package (:mod:`clio_relay.jarvis_graph`) and
+    :func:`jarvis_submit.graph_pipeline` beside the site graph, registers the
+    package in the site-level JARVIS root, and runs ``jarvis ppl submit`` (``ppl
+    run`` with no scheduler), with the site graph and a site-level JARVIS root,
+    printing JARVIS's handle as JSON. An argument after the argv's own (``$1``)
+    is the queue the job goes to; with none, the scheduler's default.
     """
     home = remote_dir.rstrip("/") or "/"
     pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
@@ -542,6 +543,7 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
         '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
         + _INIT_SITE_ROOT
+        + jarvis_graph.write_lines('"$S"')
         + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
         + f'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH={root_expression(graph)} '
@@ -562,11 +564,12 @@ def _jarvis_env(home: str, jarvis: str) -> str:
 
 
 # The site-level JARVIS root (``$R``) is set up once, the first time a site-level
-# call needs it; a run's own root is set up by the run script.
+# call needs it; a run's own root is set up by the run script. It never keeps
+# jarvis-cd's builtin repository.
 _INIT_SITE_ROOT = (
     'mkdir -p "$R"\n'
     '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init '
-    '"$R/config" "$R/private" "$R/shared" >/dev/null 2>&1\n'
+    '"$R/config" "$R/private" "$R/shared" >/dev/null 2>&1\n' + jarvis_graph.DROP_BUILTIN
 )
 
 

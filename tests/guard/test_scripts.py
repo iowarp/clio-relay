@@ -45,6 +45,9 @@ FAKE_JARVIS = """#!/bin/sh
 echo "JARVIS_ROOT=${JARVIS_ROOT:-} $*" >> "$JARVIS_LOG"
 [ -z "${JARVIS_INSTALL_ANSWERS:-}" ] || echo "answers $JARVIS_INSTALL_ANSWERS" >> "$JARVIS_LOG"
 case "$1 $2" in
+  "init "*)
+    [ -z "${JARVIS_INIT_BUILTIN:-}" ] \\
+      || printf 'repos:\\n- %s/builtin\\n' "$JARVIS_ROOT" > "$JARVIS_ROOT/repos.yaml" ;;
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
@@ -176,7 +179,7 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     log = (tmp_path / "jarvis.log").read_text().splitlines()
     assert log == [
         f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
-        f"JARVIS_ROOT={root} repo add {root}/src/demo",
+        f"JARVIS_ROOT={root} repo add {root}/src/demo +force",
         f"JARVIS_ROOT={root} ppl install yaml {job}/{PIPELINE_FILE} +check +json",
         f"JARVIS_ROOT={root} ppl check yaml {job}/{PIPELINE_FILE} +json",
         f"JARVIS_ROOT={root} ppl submit {job}/{PIPELINE_FILE} --execution-id op_x +json",
@@ -190,6 +193,23 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert (root / "src" / "demo" / "demo" / "hello" / "pkg.py").is_file()
     assert (root / "src" / "schemas" / "package-contract.v1.json").is_file()
     assert not (root / "src" / "demo" / "demo" / "other").exists()
+
+
+def test_the_job_root_drops_the_builtin_repository_jarvis_init_lists(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    _jarvis(tmp_path)
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin", JARVIS_INIT_BUILTIN="1")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 0, done.stderr
+    root = job / ".relay-jarvis"
+    log = (tmp_path / "jarvis.log").read_text().splitlines()
+    assert log[:3] == [
+        f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
+        f"JARVIS_ROOT={root} repo add {root}/src/demo +force",
+        f"JARVIS_ROOT={root} repo remove builtin",
+    ]
+    assert log[3].startswith(f"JARVIS_ROOT={root} ppl install ")
 
 
 def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> None:

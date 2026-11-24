@@ -12,7 +12,8 @@
 #
 # A package is `<repo>.<package>`, and its archive holds
 # `<repo>/<repo>/<package>/...`. The launcher runs it with JARVIS_ROOT in the
-# job's directory: jarvis init, repo add <unpacked>/<repo>, ppl create,
+# job's directory: jarvis init, repo remove builtin (when init listed it),
+# repo add <unpacked>/<repo>, ppl create,
 # ppl append <name> pkg key=value..., then ppl run. A package-service job runs
 # ppl start instead, holds until the job is cancelled, then runs ppl stop.
 #
@@ -90,10 +91,13 @@ package | package-service)
     pipeline="${pipeline//-/_}"
     # A JARVIS of the job's own, so the site's ~/.ppi-jarvis is never read or changed.
     # +force, in this job's own root only, so the staged archive always replaces any
-    # repository of its name. builtin never arrives here: relay refuses to stage it.
+    # repository of its name. builtin never arrives here: relay refuses to stage it,
+    # and the root drops the builtin repository jarvis init lists.
     export JARVIS_ROOT="$job_dir/.relay-jarvis"
     {
         jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared" \
+            && { ! grep -qs builtin "$JARVIS_ROOT/repos.yaml" \
+                || jarvis repo remove builtin > /dev/null 2>&1 || :; } \
             && jarvis repo add "$unpacked/$repo" +force \
             && jarvis ppl create "$pipeline" \
             && jarvis ppl append "$name" pkg ${params[@]+"${params[@]}"} \

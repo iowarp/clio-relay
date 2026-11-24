@@ -237,8 +237,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         job: dict[str, Any] | None = pipeline.get("scheduler")
         where = f"on {job['nodes']} compute nodes for up to {job['time']}" if job else "here"
         summary = (
-            f"JARVIS's builtin.resource_graph job runs {where} and collects the networks "
-            "it sees into the site's resource graph."
+            f"Relay's network collection job runs {where} with JARVIS and collects the "
+            "networks it sees into the site's resource graph."
         )
         graph: dict[str, Any] = {
             "path": first("graph_path"),
@@ -251,7 +251,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "pipeline": pipeline,
                 "plan": {"kind": "resource_graph", "summary": summary, "submits": job is not None},
                 "note": (
-                    "JARVIS's builtin.resource_graph job collects the networks on compute "
+                    "Relay's network collection job collects the networks on compute "
                     "nodes; run this with exec (and this plan on a guarded site) once the "
                     "person approves, then describe again"
                 ),
