@@ -523,6 +523,7 @@ All runs are in `~/clio-relay-rework/clio-relay-w1`, branch `jaimecernuda-relay-
     - FastMCP 4.2 always derives a tool title.
     - The mcp 2.3 client stamps `Mcp-Name` on each request, so the forged-name test rewrites it in an httpx request hook.
     - filelock 4 applies the explicit mode only to a lock file it creates, so the late-start test makes `transition.lock` owner-private.
+- **jarvis-cd 1.9.0, from its release wheel (coordinator, with W17's builtin removal).** `JARVIS_PIN` is now the v1.9.0 tag's commit, 4b76ee35 (ff96c29 plus four fixes: ruff formatting, a pipeline check that never creates package directories, and test updates). The site bootstrap installs `JARVIS_SOURCE`, the release's `jarvis_cd-1.9.0-py3-none-any.whl`, with its SHA-256 (1959a610...) in the URL fragment, so pip refuses any other bytes (checked: a wrong digest fails with "Expected sha256 ... Got 1959a610..."). That replaces the GitHub archive, whose bytes GitHub doesn't promise to keep stable, and the `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_JARVIS_CD` workaround the archive needed. A site with relay's jarvis-cd at the old pin is asked again, as for any pin change. Relay's dev dependency is the same wheel (uv.lock records its hash). The wheel ships jarvis-cd's `builtin` repository, but relay never registers, lists, stages or runs it (`jarvis_site.refuse_builtin`, W17's entry). The site still needs to reach github.com.
 
 ## W2. Fixtures and the Ares harness
 

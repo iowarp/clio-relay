@@ -308,8 +308,10 @@ Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
 site home, by absolute path for submit, install, check, execution and stop. It
 never runs a `jarvis` found on the site's `PATH`: an older one rejects the
 service reports and builds on the login node. When relay's is missing or at
-another pin, relay asks before it installs the pinned commit there, in a fresh
-virtual environment made with a Python 3.11 or newer. Relay looks for one
+another pin, relay asks before it installs the pinned release there, in a fresh
+virtual environment made with a Python 3.11 or newer. The release is
+jarvis-cd's published wheel, and pip checks its SHA-256 before it installs it.
+Relay looks for a Python
 itself: `python3`, then any `python3.N` on the site's `PATH`, newest first, then
 a `python` environment module (`module avail`, newest first). Name
 another in `jarvis_python`. When none is new enough, the refusal lists what

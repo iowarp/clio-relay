@@ -427,7 +427,7 @@ provides-extras = ["tapis", "globus", "iri", "testing"]
 [package.metadata.requires-dev]
 dev = [
     { name = "hatchling", specifier = "==1.31.0" },
-    { name = "jarvis-cd", git = "https://github.com/grc-iit/jarvis-cd?rev=v1.8.1" },
+    { name = "jarvis-cd", url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.0/jarvis_cd-1.9.0-py3-none-any.whl" },
     { name = "pip-audit", specifier = ">=2.10.0" },
     { name = "pyright", specifier = ">=1.1.390" },
     { name = "pytest", specifier = ">=8.3" },
@@ -955,12 +955,23 @@ wheels = [
 
 [[package]]
 name = "jarvis-cd"
-version = "1.8.1"
-source = { git = "https://github.com/grc-iit/jarvis-cd?rev=v1.8.1#9c917c25356f03d5ad717738ddbb2f7313f491f4" }
+version = "1.9.0"
+source = { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.0/jarvis_cd-1.9.0-py3-none-any.whl" }
 dependencies = [
     { name = "pandas" },
     { name = "podman-compose" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
+    { name = "pyyaml" },
+]
+wheels = [
+    { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.0/jarvis_cd-1.9.0-py3-none-any.whl", hash = "sha256:1959a6109b3f4666604d2d97b027f5daf50f3e8c674a9376a0f1ee5ec8e8a374" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pandas" },
+    { name = "podman-compose" },
+    { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=311" },
     { name = "pyyaml" },
 ]
 

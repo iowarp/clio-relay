@@ -125,9 +125,6 @@ echo "python: $python ($from)" >>"$log"
 # and a failed install leaves no jarvis behind.
 rm -rf "$dir/venv" "$dir/pin" "$dir/jarvis" "$dir/python" "$dir/pip"
 target="$dir/venv/bin/jarvis"
-# jarvis-cd takes its version from git (setuptools-scm), and an archive has no .git, so
-# the build is told one that names the pin.
-export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_JARVIS_CD="0+g${pin:0:12}"
 if ! { "$python" -m venv "$dir/venv" >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install --upgrade pip >>"$log" 2>&1 \
   && "$dir/venv/bin/python" -m pip install "jarvis-cd @ $source" >>"$log" 2>&1; } \
