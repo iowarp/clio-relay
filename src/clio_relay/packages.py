@@ -232,8 +232,9 @@ def _number(value: Any) -> float | None:
 def contract_value(value: Any, parameters: dict[str, Any]) -> Any:
     """Evaluate a contract value: a literal, ``{param: name}``, or integer arithmetic.
 
-    The arithmetic is ``{div|mul|add|ceil_div: [a, b]}`` over numbers and
-    parameter names, as clio-jarvis evaluates it. A missing operand gives ``None``.
+    The arithmetic is ``{div|mul|add|ceil_div: [a, b]}`` over numbers, parameter
+    names and nested arithmetic, as clio-jarvis evaluates it. A missing operand
+    gives ``None``.
     """
     if not isinstance(value, dict):
         return value
@@ -246,7 +247,7 @@ def contract_value(value: Any, parameters: dict[str, Any]) -> Any:
     if not isinstance(operands, list) or len(cast(list[Any], operands)) != 2:
         return None
     a, b = (
-        _number(parameters.get(item) if isinstance(item, str) else item)
+        _number(parameters.get(item) if isinstance(item, str) else contract_value(item, parameters))
         for item in cast(list[Any], operands)
     )
     if a is None or b is None:
