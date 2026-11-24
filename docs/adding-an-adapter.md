@@ -233,7 +233,9 @@ returns the first bytes of each stream, and stops it.
   own frp visitor (`clio_relay.frp_visitor`) on the desktop as its own
   process. That package is the whole desktop frp client: it reads the
   `visitor.toml` relay writes, a subset of frpc's format, and refuses any
-  setting it doesn't run rather than ignoring it. Nothing else in relay speaks
+  setting it doesn't run rather than ignoring it. It speaks `stcp`, and
+  `xtcp` with its UDP hole punch and QUIC tunnel, falling back to `stcp`
+  where the file names a `fallbackTo`. Nothing else in relay speaks
   frp's wire, and an adapter neither starts a desktop frp program nor imports
   the visitor.
 

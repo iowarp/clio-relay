@@ -66,9 +66,7 @@ Set it in the site's config, or pick it on the Compute page, where the site's
 form shows it as a choice. The worker's proxy follows the mode, so changing it
 asks for a sign-in, which places the worker again.
 
-Relay's visitor does not punch yet, so for now every `udp_rendezvous` link is
-refused with `punch_failed`, its message saying the visitor has no direct path
-yet. Use `brokered_tcp` until then. A punch that fails is refused the same way. Relay
+A punch that fails is refused with `punch_failed`, with frp's reason. Relay
 does not switch to `brokered_tcp` on its own. Retrying tries the same punch.
 To go through the rendezvous, set `link_mode: brokered_tcp`.
 

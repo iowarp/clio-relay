@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from clio_relay.frp_visitor import NO_DIRECT_MARKER, START_MARKER
+from clio_relay.frp_visitor import START_MARKER
 from clio_relay.serve.config import Rendezvous
 
 ENV_TOKEN = "CLIO_RELAY_FRP_TOKEN"
@@ -176,8 +176,6 @@ def direct_note(log_lines: list[str], wait_s: float) -> str:
     for line in log_lines:
         if any(marker in line for marker in RESTARTED):
             state, reason = "trying", ""
-        elif NO_DIRECT_MARKER in line:
-            state, reason = "no_direct", ""
         elif DIRECT_OPEN in line:
             state, reason = "open", ""
         elif FELL_BACK in line:
@@ -186,11 +184,6 @@ def direct_note(log_lines: list[str], wait_s: float) -> str:
             state = "failed"
             reason = _frp_message(line)
     wait = f"{wait_s:g} s"
-    if state == "no_direct":
-        return (
-            "the direct path (XTCP) is not in relay's frp visitor yet; connections go "
-            "through the rendezvous host (STCP)"
-        )
     if state == "open":
         return "direct path (XTCP) open"
     if state == "trying":

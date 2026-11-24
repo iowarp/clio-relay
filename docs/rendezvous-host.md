@@ -90,8 +90,8 @@ Set `"direct": true` to try a direct peer-to-peer path (XTCP) first. When it
 can't be made, frp falls back to the path through the rendezvous host. Relay
 never switches silently: the service's status and `clio-relay connect` say
 which path is in use, and why the direct one failed. Relay's desktop visitor
-doesn't make the direct path yet, so for now every connection goes through
-the rendezvous host and the status says so.
+punches the hole and carries the direct path over QUIC itself, as frpc
+does, so no frp program runs on the desktop.
 
 Two settings shape the direct path:
 

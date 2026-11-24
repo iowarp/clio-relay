@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, cast
 
 PROTOCOLS = ("tcp", "websocket", "wss")
+DEFAULT_STUN_SERVER = "stun.easyvoip.com:3478"
+"""frp's default ``natHoleStunServer``."""
 
 _COMMON_KEYS = {
     "serverAddr",
@@ -47,13 +49,17 @@ _VISITOR_KEYS = {
     "secretKey",
     "bindAddr",
     "bindPort",
+    "transport.useEncryption",
+    "transport.useCompression",
+}
+_XTCP_KEYS = {
+    "protocol",
     "keepTunnelOpen",
     "fallbackTo",
     "fallbackTimeoutMs",
     "maxRetriesAnHour",
     "minRetryInterval",
-    "transport.useEncryption",
-    "transport.useCompression",
+    "natTraversal.disableAssistedAddrs",
 }
 _NOT_YET = {
     "transport.proxyURL": "reaching the rendezvous host through an HTTP or SOCKS proxy",
@@ -87,6 +93,7 @@ class Server:
     tls_name: str | None = None
     tls_first_byte: bool = False
     login_fail_exit: bool = False
+    stun_server: str = DEFAULT_STUN_SERVER
 
     @property
     def uses_tls(self) -> bool:
@@ -112,6 +119,12 @@ class Visitor:
     server_user: str = ""
     use_encryption: bool = False
     fallback_to: str | None = None
+    protocol: str = "quic"
+    keep_tunnel_open: bool = False
+    fallback_timeout_ms: int = 1000
+    max_retries_an_hour: int = 8
+    min_retry_interval_s: int = 90
+    disable_assisted_addrs: bool = False
 
     def proxy_name(self, user: str) -> str:
         """Return the proxy name frps knows, with frp's ``user.`` prefix when there is one."""
@@ -127,10 +140,10 @@ class Config:
     visitors: tuple[Visitor, ...]
     debug: bool = False
 
-    def route(self, visitor: Visitor) -> Visitor:
-        """Return the visitor whose proxy a connection to ``visitor``'s port goes to."""
-        if visitor.kind == "stcp":
-            return visitor
+    def fallback(self, visitor: Visitor) -> Visitor | None:
+        """Return the stcp visitor an xtcp visitor's connections go to when there is no hole."""
+        if not visitor.fallback_to:
+            return None
         return next(v for v in self.visitors if v.name == visitor.fallback_to)
 
     def bound(self) -> list[Visitor]:
@@ -205,6 +218,7 @@ def _server(common: dict[str, Any]) -> Server:
         tls_name=common.get("transport.tls.serverName") or None,
         tls_first_byte=not _bool(common, "transport.tls.disableCustomTLSFirstByte", True),
         login_fail_exit=_bool(common, "loginFailExit", True),
+        stun_server=str(common.get("natHoleStunServer") or DEFAULT_STUN_SERVER),
     )
 
 
@@ -212,10 +226,17 @@ def _visitor(entry: dict[str, Any]) -> Visitor:
     name = entry.get("name")
     if not isinstance(name, str) or not name:
         raise ConfigError("every visitor needs a name")
-    _refuse_unknown(entry, _VISITOR_KEYS, f"visitor {name!r}: ")
     kind = entry.get("type")
     if kind not in ("stcp", "xtcp"):
         raise ConfigError(f"visitor {name!r}: type {kind!r} is not supported; use stcp or xtcp")
+    allowed = _VISITOR_KEYS | _XTCP_KEYS if kind == "xtcp" else _VISITOR_KEYS
+    _refuse_unknown(entry, allowed, f"visitor {name!r}: ")
+    protocol = str(entry.get("protocol", "quic"))
+    if protocol != "quic":
+        raise ConfigError(
+            f"visitor {name!r}: protocol {protocol!r} is not supported; relay's frp visitor "
+            "carries the direct path over quic"
+        )
     if _bool(entry, "transport.useCompression", False):
         raise ConfigError(f"visitor {name!r}: transport.useCompression is not supported")
     server_name = entry.get("serverName")
@@ -237,6 +258,12 @@ def _visitor(entry: dict[str, Any]) -> Visitor:
         server_user=str(entry.get("serverUser", "")),
         use_encryption=_bool(entry, "transport.useEncryption", False),
         fallback_to=entry.get("fallbackTo") or None,
+        protocol=protocol,
+        keep_tunnel_open=_bool(entry, "keepTunnelOpen", False),
+        fallback_timeout_ms=_positive(entry, "fallbackTimeoutMs", 1000),
+        max_retries_an_hour=_positive(entry, "maxRetriesAnHour", 8),
+        min_retry_interval_s=_positive(entry, "minRetryInterval", 90),
+        disable_assisted_addrs=_bool(entry, "natTraversal.disableAssistedAddrs", False),
     )
 
 
@@ -247,13 +274,13 @@ def _check_visitors(visitors: tuple[Visitor, ...]) -> None:
         raise ConfigError(f"two visitors are named {duplicate!r}")
     by_name = {v.name: v for v in visitors}
     for visitor in visitors:
-        if visitor.kind != "xtcp":
+        if visitor.kind != "xtcp" or not visitor.fallback_to:
             continue
-        target = by_name.get(visitor.fallback_to or "")
+        target = by_name.get(visitor.fallback_to)
         if target is None or target.kind != "stcp":
             raise ConfigError(
-                f"visitor {visitor.name!r}: relay's frp visitor has no direct path (XTCP) "
-                "yet, so an xtcp visitor needs fallbackTo naming an stcp visitor"
+                f"visitor {visitor.name!r}: fallbackTo {visitor.fallback_to!r} must name an "
+                "stcp visitor in the same file"
             )
     if not any(v.bind_port > 0 for v in visitors):
         raise ConfigError("no visitor has a bindPort, so there is nothing to listen on")
@@ -312,3 +339,11 @@ def _bool(entry: dict[str, Any], key: str, default: bool) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{key} must be true or false")
     return value
+
+
+def _positive(entry: dict[str, Any], key: str, default: int) -> int:
+    """Read a count where 0 means frp's default, as frp's ``EmptyOr`` does."""
+    value = _int(entry, key, default)
+    if value < 0:
+        raise ConfigError(f"{key} must not be negative")
+    return value or default

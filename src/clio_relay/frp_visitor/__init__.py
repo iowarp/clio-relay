@@ -16,11 +16,14 @@ The boundary is deliberately small:
 
 It speaks frp 0.69's v1 wire protocol to ``frps``: token login, STCP visitor
 connections, heartbeats, the yamux multiplexer, and the ``tcp`` (with or without
-TLS), ``websocket`` and ``wss`` transports. XTCP (the direct path) is not built
-yet: an XTCP visitor with a ``fallbackTo`` is served through its STCP fallback,
-and the log says so. Nothing else in relay knows these details. Relay starts it
-with :func:`command`, both for a served port (``serve.forward``) and for the
-worker's link (``frp_link``).
+TLS), ``websocket`` and ``wss`` transports. An XTCP visitor (the direct path)
+punches a UDP hole to the peer frpc through frps (``nathole.py``) and carries
+each connection as one stream of a QUIC tunnel over it (``quic.py``), as frp's
+own visitor does. When there is no hole within ``fallbackTimeoutMs`` a
+connection goes to the visitor's STCP ``fallbackTo``, and the log says so in
+frpc's words; ``visitor.py`` only picks that route. Nothing else in relay knows
+these details. Relay starts it with :func:`command`, both for a served port
+(``serve.forward``) and for the worker's link (``frp_link``).
 """
 
 from __future__ import annotations
@@ -37,9 +40,6 @@ PROTOCOL_VERSION = "0.69.1"
 
 START_MARKER = "start relay frp visitor"
 """Logged once when the process starts, so a reader can tell a restart."""
-
-NO_DIRECT_MARKER = "has no direct path (XTCP) yet"
-"""Logged when an XTCP visitor is served through its STCP fallback."""
 
 
 def command(config_path: Path | str) -> list[str]:

@@ -19,10 +19,12 @@ import ssl
 import sys
 import time
 from datetime import datetime
+from typing import Any
 
-from clio_relay.frp_visitor import NO_DIRECT_MARKER, PROTOCOL_VERSION, START_MARKER
+from clio_relay.frp_visitor import PROTOCOL_VERSION, START_MARKER
 from clio_relay.frp_visitor.config import Config, Visitor
 from clio_relay.frp_visitor.dial import dial
+from clio_relay.frp_visitor.nathole import HoleError
 from clio_relay.frp_visitor.pipe import (
     NETWORK_ERRORS,
     BufferedPipe,
@@ -31,9 +33,12 @@ from clio_relay.frp_visitor.pipe import (
     TcpPipe,
     join,
 )
+from clio_relay.frp_visitor.quic import OPEN_TUNNEL_S, DirectPath
 from clio_relay.frp_visitor.wire import (
     LOGIN,
     LOGIN_RESP,
+    NAT_HOLE_RESP,
+    NAT_HOLE_VISITOR,
     NEW_VISITOR_CONN,
     NEW_VISITOR_CONN_RESP,
     PING,
@@ -47,6 +52,9 @@ from clio_relay.frp_visitor.yamux import Session
 
 ANSWER_S = 10.0
 """How long frpc waits for frps to answer a login or a visitor connection."""
+
+EXCHANGE_S = 5.0
+"""How long frpc waits for frps to answer a NAT hole message."""
 
 HOLD_S = 10.0
 """How long a connection waits for the rendezvous host to come back."""
@@ -121,9 +129,12 @@ class VisitorProcess:
         self.config = config
         self.run_id = ""
         self._connector: Connector | None = None
+        self._control_pipe: BufferedPipe | None = None
         self._up = asyncio.Event()
         self._servers: list[asyncio.Server] = []
         self._connections: set[asyncio.Task[None]] = set()
+        self._direct: list[DirectPath] = []
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     async def run(self) -> int:
         """Log in, hold the ports and serve, logging in again after each drop."""
@@ -222,13 +233,22 @@ class VisitorProcess:
                     if body.get("error"):
                         return f"frps refused the heartbeat: {body['error']}"
                     last_pong = time.monotonic()
+                elif kind == NAT_HOLE_RESP:
+                    waiter = self._pending.get(str(body.get("transaction_id", "")))
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(body)
                 elif self.config.debug:
                     log("D", f"ignored control message type {kind!r}")
 
+        self._control_pipe = control
         tasks = [asyncio.create_task(heartbeat()), asyncio.create_task(receive())]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            self._control_pipe = None
+            for waiter in self._pending.values():
+                if not waiter.done():
+                    waiter.set_exception(ConnectionResetError("the control connection closed"))
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -240,16 +260,46 @@ class VisitorProcess:
             return _describe(exc)
         raise exc
 
+    async def transact(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Send a NatHoleVisitor message and return frps' NatHoleResp to it, as frp's transporter.
+
+        The whole exchange, including waiting for the rendezvous host to be
+        connected, takes at most ``EXCHANGE_S``.
+        """
+        transaction = str(body["transaction_id"])
+        waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[transaction] = waiter
+        try:
+            async with asyncio.timeout(EXCHANGE_S):
+                await self._up.wait()
+                control = self._control_pipe
+                if control is None:
+                    raise ConnectionResetError("the rendezvous host is not connected")
+                await control.write(pack(NAT_HOLE_VISITOR, body))
+                return await waiter
+        except TimeoutError as exc:
+            raise HoleError("get natHoleRespMsg error: context deadline exceeded") from exc
+        except NETWORK_ERRORS as exc:
+            raise HoleError(f"get natHoleRespMsg error: {_describe(exc)}") from exc
+        finally:
+            self._pending.pop(transaction, None)
+            if not waiter.done():
+                waiter.cancel()
+
     async def _bind(self) -> None:
+        server = self.config.server
         for visitor in self.config.bound():
-            route = self.config.route(visitor)
-            if route is not visitor:
-                log(
-                    "W",
-                    f"[{visitor.name}] relay's frp visitor {NO_DIRECT_MARKER}; connections "
-                    f"go through the rendezvous host as [{route.name}]",
+            direct: DirectPath | None = None
+            if visitor.kind == "xtcp":
+                direct = DirectPath(
+                    visitor,
+                    proxy_name=visitor.proxy_name(server.user),
+                    stun_server=server.stun_server,
+                    rendezvous=f"{server.address}:{server.port}",
+                    transact=self.transact,
+                    log=log,
                 )
-            handler = functools.partial(self._accept, visitor, route)
+            handler = functools.partial(self._accept, visitor, direct)
             try:
                 listener = await asyncio.start_server(handler, visitor.bind_addr, visitor.bind_port)
             except OSError as exc:
@@ -258,11 +308,14 @@ class VisitorProcess:
             self._servers.append(listener)
             address = f"{visitor.bind_addr}:{visitor.bind_port}"
             log("I", f"[{visitor.name}] start visitor success on {address}")
+            if direct is not None:
+                self._direct.append(direct)
+                direct.start()
 
     async def _accept(
         self,
         visitor: Visitor,
-        route: Visitor,
+        direct: DirectPath | None,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
@@ -271,25 +324,43 @@ class VisitorProcess:
             self._connections.add(task)
         user = TcpPipe(reader, writer)
         try:
-            try:
-                await asyncio.wait_for(self._up.wait(), HOLD_S)
-            except TimeoutError:
-                log(
-                    "W",
-                    f"[{visitor.name}] the rendezvous host is not connected; closed a connection",
-                )
-                return
-            try:
-                remote = await self._open(route)
-            except NETWORK_ERRORS as exc:
-                log("W", f"[{visitor.name}] start new visitor connection error: {_describe(exc)}")
-                return
-            await join(user, remote)
+            remote = await self._route(visitor, direct)
+            if remote is not None:
+                await join(user, remote)
         finally:
             with contextlib.suppress(*NETWORK_ERRORS):
                 await user.close()
             if task is not None:
                 self._connections.discard(task)
+
+    async def _route(self, visitor: Visitor, direct: DirectPath | None) -> Pipe | None:
+        """Pick the path for one connection: the direct tunnel, else the STCP fallback."""
+        route: Visitor | None = visitor
+        if direct is not None:
+            route = self.config.fallback(visitor)
+            wait_s = visitor.fallback_timeout_ms / 1000 if route is not None else OPEN_TUNNEL_S
+            try:
+                stream = await direct.open(wait_s)
+            except TimeoutError as exc:
+                log("E", f"[{visitor.name}] open tunnel error: {exc}")
+            else:
+                if not visitor.use_encryption:
+                    return stream
+                return CryptoPipe(BufferedPipe(stream), visitor.secret_key)
+            if route is None:
+                return None
+            if self.config.debug:
+                log("D", f"[{visitor.name}] try to transfer connection to visitor: {route.name}")
+        try:
+            await asyncio.wait_for(self._up.wait(), HOLD_S)
+        except TimeoutError:
+            log("W", f"[{visitor.name}] the rendezvous host is not connected; closed a connection")
+            return None
+        try:
+            return await self._open(route)
+        except NETWORK_ERRORS as exc:
+            log("W", f"[{visitor.name}] start new visitor connection error: {_describe(exc)}")
+            return None
 
     async def _open(self, route: Visitor) -> Pipe:
         connector = self._connector
@@ -323,6 +394,8 @@ class VisitorProcess:
         for task in list(self._connections):
             task.cancel()
         await asyncio.gather(*self._connections, return_exceptions=True)
+        for direct in self._direct:
+            await direct.close()
         if self._connector is not None:
             await self._connector.close()
 

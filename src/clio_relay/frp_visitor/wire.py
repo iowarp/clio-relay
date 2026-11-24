@@ -4,7 +4,9 @@ A v1 message is a type byte, a big-endian int64 length and a JSON body whose
 empty fields are left out, as Go's ``omitempty`` does. After login the control
 stream is encrypted with the token, and a visitor connection with
 ``useEncryption`` with its secret key: AES-128-CFB, with the key from PBKDF2
-(SHA-1, salt ``frp``, 64 rounds) and a random IV each way, sent first.
+(SHA-1, salt ``frp``, 64 rounds) and a random IV each way, sent first. A hole
+punch's datagram carries one whole message, sealed the same way with the secret
+key and its own IV.
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ NEW_VISITOR_CONN = b"v"
 NEW_VISITOR_CONN_RESP = b"3"
 PING = b"h"
 PONG = b"4"
+NAT_HOLE_VISITOR = b"i"
+NAT_HOLE_RESP = b"m"
+NAT_HOLE_SID = b"5"
 KNOWN_TYPES = frozenset(b"o1p2cwrsv3h4uinm56")
 """Every v1 type byte frp 0.69 defines; one outside these is a protocol error."""
 
@@ -50,20 +55,55 @@ def pack(kind: bytes, body: dict[str, Any]) -> bytes:
 async def read_message(pipe: BufferedPipe) -> tuple[bytes, dict[str, Any]]:
     """Read one message and return its type byte and body."""
     head = await pipe.readexactly(1 + _LENGTH.size)
+    kind, length = _head(head)
+    data = await pipe.readexactly(length) if length else b""
+    return kind, _body(data)
+
+
+def parse(data: bytes) -> tuple[bytes, dict[str, Any]]:
+    """Decode one whole message held in ``data``, as a datagram carries it."""
+    size = 1 + _LENGTH.size
+    if len(data) < size:
+        raise ProtocolError("the message is shorter than its header")
+    kind, length = _head(data[:size])
+    if len(data) != size + length:
+        raise ProtocolError("the message length does not match its header")
+    return kind, _body(data[size:])
+
+
+def seal(data: bytes, secret: str) -> bytes:
+    """Encrypt one datagram as frp's ``crypto.Encode`` does: a random IV, then AES-128-CFB."""
+    iv = os.urandom(16)
+    encryptor = _cipher(secret, iv).encryptor()
+    return iv + encryptor.update(data) + encryptor.finalize()
+
+
+def unseal(data: bytes, secret: str) -> bytes:
+    """Decrypt one datagram that :func:`seal` (or frp's ``crypto.Encode``) made."""
+    if len(data) < 16:
+        raise ProtocolError("the datagram is shorter than its IV")
+    decryptor = _cipher(secret, data[:16]).decryptor()
+    return decryptor.update(data[16:]) + decryptor.finalize()
+
+
+def _head(head: bytes) -> tuple[bytes, int]:
     kind = head[:1]
     if kind[0] not in KNOWN_TYPES:
         raise ProtocolError(f"frps sent message type {kind!r}, which frp does not define")
     (length,) = _LENGTH.unpack(head[1:])
     if length < 0 or length > MAX_MESSAGE:
         raise ProtocolError(f"frps sent a message of {length} bytes")
-    data = await pipe.readexactly(length) if length else b""
+    return kind, length
+
+
+def _body(data: bytes) -> dict[str, Any]:
     try:
         body: object = json.loads(data) if data else {}
     except ValueError as exc:
         raise ProtocolError(f"frps sent a message that is not JSON: {exc}") from exc
     if not isinstance(body, dict):
         raise ProtocolError("frps sent a message that is not a JSON object")
-    return kind, cast(dict[str, Any], body)
+    return cast(dict[str, Any], body)
 
 
 def _cipher(secret: str, iv: bytes) -> Cipher[modes.CFB]:
