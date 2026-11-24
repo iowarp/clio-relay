@@ -50,6 +50,9 @@ def _summary(view: dict[str, Any]) -> str:
             line += f"\n{seen}."
     endpoint: dict[str, Any] = result.get("endpoint") or {}
     ports: list[dict[str, Any]] = endpoint.get("ports") or []
+    if ports and OperationState(view["state"]).final:
+        line += "\nIts endpoint is closed: the service has ended."
+        ports = []
     for port in ports:
         line += f"\n{port['name']}: {address(port)}"
     if ports and view["state"] == OperationState.RUNNING.value:
