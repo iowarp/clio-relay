@@ -94,13 +94,23 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         return await relay.exec(ctx, site, command, timeout_s, max_output_bytes, read_only=True)
 
     @server.tool(name="packages_read", title="List the packages relay can run", annotations=READ)
-    async def packages_read() -> ToolResult:  # pyright: ignore[reportUnusedFunction]
+    async def packages_read(  # pyright: ignore[reportUnusedFunction]
+        match: Annotated[
+            str | None,
+            Field(description="Keep the available packages whose name or summary has these words"),
+        ] = None,
+    ) -> ToolResult:
         """List the JARVIS packages staged in relay's catalog, with their versions,
-        SHA-256s and sources, and relay's package sources. run takes a package by its
-        name from this list. An archive its sources replaced shows superseded_by. To
-        stage or remove one, use packages. This only reads."""
+        SHA-256s and sources, relay's package sources, and under available every
+        package those sources hold, staged or not, with its summary and whether it
+        has a relay contract. Look here for the application before writing a
+        package: an application's package takes its own input (a script, an input
+        bundle, a settings file), so a new case is that input, not a new package.
+        match ("lammps", "molecular dynamics") narrows available. run takes a
+        package by its name; stage an available one first with packages. An
+        archive its sources replaced shows superseded_by. This only reads."""
         try:
-            return _shown(await packages_op(relay.service, PackagesArgs(op="list")))
+            return _shown(await packages_op(relay.service, PackagesArgs(op="list", match=match)))
         except Refusal as refusal:
             return refusal_result(refusal)
 

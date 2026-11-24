@@ -27,7 +27,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.packages import PackageEntry, refresh_from_sources, stage_dir, stage_source
+from clio_relay.packages import (
+    PackageEntry,
+    refresh_from_sources,
+    source_packages,
+    stage_dir,
+    stage_source,
+)
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
@@ -54,6 +60,7 @@ class PackagesArgs(BaseModel):
     dir: str | None = None
     version: str | None = None
     sha256: str | None = None
+    match: str | None = None
 
 
 def _view(entry: PackageEntry) -> dict[str, Any]:
@@ -111,6 +118,12 @@ def _apply(service: RelayService, args: PackagesArgs) -> dict[str, Any]:
         refresh_from_sources(service.paths.state_dir, service.paths.package_sources)
     result["packages"] = [_view(entry) for entry in service.packages.all()]
     result["sources"] = [str(source) for source in service.paths.package_sources]
+    if args.op == "list":
+        staged = {entry.name for entry in service.packages.all()}
+        result["available"] = [
+            {**item, "staged": item["name"] in staged}
+            for item in source_packages(service.paths.package_sources, args.match)
+        ]
     return result
 
 

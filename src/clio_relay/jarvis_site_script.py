@@ -154,7 +154,9 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
         fail 1 "installing the Python requirements of $repo failed: $listed_now"
       }
     fi
-    "$found" repo add "$root/src/$repo" >/dev/null
+    # +force, in this job's own root only: init registered JARVIS's builtin here, and a
+    # reviewed archive of that name must replace it, or the unreviewed copy would run.
+    "$found" repo add "$root/src/$repo" +force >/dev/null
   done
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi

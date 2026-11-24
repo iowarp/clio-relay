@@ -11,7 +11,7 @@ from clio_relay.jarvis_site import archive_package
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import PackageRef
-from clio_relay.packages import PackageCatalog, describe_archive, main, stage
+from clio_relay.packages import PackageCatalog, describe_archive, main, source_packages, stage
 
 from .conftest import make_repo
 
@@ -124,3 +124,21 @@ def test_the_command_line_stages_and_lists(
     assert main(["stage", str(repo), "demo.other", "--dry-run"]) == 2
     assert "--version" in capsys.readouterr().err
     assert main(["stage", str(repo), "demo.nothing", "--version", "1"]) == 2
+
+
+def test_the_sources_list_their_packages_without_running_them(tmp_path: Path) -> None:
+    checkout = tmp_path / "sources" / "demo-checkout"
+    repo = make_repo(checkout)
+    (repo / "demo" / "hello" / "README.md").write_text(
+        "# Hello\n\n```\nnot this\n```\n\nSays hello\nto the site.\n\nMore.\n"
+    )
+    (repo / "demo" / "other" / "contract.yaml").write_text("summary: Another   demo\n")
+    listed = source_packages([tmp_path / "sources"])
+    assert listed == [
+        {"name": "demo.hello", "summary": "Says hello to the site.", "contract": False},
+        {"name": "demo.other", "summary": "Another demo", "contract": True},
+    ]
+    assert [item["name"] for item in source_packages([tmp_path / "sources"], "ANOTHER")] == [
+        "demo.other"
+    ]
+    assert source_packages([tmp_path / "missing"]) == []

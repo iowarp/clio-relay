@@ -669,8 +669,8 @@ class RelayServer:
             stage or run by name uses their new archive and lists the old one with
             superseded_by; pin its sha256 to run it. Staging runs nothing: a guarded site
             reviews the archive by its SHA-256 before its first run there, and the archive
-            reaches the site through relay's own transfer. To list what is staged, use
-            packages_read, which only reads."""
+            reaches the site through relay's own transfer. To list what is staged and what
+            the package sources hold (available), use packages_read, which only reads."""
             args = PackagesArgs(op=op, package=package, dir=dir, version=version, sha256=sha256)
 
             try:

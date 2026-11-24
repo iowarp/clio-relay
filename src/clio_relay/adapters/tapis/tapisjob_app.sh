@@ -89,10 +89,12 @@ package | package-service)
     pipeline="relay_${_tapisJobUUID:-job}"
     pipeline="${pipeline//-/_}"
     # A JARVIS of the job's own, so the site's ~/.ppi-jarvis is never read or changed.
+    # +force: jarvis init registers JARVIS's own builtin here, and a reviewed archive
+    # of the same repository name must replace it, or the unreviewed copy would run.
     export JARVIS_ROOT="$job_dir/.relay-jarvis"
     {
         jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared" \
-            && jarvis repo add "$unpacked/$repo" \
+            && jarvis repo add "$unpacked/$repo" +force \
             && jarvis ppl create "$pipeline" \
             && jarvis ppl append "$name" pkg ${params[@]+"${params[@]}"} \
             || finish "$?"
