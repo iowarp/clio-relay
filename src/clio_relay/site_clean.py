@@ -1,9 +1,12 @@
 """``clio-relay site clean``: remove what relay deployed on a site, so the next use redeploys.
 
 It stops relay's processes on the site first (:mod:`clio_relay.shutdown`), then
-removes the worker and its binaries, relay's scripts and job directories, the
-JARVIS bootstrap venv with JARVIS's resource graph, and ``~/.clio-relay`` and
-``~/.config/clio-relay``. The person's Spack store (``<site home>/spack`` and
+removes this site's own deployment: its configured ``remote_dir``, which holds the
+worker and its binaries, relay's scripts and job directories, the JARVIS bootstrap
+venv with JARVIS's resource graph, and the login hop. Nothing outside it goes, so
+another relay home on the same account (its own ``remote_dir``) is untouched; a
+``hop_dir`` setting elsewhere adds only this site's hop directory. The person's
+Spack store (``<site home>/spack`` and
 ``<site home>/spack-config``) is kept unless ``remove_spack`` says otherwise;
 rebuilding it takes hours. JARVIS's recorded install answers
 (``<site home>/jarvis-cd/site/decisions.yaml``: which MPI, which compiler) are
@@ -38,7 +41,7 @@ from typing import TYPE_CHECKING, Any, cast
 from clio_relay.adapters.base import CleansSite, ListsLiveJobs, ShutsDown
 from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.relay_state import COMMON_TARGETS, under
+from clio_relay.relay_state import under
 from clio_relay.shutdown import shutdown
 from clio_relay.site_prune import is_decisions, kept
 from clio_relay.surface import installing, queue_switch
@@ -234,7 +237,8 @@ async def plan(
         found, spared = cleaner.clean_targets()
         targets += found
         keep += spared
-    targets = list(dict.fromkeys([*targets, *COMMON_TARGETS, *_hop_dirs(service, site_id)]))
+    targets = list(dict.fromkeys(targets))
+    targets += [hop for hop in _hop_dirs(service, site_id, cleaners) if not under(hop, targets)]
     outputs = run_outputs(service, site_id, targets)
     return {
         "site": site_id,
@@ -315,7 +319,13 @@ def _outputs_line(planned: dict[str, Any]) -> str:
     )
 
 
-def _hop_dirs(service: RelayService, site_id: str) -> list[str]:
+def _hop_dirs(service: RelayService, site_id: str, cleaners: list[Any]) -> list[str]:
+    """This site's own login hop directory, as each cleaning adapter places it.
+
+    By default it is under the adapter's relay directory, already a target; a
+    ``hop_dir`` setting puts it elsewhere, and then only this site's directory in
+    it goes, never the other sites' hops beside it.
+    """
     try:
         from clio_relay.serve import config as serve_settings
     except ModuleNotFoundError:
@@ -326,7 +336,9 @@ def _hop_dirs(service: RelayService, site_id: str) -> list[str]:
         serve = serve_settings.site_serve(loaded, site_id, getattr(site, "serve", None))
     except Refusal:
         return []
-    return [serve.hop_dir]
+    return list(
+        dict.fromkeys(serve_settings.hop_dir_for(serve, cleaner, site_id) for cleaner in cleaners)
+    )
 
 
 def describe_plan(planned: dict[str, Any]) -> str:

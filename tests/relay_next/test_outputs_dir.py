@@ -110,12 +110,17 @@ def test_a_run_naming_relays_state_is_refused_with_the_outputs_directory() -> No
     for job in (
         _job(run_dir="/home/u/.clio-relay/naca_production"),
         _job(mesh="~/.clio-relay/body.stl"),
-        JobSpec(executable="x", directory="~/.config/clio-relay/run"),
+        JobSpec(executable="x", directory="~/.clio-relay/run"),
     ):
         with pytest.raises(Refusal) as caught:
             relay_state.refuse_relay_state(cleaner, job, "ares")
         assert caught.value.reason is RefusalReason.INVALID_SPEC
         assert "clio-relay-runs" in caught.value.message
+    # Another relay home's directories are not this site's deployment.
+    relay_state.refuse_relay_state(cleaner, _job(run_dir="~/.clio-relay-w2/x"), "ares")
+    relay_state.refuse_relay_state(
+        cleaner, JobSpec(executable="x", directory="~/.config/clio-relay/run"), "ares"
+    )
     relay_state.refuse_relay_state(object(), _job(run_dir="/home/u/.clio-relay/x"), "ares")
 
 

@@ -117,7 +117,7 @@ host:
 | `address`, `port` | The rendezvous host as the site sees it, when that differs from the desktop's view. |
 | `hop` | `none`: compute nodes dial out themselves. `login`: relay starts a small proxy on the login node while the site's services run, and the node's frp client goes through it. `http_proxy`: use the site's own HTTP proxy, named in `proxy_url`. |
 | `hop_advertise` | The login node's address as compute nodes see it, when its host name doesn't resolve there. |
-| `hop_dir` | Where the login hop keeps its lock, leases and password on the site, one directory per site. `~/.clio-relay/hop` by default. |
+| `hop_dir` | Where the login hop keeps its lock, leases and password on the site, one directory per site. By default `hop` under the site's own relay directory (its `remote_dir`), so site clean removes it with that directory. |
 | `login_limits` | What the login hop may use: `cpu_quota_percent`, `memory_mb`, `address_space_mb` and `cpu_s`. |
 | `path` | `auto` (the default) uses frp when a rendezvous host is set and frp can work: the site has an `frpc` or `frpc_binary`, relay's visitor speaks the transport, and the token reads. Otherwise it uses `ssh -L`. `frp` or `ssh` forces one. |
 | `stun_server` | The STUN server for this site's frp client, when the site can't reach the rendezvous one. |

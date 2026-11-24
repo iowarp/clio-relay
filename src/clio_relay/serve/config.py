@@ -135,10 +135,13 @@ class SiteServe(BaseModel):
         default=None, description="A local frpc built for the site, to stage"
     )
     python: str = Field(default="python3", description="Python on the login side, for the hop")
-    hop_dir: str = Field(
-        default="~/.clio-relay/hop",
+    hop_dir: str | None = Field(
+        default=None,
         min_length=1,
-        description="Where the login hop keeps its lock, leases and token, one directory per site",
+        description=(
+            "Where the login hop keeps its lock, leases and token, one directory per site. "
+            "Defaults to hop under the site's own relay directory (its remote_dir)"
+        ),
     )
     login_limits: LoginLimits = Field(
         default_factory=LoginLimits, description="What the login hop may use on the login node"
@@ -240,6 +243,30 @@ def site_serve(value: ServeSettings, site_id: str, entry_serve: Any = None) -> S
                 site=site_id,
             ) from exc
     return value.sites.get(site_id, SiteServe())
+
+
+FALLBACK_HOP_DIR = "~/.clio-relay/hop"
+"""The hop's parent on a site whose adapter names no relay directory of its own."""
+
+
+def hop_dir_for(site: SiteServe, adapter: Any, site_id: str) -> str:
+    """Return the login hop's directory for ``site_id``: ``<hop_dir>/<site>``.
+
+    Without a ``hop_dir`` setting, it is under the site's own relay directory
+    (:func:`clio_relay.relay_state.relay_dir`), so two relay homes on one account,
+    each with its own ``remote_dir``, never share a hop, and site clean removes it
+    with that directory.
+    """
+    from clio_relay.relay_state import relay_dir
+    from clio_relay.serve.runtime_util import safe_name
+
+    parent = site.hop_dir
+    if parent is None:
+        own = relay_dir(adapter)
+        parent = f"{own.rstrip('/')}/hop" if own else FALLBACK_HOP_DIR
+        if not parent.startswith(("/", "~")):
+            parent = f"~/{parent}"
+    return f"{parent.rstrip('/')}/{safe_name(site_id)}"
 
 
 def show(path: Path) -> dict[str, Any]:

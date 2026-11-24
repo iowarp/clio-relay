@@ -25,6 +25,7 @@ from clio_relay.adapters.base import CleansSite, ListsLiveJobs
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.serve import config as serve_settings
 from clio_relay.site_prune import jobs_script, parse_live, parse_report
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
@@ -131,6 +132,42 @@ def test_the_plan_goes_on_when_the_scheduler_lists_none(
             await service.close()
 
     assert "~/relay-worker" in asyncio.run(scenario())["targets"]
+
+
+def test_the_plan_names_only_this_sites_own_deployment(
+    relay_paths: RelayPaths, site: dict[str, Any]
+) -> None:
+    """Its remote_dir with the hop under it; never another relay home's directories."""
+    add_site(relay_paths)
+
+    async def targets() -> list[str]:
+        service = RelayService(relay_paths)
+        try:
+            return list((await site_clean.plan(service, "fx"))["targets"])
+        finally:
+            await service.close()
+
+    assert asyncio.run(targets()) == ["~/relay-worker"]
+    settings = serve_settings.settings_path(relay_paths.state_dir)
+    serve_settings.save(
+        settings,
+        serve_settings.ServeSettings(
+            sites={"fx": serve_settings.SiteServe(hop_dir="/scratch/hops")}
+        ),
+    )
+    assert asyncio.run(targets()) == ["~/relay-worker", "/scratch/hops/fx"]
+
+
+def test_the_hop_lives_under_the_sites_relay_directory() -> None:
+    class _Ssh:
+        def clean_targets(self) -> tuple[list[str], list[str]]:
+            return [".clio-relay-w1"], []
+
+    default = serve_settings.SiteServe()
+    assert serve_settings.hop_dir_for(default, _Ssh(), "ares") == "~/.clio-relay-w1/hop/ares"
+    assert serve_settings.hop_dir_for(default, object(), "ares") == "~/.clio-relay/hop/ares"
+    moved = serve_settings.SiteServe(hop_dir="/scratch/hops/")
+    assert serve_settings.hop_dir_for(moved, _Ssh(), "ares") == "/scratch/hops/ares"
 
 
 def test_a_prune_that_found_a_live_job_refuses(

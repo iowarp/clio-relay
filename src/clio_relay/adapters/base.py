@@ -300,7 +300,12 @@ class CleansSite(Protocol):
     """
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
-        """Return the site paths relay deployed, and those it keeps."""
+        """Return the site paths relay deployed, and those it keeps.
+
+        The first path is the site's own relay directory (its ``remote_dir``): the
+        login hop defaults to a directory under it. Only this site's deployment is
+        named, never a home-wide path another relay home on the account may use.
+        """
         ...
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:

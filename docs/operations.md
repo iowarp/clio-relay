@@ -105,9 +105,12 @@ clio-relay site clean my-site +json
 ```
 
 This asks you first, since it deletes files on the site. After a yes it stops
-relay's processes there, then removes the worker and its binaries,
-site-serve, relay's scripts and job directories, `~/.clio-relay`,
-`~/.config/clio-relay` and the JARVIS bootstrap venv under the site home. It
+relay's processes there, then removes this site's own deployment: its
+configured `remote_dir`, which holds the worker and its binaries, site-serve,
+relay's scripts and job directories, the login hop and the JARVIS bootstrap
+venv. Nothing outside it goes, so another relay home on the same account,
+with its own `remote_dir`, is left alone. If you moved the login hop with the
+site's serve `hop_dir`, clean also removes this site's directory in it. It
 keeps the Spack store (`<site home>/spack`, with every package built there):
 rebuilding ParaView takes hours. It also keeps JARVIS's recorded install
 answers (`<site home>/jarvis-cd/site/decisions.yaml`: which MPI, which

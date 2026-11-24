@@ -1,5 +1,10 @@
 """Relay's own state on a site, which ``site clean`` deletes, and the runs kept out of it.
 
+That state is the site's own deployment: the directories its cleaning adapter
+names (:meth:`~clio_relay.adapters.base.CleansSite.clean_targets`), its configured
+``remote_dir`` first, with the worker and the login hop under it. Never a home-wide
+path: another relay home on the same account has its own ``remote_dir``.
+
 A run's outputs and inputs are the person's. They never belong in relay's
 deployment, so a run or serve whose job names a path there is refused before
 anything is asked, with the site's outputs directory to use instead.
@@ -13,8 +18,13 @@ from clio_relay.adapters.base import CleansSite
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
-COMMON_TARGETS = ("~/.clio-relay", "~/.config/clio-relay")
-"""Relay's state on any site, whichever adapter reaches it."""
+
+def relay_dir(adapter: Any) -> str | None:
+    """Return the site's own relay directory (its ``remote_dir``), or None without one."""
+    if not isinstance(adapter, CleansSite):
+        return None
+    found, _kept = adapter.clean_targets()
+    return found[0] if found else None
 
 
 def under(path: str, targets: list[str]) -> bool:
@@ -49,7 +59,7 @@ def refuse_relay_state(adapter: Any, job: JobSpec, site_id: str) -> None:
     if not isinstance(adapter, CleansSite):
         return
     found, _kept = adapter.clean_targets()
-    targets = [*found, *COMMON_TARGETS]
+    targets = list(found)
     outputs = getattr(getattr(adapter, "config", None), "outputs_dir", None)
     if outputs and under(outputs if outputs.startswith(("/", "~")) else f"~/{outputs}", targets):
         raise Refusal(

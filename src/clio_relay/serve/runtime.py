@@ -69,7 +69,6 @@ from clio_relay.serve.report import (
 )
 from clio_relay.serve.runtime_util import (
     maybe,
-    safe_name,
     scheduler_job_name,
     site_id_of,
     state_dir_of,
@@ -308,7 +307,7 @@ class ServeRuntime(ForwardCare):
         if adapter is None or hop_plan is None:
             return stopped
         site = hop_plan.site_serve
-        hop_dir = f"{site.hop_dir.rstrip('/')}/{safe_name(site_id)}"
+        hop_dir = serve_settings.hop_dir_for(site, adapter, site_id)
         argv = [site.python, "-c", site_file("hop_proxy.py").decode(), "shutdown", hop_dir, "-"]
         run: Any = getattr(adapter, "hop_exec", None) or adapter.exec
         result = cast(
@@ -502,7 +501,7 @@ class ServeRuntime(ForwardCare):
     async def _hop(self, adapter: Any, plan: ServePlan, mode: str, *args: str) -> ExecResult:
         """Run the login hop's ``mode`` on the site, light (:mod:`clio_relay.login_load`)."""
         site = plan.site_serve
-        hop_dir = f"{site.hop_dir.rstrip('/')}/{safe_name(plan.site)}"
+        hop_dir = serve_settings.hop_dir_for(site, adapter, plan.site)
         argv = [
             site.python,
             "-c",
