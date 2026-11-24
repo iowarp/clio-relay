@@ -114,6 +114,12 @@ see the same jobs. Relay submits each operation once: the record is written
 before the adapter is called, and `find` reconciles a job whose handle was
 never recorded.
 
+Each operation also names its owner: the relay process that opened or took
+it over, and that relay's version. A relay of another version only reports
+an operation whose owner is still running, and an older relay never takes
+over a newer one's, so two versions on one state directory never both move a
+job.
+
 The content store holds bytes by SHA-256. `files(op="stage")` puts them there,
 and a job input names them by digest, so the same input is never uploaded
 twice.

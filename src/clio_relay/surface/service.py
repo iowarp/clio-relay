@@ -13,7 +13,7 @@ import logging
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay import jarvis_submit, relay_state, site_clean
+from clio_relay import __version__, jarvis_submit, relay_state, site_clean
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
@@ -29,6 +29,7 @@ from clio_relay.adapters.hooks import (
 from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
+from clio_relay.jobs.ownership import ServeLease
 from clio_relay.jobs.records import (
     OperationKind,
     OperationRecord,
@@ -138,6 +139,7 @@ class RelayService:
             paths.operations_dir, OperationRecord
         )
         self.asks: RecordStore[Ask] = RecordStore(paths.asks_dir, Ask)
+        self.lease = ServeLease(paths.operations_dir / ".serves", __version__, new_id("serve"))
         settings: dict[str, Any] = {
             "grant_files": {key: str(value) for key, value in paths.grant_files.items()},
             "config_dir": str(paths.config_dir),
@@ -156,6 +158,7 @@ class RelayService:
         """Release the hooks."""
         await self.ask_provider.close()
         await self.serve_hook.close()
+        self.lease.release()
 
     # Sites and adapters
 
@@ -363,6 +366,7 @@ class RelayService:
             history=[StateChange(state=OperationState.AWAITING_INPUT)],
             task=task,
             result=result,
+            owner=self.lease.owner(),
         )
         asks = await confirm_card.operation_asks(
             self,
@@ -490,7 +494,7 @@ class RelayService:
     async def advance(self, operation_id: str) -> OperationRecord:
         """Move an operation past its asks once they are all answered."""
         record = self.operation(operation_id)
-        if record.state != OperationState.AWAITING_INPUT:
+        if record.state != OperationState.AWAITING_INPUT or not self.acts_on(record):
             return record
         if queue_switch.asking(record):
             phase = queue_switch.state_of(record).get("phase")
@@ -552,6 +556,10 @@ class RelayService:
                 self.operations.put(operation_id, record)
             return await installing.start_install(self, operation_id, site, adapter)
 
+    def acts_on(self, record: OperationRecord) -> bool:
+        """Say whether this process may move `record` (see `jobs.ownership`)."""
+        return self.lease.acts_on(self.operations, record)
+
     def finish(
         self, operation_id: str, state: OperationState, refusal: Refusal | None
     ) -> OperationRecord:
@@ -572,7 +580,7 @@ class RelayService:
         the move, before anything reaches the scheduler (RL25a).
         """
         record = self.operation(operation_id)
-        if record.state != OperationState.AWAITING_INPUT:
+        if record.state != OperationState.AWAITING_INPUT or not self.acts_on(record):
             return record
         site = self.site(record.site)
         try:
@@ -681,7 +689,7 @@ class RelayService:
     async def refresh(self, operation_id: str) -> OperationRecord:
         """Observe an operation's job and record what changed."""
         record = self.operation(operation_id)
-        if record.state.final:
+        if record.state.final or not self.acts_on(record):
             return record
         if record.state == OperationState.AWAITING_INPUT:
             return await self.advance(operation_id)
@@ -863,6 +871,8 @@ class RelayService:
         record = self.operation(operation_id)
         if record.state.final:
             return await site_clean.leftover_cancel(self, record)
+        if not self.acts_on(record):
+            return record
         started = (
             record.state not in (OperationState.AWAITING_INPUT, OperationState.SUBMITTING)
             if record.kind == "serve"
@@ -998,6 +1008,7 @@ class RelayService:
             "result": record.result,
             "error": record.error,
             "spec_digest": record.spec_digest,
+            "owner": self.lease.shown(record.owner, final=record.state.final),
             "job": job_snapshot(self, record),
             "created_at": record.created_at.isoformat(),
             "updated_at": record.updated_at.isoformat(),

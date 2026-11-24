@@ -22,6 +22,7 @@ from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from clio_relay.jobs.handles import JobHandle, OutputRef, utc_now
+from clio_relay.jobs.ownership import Owner
 
 OperationKind = Literal["run", "serve", "files", "install"]
 
@@ -74,6 +75,7 @@ class OperationRecord(BaseModel):
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     task: bool = False
+    owner: Owner | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
