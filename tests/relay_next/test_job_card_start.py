@@ -79,7 +79,7 @@ def test_the_person_sees_no_instruction_meant_for_the_agent() -> None:
     assert (given["message"], given["agent_guidance"]) == ("TCP for now", "check ucx_info")
 
 
-def test_an_advisory_jarvis_settles_at_launch_says_so_to_the_person() -> None:
+def test_an_advisory_jarvis_settles_at_launch_is_for_the_agent_only() -> None:
     larger = _advisory(
         "sha256:aa",
         "The MPI launch network rests on uncertain cluster facts: the job asks 3 nodes but "
@@ -90,16 +90,21 @@ def test_an_advisory_jarvis_settles_at_launch_says_so_to_the_person() -> None:
     larger["details"]["reasons"] = [
         {"code": "hosts_not_in_graph", "plan": "collect_at_launch", "severity": "advisory"}
     ]
-    (advisory,) = jarvis_plan.advisories(_document(warnings=[larger]))
-    assert advisory["settled_at_launch"] is True
-    assert advisory["message"] == (
+    plan = _document(warnings=[larger, _advisory("sha256:bb")])
+    (shown,) = jarvis_plan.advisories(plan)
+    assert shown["issue_id"] == "sha256:bb"
+    (settled,) = jarvis_plan.advisories(plan, settled=True)
+    assert settled["issue_id"] == "sha256:aa" and settled["settled_at_launch"] is True
+    assert settled["message"] == (
         "The MPI launch network rests on uncertain cluster facts: the job asks 3 nodes but "
-        f"the graph was collected on 2. {jarvis_plan.SETTLED_AT_LAUNCH}"
+        "the graph was collected on 2."
     )
+    assert "collected on 2" not in jarvis_plan.summary(plan)
+    assert jarvis_plan.changes(_document(warnings=[]), _document(warnings=[larger])) == []
     larger["details"]["reasons"].append({"code": "ucx_device_unusable"})
     (mixed,) = jarvis_plan.advisories(_document(warnings=[larger]))
     assert mixed["settled_at_launch"] is False
-    assert jarvis_plan.SETTLED_AT_LAUNCH not in mixed["message"]
+    assert jarvis_plan.advisories(_document(warnings=[larger]), settled=True) == []
 
 
 def test_once_submitted_the_record_says_which_advisories_stand() -> None:

@@ -8,7 +8,9 @@ line does by default, and JARVIS's recorded install answers unless
 unless ``remove_outputs`` is set, and asks the person first on every site, in the call
 when the client shows a form, else as a ``needs_approval`` refusal to retry
 after the answer. The yes is bound to the site and to what the clean removes,
-and is used once.
+and is used once. Because relay always asks, the tool declares that it confirms
+itself (:data:`~clio_relay.surface.job_card.CONFIRM_META`), so a host that
+honours the key puts no permission ask of its own before relay's.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from clio_relay import site_clean as cleaning
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import canonical_digest
-from clio_relay.surface import exec_plan
+from clio_relay.surface import exec_plan, job_card
 from clio_relay.surface.elicit import (
     elicit_request,
     elicitation_modes,
@@ -177,6 +179,7 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         name="site_clean",
         title="Remove relay's deployment from a site",
         annotations=CHANGE,
+        meta={job_card.CONFIRM_META: job_card.CONFIRM_TOOL},
     )
     async def site_clean(  # pyright: ignore[reportUnusedFunction]
         site: Annotated[str, Field(description="The site id")],

@@ -88,11 +88,11 @@ answered, and `clio-relay asks` answers it from a terminal.
 
 ## tools that confirm themselves
 
-`run`, `serve` and `exec` confirm their own side effects. Each declares it in
-its tool `_meta` as `io.iowarp/confirm: {"version": 1}`. A host can then skip
-its own permission prompt for such a call and say so in the request's
-`params._meta` with `io.iowarp/confirm: "server"`. For that call relay asks the
-person exactly once, with a typed form:
+`run`, `serve`, `exec` and `site_clean` confirm their own side effects. Each
+declares it in its tool `_meta` as `io.iowarp/confirm: {"version": 1}`. A host
+can then skip its own permission prompt for such a call and say so in the
+request's `params._meta` with `io.iowarp/confirm: "server"`. For that call
+relay asks the person exactly once, with a typed form:
 
 - `approve`, a choice of approve or decline, and, when another of relay's
   services still runs on the site, `running_services` (keep or end them when
@@ -101,6 +101,7 @@ person exactly once, with a typed form:
   a sign-in stays its own ask, since it is a page, not a choice;
 - `run(cancel=...)` and `serve(stop=...)` get a form of their own, and `exec`
   asks for that command on a site with no guard. `exec_read` never asks.
+- `site_clean` always asks, flagged or not, naming what goes and what stays.
 
 A declined form cancels the job before anything is submitted. A client
 without form elicitation gets a `needs_approval` refusal and nothing runs.
@@ -178,8 +179,9 @@ every reason of the issue itself once the job's nodes are known (each reason's
 `plan` is `collect_at_launch`), such as `hosts_not_in_graph` for a job larger
 than the nodes the graph was collected on: the launch collects the facts on
 its own hosts, merges them into the site graph and supersedes the advisory.
-The person's line then ends by saying JARVIS checks it on the job's own nodes
-when it starts. None of them holds the job: the person
+Such an advisory asks nothing of the person, so it is not in `advisories`, the
+confirm's text or a changed plan's list: the card lists it under its own
+`settled_at_launch`, for the agent. None of them holds the job: the person
 accepts one later with `jarvis rg facts answer <issue_id> --value accept`
 through relay's JARVIS exec, or overrides it with `jarvis rg net set`. The
 confirm's text repeats each advisory's message.

@@ -105,7 +105,9 @@ def test_the_confirming_tools_say_so(relay_paths: RelayPaths) -> None:
             tools = {tool.name: tool for tool in await client.list_tools()}
         for name, tool in tools.items():
             declared = (tool.meta or {}).get(job_card.CONFIRM_META)
-            expected = job_card.CONFIRM_TOOL if name in ("run", "serve", "exec") else None
+            expected = (
+                job_card.CONFIRM_TOOL if name in ("run", "serve", "exec", "site_clean") else None
+            )
             assert declared == expected, name
 
     asyncio.run(scenario())

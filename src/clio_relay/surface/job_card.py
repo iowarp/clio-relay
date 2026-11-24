@@ -324,6 +324,7 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         walltime = job.attributes.duration.total_seconds()
     plan = _plan(record) or {}
     walltime = plan.get("time_limit_s") or walltime
+    facts = cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
     return {
         "version": VERSION,
         "operation_id": record.operation_id,
@@ -358,9 +359,8 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         if plan
         else _components(record, job, charge, state),
         "couplings": _couplings(plan),
-        "advisories": jarvis_plan.advisories(
-            plan, cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
-        ),
+        "advisories": jarvis_plan.advisories(plan, facts),
+        "settled_at_launch": jarvis_plan.advisories(plan, facts, settled=True),
         "script": plan.get("script"),
     }
 
