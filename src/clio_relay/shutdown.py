@@ -122,7 +122,7 @@ def _cmdline(pid: int) -> str | None:
     return result.stdout.strip() or None
 
 
-def _probe_windows(pid: int) -> tuple[Probe, str]:
+def probe_windows(pid: int) -> tuple[Probe, str]:
     """Probe ``pid`` through the process handle; ``tasklist`` hides other identities."""
     if sys.platform != "win32":
         return "unknown", "no Windows process API here"
@@ -166,7 +166,7 @@ def _probe(pid: int, word: str) -> tuple[Probe, str]:
     Windows shows only the program's image, so ``word`` is not checked there.
     """
     if os.name == "nt":
-        return _probe_windows(pid)
+        return probe_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

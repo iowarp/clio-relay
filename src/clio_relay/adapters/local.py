@@ -177,6 +177,28 @@ _PSIJ_STATES = {
 }
 
 
+def pid_alive(pid: object) -> bool:
+    """Say whether process ``pid`` still runs (a zombie does not)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if not POSIX:
+        from clio_relay.shutdown import probe_windows  # noqa: PLC0415
+
+        # A process relay cannot open (another user, a sandbox) counts as alive.
+        return probe_windows(pid)[0] != "gone"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    with contextlib.suppress(OSError):
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        if stat.rsplit(")", 1)[-1].split()[0] == "Z":
+            return False
+    return True
+
+
 class LocalAdapter(BaseAdapter[LocalConfig]):
     """The machine relay runs on."""
 
@@ -744,30 +766,12 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             return int(path.read_text(encoding="utf-8").strip())
         return None
 
-    @staticmethod
-    def _alive(pid: object) -> bool:
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        if not POSIX:
-            return True
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-        with contextlib.suppress(OSError):
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-            if stat.rsplit(")", 1)[-1].split()[0] == "Z":
-                return False
-        return True
-
     def _supervised_status(self, handle: JobHandle) -> JobStatus:
         job_dir = Path(handle.data["job_dir"])
         try:
             state: dict[str, Any] = json.loads((job_dir / "state.json").read_text("utf-8"))
         except FileNotFoundError:
-            if self._alive(handle.data.get("supervisor_pid")):
+            if pid_alive(handle.data.get("supervisor_pid")):
                 return JobStatus(state=JobState.QUEUED, native_state="starting")
             return JobStatus(
                 state=JobState.FAILED,
@@ -782,7 +786,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             job_state = JobState(name)
         except ValueError:
             job_state = JobState.RUNNING
-        if not job_state.final and not self._alive(state.get("supervisor_pid")):
+        if not job_state.final and not pid_alive(state.get("supervisor_pid")):
             return JobStatus(
                 state=JobState.FAILED,
                 native_state="lost",
