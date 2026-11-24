@@ -16,7 +16,7 @@ Everything lives in the worker directory, `remote_dir` in the site's settings
 | Path | What it is |
 | --- | --- |
 | `bin/clio-relay`, `tools/` | The relay install `uv tool install` made |
-| `bin/frpc` | frpc, when relay uploaded its own |
+| `bin/frpc` | frpc, when relay copied in the site's `frpc_binary` |
 | `dist/` | The wheel relay installed from, when the site sets `relay_wheel` |
 | `run/settings.json`, `run/registry.json`, `run/frp.env` | The worker's ids, tokens and rendezvous settings (0600) |
 | `run/site.pid`, `run/ready.json` | The running worker, and its ready report |

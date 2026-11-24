@@ -69,7 +69,6 @@ def _transport_proxy_name(
         remote_api_port=8765,
         api_token="owner-token",
         identity_anchor="preshared_link_secret",
-        frpc_bin="frpc",
     )
     return transport._proxy_name  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 

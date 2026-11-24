@@ -18,10 +18,19 @@ It speaks frp 0.69's v1 wire protocol to ``frps``: token login, STCP visitor
 connections, heartbeats, the yamux multiplexer, and the ``tcp`` (with or without
 TLS), ``websocket`` and ``wss`` transports. XTCP (the direct path) is not built
 yet: an XTCP visitor with a ``fallbackTo`` is served through its STCP fallback,
-and the log says so. Nothing else in relay knows these details.
+and the log says so. Nothing else in relay knows these details. Relay starts it
+with :func:`command`, both for a served port (``serve.forward``) and for the
+worker's link (``frp_link``).
 """
 
 from __future__ import annotations
+
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+MODULE = "clio_relay.frp_visitor"
+"""What ``python -m`` runs; a process's argv names it, so relay can tell its own."""
 
 PROTOCOL_VERSION = "0.69.1"
 """The frp release whose wire protocol this visitor speaks."""
@@ -31,3 +40,17 @@ START_MARKER = "start relay frp visitor"
 
 NO_DIRECT_MARKER = "has no direct path (XTCP) yet"
 """Logged when an XTCP visitor is served through its STCP fallback."""
+
+
+def command(config_path: Path | str) -> list[str]:
+    """Return the argv that runs the visitor on ``config_path`` with this interpreter.
+
+    The one way relay starts a desktop frp visitor, for a served port and for
+    the worker's link alike.
+    """
+    return [sys.executable, "-m", MODULE, "-c", str(config_path)]
+
+
+def runs_visitor(argv: Sequence[str]) -> bool:
+    """Return whether ``argv`` is a process started by :func:`command`."""
+    return any(argv[index] == "-m" and argv[index + 1] == MODULE for index in range(len(argv) - 1))

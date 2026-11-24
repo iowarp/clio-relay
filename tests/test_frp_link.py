@@ -19,6 +19,7 @@ import pytest
 from pytest import MonkeyPatch
 
 import clio_relay.frp_link as frp_link
+from clio_relay import frp_visitor
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.frp_link import (
@@ -244,7 +245,6 @@ def test_visitor_config_is_written_0600_and_removed_on_close() -> None:
         return process
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19876,
         process_factory=factory,
@@ -257,7 +257,7 @@ def test_visitor_config_is_written_0600_and_removed_on_close() -> None:
     assert config_path.name == "frpc-visitor.toml"
     if os.name != "nt":
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
-    assert processes[0].command == ["frpc", "-c", str(config_path)]
+    assert processes[0].command == frp_visitor.command(config_path)
     assert visitor.is_alive()
 
     visitor.close()
@@ -276,7 +276,6 @@ def test_a_visitor_that_ignores_terminate_is_killed() -> None:
         return process
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19877,
         process_factory=factory,
@@ -300,7 +299,6 @@ def test_bring_up_failure_carries_bounded_stderr_not_raw_output() -> None:
         )
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19878,
         process_factory=factory,
@@ -325,7 +323,6 @@ def test_bring_up_failure_carries_bounded_stdout_too() -> None:
         )
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19878,
         process_factory=factory,
@@ -349,7 +346,6 @@ def test_bring_up_failure_labels_both_streams_when_both_have_content() -> None:
         )
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19878,
         process_factory=factory,
@@ -367,7 +363,6 @@ def test_bring_up_failure_bounds_a_large_stderr() -> None:
         return FakeFrpProcess(command, dead_on_arrival=True, stderr=huge)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19879,
         process_factory=factory,
@@ -419,7 +414,6 @@ def test_stdout_pipe_is_drained_so_a_chatty_child_never_wedges() -> None:
         return _PipedProcess(command)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19878,
         process_factory=factory,
@@ -457,7 +451,6 @@ def test_establish_may_only_be_called_once() -> None:
         return FakeFrpProcess(command)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19880,
         process_factory=factory,
@@ -470,7 +463,7 @@ def test_establish_may_only_be_called_once() -> None:
 
 def test_held_frp_visitor_rejects_nonpositive_bind_port() -> None:
     with pytest.raises(ConfigurationError, match="local_bind_port"):
-        HeldFrpVisitor(frpc_bin="frpc", config=_link_config(), local_bind_port=0)
+        HeldFrpVisitor(config=_link_config(), local_bind_port=0)
 
 
 # --------------------------------------------------------------------------
@@ -492,7 +485,6 @@ def test_close_reports_residual_config_file_when_cleanup_fails(monkeypatch: Monk
         return FakeFrpProcess(command)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19883,
         process_factory=factory,
@@ -544,7 +536,6 @@ def test_wait_healthy_default_subject_names_the_visitor_type() -> None:
         return FakeFrpProcess(command, dead_on_arrival=True)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19885,
         visitor_type="xtcp",
@@ -564,7 +555,6 @@ def test_wait_healthy_accepts_an_explicit_subject_override() -> None:
         return FakeFrpProcess(command, dead_on_arrival=True)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19886,
         process_factory=factory,
@@ -598,7 +588,6 @@ def test_held_frp_visitor_names_its_stdout_and_stderr_pump_threads() -> None:
         return FakeFrpProcess(command)
 
     visitor = HeldFrpVisitor(
-        frpc_bin="frpc",
         config=_link_config(),
         local_bind_port=19887,
         process_factory=factory,

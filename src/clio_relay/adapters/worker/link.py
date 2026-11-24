@@ -67,7 +67,6 @@ class WorkerConnection:
         remote_api_port: int,
         api_token: str,
         session_owner_token: str,
-        frpc_bin: str,
         mode: LinkMode = "brokered_tcp",
     ) -> None:
         self._definition = definition
@@ -77,7 +76,6 @@ class WorkerConnection:
         self._port = remote_api_port
         self._api_token = api_token
         self._owner_token = session_owner_token
-        self._frpc_bin = frpc_bin
         self._mode: LinkMode = mode
         self._transport: BrokeredTcpTransport | UdpRendezvousTransport | None = None
         self._endpoint: ChannelEndpoint | None = None
@@ -107,7 +105,6 @@ class WorkerConnection:
             remote_api_port=self._port,
             api_token=self._api_token,
             identity_anchor="preshared_link_secret",
-            frpc_bin=self._frpc_bin,
         )
         nonce = secrets.token_hex(32)
         try:

@@ -1,7 +1,7 @@
 """Stop every long-lived process relay started, for one site or all of them.
 
 A host calls this when it closes, so that nothing relay started outlives it: the
-worker's site-serve, the login hop, the desktop forwards (frpc visitors and
+worker's site-serve, the login hop, the desktop forwards (relay's frp visitors and
 ``ssh -L``), ``clio-relay connect`` connectors, the ssh control connection, and a
 detached ``clio-relay serve --http``. Jobs are never cancelled: each one still
 running is listed with ``kind: job``. A site relay cannot reach is a failure in the
@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from clio_relay.adapters.base import ShutsDown
-from clio_relay.config import RelaySettings
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.settings import RelayPaths
@@ -375,9 +374,9 @@ def _exit_self() -> None:
 def _reap_visitors() -> list[dict[str, Any]]:
     from clio_relay.frp_visitor_reconciliation import reconcile_stale_frp_visitors
 
-    result = reconcile_stale_frp_visitors(frpc_bin=RelaySettings.from_env().frpc_bin)
+    result = reconcile_stale_frp_visitors()
     return [
-        {"site": LOCAL, "kind": "frpc", "pid": pid, "detail": "an orphaned frpc visitor"}
+        {"site": LOCAL, "kind": "frp visitor", "pid": pid, "detail": "an orphaned frp visitor"}
         for pid in result.reaped_pids
     ]
 

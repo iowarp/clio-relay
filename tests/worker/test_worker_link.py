@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.worker.adapter import (
     WORKER_LINK_FILE,
+    Rendezvous,
     WorkerAdapter,
     WorkerConfig,
     WorkerLink,
@@ -239,3 +240,65 @@ def test_a_link_stored_by_an_older_relay_asks_for_sign_in_to_replace_the_worker(
 
     assert refusal.value.reason is RefusalReason.NEEDS_SIGN_IN
     assert "older relay" in refusal.value.message
+
+
+def _placing(tmp_path: Path, **config: Any) -> tuple[WorkerAdapter, WorkerLink]:
+    context = AdapterContext(
+        site_id="site", state_dir=tmp_path / "adapter", content=ContentStore(tmp_path / "content")
+    )
+    token = tmp_path / "frps.token"
+    token.write_text("frps-token", encoding="utf-8")
+    rendezvous = Rendezvous(address="frps.example.test", port=7000, token_file=str(token))
+    adapter = WorkerAdapter(
+        WorkerConfig(
+            ssh_profile="site-login",
+            rendezvous=rendezvous,
+            relay_requirement="clio-relay==0.0.0",
+            **config,
+        ),
+        context,
+    )
+    link = WorkerLink(
+        cluster="worker-site",
+        session_id="session_1",
+        generation_id="generation_1",
+        api_token="api-token",
+        session_owner_token="owner-token",
+        stcp_secret="stcp-secret",
+        proxy_name="clio-worker-0",
+        port=8765,
+        remote_dir="~/.local/share/clio-relay/worker/site",
+    )
+    return adapter, link
+
+
+def test_placement_never_uploads_the_desktops_own_frpc(tmp_path: Path) -> None:
+    """The site's frpc is a site path or a binary built for the site, never the desktop's."""
+    adapter, link = _placing(tmp_path)
+
+    with pytest.raises(Refusal) as refusal:
+        adapter.placement_script(link, session_owner_token="owner-token")
+
+    assert refusal.value.reason is RefusalReason.INVALID_CONFIG
+    assert "site_frpc" in refusal.value.message
+    assert "frpc_binary" in refusal.value.message
+
+
+def test_placement_copies_in_the_frpc_built_for_the_site(tmp_path: Path) -> None:
+    binary = tmp_path / "frpc-linux-amd64"
+    binary.write_bytes(b"site frpc")
+    adapter, link = _placing(tmp_path, frpc_binary=str(binary))
+
+    script = adapter.placement_script(link, session_owner_token="owner-token")
+
+    assert base64.b64encode(b"site frpc").decode("ascii") in script
+    assert 'FRPC_PATH="$D/bin/frpc"' in script
+
+
+def test_placement_uses_the_sites_own_frpc_when_set(tmp_path: Path) -> None:
+    adapter, link = _placing(tmp_path, site_frpc="/opt/frp/frpc")
+
+    script = adapter.placement_script(link, session_owner_token="owner-token")
+
+    assert 'FRPC_PATH="/opt/frp/frpc"' in script
+    assert "CLIO_RELAY_FRPC" not in script

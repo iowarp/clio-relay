@@ -24,7 +24,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from clio_relay import programs
+from clio_relay import frp_visitor, programs
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.serve import detach, frp
 from clio_relay.serve.forward_exit import (
@@ -69,7 +69,7 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
     env = dict(os.environ)
     env[frp.ENV_TOKEN] = rendezvous.token()
     env[frp.ENV_SECRET_KEY] = plan.secret_key
-    return [sys.executable, "-m", "clio_relay.frp_visitor", "-c", str(path)], env
+    return frp_visitor.command(path), env
 
 
 def ssh_command(

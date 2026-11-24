@@ -1,7 +1,8 @@
-"""Stale frpc visitor reconciliation: reap prior-process orphans, sweep crumb dirs.
+"""Stale frp visitor reconciliation: reap prior-process orphans, sweep crumb dirs.
 
 iowarp/clio-relay#285: a ``brokered_tcp``/``udp_rendezvous`` connection's held
-frpc visitor (:class:`~clio_relay.frp_link.HeldFrpVisitor`) has no
+frp visitor (:class:`~clio_relay.frp_link.HeldFrpVisitor`, relay's own
+``python -m clio_relay.frp_visitor``) has no
 self-tearing-down tether the way ``ssh_forward``'s held stdin pipe does
 (``control_channel.py``'s own module docstring) -- nothing closes it when the
 owning CLI process exits. The worker adapter's atexit hook
@@ -28,7 +29,7 @@ fake :class:`~clio_relay.frp_visitor_process_inspection.ProcessRecord` rows)
 and:
 
 * :func:`reap_stale_frp_visitors` reaps every candidate row whose cmdline
-  carries both this run's configured ``frpc_bin`` and the
+  runs relay's own visitor (``-m clio_relay.frp_visitor``) and carries the
   ``HeldFrpVisitor.establish``-rendered config's directory-naming convention
   (:data:`~clio_relay.frp_link.VISITOR_CONFIG_DIR_PREFIX` in its ``-c`` path),
   AND whose parent pid is absent from that SAME snapshot -- a live parent
@@ -94,6 +95,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from clio_relay import frp_visitor
 from clio_relay.frp_link import VISITOR_CONFIG_DIR_PREFIX
 from clio_relay.frp_visitor_process_inspection import (
     DEFAULT_RECONCILE_TIMEOUT_SECONDS,
@@ -160,14 +162,13 @@ _sweep_has_run = False
 
 def reconcile_stale_frp_visitors(
     *,
-    frpc_bin: str,
     process_snapshot: ProcessSnapshotProvider | None = None,
     terminate_process: Callable[[int], None] | None = None,
     process_lookup: SingleProcessLookup | None = None,
     temp_root: Path | None = None,
     max_config_dir_age_seconds: float = DEFAULT_STALE_CONFIG_DIR_AGE_SECONDS,
 ) -> ReconciliationResult:
-    """Reap orphaned frpc visitors for this binary AND sweep stale crumb dirs.
+    """Reap relay's orphaned frp visitors AND sweep stale crumb dirs.
 
     The one entry point ``frp_transport._FrpChannelTransport.establish``
     calls at the start of every visitor spawn -- production code never calls
@@ -189,7 +190,6 @@ def reconcile_stale_frp_visitors(
     """
     try:
         reap_outcome = reap_stale_frp_visitors(
-            frpc_bin=frpc_bin,
             process_snapshot=process_snapshot,
             terminate_process=terminate_process,
             process_lookup=process_lookup,
@@ -206,9 +206,8 @@ def reconcile_stale_frp_visitors(
         logger.info("clio-relay: visitor_config_dirs_swept count=%s", swept)
     if reap_outcome.skipped_reason is not None:
         logger.warning(
-            "clio-relay: visitor_snapshot_skipped reason=%s frpc_bin=%s",
+            "clio-relay: visitor_snapshot_skipped reason=%s",
             reap_outcome.skipped_reason,
-            frpc_bin,
         )
     return ReconciliationResult(
         reaped_pids=reap_outcome.reaped_pids,
@@ -219,16 +218,15 @@ def reconcile_stale_frp_visitors(
 
 def reap_stale_frp_visitors(
     *,
-    frpc_bin: str,
     process_snapshot: ProcessSnapshotProvider | None = None,
     terminate_process: Callable[[int], None] | None = None,
     process_lookup: SingleProcessLookup | None = None,
 ) -> ReapOutcome:
-    """Reap prior frpc visitors for this binary whose owning CLI is gone.
+    """Reap relay's prior frp visitors whose owning CLI is gone.
 
     Takes exactly ONE process-table snapshot (``process_snapshot``, the real
     cross-platform ``default_process_snapshot`` by default) and, for every
-    candidate row whose cmdline carries both this run's ``frpc_bin`` and the
+    candidate row whose cmdline runs relay's own visitor and carries the
     rendered-visitor-config directory-naming convention
     (:func:`_is_stale_visitor_candidate`) with a parent pid absent from that
     SAME snapshot (a live parent means a concurrent CLI still legitimately
@@ -256,7 +254,7 @@ def reap_stale_frp_visitors(
     lookup = process_lookup or default_single_process_lookup
     reaped: list[int] = []
     for record in snapshot.records:
-        if not _is_stale_visitor_candidate(record, frpc_bin=frpc_bin):
+        if not _is_stale_visitor_candidate(record):
             continue
         if record.parent_pid is not None and record.parent_pid in live_pids:
             continue
@@ -267,14 +265,13 @@ def reap_stale_frp_visitors(
         fresh = lookup(record.pid)
         if fresh is None:
             continue  # already gone on its own; nothing to kill
-        if not _is_stale_visitor_candidate(fresh, frpc_bin=frpc_bin):
+        if not _is_stale_visitor_candidate(fresh):
             continue  # pid reused by a non-matching process -- refuse
         reap(record.pid)
         reaped.append(record.pid)
         logger.info(
-            "clio-relay: visitor_orphan_reaped pid=%s frpc_bin=%s",
+            "clio-relay: visitor_orphan_reaped pid=%s",
             record.pid,
-            frpc_bin,
         )
         _remove_visitor_config_dir(fresh.cmdline)
     return ReapOutcome(reaped_pids=tuple(reaped))
@@ -341,59 +338,21 @@ def _sweep_once(*, temp_root: Path | None, max_age_seconds: float) -> int:
     return sweep_stale_visitor_config_dirs(temp_root=temp_root, max_age_seconds=max_age_seconds)
 
 
-def _is_stale_visitor_candidate(record: ProcessRecord, *, frpc_bin: str) -> bool:
-    """Return whether ``record`` looks like one of OUR rendered visitors."""
+def _is_stale_visitor_candidate(record: ProcessRecord) -> bool:
+    """Return whether ``record`` looks like one of OUR rendered visitors.
+
+    Two things must hold: its argv runs relay's own visitor
+    (``-m clio_relay.frp_visitor``, see :func:`clio_relay.frp_visitor.runs_visitor`),
+    and it names a config in a :data:`~clio_relay.frp_link.VISITOR_CONFIG_DIR_PREFIX`
+    directory. A served port's visitor keeps its config under relay's state
+    directory instead, outlives relay on purpose, and is never a candidate.
+    The module name has underscores and the directory prefix hyphens, so
+    neither can be read as the other.
+    """
     command = record.cmdline.casefold()
     if VISITOR_CONFIG_DIR_PREFIX.casefold() not in command:
         return False
-    return _command_names_binary(command, frpc_bin)
-
-
-def _command_names_binary(command: str, frpc_bin: str) -> bool:
-    """Return whether ``command``'s OWN leading token names this configured binary.
-
-    Deliberately checks only the leading token (``argv[0]``), never a
-    substring search across the whole command: every candidate's cmdline
-    also carries its OWN rendered ``frpc-visitor.toml`` filename (see
-    :data:`~clio_relay.frp_link.VISITOR_CONFIG_DIR_PREFIX`), which itself
-    contains the literal substring ``"frpc"`` -- a plain ``"frpc" in
-    command`` search would therefore match every candidate regardless of
-    which binary actually launched it, defeating the whole "same binary"
-    scoping this exists for.
-
-    A QUALIFIED ``frpc_bin`` (a path -- contains a separator) requires an
-    EXACT normalized-path match: two ``frpc`` copies that merely share a
-    basename but live in different directories are different deployments'
-    binaries, never treated as the same one. An UNQUALIFIED ``frpc_bin``
-    (bare, ``PATH``-resolved at spawn time -- ``subprocess.Popen`` never
-    rewrites ``argv[0]`` to the resolved absolute path) instead compares
-    basenames with any file extension stripped, so a Windows cluster
-    configured with the bare ``"frpc"`` still matches an observed
-    ``"...\\frpc.exe"`` cmdline.
-    """
-    argv0 = _leading_command_token(command)
-    if not argv0:
-        return False
-    normalized_argv0 = argv0.replace("\\", "/").casefold()
-    normalized_configured = frpc_bin.strip().replace("\\", "/").casefold()
-    if not normalized_configured:
-        return False
-    if "/" in normalized_configured:
-        return normalized_argv0 == normalized_configured
-    return Path(normalized_argv0).stem == Path(normalized_configured).stem
-
-
-def _leading_command_token(command: str) -> str:
-    """Return ``command``'s first argv-shaped token (a quoted path, or up to the first space)."""
-    stripped = command.strip()
-    if not stripped:
-        return ""
-    if stripped[0] == '"':
-        closing = stripped.find('"', 1)
-        if closing != -1:
-            return stripped[1:closing]
-        return stripped[1:]
-    return stripped.split(None, 1)[0]
+    return frp_visitor.runs_visitor(_tokenize_command(command))
 
 
 def _tokenize_command(command: str) -> list[str]:
@@ -424,7 +383,7 @@ def _extract_config_path(command: str) -> str | None:
     """Return the ``-c <path>`` argument of a visitor cmdline, or ``None``.
 
     ``HeldFrpVisitor.establish``'s spawn convention is exactly
-    ``[frpc_bin, "-c", str(config_path)]`` -- three tokens, no other flags --
+    :func:`clio_relay.frp_visitor.command`, ending in ``-c <config_path>``,
     so the path is whatever token immediately follows ``-c``.
     """
     tokens = _tokenize_command(command)
@@ -467,10 +426,14 @@ def _terminate_pid(pid: int) -> None:
     that ever reaches the OS to kill anything. POSIX: SIGTERM then SIGKILL,
     matching ``HeldFrpVisitor.close``'s own escalation. Windows: ``taskkill
     /PID <pid> /F`` -- deliberately WITHOUT ``/T`` (D1 adversarial-review
-    fix): ``frpc`` spawns no children of its own, so descending the process
-    tree only ever adds blast radius; the reviewer's own repro fed a stale
-    row and watched ``/T`` amplify the (already-wrong, now separately fixed
-    by the D1 re-verify above) kill into an unrelated child process too.
+    fix): descending the process tree only ever adds blast radius; the
+    reviewer's own repro fed a stale row and watched ``/T`` amplify the
+    (already-wrong, now separately fixed by the D1 re-verify above) kill
+    into an unrelated child process too. The visitor's one possible child is
+    the base interpreter a venv's launcher starts (``uv``'s and CPython's
+    alike); the launcher holds it in a kill-on-close job, so killing the
+    orphaned launcher ends it too, and a child whose launcher already died
+    is itself a candidate with no live parent.
     Either way this is a best-effort bound, not a verified teardown -- a
     process that survives is left for the NEXT reconciliation pass, which
     reaps it again (idempotent: a genuinely-dead pid is simply absent from

@@ -40,7 +40,7 @@ In that one ssh pass relay:
 
 1. installs `uv` on the cluster if it is missing;
 2. installs `clio-relay` into the worker directory with `uv tool install`;
-3. copies frpc over, unless the site has its own (`site_frpc`);
+3. copies `frpc_binary` over, unless the site has its own frpc (`site_frpc`);
 4. writes the worker's settings and starts it in the background;
 5. waits for the worker to report ready, then closes ssh.
 
@@ -48,8 +48,10 @@ The worker then dials out to the rendezvous and keeps that link up. Relay dials
 the same rendezvous and reaches the worker through it. Each sign-in places a
 fresh worker generation with new secrets and stops the previous one.
 
-When the link drops, calls are refused with `unreachable`. If the worker is
-gone, sign in again.
+Relay's end of the link is its own frp visitor, the same one a served port
+uses (see [running a rendezvous host](../rendezvous-host.md)), so the desktop
+needs no `frpc`. When the link drops, calls are refused with `unreachable`. If
+the worker is gone, sign in again.
 
 ## The link
 
@@ -64,7 +66,9 @@ Set it in the site's config, or pick it on the Compute page, where the site's
 form shows it as a choice. The worker's proxy follows the mode, so changing it
 asks for a sign-in, which places the worker again.
 
-In `udp_rendezvous` a punch that fails is refused with `punch_failed`. Relay
+Relay's visitor does not punch yet, so for now every `udp_rendezvous` link is
+refused with `punch_failed`, its message saying the visitor has no direct path
+yet. Use `brokered_tcp` until then. A punch that fails is refused the same way. Relay
 does not switch to `brokered_tcp` on its own. Retrying tries the same punch.
 To go through the rendezvous, set `link_mode: brokered_tcp`.
 
@@ -85,7 +89,8 @@ picks those.
 | `outputs_dir` | `clio-relay-runs` | Where runs write, outside relay's directories, as in the [ssh adapter](ssh.md#settings) |
 | `relay_wheel` | none | A local clio-relay wheel to install instead of the PyPI release |
 | `relay_requirement` | `clio-relay==<this version>` | What `uv` installs on the cluster |
-| `site_frpc` | upload relay's frpc | An frpc already on the cluster |
+| `site_frpc` | none | An frpc already on the cluster |
+| `frpc_binary` | none | A local frpc built for the cluster, which relay copies in when `site_frpc` is unset. One of the two is needed |
 | `python` | `3.12` | The Python `uv` installs the worker with |
 | `submit_timeout_s` | 60 | How long one scheduler submit command may take |
 | `jarvis_python` | empty | The Python relay installs its jarvis-cd with on the cluster, as in the [ssh adapter](ssh.md#settings) |

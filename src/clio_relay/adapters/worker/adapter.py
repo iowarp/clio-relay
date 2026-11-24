@@ -35,7 +35,6 @@ import posixpath
 import re
 import secrets
 import shlex
-import shutil
 import threading
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
@@ -144,7 +143,11 @@ class WorkerConfig(BaseModel):
         default=None, description="What uv installs on the site instead, such as clio-relay==1.7.0"
     )
     site_frpc: str | None = Field(
-        default=None, description="frpc on the site. When unset relay uploads its own frpc"
+        default=None, description="frpc on the site. When unset relay copies in frpc_binary"
+    )
+    frpc_binary: str | None = Field(
+        default=None,
+        description="A local frpc built for the site, copied in when site_frpc is unset",
     )
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
@@ -423,7 +426,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     def placement_script(self, link: WorkerLink, *, session_owner_token: str) -> str:
         """Return the bash script the one ssh pass runs on the site."""
         from clio_relay.cluster_config import ClusterRegistry
-        from clio_relay.config import RelaySettings
 
         _, token = self._rendezvous()
         remote_dir = self._remote_dir()
@@ -476,13 +478,19 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if self.config.site_frpc:
             frpc = self.config.site_frpc
         else:
-            local_frpc = shutil.which(RelaySettings.from_env().frpc_bin)
-            if local_frpc is None:
+            if not self.config.frpc_binary:
                 raise Refusal(
                     RefusalReason.INVALID_CONFIG,
-                    "relay has no frpc to upload; set site_frpc or CLIO_RELAY_FRPC_BIN",
+                    "the site has no frp client: set site_frpc (a site path), or frpc_binary "
+                    "(a local frpc built for the site, which relay copies in)",
                 )
-            parts.append(self._payload("FRPC", "$D/bin/frpc", Path(local_frpc).read_bytes(), "700"))
+            try:
+                binary = Path(os.path.expanduser(self.config.frpc_binary)).read_bytes()
+            except OSError as exc:
+                raise Refusal(
+                    RefusalReason.INVALID_CONFIG, f"cannot read frpc_binary: {exc.strerror}"
+                ) from exc
+            parts.append(self._payload("FRPC", "$D/bin/frpc", binary, "700"))
             frpc = "$D/bin/frpc"
         registry = ClusterRegistry(clusters={link.cluster: self._definition(link, site_view=True)})
         settings = {
@@ -686,7 +694,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     def _new_connection(self, link: WorkerLink) -> WorkerConnection:
         """Return an unconnected link to the placed worker, its secrets in the environment."""
         from clio_relay.adapters.worker.link import WorkerConnection
-        from clio_relay.config import RelaySettings
 
         assert link.session_owner_token is not None
         _, token = self._rendezvous()
@@ -700,7 +707,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             remote_api_port=link.port,
             api_token=link.api_token,
             session_owner_token=link.session_owner_token,
-            frpc_bin=RelaySettings.from_env().frpc_bin,
             mode=link.link_mode,
         )
 
@@ -754,7 +760,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             stopped["pid"] = pid
         if held is None:
             return [stopped]
-        return [stopped, {"kind": "frpc", "detail": "relay's link visitor to the worker"}]
+        return [stopped, {"kind": "frp visitor", "detail": "relay's link visitor to the worker"}]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
         """The worker's directory and job homes; each home's Spack store and JARVIS answers stay."""

@@ -35,7 +35,7 @@ from clio_relay.frp_visitor_reconciliation import (
     reconcile_stale_frp_visitors,
 )
 
-FRPC_BIN = "frpc"
+VISITOR = "/opt/venv/bin/python -m clio_relay.frp_visitor"
 
 
 @pytest.fixture(autouse=True)
@@ -45,9 +45,9 @@ def _reset_sweep_once_gate(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright:
 
 
 def _visitor_cmdline(
-    *, frpc_bin: str = FRPC_BIN, config_dir: str = "clio-relay-frp-visitor-abc123"
+    *, program: str = VISITOR, config_dir: str = "clio-relay-frp-visitor-abc123"
 ) -> str:
-    return f"{frpc_bin} -c /tmp/{config_dir}/frpc-visitor.toml"
+    return f"{program} -c /tmp/{config_dir}/frpc-visitor.toml"
 
 
 def _snapshot(records: list[ProcessRecord]) -> ProcessSnapshot:
@@ -260,7 +260,6 @@ def test_reap_reports_a_skipped_snapshot_rather_than_reaping_nothing_silently() 
     skipped = ProcessSnapshot(records=(), skipped_reason=SNAPSHOT_SKIP_TIMEOUT)
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: skipped,
         terminate_process=lambda _pid: pytest.fail("must never be called"),
     )
@@ -378,7 +377,6 @@ def test_reconcile_composes_reap_and_sweep(tmp_path: Path) -> None:
     orphan = ProcessRecord(pid=321, parent_pid=None, cmdline=_visitor_cmdline())
 
     result = reconcile_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([orphan]),
         terminate_process=lambda _pid: None,
         process_lookup=_lookup_returning(orphan),
@@ -393,7 +391,6 @@ def test_reconcile_propagates_a_skipped_snapshot_reason(tmp_path: Path) -> None:
     skipped = ProcessSnapshot(records=(), skipped_reason=SNAPSHOT_SKIP_OSERROR)
 
     result = reconcile_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: skipped,
         temp_root=tmp_path,
     )
@@ -412,7 +409,7 @@ def test_reconcile_never_raises_when_reaping_fails_unexpectedly(
 
     monkeypatch.setattr(reconciliation, "reap_stale_frp_visitors", _raise)
 
-    result = reconcile_stale_frp_visitors(frpc_bin=FRPC_BIN)
+    result = reconcile_stale_frp_visitors()
 
     assert result == ReconciliationResult(
         reaped_pids=(), swept_config_dirs=0, skipped_reason="reconciliation_failed:exception"
@@ -427,7 +424,7 @@ def test_reconcile_never_raises_when_sweeping_fails_unexpectedly(
 
     monkeypatch.setattr(reconciliation, "_sweep_once", _raise)
 
-    result = reconcile_stale_frp_visitors(frpc_bin=FRPC_BIN)
+    result = reconcile_stale_frp_visitors()
 
     assert result == ReconciliationResult(
         reaped_pids=(), swept_config_dirs=0, skipped_reason="reconciliation_failed:exception"
@@ -444,13 +441,11 @@ def test_sweep_runs_only_once_per_process_across_reconcile_calls(tmp_path: Path)
         _backdate(stale, seconds_ago=7200)
 
     first = reconcile_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([]),
         temp_root=tmp_path,
         max_config_dir_age_seconds=3600,
     )
     second = reconcile_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([]),
         temp_root=tmp_path,
         max_config_dir_age_seconds=3600,
@@ -464,7 +459,6 @@ def test_sweep_runs_only_once_per_process_across_reconcile_calls(tmp_path: Path)
     remaining.mkdir()
     _backdate(remaining, seconds_ago=7200)
     third = reconcile_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([]),
         temp_root=tmp_path,
         max_config_dir_age_seconds=3600,

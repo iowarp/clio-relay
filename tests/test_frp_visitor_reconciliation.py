@@ -1,5 +1,5 @@
 """Classification, reap (D1 pid-reuse re-verify, D3 secret removal), and sweep
-unit coverage for the stale-frpc-visitor reconciliation pass (#285). Every
+unit coverage for the stale-frp-visitor reconciliation pass (#285). Every
 test uses FAKE ``ProcessRecord`` rows -- never a real OS process.
 
 Split to stay under the file-size sweet spot: cross-platform snapshot/lookup
@@ -28,13 +28,14 @@ from clio_relay.frp_visitor_reconciliation import (
     sweep_stale_visitor_config_dirs,
 )
 
-FRPC_BIN = "frpc"
+VISITOR = "/opt/venv/bin/python -m clio_relay.frp_visitor"
+"""How relay's own visitor shows up in a process table (``frp_visitor.command``)."""
 
 
 def _visitor_cmdline(
-    *, frpc_bin: str = FRPC_BIN, config_dir: str = "clio-relay-frp-visitor-abc123"
+    *, program: str = VISITOR, config_dir: str = "clio-relay-frp-visitor-abc123"
 ) -> str:
-    return f"{frpc_bin} -c /tmp/{config_dir}/frpc-visitor.toml"
+    return f"{program} -c /tmp/{config_dir}/frpc-visitor.toml"
 
 
 def _snapshot(records: list[ProcessRecord]) -> ProcessSnapshot:
@@ -50,68 +51,46 @@ def _backdate(path: Path, *, seconds_ago: float) -> None:
     os.utime(path, (stamp, stamp))
 
 
-# _is_stale_visitor_candidate / _command_names_binary
+# _is_stale_visitor_candidate
 #
-# These tests reach the module's private classification helpers directly --
+# These tests reach the module's private classification helper directly --
 # the injectable public seams (process_snapshot/terminate_process) are what
 # reap_stale_frp_visitors's OWN tests below exercise; these prove the
 # classification logic itself in isolation. reportPrivateUsage/SLF001 are
 # suppressed throughout this section by design, not oversight.
 
 
+def _is_candidate(cmdline: str) -> bool:
+    record = ProcessRecord(pid=100, parent_pid=None, cmdline=cmdline)
+    return reconciliation._is_stale_visitor_candidate(record)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+
+
 def test_candidate_requires_the_visitor_config_dir_marker() -> None:
-    record = ProcessRecord(pid=100, parent_pid=None, cmdline=f"{FRPC_BIN} -c /tmp/unrelated/x.toml")
-    is_candidate = reconciliation._is_stale_visitor_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        record, frpc_bin=FRPC_BIN
+    assert _is_candidate(f"{VISITOR} -c /tmp/unrelated/x.toml") is False
+
+
+def test_candidate_requires_relays_own_visitor_module() -> None:
+    """An upstream ``frpc`` on the same config shape is not relay's, and is left alone."""
+    assert _is_candidate(_visitor_cmdline(program="/usr/local/bin/frpc")) is False
+    assert _is_candidate(_visitor_cmdline(program="python -m some_other_module")) is False
+
+
+def test_candidate_matches_marker_and_module_together() -> None:
+    assert _is_candidate(_visitor_cmdline()) is True
+
+
+def test_candidate_matches_a_quoted_windows_interpreter() -> None:
+    command = (
+        '"C:\\Users\\x\\app\\.venv\\Scripts\\python.exe" -m clio_relay.frp_visitor '
+        '-c "C:\\Users\\x\\Temp\\clio-relay-frp-visitor-1\\frpc-visitor.toml"'
     )
-    assert is_candidate is False
+    assert _is_candidate(command) is True
 
 
-def test_candidate_requires_the_configured_binary() -> None:
-    record = ProcessRecord(
-        pid=100, parent_pid=None, cmdline=_visitor_cmdline(frpc_bin="some-other-tool")
-    )
-    is_candidate = reconciliation._is_stale_visitor_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        record, frpc_bin=FRPC_BIN
-    )
-    assert is_candidate is False
-
-
-def test_candidate_matches_marker_and_binary_together() -> None:
-    record = ProcessRecord(pid=100, parent_pid=None, cmdline=_visitor_cmdline())
-    is_candidate = reconciliation._is_stale_visitor_candidate(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        record, frpc_bin=FRPC_BIN
-    )
-    assert is_candidate is True
-
-
-def _command_names_binary(command: str, frpc_bin: str) -> bool:
-    return reconciliation._command_names_binary(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        command, frpc_bin
-    )
-
-
-def test_command_names_binary_matches_an_unqualified_configured_binary() -> None:
-    """A bare ``"frpc"`` (resolved through PATH) never shows up as an absolute
-    path in the observed cmdline -- the bare-name fallback must still match.
-    """
-    command = 'c:/tools/frpc.exe -c "c:/users/x/temp/clio-relay-frp-visitor-1/frpc-visitor.toml"'
-    assert _command_names_binary(command, "frpc") is True
-
-
-def test_command_names_binary_matches_an_absolute_configured_binary() -> None:
-    command = "/opt/frp/frpc -c /tmp/clio-relay-frp-visitor-1/frpc-visitor.toml"
-    assert _command_names_binary(command, "/opt/frp/frpc") is True
-
-
-def test_command_names_binary_normalizes_windows_path_separators() -> None:
-    command = r'c:\tools\frpc.exe -c "c:\temp\clio-relay-frp-visitor-1\frpc-visitor.toml"'
-    assert _command_names_binary(command, "C:/tools/frpc.exe") is True
-
-
-def test_command_names_binary_refuses_a_different_deployments_binary() -> None:
-    command = "/opt/other-frp/frpc -c /tmp/clio-relay-frp-visitor-1/frpc-visitor.toml"
-    assert _command_names_binary(command, "/opt/frp/frpc") is False
+def test_candidate_never_matches_a_served_ports_visitor() -> None:
+    """A served port's visitor keeps its config under relay's state and outlives relay."""
+    command = f"{VISITOR} -c /home/x/.clio-relay/state/serve/forwards/op_1/visitor.toml"
+    assert _is_candidate(command) is False
 
 
 # _extract_config_path / _tokenize_command (D3)
@@ -141,25 +120,20 @@ def test_extract_config_path_returns_none_without_a_dash_c_token() -> None:
 
 
 def test_reap_stale_frp_visitors_reaps_the_one_true_orphan() -> None:
-    """One orphan (parent gone), one unrelated process, one QUALIFIED-path
-    different deployment (see ...reaps_a_bare_configured_binary for the
-    bare/unqualified case) -- exactly the orphan is reaped.
+    """One orphan (parent gone), one unrelated process, one upstream ``frpc`` on
+    the same config shape -- exactly the orphan is reaped.
     """
-    configured_bin = "/opt/frp/frpc"
-    orphan = ProcessRecord(
-        pid=501, parent_pid=None, cmdline=_visitor_cmdline(frpc_bin=configured_bin)
-    )
+    orphan = ProcessRecord(pid=501, parent_pid=None, cmdline=_visitor_cmdline())
     snapshot = [
         orphan,
         ProcessRecord(pid=502, parent_pid=1, cmdline="python -m something"),  # unrelated
         ProcessRecord(
-            pid=503, parent_pid=None, cmdline=_visitor_cmdline(frpc_bin="/opt/other-frp/frpc")
-        ),  # different deployment (different directory, same basename)
+            pid=503, parent_pid=None, cmdline=_visitor_cmdline(program="/opt/frp/frpc")
+        ),  # not relay's
     ]
     reaped_calls: list[int] = []
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=configured_bin,
         process_snapshot=lambda: _snapshot(snapshot),
         terminate_process=reaped_calls.append,
         process_lookup=_lookup_returning(orphan),
@@ -169,18 +143,24 @@ def test_reap_stale_frp_visitors_reaps_the_one_true_orphan() -> None:
     assert reaped_calls == [501]
 
 
-def test_reap_stale_frp_visitors_reaps_a_bare_configured_binary() -> None:
-    """The common configuration (``frpc_bin="frpc"``, PATH-resolved) still reaps."""
-    orphan = ProcessRecord(pid=504, parent_pid=None, cmdline=_visitor_cmdline(frpc_bin=FRPC_BIN))
+def test_reap_skips_the_interpreter_a_live_venv_launcher_started() -> None:
+    """On Windows a venv's launcher starts the base interpreter as its child.
+
+    Only the orphaned launcher is reaped; its child has a live parent, and the
+    launcher's kill-on-close job ends it.
+    """
+    launcher = ProcessRecord(pid=901, parent_pid=None, cmdline=_visitor_cmdline())
+    child = ProcessRecord(pid=902, parent_pid=901, cmdline=_visitor_cmdline())
+    reaped_calls: list[int] = []
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
-        process_snapshot=lambda: _snapshot([orphan]),
-        terminate_process=lambda _pid: None,
-        process_lookup=_lookup_returning(orphan),
+        process_snapshot=lambda: _snapshot([launcher, child]),
+        terminate_process=reaped_calls.append,
+        process_lookup=lambda pid: {901: launcher, 902: child}.get(pid),
     )
 
-    assert outcome.reaped_pids == (504,)
+    assert outcome.reaped_pids == (901,)
+    assert reaped_calls == [901]
 
 
 def test_reap_stale_frp_visitors_never_touches_a_process_whose_parent_is_alive() -> None:
@@ -198,7 +178,6 @@ def test_reap_stale_frp_visitors_never_touches_a_process_whose_parent_is_alive()
         return None
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot(snapshot),
         terminate_process=lambda _pid: pytest.fail("must never be called"),
         process_lookup=lookup,
@@ -216,7 +195,6 @@ def test_reap_stale_frp_visitors_reaps_a_visitor_with_unknown_parent() -> None:
     orphan = ProcessRecord(pid=701, parent_pid=None, cmdline=_visitor_cmdline())
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([orphan]),
         terminate_process=lambda _pid: None,
         process_lookup=_lookup_returning(orphan),
@@ -235,7 +213,6 @@ def test_reap_stale_frp_visitors_reaps_multiple_orphans_in_one_pass() -> None:
     by_pid = {801: orphan_a, 802: orphan_b}
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([orphan_a, orphan_b]),
         terminate_process=lambda _pid: None,
         process_lookup=lambda pid: by_pid.get(pid),
@@ -258,7 +235,7 @@ def test_reap_stale_frp_visitors_uses_the_real_snapshot_and_kill_by_default(
     monkeypatch.setattr(reconciliation, "default_single_process_lookup", fake_lookup)
     monkeypatch.setattr(reconciliation, "_terminate_pid", calls.append)
 
-    outcome = reap_stale_frp_visitors(frpc_bin=FRPC_BIN)
+    outcome = reap_stale_frp_visitors()
 
     assert outcome.reaped_pids == (999,)
     assert calls == [999]
@@ -281,7 +258,6 @@ def test_reap_refuses_to_kill_a_pid_reused_by_a_non_matching_process() -> None:
     reaped_calls: list[int] = []
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([stale_row]),
         terminate_process=reaped_calls.append,
         process_lookup=_lookup_returning(innocent_now_at_that_pid),
@@ -298,7 +274,6 @@ def test_reap_kills_when_the_fresh_reverify_still_matches() -> None:
     reaped_calls: list[int] = []
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([stale_row]),
         terminate_process=reaped_calls.append,
         process_lookup=_lookup_returning(fresh_row),
@@ -317,7 +292,6 @@ def test_reap_refuses_to_kill_a_pid_that_already_exited_before_the_reverify() ->
     reaped_calls: list[int] = []
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([stale_row]),
         terminate_process=reaped_calls.append,
         process_lookup=_lookup_returning(None),
@@ -328,7 +302,7 @@ def test_reap_refuses_to_kill_a_pid_that_already_exited_before_the_reverify() ->
 
 
 def test_terminate_pid_windows_kill_never_passes_slash_t(monkeypatch: pytest.MonkeyPatch) -> None:
-    """D1: frpc spawns no children -- ``/T`` only ever adds blast radius
+    """D1: ``/T`` only ever adds blast radius
     (the adversarial review's own repro: a stale-row kill amplified by
     ``/T`` took an unrelated child process down too).
     """
@@ -356,11 +330,10 @@ def test_reap_removes_the_reaped_visitors_own_config_dir(tmp_path: Path) -> None
     config_dir.mkdir()
     config_file = config_dir / "frpc-visitor.toml"
     config_file.write_text("secretKey = 'plaintext-secret'", encoding="utf-8")
-    cmdline = f"{FRPC_BIN} -c {config_file}"
+    cmdline = f"{VISITOR} -c {config_file}"
     orphan = ProcessRecord(pid=601, parent_pid=None, cmdline=cmdline)
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([orphan]),
         terminate_process=lambda _pid: None,
         process_lookup=_lookup_returning(orphan),
@@ -376,11 +349,10 @@ def test_reap_never_removes_a_config_dir_when_the_reverify_refuses_the_kill(tmp_
     config_dir.mkdir()
     config_file = config_dir / "frpc-visitor.toml"
     config_file.write_text("secretKey = 'plaintext-secret'", encoding="utf-8")
-    stale_row = ProcessRecord(pid=602, parent_pid=None, cmdline=f"{FRPC_BIN} -c {config_file}")
+    stale_row = ProcessRecord(pid=602, parent_pid=None, cmdline=f"{VISITOR} -c {config_file}")
     innocent = ProcessRecord(pid=602, parent_pid=1, cmdline="notepad.exe")
 
     outcome = reap_stale_frp_visitors(
-        frpc_bin=FRPC_BIN,
         process_snapshot=lambda: _snapshot([stale_row]),
         terminate_process=lambda _pid: None,
         process_lookup=_lookup_returning(innocent),
@@ -401,7 +373,7 @@ def test_remove_visitor_config_dir_refuses_a_path_without_the_naming_convention(
     unrelated_file.write_text("x", encoding="utf-8")
 
     reconciliation._remove_visitor_config_dir(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        f"{FRPC_BIN} -c {unrelated_file}"
+        f"{VISITOR} -c {unrelated_file}"
     )
 
     assert unrelated_dir.exists()

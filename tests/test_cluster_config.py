@@ -1,14 +1,11 @@
-"""The frp link settings and the frpc lookup."""
+"""The frp link settings."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from clio_relay.cluster_config import ClusterDefinition, ClusterRegistry, FrpTransportConfig
-from clio_relay.config import RelaySettings
 from clio_relay.errors import ConfigurationError
 
 
@@ -45,16 +42,3 @@ def test_ssh_host_is_one_destination(host: str) -> None:
 def test_unknown_fields_are_refused() -> None:
     with pytest.raises(ValidationError):
         ClusterDefinition.model_validate({"name": "a", "ssh_host": "h", "spool_dir": "/x"})
-
-
-def test_frpc_bin_prefers_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("CLIO_RELAY_FRPC_BIN", "/opt/frp/frpc")
-    assert RelaySettings.from_env().frpc_bin == "/opt/frp/frpc"
-
-
-def test_frpc_bin_falls_back_to_the_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("CLIO_RELAY_FRPC_BIN", raising=False)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.chdir(tmp_path)
-    assert RelaySettings.from_env().frpc_bin == "frpc"

@@ -35,8 +35,6 @@ those `path: auto` uses `ssh -L`.
 
 ## Run the server
 
-## Run the server
-
 A minimal `frps.toml`:
 
 ```toml

@@ -6,7 +6,7 @@ items 1-3+5).
 mode (c): dial once, hold the process for the connection's lifetime, prove the
 bring-up identity document out of band, refuse to redial internally. Both
 classes here hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor`
-(the R4 substrate) instead -- a local ``frpc`` process holding an stcp/xtcp
+(the R4 substrate) instead -- a local frp visitor process holding an stcp/xtcp
 visitor tunnel through the cluster's configured relay point -- and follow the
 same discipline: ``establish`` is callable once (§8.5's R10 fix: a failed
 attempt permanently consumes the instance, exactly like ``SshForwardTransport``
@@ -51,7 +51,7 @@ the render call itself, not only by inspecting rendered text
 ``allow_stcp_fallback`` has no equivalent here.
 
 No real sockets are held open by anything in this module's own tests: no real
-``frpc``, no real cluster, only a temp dir for rendered TOML and (for the one
+visitor, no real cluster, only a temp dir for rendered TOML and (for the one
 health-timeout test that deliberately does not mock ``wait_for_channel_health``)
 a real, immediately-refused loopback connection attempt against a port nothing
 is listening on.
@@ -127,7 +127,7 @@ class _FrpChannelTransport:
 
     Both modes hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor` for
     the connection's lifetime. ``establish`` writes its rendered visitor config,
-    spawns ``frpc`` once, waits for the mapped local port to answer, then
+    starts relay's frp visitor once, waits for the mapped local port to answer, then
     fetches the bring-up document -- identity first -- over that SAME held
     link. Subclasses fix ``_mode``/``_visitor_type`` and may override
     :meth:`_translate_tunnel_failure` to turn a failed tunnel into a
@@ -147,7 +147,6 @@ class _FrpChannelTransport:
         remote_api_port: int,
         api_token: str,
         identity_anchor: IdentityAnchor,
-        frpc_bin: str,
         process_factory: FrpProcessFactory | None = None,
         local_bind_port: int | None = None,
         ready_timeout_seconds: float = DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS,
@@ -169,7 +168,6 @@ class _FrpChannelTransport:
         self._remote_api_port = remote_api_port
         self._api_token = api_token
         self._identity_anchor: IdentityAnchor = identity_anchor
-        self._frpc_bin = frpc_bin
         self._process_factory = process_factory
         self._local_bind_port = local_bind_port
         self._ready_timeout_seconds = ready_timeout_seconds
@@ -230,7 +228,7 @@ class _FrpChannelTransport:
         (``RelayTransport``'s own Protocol docstring).
 
         iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
-        reconciliation pass runs for this exact ``frpc_bin`` -- re-verified,
+        reconciliation pass runs for relay's own frp visitors -- re-verified,
         pid-reuse-safe reaping (D1) of any prior visitor whose owning CLI
         process is gone (a ``kill -9`` or crash the worker adapter's atexit
         hook could never have caught), each
@@ -246,7 +244,7 @@ class _FrpChannelTransport:
         if self._established:
             raise RelayError(f"{self._mode} transport was already established")
         validate_channel_nonce(nonce)
-        reconciliation = reconcile_stale_frp_visitors(frpc_bin=self._frpc_bin)
+        reconciliation = reconcile_stale_frp_visitors()
         self._reaped_orphan_visitor_pids = reconciliation.reaped_pids
         self._swept_config_dirs = reconciliation.swept_config_dirs
         self._reconciliation_skipped_reason = reconciliation.skipped_reason
@@ -258,7 +256,6 @@ class _FrpChannelTransport:
             proxy_name=self._proxy_name,
         )
         visitor = HeldFrpVisitor(
-            frpc_bin=self._frpc_bin,
             config=config,
             local_bind_port=local_bind_port,
             visitor_type=self._visitor_type,
@@ -367,7 +364,7 @@ class BrokeredTcpTransport(_FrpChannelTransport):
     Both relays dial out; the relay point brokers the handshake that joins
     them. Bring-up costs exactly one frp visitor pair and zero ssh connections
     (§8.4), held for the connection's lifetime -- the same one-held-process
-    dial-count shape as ``ssh_forward``, just over ``frpc`` instead of ``ssh``.
+    dial-count shape as ``ssh_forward``, just over relay's frp visitor instead of ``ssh``.
     """
 
     _mode: ClassVar[TransportMode] = "brokered_tcp"

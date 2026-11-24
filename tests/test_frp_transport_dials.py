@@ -253,8 +253,8 @@ def _install(
     def skip_health(*_args: object, **_kwargs: object) -> None:
         """The tunnel is faked, so its loopback readiness probe is a no-op."""
 
-    def reconcile(*, frpc_bin: str, **_kwargs: object) -> ReconciliationResult:
-        harness.reconciliation_calls.append(frpc_bin)
+    def reconcile(**_kwargs: object) -> ReconciliationResult:
+        harness.reconciliation_calls.append("visitor")
         return harness.reconciliation_result
 
     monkeypatch.setattr("clio_relay.frp_link.spawn_frp_process", process_factory)
@@ -300,7 +300,6 @@ def _transport(
         remote_api_port=API_PORT,
         api_token="session-api-token",
         identity_anchor="preshared_link_secret",
-        frpc_bin="frpc",
         ready_timeout_seconds=ready_timeout_seconds,
     )
 
@@ -313,7 +312,6 @@ def _worker() -> WorkerConnection:
         remote_api_port=API_PORT,
         api_token="session-api-token",
         session_owner_token=OWNER_TOKEN,
-        frpc_bin="frpc",
     )
 
 
@@ -503,7 +501,7 @@ def test_reconciliation_runs_for_the_configured_frpc_and_reports_reaped_pids(
     assert transport.reaped_orphan_visitor_pids == (4321, 4322)
     assert transport.swept_stale_config_dirs == 1
     assert transport.reconciliation_skipped_reason is None
-    assert harness.reconciliation_calls == ["frpc"]
+    assert harness.reconciliation_calls == ["visitor"]
 
 
 def test_no_orphans_means_nothing_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -514,7 +512,7 @@ def test_no_orphans_means_nothing_reaped(monkeypatch: pytest.MonkeyPatch) -> Non
     transport.establish(nonce=NONCE)
 
     assert transport.reaped_orphan_visitor_pids == ()
-    assert harness.reconciliation_calls == ["frpc"]
+    assert harness.reconciliation_calls == ["visitor"]
 
 
 def test_a_skipped_snapshot_is_reported_rather_than_read_as_no_orphans(
