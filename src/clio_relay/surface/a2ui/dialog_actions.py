@@ -229,13 +229,15 @@ class DialogActions:
             if detail:
                 test["detail"] = detail
             save = as_dict(draft.get("save"))
-            save.setdefault("name", built.title)
-            save.setdefault("policy", [self.state.default("security")])
+            # The draft holds every field, empty until the person fills it: fill the empty ones.
+            filled = {"name": built.title, "policy": [self.state.default("security")]}
             from clio_relay.surface.a2ui.surfaces import spend_draft
             from clio_relay.surface.a2ui.values import spend_ask
 
-            for key, value in spend_draft(spend_ask(self.state.default("spend"))).items():
-                save.setdefault(key, value)
+            filled.update(spend_draft(spend_ask(self.state.default("spend"))))
+            for key, value in filled.items():
+                if save.get(key) in (None, "", []):
+                    save[key] = value
             draft["save"] = save
         elif state == "needs_sign_in":
             provider = (entry.identity or entry.adapter).lower()

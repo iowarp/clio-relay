@@ -182,6 +182,7 @@
   "Save endpoint": "エンドポイントを保存",
   "Saved": "保存済み",
   "Saved SSH hosts": "保存済みの SSH ホスト",
+  "Saved the defaults for new endpoints": "新しいエンドポイントの既定値を保存しました",
   "Scheduler": "スケジューラー",
   "Scope": "スコープ",
   "Scp command": "scp コマンド",

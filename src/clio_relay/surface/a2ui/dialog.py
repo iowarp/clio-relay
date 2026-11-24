@@ -118,12 +118,14 @@ def add_data(state: TabState, forms: dict[str, Form]) -> dict[str, Any]:
 
 def defaults_data(state: TabState) -> dict[str, Any]:
     """Return ``/defaultsDraft``: the defaults dialog's fields, from the saved defaults."""
+    from clio_relay.surface.a2ui.surfaces import SPEND, SPEND_LIMIT_FIELD
     from clio_relay.surface.a2ui.values import spend_ask
 
     return {
         "protocol": [state.default("protocol")],
         "policy": [state.default("security")],
-        **spend_draft(spend_ask(state.default("spend"))),
+        # As the fields bind them: Spending is a picker's list, like the two above.
+        **draft((SPEND, SPEND_LIMIT_FIELD), spend_draft(spend_ask(state.default("spend")))),
     }
 
 

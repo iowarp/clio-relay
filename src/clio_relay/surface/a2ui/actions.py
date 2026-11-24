@@ -421,7 +421,7 @@ class TabActions(DialogActions):
             self.state.notice = sentence(refusal.message)
             return Outcome(ok=False, resend={SITES_SURFACE: ("/defaults",)})
         self.state.defaults = defaults_state(saved)
-        self.state.notice = "Saved the defaults for new endpoints."
+        self.state.notice = _("Saved the defaults for new endpoints") + "."
         return Outcome(ok=True, resend={SITES_SURFACE: ("/defaults",)})
 
     async def _set_spend(self, site: SiteEntry, value: str) -> Outcome:

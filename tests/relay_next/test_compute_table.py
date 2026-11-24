@@ -104,6 +104,7 @@ def test_the_table_has_headers_and_a_row_per_endpoint(relay_paths: RelayPaths) -
             assert not host.is_open("defaults-dialog") and not host.is_open("add-dialog")
             assert host.get("relay-sites", "/defaultsDraft/protocol") == ["ssh"]
             assert host.get("relay-sites", "/defaultsDraft/policy") == ["guarded"]
+            assert host.get("relay-sites", "/defaultsDraft/spend") == ["always"]
             row = host.row("fx")
             assert row["values"] == {
                 "protocol": "fixture",

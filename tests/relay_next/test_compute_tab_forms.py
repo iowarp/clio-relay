@@ -6,7 +6,7 @@ import asyncio
 
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui.components import Tree
-from clio_relay.surface.a2ui.forms import Field, Kind, field_components, form
+from clio_relay.surface.a2ui.forms import Field, Kind, draft_value, field_components, form
 from clio_relay.surface.settings import RelayPaths
 
 from .a2ui_host import Host, basic_client
@@ -31,6 +31,14 @@ def test_every_field_carries_its_own_error_as_a_check() -> None:
     ids = field_components(tree, "c", Field("x", "X", "choice", options=("a",)), "/d/x", "Wrong")
     assert ids == ["c", "c-error"]
     assert "checks" not in tree.components[0]
+
+
+def test_a_picker_list_sent_back_stays_one_list() -> None:
+    """A ChoicePicker's draft comes back from the client as its list, empty or not."""
+    item = Field("policy", "Security", "choice", options=("guarded", "open"))
+    assert draft_value(item, []) == []
+    assert draft_value(item, ["open"]) == ["open"]
+    assert draft_value(item, "open") == ["open"]
 
 
 def test_globus_names_its_compute_endpoint() -> None:

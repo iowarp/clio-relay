@@ -2277,6 +2277,11 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
   - **Deviations from the mock.** The header buttons sit on the subtitle line. Stop is the busy state of Test. Only a protocol's required fields show in the dialog. "Suggested" is a label; there is no separate suggested-protocol default. Only the dialog's tabs have icons.
   - **Module split.** The new code went into `dialog.py`, `dialog_actions.py`, `editform.py`, `site_dialogs.py`, `newsite.py`, `saved.py`, `i18n.py` and `tool_meta.py` to keep each file under the size ratchet.
   - **Lesson: the locale files.** Writing non-ASCII through a PowerShell pipe into Python turned every such character into "?". The files were written again as UTF-8, and a test checks that every language has every string, its placeholders, and no middle dot.
+  - **Fixes from the live QA (es locale, after a8).**
+    - A picker's draft the client sends back is already a list, so `forms.draft_value` keeps its items instead of wrapping it again (`[]` had become `["[]"]`).
+    - A test that passes fills the Save step's empty name, Security and Spending, not only missing keys, so the defaults show selected.
+    - `/defaultsDraft/spend` is a picker's list like protocol and policy, so the defaults dialog shows the saved Spending.
+    - "Saved the defaults for new endpoints" is translated.
 
 ### Facts
 

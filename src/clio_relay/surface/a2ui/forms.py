@@ -169,6 +169,9 @@ def draft_value(item: Field, value: Any) -> Any:
     if item.kind == "bool":
         return bool(current)
     if item.kind == "choice":
+        if isinstance(current, list):
+            # A draft the client sent back is already the picker's list.
+            return [str(value) for value in cast(list[Any], current) if value not in (None, "")]
         return [str(current)] if current is not None else []
     if current is None:
         return ""
