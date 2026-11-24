@@ -80,6 +80,28 @@ def split_name(name: str) -> tuple[str, str]:
     return repo, package
 
 
+JARVIS_BUILTIN = "builtin"
+"""jarvis-cd's own repository, whose packages relay never stages, lists or runs.
+
+They hardcode a case or a site's setup, so they are a reference for writing a
+generic package, not packages to run. JARVIS's own steps relay asks for
+(``builtin.resource_graph``) are JARVIS's machinery, not staged packages.
+"""
+
+
+def refuse_builtin(name: str) -> None:
+    """Refuse ``name`` when it is one of jarvis-cd's builtin packages (:data:`JARVIS_BUILTIN`)."""
+    if name.partition(".")[0] == JARVIS_BUILTIN:
+        raise Refusal(
+            RefusalReason.POLICY_REFUSED,
+            f"{name} is one of jarvis-cd's builtin packages, which relay does not stage or "
+            "run. Read it only as a reference, and use a package relay's sources hold for "
+            "the application or write a generic one with the jarvis-package skill",
+            package=name,
+            next_step="write_package",
+        )
+
+
 # Building an archive
 
 

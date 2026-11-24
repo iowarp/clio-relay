@@ -168,3 +168,18 @@ def test_the_sources_list_their_packages_without_running_them(tmp_path: Path) ->
         "demo.other"
     ]
     assert source_packages([tmp_path / "missing"]) == []
+
+
+def test_jarvis_builtin_packages_are_never_listed_staged_or_run(tmp_path: Path) -> None:
+    builtin = make_repo(tmp_path / "sources" / "jarvis-cd", repo="builtin")
+    assert source_packages([tmp_path / "sources"]) == []
+    state = tmp_path / "state"
+    with pytest.raises(Refusal) as staged:
+        stage(state, archive_package(builtin, "builtin.hello"), "builtin.hello", version="1")
+    assert staged.value.reason is RefusalReason.POLICY_REFUSED
+    assert staged.value.data["next_step"] == "write_package"
+    assert not (state / "packages").exists()
+    pinned = PackageRef(name="builtin.hello", version="1", sha256="a" * 64)
+    with pytest.raises(Refusal) as run:
+        PackageCatalog(state / "packages").resolve(pinned)
+    assert run.value.reason is RefusalReason.POLICY_REFUSED

@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import yaml
 
+from clio_relay.jarvis_site import JARVIS_BUILTIN
 from clio_relay.packages import source_dirs
 
 _SUMMARY_CHARS = 240
@@ -94,6 +95,7 @@ def source_packages(sources: Sequence[Path], match: str | None = None) -> list[d
     Each is ``{name, summary, contract}``: ``contract`` says whether it has a
     ``contract.yaml`` relay reads its outputs, progress and resources from. ``match``
     keeps those whose name or summary holds every one of its words, case-insensitive.
+    jarvis-cd's builtin repository is never listed (:data:`JARVIS_BUILTIN`).
     """
     words = [word.lower() for word in (match or "").split()]
     found: dict[str, dict[str, Any]] = {}
@@ -101,7 +103,7 @@ def source_packages(sources: Sequence[Path], match: str | None = None) -> list[d
         for candidate in source_dirs(source):
             for repo_dir in source_dirs(candidate):
                 inner = repo_dir / repo_dir.name
-                if not (inner / "__init__.py").is_file():
+                if repo_dir.name == JARVIS_BUILTIN or not (inner / "__init__.py").is_file():
                     continue
                 try:
                     children = sorted(child for child in inner.iterdir() if child.is_dir())

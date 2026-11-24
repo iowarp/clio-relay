@@ -89,8 +89,8 @@ package | package-service)
     pipeline="relay_${_tapisJobUUID:-job}"
     pipeline="${pipeline//-/_}"
     # A JARVIS of the job's own, so the site's ~/.ppi-jarvis is never read or changed.
-    # +force: jarvis init registers JARVIS's own builtin here, and a reviewed archive
-    # of the same repository name must replace it, or the unreviewed copy would run.
+    # +force, in this job's own root only, so the staged archive always replaces any
+    # repository of its name. builtin never arrives here: relay refuses to stage it.
     export JARVIS_ROOT="$job_dir/.relay-jarvis"
     {
         jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared" \

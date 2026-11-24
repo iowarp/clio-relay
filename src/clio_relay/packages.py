@@ -38,10 +38,12 @@ import yaml
 from pydantic import BaseModel, Field
 
 from clio_relay.jarvis_site import (
+    JARVIS_BUILTIN,
     SOURCE_FILE,
     archive_package,
     git_source,
     inspect_archive,
+    refuse_builtin,
     split_name,
 )
 from clio_relay.jobs.content import ContentStore
@@ -165,8 +167,8 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
 
     The version is ``version`` when given, else the contract's, else the git
     tag the archive was built at, else the first 12 characters of the commit its
-    source record names when that copy is unmodified (a pinned source such as
-    jarvis-cd's builtin repository). With none of these it refuses.
+    source record names when that copy is unmodified (a source copied at a
+    pinned commit). With none of these it refuses.
     """
     info = inspect_archive(data, name)
     repo, package = split_name(name)
@@ -420,8 +422,12 @@ class PackageCatalog:
         return removed
 
     def all(self) -> list[PackageEntry]:
-        """Return every entry, newest version of each name last."""
-        return sorted(self.records.all(), key=lambda entry: (entry.name, entry.staged_at))
+        """Return every entry, newest version of each name last.
+
+        An archive of jarvis-cd's builtin staged by an earlier relay is left out.
+        """
+        kept = (e for e in self.records.all() if e.name.partition(".")[0] != JARVIS_BUILTIN)
+        return sorted(kept, key=lambda entry: (entry.name, entry.staged_at))
 
     def newest(self) -> list[PackageEntry]:
         """Return the newest entry of each package name, by when it was staged.
@@ -464,7 +470,9 @@ class PackageCatalog:
         which one and pins its ``version`` or ``sha256``. A superseded archive
         is pinned only by its ``sha256``; call :func:`stage_current` first, so
         a change in relay's package sources supersedes what they gave before.
+        jarvis-cd's builtin packages are refused (:func:`refuse_builtin`).
         """
+        refuse_builtin(package.name)
         if package.version is not None and package.sha256 is not None:
             return package
         found = [
@@ -540,8 +548,10 @@ def stage(
     """Put an archive in relay's content store and record it in the catalog.
 
     An archive from relay's package sources supersedes what they gave before
-    under that name (:meth:`PackageCatalog.supersede`).
+    under that name (:meth:`PackageCatalog.supersede`). jarvis-cd's builtin
+    packages are refused (:func:`refuse_builtin`).
     """
+    refuse_builtin(name)
     entry = describe_archive(data, name, version=version).model_copy(update={"origin": origin})
     ContentStore(state_dir / "content").put(data)
     catalog = PackageCatalog(state_dir / "packages")
@@ -683,8 +693,9 @@ def stage_current(state_dir: Path, sources: Sequence[Path], name: str) -> Packag
     the one they gave before is superseded: the run pins the new archive and its
     review is asked, never an old archive quietly. The archive is deterministic,
     so an unchanged source stages the same entry and changes nothing. Returns
-    ``None`` when no source holds ``name``.
+    ``None`` when no source holds ``name``. jarvis-cd's builtin is refused.
     """
+    refuse_builtin(name)
     try:
         repo_dir = find_repository(sources, name)
     except Refusal:

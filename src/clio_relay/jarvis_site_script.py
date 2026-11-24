@@ -154,8 +154,8 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
         fail 1 "installing the Python requirements of $repo failed: $listed_now"
       }
     fi
-    # +force, in this job's own root only: init registered JARVIS's builtin here, and a
-    # reviewed archive of that name must replace it, or the unreviewed copy would run.
+    # +force, in this job's own root only, so a staged archive always replaces any
+    # repository of its name. builtin never arrives here: relay refuses to stage it.
     "$found" repo add "$root/src/$repo" +force >/dev/null
   done
   printf '%s\n' "$steps" > "$root/.relay-setup"
