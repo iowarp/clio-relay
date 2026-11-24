@@ -339,7 +339,9 @@ def test_the_page_and_the_cli_share_the_defaults(
 
     async def pick() -> None:
         async with a2ui_client(relay_paths) as client:
-            result = await _save_defaults(Host(client), "local", "open")
+            host = Host(client)
+            await host.open()
+            result = await _save_defaults(host, "local", "open")
             assert result.structured_content["ok"] is True, said(result)
 
     async def shown() -> dict[str, Any]:

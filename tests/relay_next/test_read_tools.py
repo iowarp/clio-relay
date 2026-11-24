@@ -17,12 +17,23 @@ from .a2ui_host import basic_client
 from .conftest import add_site
 
 READS = {"describe", "exec_read", "files_read", "packages_read"}
-PAGE_ONLY = {surfaces.OPEN_ADD, surfaces.EDIT_SITE, surfaces.CANCEL, surfaces.REMOVE_SITE}
+PAGE_ONLY = {
+    surfaces.OPEN_ADD,
+    surfaces.EDIT_SITE,
+    surfaces.CANCEL,
+    surfaces.REMOVE_SITE,
+    surfaces.OPEN_DIALOG,
+    surfaces.PICK,
+    surfaces.BACK,
+    surfaces.CLOSE_DIALOG,
+}
 REPLACES = {
     surfaces.SAVE_SITE,
     surfaces.SWITCH_ADAPTER,
     surfaces.SET_VALUE,
     surfaces.CONFIRM_REMOVE,
+    surfaces.SAVE_DEFAULTS,
+    surfaces.UNDO,
 }
 
 
