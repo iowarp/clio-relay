@@ -163,6 +163,9 @@ def test_the_hop_lives_under_the_sites_relay_directory() -> None:
         def clean_targets(self) -> tuple[list[str], list[str]]:
             return [".clio-relay-w1"], []
 
+        async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
+            return {"removed": targets, "kept": keep}
+
     default = serve_settings.SiteServe()
     assert serve_settings.hop_dir_for(default, _Ssh(), "ares") == "~/.clio-relay-w1/hop/ares"
     assert serve_settings.hop_dir_for(default, object(), "ares") == "~/.clio-relay/hop/ares"
