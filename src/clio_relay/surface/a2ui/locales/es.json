@@ -56,7 +56,7 @@
   "Credentials": "Credenciales",
   "Default account": "Cuenta predeterminada",
   "Default queue": "Cola predeterminada",
-  "Defaults for new endpoints": "Valores predeterminados para endpoints nuevos",
+  "Defaults for new endpoints": "Predeterminados para nuevos",
   "Defaults to relay's CLIO_RELAY_FRPS_ADDR and CLIO_RELAY_FRP_TOKEN": "Por defecto, CLIO_RELAY_FRPS_ADDR y CLIO_RELAY_FRP_TOKEN de relay",
   "Directory for job directories, under root when relative; empty for none": "Directorio para los directorios de trabajo, bajo la raíz si es relativo; vacío para ninguno",
   "Directory on relay's machine that the local collection shares": "Directorio de la máquina de relay que comparte la colección local",
