@@ -12,6 +12,7 @@ import json
 import re
 from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -272,6 +273,56 @@ def test_a_saved_host_builds_an_ssh_endpoint(
     assert [item.key for item in saved_items([record], ["lab", "old"], environ)] == ["clio:mine"]
     built = build({"tab": SAVED_TAB, "saved": "removed:0"}, store, {}, [record], environ=environ)
     assert built.entry is not None and built.entry.id == "old"
+
+
+CATALOG_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "plugin"
+    / "ai.iowarp.clio"
+    / "a2ui"
+    / "clio-relay-compute"
+    / "catalog.json"
+)
+# ComponentCommon lives in A2UI's common_types, which relay doesn't vendor.
+COMMON = {"id", "accessibility", "weight"}
+
+
+def _declared(catalog: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    """Return the properties a component schema declares, local refs followed."""
+    found: dict[str, Any] = dict(schema.get("properties", {}))
+    for part in schema.get("allOf", []):
+        ref = part.get("$ref", "")
+        if ref.startswith("#/$defs/"):
+            found |= _declared(catalog, catalog["$defs"][ref.removeprefix("#/$defs/")])
+        elif not ref:
+            found |= _declared(catalog, part)
+    return found
+
+
+def test_everything_the_page_draws_fits_the_shipped_catalog(relay_paths: RelayPaths) -> None:
+    """CLIO refuses a surface its catalog doesn't allow, so the page must fit it."""
+    catalog = json.loads(CATALOG_FILE.read_text("utf-8"))
+    SiteStore(relay_paths.sites_file).add(SiteEntry(id="here", name="Here", adapter="local"))
+    drawn: list[dict[str, Any]] = []
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            drawn.extend(host.surfaces["relay-sites"]["components"].values())
+            await host.add()
+            drawn.extend(host.surfaces["relay-sites"]["components"].values())
+
+    asyncio.run(scenario())
+    assert any(c["component"] == "clio.dialog.v1" for c in drawn)
+    for component in drawn:
+        declared = _declared(catalog, catalog["components"][component["component"]])
+        extra = set(component) - set(declared) - COMMON
+        assert not extra, f"{component['id']} uses {extra}, which the catalog lacks"
+        for key, value in component.items():
+            allowed = declared.get(key, {}).get("enum")
+            if allowed is not None:
+                assert value in allowed, f"{component['id']}.{key} is {value!r}, not in {allowed}"
 
 
 def test_the_page_speaks_the_locale_the_request_names(relay_paths: RelayPaths) -> None:

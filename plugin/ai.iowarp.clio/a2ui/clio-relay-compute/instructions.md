@@ -10,13 +10,14 @@ unmodified) and three of CLIO's own components:
   Spending, Status), then one row per endpoint with its pickers, its status and
   a menu of Connect, Test, Edit and Remove. The headers show even with no rows.
   A row's `options` limits a column to the protocols that endpoint has, and
-  `inherited` marks values that follow the defaults.
+  `inherited` marks values that follow the defaults. The table's `defaults`
+  row, above the endpoints, holds the values new endpoints start with; the
+  person changes them in place.
 - `clio.dialog.v1`, a dialog frame. Its trigger sits in the page and opens it.
-  The Add endpoint dialog has three tabs (Catalog, Saved, Your own), a step rail
-  (Site, Protocol, Test, Save), a status line for the test and a footer with
-  Test, Cancel or Back, and Save endpoint. Save stays off until a test of the
-  same choices passes. The gear opens the defaults for new endpoints in a
-  narrow dialog, and Edit and Sign in open in dialogs too.
+  The Add endpoint dialog is wide, with three tabs (Catalog, Saved, Your own),
+  a step rail (Site, Protocol, Test, Save), a status line for the test and a
+  footer with Test, Cancel or Back, and Save endpoint. Save stays off until a
+  test of the same choices passes. Edit and Sign in open in dialogs too.
 - `clio.picker.v1`, a searchable list or compact select of items, each with
   a title, a subtitle and chips. The dialog picks a site, a protocol or a saved
   computer with it.

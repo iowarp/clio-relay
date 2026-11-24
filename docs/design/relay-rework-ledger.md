@@ -2287,6 +2287,7 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
     - The gear had no purpose left, so it is gone, with `defaults-dialog`, `/defaultsDraft` and the `compute_save_defaults` tool. An A2UI client now sees one tool fewer.
     - What that drops: a custom spending limit as the default. The row offers the Spending column's options, as each endpoint's row does. The CLI's `site defaults --spend` still takes any node-hour threshold.
     - `add-dialog` has `width: "wide"`, which clio-schemas b20595a0 (0.8.0b5) and gact-tui d296a4df5 add: up to 880 px across and a taller body. Under 600 px a tabbed dialog still fills the window.
+    - a11 shipped without `"wide"` in the plugin's own catalog (`plugin/ai.iowarp.clio/a2ui/clio-relay-compute/catalog.json`), so CLIO refused the page live with `a2ui_validation_failed` ("'wide' is not one of ['narrow', 'default']"). The catalog and its instructions now say so. A new test checks every component the page draws, with an endpoint row and with the add dialog open, against the shipped catalog: each prop must be declared and each enum value allowed. Relay doesn't vendor A2UI's `common_types`, so the test is structural, not a full JSON Schema validation.
 
 ### Facts
 
