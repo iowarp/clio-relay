@@ -495,3 +495,23 @@ def test_render_detached(tmp_path: Path) -> None:
     assert "exec env -i 'X=a b' sh -c 'echo $X'" in child
     assert f">{job_dir}/stdout" in child
     assert f"J={job_dir}" in rendered.files["supervise.sh"]
+
+
+@pytest.mark.parametrize(
+    ("verb", "extra"), [("get", ()), ("cancel", ()), ("stop", ()), ("move", ("--queue", "debug"))]
+)
+def test_jarvis_execution_shell_keeps_the_env_ahead_of_jarvis(
+    verb: jarvis_submit.ExecutionVerb, extra: tuple[str, ...]
+) -> None:
+    shell = jarvis_submit.execution_shell(
+        verb, "ex1", job_dir="/scratch/job", pipeline="pl1", extra=extra
+    )
+    tail = " ".join(["execution", verb, "ex1", *extra, "--pipeline-id", "pl1", "+json"])
+    assert shell == (
+        f'env JARVIS_ROOT=/scratch/job/.relay-jarvis JARVIS_NO_BUILTIN=1 "$jarvis" {tail}'
+    )
+    argv = jarvis_submit.execution_argv(
+        verb, "ex1", job_dir="/scratch/job", jarvis="/opt/jarvis", pipeline="pl1", extra=extra
+    )
+    assert argv[: argv.index("/opt/jarvis")] == jarvis_submit.execution_env("/scratch/job")
+    assert argv[argv.index("/opt/jarvis") + 1 :] == tail.split()

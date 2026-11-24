@@ -922,11 +922,18 @@ def execution_argv(
     """
     if verb not in EXECUTION_VERBS:
         raise ValueError(f"unknown execution verb {verb!r}")
+    return [*execution_env(job_dir), jarvis, *_execution_tail(verb, execution_id, pipeline, extra)]
+
+
+def execution_env(job_dir: str) -> list[str]:
+    """The ``env NAME=VALUE ...`` prefix every ``jarvis execution`` call runs under."""
+    return ["env", f"JARVIS_ROOT={jarvis_root(job_dir)}", f"{NO_BUILTIN_ENV}=1"]
+
+
+def _execution_tail(
+    verb: ExecutionVerb, execution_id: str, pipeline: str | None, extra: Sequence[str]
+) -> list[str]:
     return [
-        "env",
-        f"JARVIS_ROOT={jarvis_root(job_dir)}",
-        f"{NO_BUILTIN_ENV}=1",
-        jarvis,
         "execution",
         verb,
         execution_id,
@@ -948,13 +955,15 @@ def execution_shell(
     """Return ``jarvis execution <verb>`` as shell, with JARVIS from ``relay.jarvis``.
 
     The command runs in the job directory, after ``jarvis=$(cat relay.jarvis)``.
+    The env prefix is built apart from JARVIS's own argv, so neither moves the other.
     """
-    argv = execution_argv(
-        verb, execution_id, job_dir=job_dir, jarvis="JARVIS", pipeline=pipeline, extra=extra
+    if verb not in EXECUTION_VERBS:
+        raise ValueError(f"unknown execution verb {verb!r}")
+    env = " ".join(shlex.quote(part) for part in execution_env(job_dir))
+    tail = " ".join(
+        shlex.quote(part) for part in _execution_tail(verb, execution_id, pipeline, extra)
     )
-    parts = [shlex.quote(part) for part in argv]
-    parts[2] = '"$jarvis"'
-    return " ".join(parts)
+    return f'{env} "$jarvis" {tail}'
 
 
 def handle_pipeline(data: Mapping[str, Any]) -> tuple[str, str]:
