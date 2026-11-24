@@ -90,9 +90,7 @@ async def operation_asks(
         asks.append(await _card(service, site, record, job, decision, charge, action, spends))
         return asks
     asks.extend(await review_asks(service, site, record, decision))
-    if held := await held_services.ask(service, site, kind, record.operation_id):
-        asks.append(held[0])
-        record.result = {**(record.result or {}), held_services.KEY: held[1]}
+    held = await held_services.question(service, site, kind, record.operation_id)
     if spends and site.spend.needs_approval(charge.node_hours):
         binding = {
             "site": site.id,
@@ -108,6 +106,13 @@ async def operation_asks(
                 plain=False,
             )
         )
+    if held is not None:
+        # The job's last yes-or-no ask carries the choice; one ask, not two.
+        own = [a for a in asks if a.kind == "approve"]
+        if own:
+            held_services.fold(service, own[-1], record, held)
+        else:
+            asks.append(await held_services.ask(service, site, record, held))
     return asks
 
 
@@ -161,20 +166,7 @@ async def _card(
         site=site, operation_id=record.operation_id, message=message, binding=binding, plain=False
     )
     if held is not None:
-        schema = dict(ask.requested_schema or {})
-        properties = dict(schema.get("properties") or {})
-        properties[held_services.FIELD] = {
-            "type": "string",
-            "title": "The site's running services",
-            # A job card shows in place of the message, so the field says which services.
-            "description": held[0],
-            "enum": [held_services.END, held_services.KEEP],
-            "default": held_services.KEEP,
-        }
-        schema["properties"] = properties
-        ask.requested_schema = schema
-        state = {"ask_id": ask.ask_id, "operations": held[1], "in_card": True}
-        record.result = {**(record.result or {}), held_services.KEY: state}
+        held_services.fold(service, ask, record, held)
     ask.meta = {job_card.JOB_META: job_card.snapshot(service, record)}
     service.asks.put(ask.ask_id, ask)
     return ask

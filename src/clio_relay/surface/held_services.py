@@ -7,8 +7,10 @@ pilot's three and a production run's three, say. So when a run or service is
 opened while another service of the site's runs, relay asks once, with the
 job's other asks: end those services when this job is submitted, or keep them
 running. Relay never ends one on its own, and keeping is the answer to a
-declined or cancelled ask. The person still has each service's review until
-they choose to end it.
+declined or cancelled ask. The choice rides in the job's own ask (its card, or
+the approval relay asks for it), so the person answers once; only a job that
+asks nothing else asks it on its own. The person still has each service's
+review until they choose to end it.
 """
 
 from __future__ import annotations
@@ -109,22 +111,68 @@ async def question(
     return message, [r.operation_id for r in running]
 
 
+TITLE = "The site's running services"
+
+
+def field(message: str) -> dict[str, Any]:
+    """Return the form field that holds the choice, titled for the person."""
+    return {
+        "type": "string",
+        "title": TITLE,
+        # A job card shows in place of the message, so the field says which services.
+        "description": message,
+        "enum": [END, KEEP],
+        "default": KEEP,
+    }
+
+
+def fold(
+    service: RelayService,
+    into: Ask,
+    record: OperationRecord,
+    held: tuple[str, list[str]],
+) -> None:
+    """Put the choice in the job's own ask, so the person answers both at once.
+
+    Declining that ask declines the job, so nothing is submitted and nothing ends.
+    """
+    message, operations = held
+    schema = dict(into.requested_schema or {})
+    properties = dict(schema.get("properties") or {})
+    properties[FIELD] = field(message)
+    schema["properties"] = properties
+    into.requested_schema = schema
+    service.asks.put(into.ask_id, into)
+    state = {"ask_id": into.ask_id, "operations": operations, "in_card": True}
+    record.result = {**(record.result or {}), KEY: state}
+
+
 async def ask(
-    service: RelayService, site: SiteEntry, kind: OperationKind, operation_id: str
-) -> tuple[Ask, dict[str, Any]] | None:
-    """Build the ask for a new run or service while others of the site run, if any do."""
-    found = await question(service, site, kind, operation_id)
-    if found is None:
-        return None
-    message, operations = found
+    service: RelayService,
+    site: SiteEntry,
+    record: OperationRecord,
+    held: tuple[str, list[str]],
+) -> Ask:
+    """Ask the choice on its own, for a job that asks nothing else of the person."""
+    message, operations = held
     asked = await service.ask_provider.choose(
         site=site,
-        operation_id=operation_id,
+        operation_id=record.operation_id,
         message=message,
         field_name=FIELD,
         options=[END, KEEP],
     )
-    return asked, {"ask_id": asked.ask_id, "operations": operations}
+    schema = dict(asked.requested_schema or {})
+    properties = dict(schema.get("properties") or {})
+    properties[FIELD] = {**cast(dict[str, Any], properties.get(FIELD) or {}), "title": TITLE}
+    schema["properties"] = properties
+    asked.requested_schema = schema
+    service.asks.put(asked.ask_id, asked)
+    record.result = {
+        **(record.result or {}),
+        KEY: {"ask_id": asked.ask_id, "operations": operations},
+    }
+    return asked
 
 
 async def end_chosen(service: RelayService, operation_id: str) -> None:
