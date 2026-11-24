@@ -341,7 +341,7 @@ async def start_install(
                 "own limits, in the background with no time limit; cancel stops it"
             )
         record.result = {**(record.result or {}), INSTALL_KEY: state, "message": message}
-        cancelled = record.state == OperationState.CANCELLED
+        cancelled = record.state.final
         record.move(OperationState.QUEUED, message)
         service.operations.put(operation_id, record)
     if cancelled:

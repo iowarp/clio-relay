@@ -534,15 +534,16 @@ class RelayService:
             adapter = self.adapter_named(site, record.adapter)
         except Refusal as refusal:
             return self.finish(operation_id, OperationState.FAILED, refusal)
-        with self.operations.locked(operation_id):
-            record = self.operation(operation_id)
-            if record.state != OperationState.AWAITING_INPUT or not installing.pending(record):
-                return record
-            state = {**installing.state_of(record), "stage": "starting"}
-            record.result = {**(record.result or {}), installing.INSTALL_KEY: state}
-            record.move(OperationState.SUBMITTING, "starting the install")
-            self.operations.put(operation_id, record)
-        return await installing.start_install(self, operation_id, site, adapter)
+        with self.operations.submitting(operation_id):
+            with self.operations.locked(operation_id):
+                record = self.operation(operation_id)
+                if record.state != OperationState.AWAITING_INPUT or not installing.pending(record):
+                    return record
+                state = {**installing.state_of(record), "stage": "starting"}
+                record.result = {**(record.result or {}), installing.INSTALL_KEY: state}
+                record.move(OperationState.SUBMITTING, "starting the install")
+                self.operations.put(operation_id, record)
+            return await installing.start_install(self, operation_id, site, adapter)
 
     def finish(
         self, operation_id: str, state: OperationState, refusal: Refusal | None
@@ -572,16 +573,28 @@ class RelayService:
         except Refusal as refusal:
             return self.finish(operation_id, OperationState.FAILED, refusal)
         job_name = _job_name(adapter, operation_id) if record.kind == "run" else None
-        with self.operations.locked(operation_id):
-            record = self.operation(operation_id)
-            if record.state != OperationState.AWAITING_INPUT:
-                return record
-            if job_name is not None:
-                record.result = {**(record.result or {}), "job_name": job_name}
-            record.move(
-                OperationState.SUBMITTING, None if job_name is None else f"job name {job_name}"
-            )
-            self.operations.put(operation_id, record)
+        # The lease is taken before the move, so a live process holds it for as
+        # long as the record reads ``submitting``; a crash drops it.
+        with self.operations.submitting(operation_id):
+            with self.operations.locked(operation_id):
+                record = self.operation(operation_id)
+                if record.state != OperationState.AWAITING_INPUT:
+                    return record
+                if job_name is not None:
+                    record.result = {**(record.result or {}), "job_name": job_name}
+                record.move(
+                    OperationState.SUBMITTING, None if job_name is None else f"job name {job_name}"
+                )
+                self.operations.put(operation_id, record)
+            return await self._submit_held(operation_id, site, adapter, record)
+
+    async def _submit_held(
+        self,
+        operation_id: str,
+        site: SiteEntry,
+        adapter: BaseAdapter[Any],
+        record: OperationRecord,
+    ) -> OperationRecord:
         await held_services.end_chosen(self, operation_id)
         if record.kind == "serve":
             return await self._start_service(operation_id, site, adapter, record)
@@ -607,10 +620,11 @@ class RelayService:
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             record.handle = handle
-            cancelled = record.state == OperationState.CANCELLED
+            # Cancelled, or ended by anyone, while it was submitting: the job must not outlive it.
+            ended = record.state.final
             record.move(OperationState.QUEUED, f"native id {handle.native_id}")
             self.operations.put(operation_id, record)
-        if cancelled:
+        if ended:
             await adapter.cancel(handle)
         return record
 
@@ -641,7 +655,8 @@ class RelayService:
             )
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
-            cancelled = record.state == OperationState.CANCELLED
+            # Cancelled, or ended by anyone, while it started: the service must not outlive it.
+            cancelled = record.state.final
             if endpoint is not None:
                 record.result = {
                     **(record.result or {}),
@@ -663,6 +678,11 @@ class RelayService:
             return record
         if record.state == OperationState.AWAITING_INPUT:
             return await self.advance(operation_id)
+        if record.state == OperationState.SUBMITTING and self.operations.submit_in_hand(
+            operation_id
+        ):
+            # A live process is submitting it and moves it on; only a crash leaves it here.
+            return record
         site = self.site(record.site)
         adapter = self.adapter_named(site, record.adapter)
         install = installing.install_handle(record)

@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 JOB_WATCH_S = 30.0
 """How often relay itself looks at an open job nobody else is observing."""
 WATCHED_KINDS = ("run", "serve", "install")
-WATCHED_STATES = (OperationState.QUEUED, OperationState.RUNNING)
+WATCHED_STATES = (OperationState.SUBMITTING, OperationState.QUEUED, OperationState.RUNNING)
+"""``submitting`` too: a submission a crash cut short is reconciled with nobody polling it."""
 
 _ANNOUNCE: WeakKeyDictionary[RelayService, ServerChanges] = WeakKeyDictionary()
 _LOOKS: WeakKeyDictionary[RelayService, dict[str, asyncio.Future[bool]]] = WeakKeyDictionary()

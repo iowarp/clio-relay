@@ -18,7 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
 
 from clio_relay.jobs.handles import JobHandle, OutputRef, utc_now
@@ -97,6 +97,10 @@ def _safe_id(record_id: str) -> str:
     return record_id
 
 
+_LEASES: dict[str, int] = {}
+"""The submit leases this process holds, by lock path, with how deep each is taken."""
+
+
 class RecordStore[RecordT: BaseModel]:
     """A directory of JSON records of one model, one file per id."""
 
@@ -118,6 +122,44 @@ class RecordStore[RecordT: BaseModel]:
         self._ensure()
         with FileLock(str(self._locks / f"{_safe_id(record_id)}.lock"), timeout=timeout):
             yield
+
+    @contextmanager
+    def submitting(self, record_id: str, timeout: float = 30.0) -> Generator[None]:
+        """Hold the record's submit lease while this process submits its job.
+
+        The operating system drops the lease when the holder dies, so an
+        observer can tell a submission still in hand from one a crash cut short.
+        A submission that resubmits (an install that then runs) takes it again.
+        """
+        self._ensure()
+        path = str(self._locks / f"{_safe_id(record_id)}.submit.lock")
+        if path in _LEASES:
+            _LEASES[path] += 1
+            try:
+                yield
+            finally:
+                _LEASES[path] -= 1
+            return
+        with FileLock(path, timeout=timeout):
+            _LEASES[path] = 1
+            try:
+                yield
+            finally:
+                del _LEASES[path]
+
+    def submit_in_hand(self, record_id: str) -> bool:
+        """Say whether a live process, this one or another, holds the submit lease."""
+        self._ensure()
+        path = str(self._locks / f"{_safe_id(record_id)}.submit.lock")
+        if path in _LEASES:
+            return True
+        lease = FileLock(path, timeout=0)
+        try:
+            lease.acquire()
+        except Timeout:
+            return True
+        lease.release()
+        return False
 
     def get(self, record_id: str) -> RecordT | None:
         """Return the record, or ``None`` if there is none."""
