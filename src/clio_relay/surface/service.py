@@ -739,9 +739,7 @@ class RelayService:
             return self.observation_failed(operation_id, reason, "job")
         status = await with_package_progress(adapter, record, status)
         record = await self._apply(operation_id, adapter, status)
-        if status.queue and record.kind == "run":
-            record = await queue_switch.consider(self, operation_id, adapter, handle, "job")
-        return record
+        return await queue_switch.consider(self, operation_id, adapter, handle, "job")
 
     async def _refresh_service(
         self,
@@ -764,7 +762,8 @@ class RelayService:
             # One failed look is not the service's end; it stays open and says why.
             logger.warning("observing service %s", operation_id, exc_info=True)
             return self.observation_failed(operation_id, f"{type(exc).__name__}: {exc}")
-        return await self._apply(operation_id, adapter, status, endpoint)
+        record = await self._apply(operation_id, adapter, status, endpoint)
+        return await queue_switch.consider(self, operation_id, adapter, record.handle, "job")
 
     def observation_failed(
         self, operation_id: str, error: str, what: str = "service"

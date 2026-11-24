@@ -14,10 +14,11 @@ from fastmcp_tasks.client import (
 
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import HookContext, set_hook
-from clio_relay.jobs.handles import Endpoint, JobState, JobStatus
+from clio_relay.jobs.handles import Endpoint, JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.sites.models import SiteEntry
+from clio_relay.surface import queue_switch
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -123,6 +124,40 @@ async def test_a_failed_look_keeps_the_service_open_and_says_why(
     assert (seen.result or {})["message"] == (
         "relay could not observe the service: RuntimeError: the job store is unreadable"
     )
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_a_service_job_that_waits_long_asks_to_move(
+    relay_paths: RelayPaths, scripted: list[ScriptedServe], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _lab(relay_paths)
+
+    def movable(adapter: BaseAdapter[Any]) -> bool:
+        return True
+
+    monkeypatch.setattr(queue_switch, "can_move", movable)
+    service = RelayService(relay_paths)
+    record = await service.start_serve("lab", SPEC)
+    with service.operations.locked(record.operation_id):
+        stored = service.operation(record.operation_id)
+        stored.handle = JobHandle(adapter="local", native_id="7")
+        service.operations.put(record.operation_id, stored)
+    scripted[-1].next = JobStatus(
+        state=JobState.QUEUED,
+        queue={
+            "partition": "compute",
+            "reason": "Priority",
+            "starts_in_s": 7200,
+            "partitions": [{"partition": "debug", "fits": True, "idle_nodes": 6}],
+        },
+    )
+    seen = await service.refresh(record.operation_id)
+    assert seen.state == OperationState.AWAITING_INPUT
+    assert queue_switch.state_of(seen)["options"] == {
+        "keep waiting in compute": "",
+        "move to debug": "debug",
+    }
     await service.close()
 
 
