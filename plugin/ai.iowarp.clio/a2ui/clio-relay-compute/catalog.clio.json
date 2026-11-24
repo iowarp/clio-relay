@@ -26,6 +26,9 @@
     "Button": {
       "kernel": "Button"
     },
+    "Icon": {
+      "kernel": "Icon"
+    },
     "TextField": {
       "kernel": "TextField"
     },
@@ -37,6 +40,12 @@
     },
     "clio.choice-table.v1": {
       "kernel": "clio.choice-table.v1"
+    },
+    "clio.dialog.v1": {
+      "kernel": "clio.dialog.v1"
+    },
+    "clio.picker.v1": {
+      "kernel": "clio.picker.v1"
     }
   },
   "instructions": "instructions.md"

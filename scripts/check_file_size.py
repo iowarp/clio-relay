@@ -52,11 +52,10 @@ RATCHET_BASELINE: dict[str, int] = {
     # Recorded in the relay middle-man refactor: the rework's merges had grown
     # these past the cap with the baseline left empty, so the check already
     # failed at 21fffaa5. Each is held at its length here and may only shrink.
-    "src/clio_relay/adapters/local.py": 923,
-    "src/clio_relay/adapters/ssh/adapter.py": 1205,
+    "src/clio_relay/adapters/local.py": 912,
+    "src/clio_relay/adapters/ssh/adapter.py": 1195,
     "src/clio_relay/adapters/worker/adapter.py": 1053,
-    "src/clio_relay/frp_link.py": 812,
-    "src/clio_relay/jarvis_submit.py": 1412,
+    "src/clio_relay/jarvis_submit.py": 1378,
     "src/clio_relay/serve/runtime.py": 922,
     "src/clio_relay/surface/server.py": 813,
     "src/clio_relay/surface/service.py": 978,
@@ -100,11 +99,11 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: 93.63 (147/157) after the Slurm path patterns module.
 #: 89.59 (155/173) recorded in the middle-man refactor: the rework's merges had
 #: dropped the share below the floor, so the check already failed at 21fffaa5.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 90.90
+SRC_DISTRIBUTION_BASELINE_PERCENT = 91.66
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 96.50
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 96.64
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

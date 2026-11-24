@@ -9,7 +9,7 @@ from clio_relay.surface.a2ui.components import Tree
 from clio_relay.surface.a2ui.forms import Field, Kind, field_components, form
 from clio_relay.surface.settings import RelayPaths
 
-from .a2ui_host import Host, a2ui_client
+from .a2ui_host import Host, basic_client
 
 
 def test_every_field_carries_its_own_error_as_a_check() -> None:
@@ -42,8 +42,10 @@ def test_globus_names_its_compute_endpoint() -> None:
 
 
 def test_add_from_catalog(relay_paths: RelayPaths) -> None:
+    """The Basic page's add form; relay's catalog gets the add dialog instead."""
+
     async def scenario() -> None:
-        async with a2ui_client(relay_paths) as client:
+        async with basic_client(relay_paths) as client:
             host = Host(client)
             await host.open()
             await host.add()
@@ -69,7 +71,7 @@ def test_add_from_catalog(relay_paths: RelayPaths) -> None:
             assert host.get("relay-add", "/catalog/valid") == {}
             [site] = SiteStore(relay_paths.sites_file).list()
             assert site.id == "mine"
-            assert host.row("mine")["title"] == site.title
+            assert f"s-{site.id}" in host.visible("relay-sites")
             assert host.visible("relay-add") == {"root"}, "a successful add closes the form"
 
     asyncio.run(scenario())

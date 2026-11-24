@@ -37,7 +37,7 @@ from clio_relay.identity.probe import probes_file
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface.a2ui import adding, cards, protocol, surfaces, table
+from clio_relay.surface.a2ui import adding, cards, i18n, protocol, surfaces, table
 from clio_relay.surface.a2ui.actions import Outcome, TabActions
 from clio_relay.surface.a2ui.forms import Form, form
 from clio_relay.surface.a2ui.protocol import (
@@ -47,6 +47,7 @@ from clio_relay.surface.a2ui.protocol import (
     Message,
     a2ui_client,
     embedded,
+    request_locale,
 )
 from clio_relay.surface.a2ui.surfaces import (
     ADD_SURFACE,
@@ -56,6 +57,7 @@ from clio_relay.surface.a2ui.surfaces import (
 )
 from clio_relay.surface.a2ui.surfaces import defaults_state as _defaults_state
 from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.tool_meta import ANNOTATIONS, TITLES
 from clio_relay.surface.a2ui.values import as_dict, pointer
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.describing import site_status
@@ -70,48 +72,9 @@ logger = logging.getLogger(__name__)
 TAB_URI = "a2ui://clio-relay/compute"
 WATCH_INTERVAL_S = 2.0
 
-_TITLES = {
-    surfaces.OPEN_ADD: "Open the add-endpoint form",
-    surfaces.ADD_SITE: "Add an endpoint",
-    surfaces.ADD_FROM_CATALOG: "Add an endpoint from the catalog",
-    surfaces.EDIT_SITE: "Edit an endpoint",
-    surfaces.SAVE_SITE: "Save an endpoint",
-    surfaces.CANCEL: "Cancel a form or a removal",
-    surfaces.REMOVE_SITE: "Ask to remove an endpoint",
-    surfaces.CONFIRM_REMOVE: "Remove an endpoint",
-    surfaces.PROBE_SITE: "Probe an endpoint",
-    surfaces.SWITCH_ADAPTER: "Change an endpoint's protocol",
-    surfaces.SET_VALUE: "Change an endpoint's protocol, security or spending, or a default",
-    surfaces.CONNECT_SITE: "Sign in to an endpoint",
-}
 
-# What each action does to relay's endpoints. Opening a form, editing a draft,
-# cancelling and asking to remove change only the page; probing writes relay's
-# probe cache; adding and signing in add; saving, switching, setting and
-# confirming a removal replace or delete what was there.
-_PAGE_ONLY = mcp_types.ToolAnnotations(
-    read_only_hint=True, destructive_hint=False, open_world_hint=False
-)
-_ADDS = mcp_types.ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, open_world_hint=False
-)
-_REPLACES = mcp_types.ToolAnnotations(
-    read_only_hint=False, destructive_hint=True, open_world_hint=False
-)
-_ANNOTATIONS = {
-    surfaces.OPEN_ADD: _PAGE_ONLY,
-    surfaces.EDIT_SITE: _PAGE_ONLY,
-    surfaces.CANCEL: _PAGE_ONLY,
-    surfaces.REMOVE_SITE: _PAGE_ONLY,
-    surfaces.PROBE_SITE: _ADDS,
-    surfaces.ADD_SITE: _ADDS,
-    surfaces.ADD_FROM_CATALOG: _ADDS,
-    surfaces.CONNECT_SITE: _ADDS,
-    surfaces.SAVE_SITE: _REPLACES,
-    surfaces.SWITCH_ADAPTER: _REPLACES,
-    surfaces.SET_VALUE: _REPLACES,
-    surfaces.CONFIRM_REMOVE: _REPLACES,
-}
+TOAST_META = "io.iowarp/toast"
+"""The result ``_meta`` key of the toast a host shows for an action: message, tone, undo."""
 
 
 class ComputeTab(TabActions):
@@ -256,18 +219,26 @@ class ComputeTab(TabActions):
     async def _surfaces(
         self, views: list[SiteView], client: A2UIClient
     ) -> dict[str, tuple[list[dict[str, Any]], dict[str, Any]]]:
-        """Return both surfaces: the endpoint table for relay's catalog, cards for Basic."""
+        """Return the surfaces: the page and its dialogs for relay's catalog, cards for Basic."""
         forms = self.forms()
-        build = table.endpoints_surface
-        if client.catalog_id != RELAY_CATALOG_ID:
-            build = cards.sites_surface
+        if client.catalog_id == RELAY_CATALOG_ID:
+            inputs = await asyncio.to_thread(self.dialog_inputs)
+            page = table.endpoints_surface(views, self.state, forms, self.tokens, inputs)
+            return {SITES_SURFACE: page}
         return {
-            SITES_SURFACE: build(views, self.state, forms, self.tokens),
+            SITES_SURFACE: cards.sites_surface(views, self.state, forms, self.tokens),
             ADD_SURFACE: adding.add_surface(forms, self._catalog(), self.state, self.tokens),
         }
 
-    async def read(self, client: A2UIClient | None) -> ResourceResult:
+    async def read(self, client: A2UIClient | None, ctx: Context | None = None) -> ResourceResult:
         """Return the whole tab: A2UI for a client that renders it, text otherwise."""
+        spoken = i18n.use(request_locale(ctx))
+        try:
+            return await self._read(client)
+        finally:
+            i18n.reset(spoken)
+
+    async def _read(self, client: A2UIClient | None) -> ResourceResult:
         self._watch()
         await asyncio.to_thread(self._load_state)
         views = await self.views()
@@ -328,6 +299,20 @@ class ComputeTab(TabActions):
 
         ``choice`` is the column and value a table row's picker sent, if any.
         """
+        spoken = i18n.use(request_locale(ctx))
+        try:
+            return await self._act(ctx, action, token, values, choice)
+        finally:
+            i18n.reset(spoken)
+
+    async def _act(
+        self,
+        ctx: Context | None,
+        action: str,
+        token: str,
+        values: Any,
+        choice: dict[str, Any] | None = None,
+    ) -> ToolResult:
         grant = self.tokens.spend(token, action) if token else None
         if grant is None:
             # The process that rendered the tab may not be this one: changing the
@@ -368,6 +353,10 @@ class ComputeTab(TabActions):
             views = await self.views()
             client = a2ui_client(ctx)
             text = surfaces.summary(views, self.state.notice)
+            toast = outcome.toast
+            if toast is None and self.state.notice:
+                tone = "positive" if outcome.ok else "negative"
+                toast = {"message": self.state.notice.rstrip("."), "tone": tone}
             content: list[Any] = [mcp_types.TextContent(type="text", text=text)]
             if client is not None:
                 messages: list[Message] = []
@@ -386,7 +375,9 @@ class ComputeTab(TabActions):
                         )
                 content.append(embedded(TAB_URI, messages))
         return ToolResult(
-            content=content, structured_content={"ok": outcome.ok, "notice": self.state.notice}
+            content=content,
+            structured_content={"ok": outcome.ok, "notice": self.state.notice},
+            meta={TOAST_META: toast} if toast else None,
         )
 
 
@@ -430,10 +421,10 @@ def _action_tool(server: FastMCP[Any], tab: ComputeTab, action: str) -> None:
 
     server.tool(
         name=action,
-        title=_TITLES[action],
-        description=f"{_TITLES[action]} from the Compute page. Only the page calls this.",
+        title=TITLES[action],
+        description=f"{TITLES[action]} from the Compute page. Only the page calls this.",
         app=AppConfig(visibility=["app"]),
-        annotations=_ANNOTATIONS[action],
+        annotations=ANNOTATIONS[action],
     )(act)
 
 
@@ -450,7 +441,8 @@ def install(server: FastMCP[Any], service: RelayService, changes: ServerChanges)
         annotations=mcp_types.Annotations(audience=["user"]),
     )
     async def compute_tab() -> ResourceResult:  # pyright: ignore[reportUnusedFunction]
-        return await tab.read(a2ui_client(get_context()))
+        ctx = get_context()
+        return await tab.read(a2ui_client(ctx), ctx)
 
     for action in surfaces.ACTIONS:
         _action_tool(server, tab, action)

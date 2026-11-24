@@ -4,26 +4,25 @@ These builders are pure. They take what the page knows about each endpoint (a
 site in relay's store), mint one action token per control, and return components
 and a data model. The page (:mod:`clio_relay.surface.a2ui.tab`) gathers the facts
 and wraps the result in A2UI messages. A client that renders relay's own catalog
-gets the endpoint table of :mod:`clio_relay.surface.a2ui.table`; a Basic-only
-client gets the cards of :mod:`clio_relay.surface.a2ui.cards`. The add form is in
+gets the page of :mod:`clio_relay.surface.a2ui.table`, with its dialogs in
+:mod:`clio_relay.surface.a2ui.dialog`; a Basic-only client gets the cards of
+:mod:`clio_relay.surface.a2ui.cards` and the add form of
 :mod:`clio_relay.surface.a2ui.adding`.
 
-Text is English. No locale reaches an MCP server, so CLIO shows relay's words as
-relay sends them.
+The page speaks the language the host sends with each request
+(:mod:`clio_relay.surface.a2ui.i18n`), else English. The Basic cards are English.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, cast
 
 from clio_relay.sites.models import SiteEntry, SpendAsk
 from clio_relay.sites.store import NewSiteDefaults
-from clio_relay.surface.a2ui.components import Tree, bound, event
-from clio_relay.surface.a2ui.forms import Field, Form, draft, field_rows, form_error
-from clio_relay.surface.a2ui.tokens import ActionTokens
+from clio_relay.surface.a2ui.forms import Field
 from clio_relay.surface.a2ui.values import SPEND_ABOVE, SPEND_LIMIT, spend_value
 from clio_relay.wording import with_article
 
@@ -42,6 +41,14 @@ PROBE_SITE = "compute_probe_site"
 SWITCH_ADAPTER = "compute_switch_adapter"
 CONNECT_SITE = "compute_connect_site"
 SET_VALUE = "compute_set_value"
+OPEN_DIALOG = "compute_open_dialog"
+PICK = "compute_pick"
+TEST_ENDPOINT = "compute_test_endpoint"
+SAVE_ENDPOINT = "compute_save_endpoint"
+BACK = "compute_back"
+CLOSE_DIALOG = "compute_close_dialog"
+SAVE_DEFAULTS = "compute_save_defaults"
+UNDO = "compute_undo"
 ACTIONS = (
     OPEN_ADD,
     ADD_SITE,
@@ -55,11 +62,31 @@ ACTIONS = (
     SWITCH_ADAPTER,
     SET_VALUE,
     CONNECT_SITE,
+    OPEN_DIALOG,
+    PICK,
+    TEST_ENDPOINT,
+    SAVE_ENDPOINT,
+    BACK,
+    CLOSE_DIALOG,
+    SAVE_DEFAULTS,
+    UNDO,
 )
 
 # Subjects that are not endpoints. An endpoint id never starts with "@".
 ADD_SUBJECT = "@add"
 DEFAULTS_SUBJECT = "@defaults"
+UNDO_SUBJECT = "@undo"
+DIALOG_SUBJECT = "@dialog"
+
+# The page's dialogs: which one is open is TabState.dialog.
+ADD_DIALOG = "add"
+DEFAULTS_DIALOG = "defaults"
+EDIT_DIALOG = "edit:"
+SIGN_IN_DIALOG = "signin:"
+# The add dialog's tabs, by the id of each tab's child.
+ADD_TABS = ("add-catalog", "add-saved", "add-own")
+REMOVED_KEPT = 10
+"""Removed endpoints the add dialog's Saved tab offers back, newest first."""
 
 HOST_SIGN_IN = "data_source/login/"
 
@@ -156,7 +183,7 @@ _PROBE = {
     "unreachable": "Unreachable",
     "not_configured": "Not configured",
 }
-_SIGN_IN = {"signed_in": "Signed in", "signed_out": "Signed out", "expired": "Expired"}
+SIGN_IN_STATES = {"signed_in": "Signed in", "signed_out": "Signed out", "expired": "Expired"}
 
 
 def protocol_name(adapter: str) -> str:
@@ -208,6 +235,14 @@ class TabState:
     """The site store's defaults for new endpoints, read on each load and never saved here."""
     pending: dict[str, str] = field(default_factory=dict[str, str])
     """A protocol picked for an endpoint that has no settings for it yet, by endpoint."""
+    dialog: str = ""
+    """The open dialog: ``add``, ``defaults``, ``edit:<id>`` or ``signin:<id>``."""
+    add: dict[str, Any] = field(default_factory=dict[str, Any])
+    """The add dialog's draft: its tab, what was picked, the values sent, the last test."""
+    undo: dict[str, Any] = field(default_factory=dict[str, Any])
+    """What the last toast's Undo reverses: an added id, or a removed entry."""
+    removed: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    """Endpoints the person removed, newest first: ``{"entry": ..., "at": ...}``."""
 
     def default(self, column: str) -> str:
         """Return the protocol, security or spend setting a new endpoint starts with."""
@@ -223,6 +258,10 @@ class TabState:
             "links": self.links,
             "adding": self.adding,
             "pending": self.pending,
+            "dialog": self.dialog,
+            "add": self.add,
+            "undo": self.undo,
+            "removed": self.removed,
         }
 
     @classmethod
@@ -251,6 +290,16 @@ class TabState:
             links={str(k): str(v) for k, v in mapping(raw.get("links")).items()},
             adding=raw.get("adding") is True,
             pending={str(k): str(v) for k, v in mapping(raw.get("pending")).items()},
+            dialog=str(raw.get("dialog") or ""),
+            add=mapping(raw.get("add")),
+            undo=mapping(raw.get("undo")),
+            removed=[
+                mapping(item)
+                for item in cast(list[Any], raw.get("removed") or [])
+                if isinstance(item, dict)
+            ][:REMOVED_KEPT]
+            if isinstance(raw.get("removed"), list)
+            else [],
         )
 
     def forget(self, site_id: str) -> None:
@@ -260,6 +309,8 @@ class TabState:
         self.errors.pop(site_id, None)
         self.links.pop(site_id, None)
         self.pending.pop(site_id, None)
+        if self.dialog in (EDIT_DIALOG + site_id, SIGN_IN_DIALOG + site_id):
+            self.dialog = ""
 
 
 # Text
@@ -340,7 +391,7 @@ def spend_draft(ask: SpendAsk) -> dict[str, Any]:
     return {"spend": SPEND_ABOVE, SPEND_LIMIT: f"{ask:g}"}
 
 
-def _duration(value: timedelta) -> str:
+def duration_text(value: timedelta) -> str:
     minutes = value.total_seconds() / 60
     return f"{minutes / 60:g} h" if minutes >= 60 and minutes % 60 == 0 else f"{minutes:g} min"
 
@@ -383,141 +434,3 @@ def summary(views: list[SiteView], notice: str = "") -> str:
 
 
 # The sites surface
-
-
-def _common_draft(site: SiteEntry) -> dict[str, Any]:
-    values: dict[str, Any] = {
-        "name": site.name,
-        "address": site.address,
-        "policy": site.policy,
-        **spend_draft(site.spend.ask),
-        "skill": site.skill,
-        "account": site.defaults.account,
-        "queue": site.defaults.queue,
-    }
-    return draft(EDIT_FIELDS, values)
-
-
-def _edit_order(site: SiteEntry, forms: dict[str, Form], pending: str = "") -> list[str]:
-    order = [site.adapter, *site.alternatives]
-    if pending and pending not in order:
-        order.insert(0, pending)  # the tab that opens first is the one to fill in
-    rest = [name for name, item in forms.items() if item.listed and name not in order]
-    return order + protocol_order(rest)
-
-
-def edit_draft(site: SiteEntry, forms: dict[str, Form], pending: str = "") -> dict[str, Any]:
-    """Return the edit form's starting draft for ``site``.
-
-    ``pending`` is a protocol picked for it that needs settings first, so it starts in use.
-    """
-    adapters: dict[str, Any] = {}
-    for name in _edit_order(site, forms):
-        adapter_form = forms.get(name)
-        if adapter_form is None:
-            continue
-        config = site.config if name == site.adapter else site.alternatives.get(name, {})
-        use = name in site.alternatives or name == pending
-        adapters[name] = {"use": use, **draft(adapter_form.fields, config)}
-    return {"site": _common_draft(site), "adapters": adapters}
-
-
-def edit_form(
-    tree: Tree,
-    site: SiteEntry,
-    forms: dict[str, Form],
-    tokens: ActionTokens,
-    errors: dict[str, str],
-    pending: str = "",
-    facts: Sequence[str] = (),
-) -> str:
-    """Add one endpoint's edit form and return its id; ``facts`` go under its heading."""
-    base = f"e-{site.id}"
-    path = f"/drafts/{site.id}"
-    children = [tree.text(f"{base}-title", f"Edit {site.title}", "h4"), *facts]
-    children += form_error(tree, base, errors)
-    children += field_rows(tree, f"{base}-s", EDIT_FIELDS, f"{path}/site", errors, "site.", path)
-    children.append(tree.text(f"{base}-ways", "Protocols", "h5"))
-    tabs: list[dict[str, str]] = []
-    for name in _edit_order(site, forms, pending):
-        adapter_form = forms.get(name)
-        if adapter_form is None:
-            continue
-        tab_base = f"{base}-a-{name}"
-        adapter_path = f"{path}/adapters/{name}"
-        rows: list[str] = []
-        if name == site.adapter:
-            rows.append(tree.text(f"{tab_base}-inuse", "In use", "caption"))
-        else:
-            rows.append(
-                tree.add(
-                    f"{tab_base}-use",
-                    "CheckBox",
-                    label="Also reach it this way",
-                    value=bound(f"{adapter_path}/use"),
-                )
-            )
-        rows += field_rows(
-            tree, tab_base, adapter_form.fields, adapter_path, errors, f"adapters.{name}.", path
-        )
-        if not adapter_form.fields:
-            rows.append(tree.text(f"{tab_base}-none", "No settings", "caption"))
-        title = protocol_name(name)
-        tabs.append({"title": title, "child": tree.column(f"{tab_base}-col", rows)})
-    children.append(tree.add(f"{base}-tabs", "Tabs", tabs=tabs))
-    save = tree.button(
-        f"{base}-save",
-        "Save",
-        event(SAVE_SITE, {"token": tokens.mint(SAVE_SITE, site.id), "values": bound(path)}),
-        "primary",
-    )
-    cancel = tree.button(
-        f"{base}-cancel", "Cancel", event(CANCEL, {"token": tokens.mint(CANCEL, site.id)})
-    )
-    children.append(tree.row(f"{base}-buttons", [save, cancel], justify="start"))
-    return tree.column(base, children)
-
-
-def identity_rows(tree: Tree, base: str, view: SiteView) -> list[str]:
-    """Add the endpoint's identity and sign-in facts."""
-    identity = view.identity
-    if identity is None:
-        return []
-    rows = [tree.fact(f"{base}-identity", "Identity", str(identity.get("title") or ""))]
-    state = str(identity.get("state") or "")
-    shown = _SIGN_IN.get(state, state)
-    if state == "signed_in" and identity.get("account"):
-        shown = f"Signed in as {identity['account']}"
-    rows.append(tree.fact(f"{base}-signin", "Sign-in", shown))
-    return rows
-
-
-def settings_rows(tree: Tree, base: str, view: SiteView, fields: bool = True) -> list[str]:
-    """Add the endpoint's settings as facts.
-
-    ``fields`` False leaves out the settings the edit form shows as fields.
-    """
-    site = view.site
-    rows: list[str] = []
-    if fields:
-        rows.append(tree.fact(f"{base}-policy", "Security", security_name(site.policy)))
-    if view.reviewed is not None and site.policy == "guarded":
-        rows.append(tree.fact(f"{base}-reviewed", "Reviewed packages", str(view.reviewed)))
-    defaults = site.defaults
-    if fields:
-        rows.append(tree.fact(f"{base}-spend", "Spending", spend_text(site.spend.ask)))
-        if defaults.account:
-            rows.append(tree.fact(f"{base}-account", "Default account", defaults.account))
-        if defaults.queue:
-            rows.append(tree.fact(f"{base}-queue", "Default queue", defaults.queue))
-    if defaults.duration is not None:
-        rows.append(tree.fact(f"{base}-duration", "Default duration", _duration(defaults.duration)))
-    if view.has_system_id:
-        shown = view.system_id or "Relay registers one after you sign in"
-        rows.append(tree.fact(f"{base}-system", "System ID", shown))
-    if view.skill:
-        rows.append(tree.fact(f"{base}-skill", "Skill", str(view.skill.get("linked") or "")))
-        note = view.skill.get("uri") or view.skill.get("detail")
-        if note:
-            rows.append(tree.text(f"{base}-skill-uri", str(note), "caption"))
-    return rows

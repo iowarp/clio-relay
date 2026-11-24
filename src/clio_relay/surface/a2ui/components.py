@@ -1,9 +1,11 @@
 """A small builder for A2UI components, limited to relay's catalog (RL33).
 
-Relay's catalog is a subset of the Basic catalog plus CLIO's choice table
-(:data:`TABLE`). :data:`COMPONENTS` names them, and :class:`Tree` refuses any
-other component, so a surface can never ask CLIO for a component it does not
-already render. Only a client that lists relay's catalog gets the table.
+Relay's catalog is a subset of the Basic catalog plus three of CLIO's own
+components: the choice table (:data:`TABLE`), a dialog frame (:data:`DIALOG`)
+and a picker list (:data:`PICKER`). :data:`COMPONENTS` names them, and
+:class:`Tree` refuses any other component, so a surface can never ask CLIO for a
+component it does not already render. Only a client that lists relay's catalog
+gets CLIO's components.
 """
 
 from __future__ import annotations
@@ -22,10 +24,15 @@ COMPONENTS = frozenset(
         "TextField",
         "CheckBox",
         "ChoicePicker",
+        "Icon",
         "clio.choice-table.v1",
+        "clio.dialog.v1",
+        "clio.picker.v1",
     }
 )
 TABLE = "clio.choice-table.v1"
+DIALOG = "clio.dialog.v1"
+PICKER = "clio.picker.v1"
 
 Component = dict[str, Any]
 
@@ -75,6 +82,24 @@ class Tree:
         """Add a button labelled ``label``."""
         label_id = self.text(f"{component_id}-label", label)
         return self.add(component_id, "Button", child=label_id, action=action, variant=variant)
+
+    def icon_label(self, component_id: str, icon: str, label: str) -> str:
+        """Add an icon and a label side by side, as one button's child."""
+        icon_id = self.add(f"{component_id}-icon", "Icon", name=icon)
+        text_id = self.text(f"{component_id}-text", label)
+        return self.row(component_id, [icon_id, text_id], align="center")
+
+    def icon_button(self, component_id: str, icon: str, label: str, action: dict[str, Any]) -> str:
+        """Add a button that shows only ``icon``, named ``label`` for hover and screen readers."""
+        icon_id = self.add(f"{component_id}-icon", "Icon", name=icon)
+        return self.add(
+            component_id,
+            "Button",
+            child=icon_id,
+            action=action,
+            variant="borderless",
+            accessibility={"label": label},
+        )
 
     def fact(self, component_id: str, label: str, value: str) -> str:
         """Add a caption and its value side by side, with no separator between them."""

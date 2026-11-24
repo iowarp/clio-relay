@@ -57,6 +57,28 @@ def _strings(value: Any) -> list[str]:
     return [str(item) for item in value if isinstance(item, str)]  # pyright: ignore[reportUnknownVariableType]
 
 
+def request_locale(ctx: Context | None) -> str | None:
+    """Return the language the host sent with this request, if any (see :mod:`.i18n`)."""
+    from clio_relay.surface.a2ui.i18n import LOCALE_META
+
+    if ctx is None:
+        return None
+    try:
+        meta: Any = ctx.request_context.meta if ctx.request_context else None
+    except (AttributeError, RuntimeError, LookupError):
+        return None
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        found: Any = cast(dict[str, Any], meta).get(LOCALE_META)
+    else:
+        extra: Any = getattr(meta, "model_extra", None) or {}
+        found = cast(dict[str, Any], extra).get(LOCALE_META) if isinstance(extra, dict) else None
+        if found is None:
+            found = getattr(meta, LOCALE_META, None)
+    return found if isinstance(found, str) and found.strip() else None
+
+
 def a2ui_client(ctx: Context | None) -> A2UIClient | None:
     """Return what the requesting client renders, or None when it renders no A2UI relay sends."""
     if ctx is None:

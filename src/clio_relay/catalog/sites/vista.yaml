@@ -1,5 +1,7 @@
 id: vista
 name: TACC Vista
+summary: TACC, needs an allocation
+featured: 3
 description: >-
   TACC's Vista, through Tapis. Needs a TACC allocation on Vista. Jobs run reviewed
   clio-jarvis packages only, and every job asks before it spends.

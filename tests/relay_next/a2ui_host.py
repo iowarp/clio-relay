@@ -12,6 +12,7 @@ from mcp.client.extension import advertise
 
 from clio_relay.surface.a2ui import BASIC_CATALOG_ID, EXTENSION_ID, RELAY_CATALOG_ID, TAB_URI
 from clio_relay.surface.a2ui.components import TABLE
+from clio_relay.surface.a2ui.i18n import LOCALE_META
 from clio_relay.surface.a2ui.protocol import MIME_TYPE
 from clio_relay.surface.server import create_server
 from clio_relay.surface.settings import RelayPaths
@@ -85,12 +86,25 @@ def put(data: dict[str, Any], path: str, value: Any) -> None:
     data[parts[-1]] = copy.deepcopy(value)
 
 
-class Host:
-    """Folds A2UI messages the way CLIO does and presses buttons for a test."""
+TOAST_META = "io.iowarp/toast"
 
-    def __init__(self, client: Client[Any]) -> None:
+
+def toast(result: Any) -> dict[str, Any] | None:
+    """Return the toast an action's result asks the host to show, if any."""
+    meta = cast(dict[str, Any], result.meta or {})
+    return meta.get(TOAST_META)
+
+
+class Host:
+    """Folds A2UI messages the way CLIO does and presses buttons for a test.
+
+    ``locale`` is the language the host sends with every request, as CLIO does.
+    """
+
+    def __init__(self, client: Client[Any], locale: str | None = None) -> None:
         self.client = client
         self.surfaces: dict[str, dict[str, Any]] = {}
+        self.meta = {LOCALE_META: locale} if locale else None
 
     def apply(self, messages: list[dict[str, Any]]) -> None:
         for message in messages:
@@ -107,7 +121,7 @@ class Host:
                 put(data, found.get("path", "/"), found.get("value"))
 
     async def open(self) -> list[dict[str, Any]]:
-        contents = await self.client.read_resource(TAB_URI)
+        contents = await self.client.read_resource(TAB_URI, meta=self.meta)
         assert len(contents) == 1 and contents[0].mime_type == MIME_TYPE
         messages = json.loads(body(contents[0]))
         assert "createSurface" in messages[0]
@@ -127,8 +141,9 @@ class Host:
             seen.add(cid)
             component = components[cid]
             stack += component.get("children", [])
-            if "child" in component:
-                stack.append(component["child"])
+            for key in ("child", "content", "trigger"):
+                if key in component:
+                    stack.append(component[key])
             stack += [tab["child"] for tab in component.get("tabs", [])]
         return seen
 
@@ -174,7 +189,7 @@ class Host:
         return str(event["name"]), self._context(sid, event)
 
     async def call(self, name: str, context: dict[str, Any]) -> Any:
-        result = await self.client.call_tool(name, context, raise_on_error=False)
+        result = await self.client.call_tool(name, context, raise_on_error=False, meta=self.meta)
         assert result.content[0].type == "text"
         if not result.is_error:
             embedded = [
@@ -208,7 +223,7 @@ class Host:
         """Return the call a pick makes: the event's context, the row's, then the pick."""
         component = self.table(sid)
         event = component["onChoose"]["event"]
-        owner = component["defaults"] if row_id == "" else self.row(row_id, sid)
+        owner = self.row(row_id, sid)
         context = self._context(sid, event) | owner.get("context", {})
         return str(event["name"]), context | {"row": row_id, "column": column, "value": value}
 
@@ -226,6 +241,42 @@ class Host:
     async def menu(self, row_id: str, item: str, sid: str = "relay-sites") -> Any:
         return await self.call(*self.menu_item(row_id, item, sid))
 
-    async def add(self, sid: str = "relay-sites") -> Any:
-        event = self.table(sid)["add"]["action"]["event"]
+    # The page's dialogs and pickers, as CLIO's dialog and picker renderers drive them
+
+    def component(self, cid: str, sid: str = "relay-sites") -> dict[str, Any]:
+        assert cid in self.visible(sid), f"{cid} is not on {sid}"
+        return self.surfaces[sid]["components"][cid]
+
+    def is_open(self, dialog: str, sid: str = "relay-sites") -> bool:
+        return bool(self.get(sid, self.component(dialog, sid)["open"]["path"]))
+
+    async def dialog(self, dialog: str, part: str, sid: str = "relay-sites") -> Any:
+        """Press a dialog's ``test``, ``cancel`` or ``confirm``, or close it (``onClose``)."""
+        found = self.component(dialog, sid)
+        assert self.is_open(dialog, sid), f"{dialog} is closed"
+        if part == "cancel" and "action" not in found["cancel"]:
+            part = "onClose"
+        event = found[part]["event"] if part == "onClose" else found[part]["action"]["event"]
         return await self.call(str(event["name"]), self._context(sid, event))
+
+    async def pick(self, picker: str, value: str, sid: str = "relay-sites") -> Any:
+        """Pick ``value`` in a picker: write its bound value, then send its onPick."""
+        found = self.component(picker, sid)
+        self.set(sid, found["value"]["path"], value)
+        event = found["onPick"]["event"]
+        return await self.call(str(event["name"]), self._context(sid, event) | {"value": value})
+
+    def items(self, picker: str, sid: str = "relay-sites") -> list[dict[str, Any]]:
+        return list(self.component(picker, sid)["items"])
+
+    async def undo(self, result: Any, sid: str = "relay-sites") -> Any:
+        """Press Undo on the toast ``result`` raised."""
+        found = toast(result)
+        assert found and "undo" in found, f"no Undo in {found}"
+        event = found["undo"]["action"]["event"]
+        return await self.call(str(event["name"]), self._context(sid, event))
+
+    async def add(self, sid: str = "relay-sites") -> Any:
+        """Open the add dialog, or the Basic page's add form."""
+        button = "add-open" if "add-open" in self.visible(sid) else "sites-add"
+        return await self.press(sid, button)

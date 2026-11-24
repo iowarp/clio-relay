@@ -1,5 +1,6 @@
 id: ares-tapis
 name: Ares (through Tapis)
+site: ares
 description: >-
   IIT's Ares cluster, reached through TACC's Tapis. Relay registers Ares as the
   person's own Tapis system with one logical queue per Slurm partition and runs jobs as

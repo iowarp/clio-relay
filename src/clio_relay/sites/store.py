@@ -171,20 +171,44 @@ class SiteStore:
             self._write(entries)
         return entry
 
-    def add_from_catalog(self, catalog: CatalogEntry, site_id: str | None = None) -> SiteEntry:
+    def add_from_catalog(
+        self,
+        catalog: CatalogEntry,
+        site_id: str | None = None,
+        adapter: str | None = None,
+        changes: dict[str, Any] | None = None,
+    ) -> SiteEntry:
         """Copy a catalog entry into ``sites.yaml``, where the person edits it.
 
+        What is added is :meth:`from_catalog`'s site.
+        """
+        return self.add(self.from_catalog(catalog, site_id, adapter, changes))
+
+    def from_catalog(
+        self,
+        catalog: CatalogEntry,
+        site_id: str | None = None,
+        adapter: str | None = None,
+        changes: dict[str, Any] | None = None,
+    ) -> SiteEntry:
+        """Return the site a catalog entry becomes, without adding it.
+
+        ``adapter`` picks one of the entry's alternatives as the protocol in use,
+        and ``changes`` replaces top-level fields (a name, a config) first.
         An entry that sets no security or spend setting takes the person's default
         for new sites (Secure, and always ask, unless they changed them).
         """
-        site = catalog.to_site(site_id)
+        site = catalog.to_site(site_id, adapter)
+        given = changes or {}
+        if given:
+            site = SiteEntry.model_validate(site.model_dump(mode="json") | given)
         defaults = self.defaults()
-        changes: dict[str, Any] = {}
-        if "policy" not in catalog.model_fields_set:
-            changes["policy"] = defaults.policy
-        if "spend" not in catalog.model_fields_set:
-            changes["spend"] = SpendPolicy(ask=defaults.spend)
-        return self.add(site.model_copy(update=changes) if changes else site)
+        update: dict[str, Any] = {}
+        if "policy" not in catalog.model_fields_set and "policy" not in given:
+            update["policy"] = defaults.policy
+        if "spend" not in catalog.model_fields_set and "spend" not in given:
+            update["spend"] = SpendPolicy(ask=defaults.spend)
+        return site.model_copy(update=update) if update else site
 
     def edit(self, site_id: str, changes: dict[str, Any]) -> SiteEntry:
         """Apply top-level field changes to a site and validate the result."""

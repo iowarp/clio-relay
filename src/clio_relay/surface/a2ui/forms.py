@@ -20,6 +20,7 @@ from typing import Any, Literal, cast
 import yaml
 
 from clio_relay.surface.a2ui.components import Tree, bound
+from clio_relay.surface.a2ui.i18n import _
 
 FORM_ERROR = ""
 """The error key for a message about the whole form, not one field."""
@@ -45,7 +46,13 @@ _WORDS = {
 
 # Labels a property name can't give. Globus's ``endpoint`` would read as the page's own
 # "Endpoint", so it names the Globus Compute endpoint it is.
-_LABELS = {("globus", "endpoint"): "Globus Compute endpoint ID"}
+_LABELS = {
+    ("globus", "endpoint"): "Globus Compute endpoint ID",
+    ("ssh", "ssh_profile"): "SSH host",
+    ("worker", "ssh_profile"): "SSH host",
+}
+_HOST_HELP = "An alias from ~/.ssh/config or a saved SSH host"
+_HELP = {("ssh", "ssh_profile"): _HOST_HELP, ("worker", "ssh_profile"): _HOST_HELP}
 
 
 def humanize(key: str) -> str:
@@ -79,7 +86,7 @@ class Field:
         """Return the choice's options as ChoicePicker options."""
         shown = self.labels or self.options
         return [
-            {"label": label, "value": value}
+            {"label": _(label), "value": value}
             for label, value in zip(shown, self.options, strict=True)
         ]
 
@@ -147,7 +154,7 @@ def form(adapter: str, schema: dict[str, Any], *, listed: bool = True) -> Form:
                 key=key,
                 label=_LABELS.get((adapter, key)) or humanize(key),
                 kind=kind,
-                help=cast(str | None, own.get("description")),
+                help=_HELP.get((adapter, key)) or cast(str | None, own.get("description")),
                 required=key in required,
                 options=options,
                 default=own.get("default"),
@@ -267,7 +274,7 @@ def field_components(
     Each field shows its own error, through a check bound to ``check_path``
     that the form's data sets false. Without a ``check_path`` the error is a caption.
     """
-    label = f"{item.label} (required)" if item.required else item.label
+    label = _("{label} (required)", label=_(item.label)) if item.required else _(item.label)
     value = bound(path)
     checks = error_checks(error, check_path)
     if item.kind == "bool":
@@ -296,7 +303,7 @@ def field_components(
     if error and not checks:
         ids.append(tree.text(f"{base}-error", error, "caption"))
     if item.help:
-        ids.append(tree.text(f"{base}-help", item.help, "caption"))
+        ids.append(tree.text(f"{base}-help", _(item.help), "caption"))
     return ids
 
 

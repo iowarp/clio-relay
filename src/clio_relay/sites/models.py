@@ -83,15 +83,49 @@ class SiteEntry(BaseModel):
         return self.name or self.id
 
 
+_CATALOG_ONLY = {
+    "source",
+    "description",
+    "site",
+    "site_name",
+    "summary",
+    "protocols",
+    "featured",
+}
+
+
 class CatalogEntry(SiteEntry):
-    """A site relay ships. ``source`` is the facility page its facts came from."""
+    """A site relay ships. ``source`` is the facility page its facts came from.
+
+    Entries that reach one machine in different ways share a ``site``: the page
+    shows them as one site with each entry's protocols. ``site_name`` names that
+    site when it differs from the entry's own name, ``summary`` is its short
+    line ("Illinois Tech, Slurm"), and ``protocols`` says, per protocol, what
+    reaching this site that way means.
+    """
 
     source: str | None = None
     description: str | None = None
+    site: str | None = Field(default=None, pattern=SITE_ID_PATTERN)
+    site_name: str | None = None
+    summary: str | None = None
+    protocols: dict[str, str] = Field(default_factory=dict[str, str])
+    featured: int | None = None
+    """Where the add dialog lists the site before the rest, 1 first; others follow by name."""
 
-    def to_site(self, site_id: str | None = None) -> SiteEntry:
-        """Return a copy for ``sites.yaml``."""
-        data = self.model_dump(exclude={"source", "description"})
+    @property
+    def group(self) -> str:
+        """Return the id of the site this entry reaches."""
+        return self.site or self.id
+
+    def to_site(self, site_id: str | None = None, adapter: str | None = None) -> SiteEntry:
+        """Return a copy for ``sites.yaml``, using ``adapter`` when it is an alternative."""
+        data = self.model_dump(exclude=_CATALOG_ONLY)
         if site_id is not None:
             data["id"] = site_id
+        if adapter and adapter != self.adapter and adapter in self.alternatives:
+            alternatives = dict(self.alternatives)
+            data["config"] = alternatives.pop(adapter)
+            data["alternatives"] = {self.adapter: self.config} | alternatives
+            data["adapter"] = adapter
         return SiteEntry.model_validate(data)

@@ -25,7 +25,9 @@ from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui import surfaces
+from clio_relay.surface.a2ui.dialog_actions import DIALOG_PATHS, DialogActions
 from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, FormError
+from clio_relay.surface.a2ui.i18n import _
 from clio_relay.surface.a2ui.surfaces import (
     ADD_FIELDS,
     ADD_PATH,
@@ -37,8 +39,10 @@ from clio_relay.surface.a2ui.surfaces import (
     CATALOG_SITE_ERROR,
     DEFAULTS,
     DEFAULTS_SUBJECT,
+    EDIT_DIALOG,
     EDIT_FIELDS,
     SECURITY,
+    SIGN_IN_DIALOG,
     SITES_SURFACE,
     TabState,
     defaults_state,
@@ -69,9 +73,11 @@ class Outcome:
 
     ok: bool
     resend: dict[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
+    toast: dict[str, Any] | None = None
+    """What a client that shows toasts says: ``message``, ``tone``, and an optional ``undo``."""
 
 
-class TabActions:
+class TabActions(DialogActions):
     """The page's actions. :class:`~clio_relay.surface.a2ui.tab.ComputeTab` supplies the rest."""
 
     service: RelayService
@@ -95,20 +101,34 @@ class TabActions:
             surfaces.SWITCH_ADAPTER: self.switch_adapter,
             surfaces.SET_VALUE: self.set_value,
             surfaces.CONNECT_SITE: self.connect_site,
+            surfaces.OPEN_DIALOG: self.open_dialog,
+            surfaces.PICK: self.pick,
+            surfaces.TEST_ENDPOINT: self.test_endpoint,
+            surfaces.SAVE_ENDPOINT: self.save_endpoint,
+            surfaces.BACK: self.back,
+            surfaces.CLOSE_DIALOG: self.close_dialog,
+            surfaces.SAVE_DEFAULTS: self.save_defaults,
+            surfaces.UNDO: self.undo,
         }
 
     def _resend(self, surface_id: str, outcome: Outcome, data: dict[str, Any]) -> list[str]:
         """Return the paths to send again: the action's, then every form's ``valid`` map.
 
         The ``valid`` maps go every time, so a field's check follows the errors the
-        components were just built from.
+        components were just built from, and so do the dialogs' data.
         """
+        always: list[str] = []
         if surface_id == ADD_SURFACE:
             forms = [ADD_PATH, CATALOG_PATH]
         else:
-            forms = [f"/drafts/{site_id}" for site_id in sorted(self.state.editing)]
-        paths = [*outcome.resend.get(surface_id, ()), *(f"{path}/valid" for path in forms)]
-        return [path for path in paths if pointer(data, path) is not None]
+            editing = set(self.state.editing)
+            if self.state.dialog.startswith(EDIT_DIALOG):
+                editing.add(self.state.dialog[len(EDIT_DIALOG) :])
+            forms = [f"/drafts/{site_id}" for site_id in sorted(editing)]
+            always = list(DIALOG_PATHS)
+        paths = [*outcome.resend.get(surface_id, ()), *always, *(f"{path}/valid" for path in forms)]
+        unique = list(dict.fromkeys(paths))
+        return [path for path in unique if pointer(data, path) is not None]
 
     def _fail(self, key: str, errors: dict[str, str]) -> Outcome:
         self.state.errors[key] = errors
@@ -207,6 +227,7 @@ class TabActions:
         self.state.editing.add(site_id)
         self.state.confirming.discard(site_id)
         self.state.errors.pop(site_id, None)
+        self.state.dialog = EDIT_DIALOG + site_id
         return Outcome(ok=True, resend={SITES_SURFACE: (f"/drafts/{site_id}",)})
 
     async def save_site(self, site_id: str, values: dict[str, Any]) -> Outcome:
@@ -259,6 +280,7 @@ class TabActions:
             return self._fail(site_id, errors or {FORM_ERROR: refusal.message})
         self.state.editing.discard(site_id)
         self.state.errors.pop(site_id, None)
+        self.close_site_dialog(site_id)
         done = f"Saved {saved.title}."
         wanted = self.state.pending.pop(site_id, None)
         if wanted and wanted in saved.alternatives:
@@ -289,6 +311,8 @@ class TabActions:
         self.state.editing.discard(site_id)
         self.state.confirming.discard(site_id)
         self.state.errors.pop(site_id, None)
+        self.state.links.pop(site_id, None)
+        self.close_site_dialog(site_id)
         return Outcome(ok=True)
 
     async def remove_site(self, site_id: str, _values: dict[str, Any]) -> Outcome:
@@ -305,8 +329,14 @@ class TabActions:
             self.state.notice = sentence(refusal.message) + "."
             return Outcome(ok=False)
         self.state.forget(site_id)
-        self.state.notice = f"Removed {removed.title}."
-        return Outcome(ok=True)
+        self.remember_removed(removed)
+        message = _("Removed {name}", name=removed.title)
+        self.state.notice = message + "."
+        toast = self.toast(
+            message,
+            undo={"kind": "removed", "entry": removed.model_dump(mode="json", exclude_none=True)},
+        )
+        return Outcome(ok=True, toast=toast)
 
     async def probe_site(self, site_id: str, _values: dict[str, Any]) -> Outcome:
         site = self._site(site_id)
@@ -435,6 +465,7 @@ class TabActions:
             # It needs settings first: open the form, and use it once they are saved.
             self.state.pending[site.id] = value
             self.state.editing.add(site.id)
+            self.state.dialog = EDIT_DIALOG + site.id
             self.state.confirming.discard(site.id)
             self.state.errors.pop(site.id, None)
             name = protocol_name(value)
@@ -469,5 +500,6 @@ class TabActions:
         if not url:
             return self._fail(site_id, {FORM_ERROR: "Relay has no sign-in page to offer here"})
         self.state.links[site_id] = url
+        self.state.dialog = SIGN_IN_DIALOG + site_id
         self.state.notice = f"Open the sign-in page for {site.title}."
         return Outcome(ok=True)

@@ -1,8 +1,9 @@
 """The Compute page's endpoint table, for a client that renders relay's catalog.
 
-The table follows CLIO's Tools settings: a defaults row, then one row per
-endpoint with inline Protocol and Security pickers, its Status and a menu. Each
-pick and menu item changes the same site store the CLI does.
+The table follows CLIO's Tools settings: column headers, then one row per
+endpoint with inline Protocol, Security and Spending pickers, its Status and a
+menu. The defaults for new endpoints sit behind a gear, in a dialog. Each pick
+and menu item changes the same site store the CLI does.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from clio_relay.surface.a2ui.components import COMPONENTS, TABLE
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
-from .a2ui_host import Host, a2ui_client, basic_client, said
+from .a2ui_host import Host, a2ui_client, basic_client, said, toast
 from .conftest import add_site
 
 # What CLIO's choice-table renderer accepts: rows and the table are strict.
@@ -32,6 +33,7 @@ ROW_KEYS = frozenset(
         "caption",
         "icon",
         "values",
+        "options",
         "inherited",
         "error",
         "context",
@@ -45,10 +47,8 @@ TABLE_KEYS = frozenset(
         "label",
         "columns",
         "rows",
-        "defaults",
         "onChoose",
         "rowMenu",
-        "add",
         "empty",
         "accessibility",
         "weight",
@@ -61,8 +61,9 @@ def _options(table: dict[str, Any], column: str) -> dict[str, dict[str, Any]]:
     return {option["value"]: option for option in found["options"]}
 
 
-def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayPaths) -> None:
+def test_the_table_has_headers_and_a_row_per_endpoint(relay_paths: RelayPaths) -> None:
     add_site(relay_paths)
+    add_site(relay_paths, "plain", policy="guarded", spend="always")
 
     async def scenario() -> None:
         async with a2ui_client(relay_paths) as client:
@@ -97,12 +98,12 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
             status = [column for column in table["columns"] if column["id"] == "status"][0]
             assert status["editable"] is False
             assert all(option["icon"] and option["tone"] for option in status["options"])
-            assert table["defaults"]["values"] == {
-                "protocol": "ssh",
-                "security": "guarded",
-                "spend": "always",
-            }
-            assert table["add"]["label"] == "Add endpoint"
+            assert "defaults" not in table and "add" not in table
+            # The gear and Add endpoint sit on the page's header line, each opening a dialog.
+            assert {"page-head", "defaults-open", "add-open"} <= host.visible("relay-sites")
+            assert not host.is_open("defaults-dialog") and not host.is_open("add-dialog")
+            assert host.get("relay-sites", "/defaultsDraft/protocol") == ["ssh"]
+            assert host.get("relay-sites", "/defaultsDraft/policy") == ["guarded"]
             row = host.row("fx")
             assert row["values"] == {
                 "protocol": "fixture",
@@ -110,14 +111,18 @@ def test_the_table_has_a_defaults_row_and_a_row_per_endpoint(relay_paths: RelayP
                 "spend": "never",
                 "status": "ready",
             }
-            assert [item["id"] for item in row["menu"]] == ["probe", "edit", "remove"]
+            assert [item["id"] for item in row["menu"]] == ["test", "edit", "remove"]
             assert row["menu"][-1]["destructive"] is True
+            assert row["options"] == {"protocol": ["fixture"]}
+            assert "inherited" not in row
+            # A value the defaults gave shows as inherited, the way Tools marks its defaults.
+            assert host.row("plain")["inherited"] == ["security", "spend"]
             assert set(row) <= ROW_KEYS and set(table) <= TABLE_KEYS
             assert "s-fx-detail" not in host.visible("relay-sites")
             for surface in host.surfaces.values():
                 for component in surface["components"].values():
                     assert component["component"] in COMPONENTS
-            assert host.visible("relay-add") == {"root"}
+            assert set(host.surfaces) == {"relay-sites"}
 
     asyncio.run(scenario())
 
@@ -136,7 +141,6 @@ def test_rows_stay_within_the_tables_bounds(relay_paths: RelayPaths) -> None:
             table = host.table()
             declared = {column["id"] for column in table["columns"]}
             assert set(row["values"]) <= declared
-            assert set(table["defaults"]["values"]) <= declared
             icons = [
                 option["icon"]
                 for column in table["columns"]
@@ -217,7 +221,7 @@ def test_picking_security_and_protocol_edits_the_endpoint(
     asyncio.run(scenario())
 
 
-def test_a_protocol_that_needs_settings_opens_them_under_its_row(relay_paths: RelayPaths) -> None:
+def test_a_protocol_that_needs_settings_opens_them_in_a_dialog(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, "lab", adapter="local", config={})
     store = SiteStore(relay_paths.sites_file)
 
@@ -229,38 +233,45 @@ def test_a_protocol_that_needs_settings_opens_them_under_its_row(relay_paths: Re
             assert result.structured_content["ok"] is True, said(result)
             assert "Fill in lab's SSH settings, then save to use SSH." in said(result)
             assert store.get("lab").adapter == "local", "nothing changes before the save"
-            assert "s-lab-detail" in host.visible("relay-sites")
-            assert "e-lab-save" in host.visible("relay-sites")
+            assert host.is_open("edit-dialog")
+            assert "e-lab-save" not in host.visible("relay-sites"), "the dialog holds the buttons"
             assert host.get("relay-sites", "/drafts/lab/adapters/ssh/use") is True
-            assert [item["id"] for item in host.row("lab")["menu"]] == ["probe", "remove"]
 
             # Saving without the profile shows the error on its field.
-            result = await host.press("relay-sites", "e-lab-save")
+            result = await host.dialog("edit-dialog", "confirm")
             assert result.structured_content["ok"] is False
             assert set(host.failing("relay-sites")) == {"e-lab-a-ssh-f-ssh_profile"}
 
             host.set("relay-sites", "/drafts/lab/adapters/ssh/ssh_profile", "lab-login")
-            result = await host.press("relay-sites", "e-lab-save")
+            result = await host.dialog("edit-dialog", "confirm")
             assert result.structured_content["ok"] is True, host.text("relay-sites")
             site = store.get("lab")
             assert site.adapter == "ssh" and site.config["ssh_profile"] == "lab-login"
             assert "local" in site.alternatives
             assert "It now uses SSH." in said(result)
-            assert "s-lab-detail" not in host.visible("relay-sites")
+            assert "edit-dialog" not in host.visible("relay-sites")
 
             # Cancelling a picked protocol leaves the endpoint as it was.
             await host.choose("lab", "protocol", "iri")
             tabs = host.surfaces["relay-sites"]["components"]["e-lab-tabs"]["tabs"]
             assert tabs[0]["title"] == "IRI", "the protocol to fill in opens first"
-            await host.press("relay-sites", "e-lab-cancel")
+            await host.dialog("edit-dialog", "cancel")
             assert store.get("lab").adapter == "ssh"
             assert "iri" not in store.get("lab").alternatives
-            assert "s-lab-detail" not in host.visible("relay-sites")
+            assert "edit-dialog" not in host.visible("relay-sites")
 
     asyncio.run(scenario())
 
 
-def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
+async def _save_defaults(host: Host, protocol: str, policy: str) -> Any:
+    await host.press("relay-sites", "defaults-open")
+    assert host.is_open("defaults-dialog")
+    host.set("relay-sites", "/defaultsDraft/protocol", [protocol])
+    host.set("relay-sites", "/defaultsDraft/policy", [policy])
+    return await host.dialog("defaults-dialog", "confirm")
+
+
+def test_the_gear_holds_the_defaults_for_new_endpoints(relay_paths: RelayPaths) -> None:
     store = SiteStore(relay_paths.sites_file)
 
     async def scenario() -> None:
@@ -268,28 +279,33 @@ def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
             host = Host(client)
             await host.open()
             assert host.table()["rows"] == []
-            assert host.table()["empty"] == "No endpoints yet."
-            result = await host.choose("", "protocol", "local")
+            assert host.table()["empty"] == "No endpoints yet"
+            assert [column["title"] for column in host.table()["columns"]][0] == "Protocol"
+            result = await _save_defaults(host, "fixture", "open")
+            assert result.structured_content["ok"] is False, "a test-only protocol is not offered"
+            assert host.is_open("defaults-dialog")
+            assert host.component("defaults-dialog")["status"]["tone"] == "negative"
+
+            result = await _save_defaults(host, "local", "open")
             assert result.structured_content["ok"] is True, said(result)
-            await host.choose("", "security", "open")
-            assert host.table()["defaults"]["values"] == {
-                "protocol": "local",
-                "security": "open",
+            assert toast(result) == {
+                "message": "Saved the defaults for new endpoints",
+                "tone": "positive",
+            }
+            assert not host.is_open("defaults-dialog")
+            assert store.defaults().model_dump() == {
+                "adapter": "local",
+                "policy": "open",
                 "spend": "always",
             }
-            result = await host.choose("", "protocol", "fixture")
-            assert result.structured_content["ok"] is False, "a test-only protocol is not offered"
+            assert host.get("relay-sites", "/defaultsDraft/policy") == ["open"]
 
-            await host.add()
-            tabs = host.surfaces["relay-add"]["components"]["add-tabs"]["tabs"]
-            assert tabs[0]["title"] == "Local"
-            assert host.get("relay-add", "/drafts/add/site/policy") == ["open"]
-            host.set("relay-add", "/drafts/add/site/id", "here")
-            result = await host.press("relay-add", "add-a-local-add")
-            assert result.structured_content["ok"] is True, host.text("relay-add")
-            site = store.get("here")
-            assert (site.adapter, site.policy) == ("local", "open")
-            assert host.row("here")["values"]["protocol"] == "local"
+            # Closing the dialog without saving changes nothing.
+            await host.press("relay-sites", "defaults-open")
+            host.set("relay-sites", "/defaultsDraft/policy", ["guarded"])
+            await host.dialog("defaults-dialog", "cancel")
+            assert not host.is_open("defaults-dialog")
+            assert store.defaults().policy == "open"
 
         # A client with only the Basic catalog saves the same defaults from its form.
         async with basic_client(relay_paths) as client:
@@ -307,7 +323,7 @@ def test_defaults_shape_the_add_form(relay_paths: RelayPaths) -> None:
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            assert host.table()["defaults"]["values"]["security"] == "guarded"
+            assert host.get("relay-sites", "/defaultsDraft/policy") == ["guarded"]
 
     asyncio.run(scenario())
 
@@ -322,16 +338,15 @@ def test_the_page_and_the_cli_share_the_defaults(
 
     async def pick() -> None:
         async with a2ui_client(relay_paths) as client:
-            host = Host(client)
-            await host.open()
-            await host.choose("", "protocol", "local")
-            await host.choose("", "security", "open")
+            result = await _save_defaults(Host(client), "local", "open")
+            assert result.structured_content["ok"] is True, said(result)
 
     async def shown() -> dict[str, Any]:
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            return host.table()["defaults"]["values"]
+            found = host.get("relay-sites", "/defaultsDraft")
+            return {"protocol": found["protocol"], "policy": found["policy"]}
 
     asyncio.run(pick())
     assert store.defaults().model_dump() == {
@@ -358,10 +373,10 @@ def test_the_page_and_the_cli_share_the_defaults(
         "policy": "guarded",
         "spend": "always",
     }
-    assert asyncio.run(shown()) == {"protocol": "local", "security": "guarded", "spend": "always"}
+    assert asyncio.run(shown()) == {"protocol": ["local"], "policy": ["guarded"]}
 
 
-def test_the_row_menu_probes_edits_and_removes(relay_paths: RelayPaths) -> None:
+def test_the_row_menu_tests_edits_and_removes_with_undo(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, "lab")
     store = SiteStore(relay_paths.sites_file)
 
@@ -369,30 +384,36 @@ def test_the_row_menu_probes_edits_and_removes(relay_paths: RelayPaths) -> None:
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            result = await host.menu("lab", "probe")
+            result = await host.menu("lab", "test")
             assert result.structured_content["ok"] is True, said(result)
             assert "Probed lab." in said(result)
-            assert "The last probe found it" in host.row("lab")["caption"]
-            assert "·" not in host.row("lab")["caption"]
+            assert "The last test found it" in host.row("lab")["caption"]
+            assert "\u00b7" not in host.row("lab")["caption"]
 
             await host.menu("lab", "edit")
-            assert "e-lab-save" in host.visible("relay-sites")
-            edit = host.surfaces["relay-sites"]["components"]["e-lab"]["children"]
-            assert edit[0] == "e-lab-title", "the edit form's heading opens the card"
-            assert "s-lab-spend" not in host.visible("relay-sites"), "it is a field in the form"
+            assert host.is_open("edit-dialog")
+            assert host.component("edit-dialog")["title"] == "Edit lab"
             host.set("relay-sites", "/drafts/lab/site/name", "Lab cluster")
-            result = await host.press("relay-sites", "e-lab-save")
+            result = await host.dialog("edit-dialog", "confirm")
             assert result.structured_content["ok"] is True, host.text("relay-sites")
             assert store.get("lab").name == "Lab cluster"
             assert host.row("lab")["title"] == "Lab cluster"
+            assert "edit-dialog" not in host.visible("relay-sites")
 
-            await host.menu("lab", "remove")
-            assert "s-lab-confirm-yes" in host.visible("relay-sites")
-            assert store.list() != []
-            await host.press("relay-sites", "s-lab-confirm-yes")
+            # Remove acts at once and offers Undo, rather than asking first.
+            result = await host.menu("lab", "remove")
             assert store.list() == []
             assert host.table()["rows"] == []
-            assert "Removed Lab cluster." in host.text("relay-sites")
+            shown = toast(result)
+            assert shown is not None and shown["message"] == "Removed Lab cluster"
+            assert shown["undo"]["label"] == "Undo"
+            result = await host.undo(result)
+            assert result.structured_content["ok"] is True, said(result)
+            assert store.get("lab").name == "Lab cluster"
+            back = toast(result)
+            assert back is not None
+            assert str(back["message"]).startswith("Put Lab cluster back")
+            assert "undo" not in back, "putting it back offers no second Undo"
 
     asyncio.run(scenario())
 
@@ -409,15 +430,17 @@ def test_connect_is_in_the_menu_of_an_endpoint_that_needs_a_sign_in(
             row = host.row("signs")
             assert row["values"]["status"] == "needs_sign_in"
             assert row["menu"][0]["id"] == "connect"
-            assert row["caption"].startswith("Needs a ")
+            assert row["caption"].startswith("Needs ")
             result = await host.menu("signs", "connect")
             assert result.structured_content["ok"] is True, said(result)
-            assert "s-signs-detail" in host.visible("relay-sites")
-            link = host.surfaces["relay-sites"]["components"]["s-signs-open"]
+            assert host.is_open("signin-dialog")
+            link = host.component("signin-open")
             assert link["action"]["functionCall"]["args"]["url"].startswith("http://127.0.0.1:")
             assert all(
                 component["component"] != TABLE or component["id"] == "endpoints"
                 for component in host.surfaces["relay-sites"]["components"].values()
             )
+            await host.dialog("signin-dialog", "cancel")
+            assert "signin-dialog" not in host.visible("relay-sites")
 
     asyncio.run(scenario())

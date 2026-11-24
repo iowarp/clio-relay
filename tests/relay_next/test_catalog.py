@@ -39,3 +39,27 @@ def test_catalog_site_is_valid(entry: CatalogEntry) -> None:
 
 def test_catalog_schema_is_the_entry_model() -> None:
     assert catalog.schema() == CatalogEntry.model_json_schema()
+
+
+def test_entries_of_one_machine_are_one_site_with_its_protocols() -> None:
+    found = catalog.grouped()
+    ids = [site.id for site in found]
+    assert len(ids) == len(set(ids)), "each machine is listed once"
+    assert ids[0] == "ares" and ids[-1] == "local", "featured sites first, this computer last"
+    assert "ares-tapis" not in ids
+    ares = found[0]
+    assert [(way.adapter, way.entry) for way in ares.ways] == [
+        ("ssh", "ares"),
+        ("tapis", "ares-tapis"),
+        ("worker", "ares"),
+    ]
+    assert ares.way(None).adapter == "ssh", "the first protocol is the suggested one"
+    assert ares.way("tapis").entry == "ares-tapis"
+    assert ares.way("not-a-protocol").adapter == "ssh"
+    for site in found:
+        assert [way.adapter for way in site.ways] == list(
+            dict.fromkeys(way.adapter for way in site.ways)
+        ), f"{site.id} offers each protocol once"
+        for way in site.ways:
+            entry = catalog.site(way.entry)
+            assert way.adapter == entry.adapter or way.adapter in entry.alternatives

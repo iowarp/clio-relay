@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from clio_relay import catalog
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import AdapterContext
+from clio_relay.adapters.base import AdapterContext, SiteInfo
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import write_json_atomic
@@ -96,19 +96,10 @@ def _classify(refusal: Refusal) -> ProbeState:
     return "unreachable"
 
 
-async def probe_site(
-    entry: SiteEntry,
-    identity: str,
-    origin: Literal["sites", "catalog"],
-    paths: RelayPaths,
-) -> ProbeResult:
-    """Probe one site."""
-
-    def result(state: ProbeState, detail: str | None = None) -> ProbeResult:
-        return ProbeResult(
-            site=entry.id, identity=identity, origin=origin, state=state, detail=detail
-        )
-
+async def try_site(
+    entry: SiteEntry, paths: RelayPaths
+) -> tuple[ProbeState, str | None, SiteInfo | None]:
+    """Try one site, saved or not: its state, what that means, and what it said of itself."""
     try:
         context = AdapterContext(
             site_id=entry.id,
@@ -118,16 +109,27 @@ async def probe_site(
         adapter = registry.build(entry.adapter, entry.config, context)
         need = await adapter.sign_in_needed()
         if need is not None:
-            return result("needs_sign_in", need.message)
+            return "needs_sign_in", need.message, None
         info = await adapter.describe()
     except Refusal as refusal:
-        return result(_classify(refusal), refusal.message)
+        return _classify(refusal), refusal.message, None
     except Exception as exc:
-        return result("unreachable", type(exc).__name__)
-    accounts = info.accounts
+        return "unreachable", type(exc).__name__, None
     if info.facts.get("allocation") is False:
-        return result("missing_allocation", "no allocation on this account")
-    return result("ready", f"{len(accounts)} account(s)" if accounts else None)
+        return "missing_allocation", "no allocation on this account", info
+    accounts = info.accounts
+    return "ready", f"{len(accounts)} account(s)" if accounts else None, info
+
+
+async def probe_site(
+    entry: SiteEntry,
+    identity: str,
+    origin: Literal["sites", "catalog"],
+    paths: RelayPaths,
+) -> ProbeResult:
+    """Probe one site."""
+    state, detail, _info = await try_site(entry, paths)
+    return ProbeResult(site=entry.id, identity=identity, origin=origin, state=state, detail=detail)
 
 
 def probes_file(paths: RelayPaths) -> Path:

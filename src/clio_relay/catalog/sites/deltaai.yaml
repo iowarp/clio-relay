@@ -5,6 +5,7 @@
 # is relay's reading, and LQ-L8 checks it against the endpoint's schema.
 id: deltaai
 name: NCSA DeltaAI
+summary: NCSA, Slurm
 address: dtai-login.delta.ncsa.illinois.edu
 adapter: globus
 identity: globus

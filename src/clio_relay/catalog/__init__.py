@@ -8,6 +8,7 @@ person's ``sites.yaml``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from typing import Any
@@ -70,6 +71,90 @@ def site(site_id: str) -> CatalogEntry:
         f"the catalog has no site named {site_id!r}",
         site=site_id,
         known=[entry.id for entry in sites()],
+    )
+
+
+@dataclass(frozen=True)
+class Way:
+    """One protocol a catalog site offers: the entry it comes from and what it means there."""
+
+    adapter: str
+    entry: str
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class CatalogSite:
+    """One machine the catalog knows, with every protocol its entries offer.
+
+    The first way is the site's suggested one: its main entry's protocol in use.
+    """
+
+    id: str
+    name: str
+    summary: str | None
+    address: str | None
+    description: str | None
+    ways: tuple[Way, ...]
+    featured: int | None = None
+
+    def way(self, adapter: str | None) -> Way:
+        """Return the way for ``adapter``, or the suggested one when it is None or not offered."""
+        for item in self.ways:
+            if item.adapter == adapter:
+                return item
+        return self.ways[0]
+
+
+def grouped(entries: list[CatalogEntry] | None = None) -> list[CatalogSite]:
+    """Return the catalog as sites: entries that share a ``site`` become one.
+
+    A site's main entry is the one whose id is the site's id, else its first. Its
+    protocols are the main entry's, then each other entry's in use, then the
+    alternatives, each once. Featured sites come first, in their order, then the
+    rest by name, with the local computer last.
+    """
+    found = sites() if entries is None else entries
+    groups: dict[str, list[CatalogEntry]] = {}
+    for entry in found:
+        groups.setdefault(entry.group, []).append(entry)
+    result: list[CatalogSite] = []
+    for group_id, members in groups.items():
+        main = next((entry for entry in members if entry.id == group_id), members[0])
+        ordered = [main, *(entry for entry in members if entry is not main)]
+        notes: dict[str, str] = {}
+        for entry in ordered:
+            for name, note in entry.protocols.items():
+                notes.setdefault(name, note)
+        ways: list[Way] = []
+        seen: set[str] = set()
+        candidates = [(entry.adapter, entry) for entry in ordered] + [
+            (name, entry) for entry in ordered for name in entry.alternatives
+        ]
+        for adapter, entry in candidates:
+            if adapter in seen:
+                continue
+            seen.add(adapter)
+            ways.append(Way(adapter=adapter, entry=entry.id, note=notes.get(adapter)))
+        result.append(
+            CatalogSite(
+                id=group_id,
+                name=main.site_name or main.title,
+                summary=main.summary,
+                address=next((entry.address for entry in ordered if entry.address), None),
+                description=main.description,
+                ways=tuple(ways),
+                featured=main.featured,
+            )
+        )
+    return sorted(
+        result,
+        key=lambda item: (
+            item.featured is None,
+            item.featured or 0,
+            item.ways[0].adapter == "local",
+            item.name.lower(),
+        ),
     )
 
 

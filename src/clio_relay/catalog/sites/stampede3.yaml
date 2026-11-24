@@ -1,5 +1,6 @@
 id: stampede3
 name: TACC Stampede3
+summary: TACC, needs an allocation
 description: >-
   TACC's Stampede3, through Tapis. Needs a TACC allocation on Stampede3. Jobs run
   reviewed clio-jarvis packages only, and every job asks before it spends.

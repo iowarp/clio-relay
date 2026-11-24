@@ -1,52 +1,62 @@
-"""The Compute page's endpoint table, for a client that renders relay's catalog (RL32).
+"""The Compute page, for a client that renders relay's catalog (RL32).
 
-The table is one ``clio.choice-table.v1`` component, laid out like CLIO's Tools
-settings. A header row holds the defaults for new endpoints, then there is one
-row per endpoint. Each row has inline Protocol, Security and Spending pickers, its Status,
-and a menu of Probe, Edit and Remove. Picking a value calls
-:data:`~clio_relay.surface.a2ui.surfaces.SET_VALUE` with the row's token, and the
-host adds the column and value. An open edit form, remove confirmation or
-sign-in link is rendered as a Basic card after the table, headed by its
-endpoint's name, so the table keeps to the component's published schema.
+Laid out like CLIO's Settings > Tools. Under the page's heading, a line says what
+the page is for, with the gear (the defaults for new endpoints) and Add endpoint
+beside it. Then one ``clio.choice-table.v1`` lists the person's endpoints, with
+its column headers even when there are none. Each row has inline Protocol,
+Security and Spending pickers, its Status, and a menu of Connect, Test, Edit and
+Remove. Protocol offers only the ways that endpoint has. A value the endpoint
+takes from the defaults is marked inherited.
+
+Everything else opens in a dialog (:mod:`clio_relay.surface.a2ui.dialog`), and
+what an action did shows as a toast, with Undo when it can be undone. Nothing
+opens in the page itself.
 
 A client that renders only the Basic catalog gets the cards of
-:mod:`clio_relay.surface.a2ui.surfaces` instead.
+:mod:`clio_relay.surface.a2ui.cards` instead.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from clio_relay.surface.a2ui.components import TABLE, Tree, event, open_url
-from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, valid_map
+from clio_relay.surface.a2ui.components import TABLE, Tree, event
+from clio_relay.surface.a2ui.dialog import (
+    ADD,
+    DEFAULTS_DRAFT,
+    DialogInputs,
+    add_data,
+    add_dialog,
+    add_trigger,
+    defaults_data,
+    dialog_flags,
+)
+from clio_relay.surface.a2ui.forms import FORM_ERROR, Form
+from clio_relay.surface.a2ui.i18n import _
+from clio_relay.surface.a2ui.site_dialogs import (
+    defaults_dialog,
+    edit_data,
+    edit_dialog,
+    sign_in_dialog,
+)
 from clio_relay.surface.a2ui.surfaces import (
-    ADD_SUBJECT,
-    CANCEL,
     CONFIRM_REMOVE,
     CONNECT_SITE,
-    DEFAULTS,
-    DEFAULTS_SUBJECT,
-    EDIT_ERROR_PREFIXES,
+    EDIT_DIALOG,
     EDIT_SITE,
     HOST_SIGN_IN,
-    OPEN_ADD,
     PROBE_SITE,
     PROTOCOLS,
-    REMOVE_SITE,
     SECURITY,
     SECURITY_HELP,
     SET_VALUE,
+    SIGN_IN_DIALOG,
     SPEND_HELP,
     SiteView,
     TabState,
-    edit_draft,
-    edit_form,
-    identity_rows,
     probe_text,
     protocol_name,
     protocol_order,
-    settings_rows,
-    sign_in_text,
     spend_options,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
@@ -68,76 +78,93 @@ _PROTOCOL_ICON = {
 _SECURITY_LOOK = {"guarded": ("lock", "positive"), "open": ("lockOpen", "warning")}
 _STATUS = {
     "ready": ("Ready", "Answers and needs nothing from you", "check", "positive"),
-    "needs_sign_in": ("Needs a sign-in", "Connect it from the row's menu", "warning", "warning"),
+    "needs_sign_in": ("Sign-in needed", "Connect it from the row's menu", "warning", "warning"),
     "unavailable": ("Unavailable", "Relay cannot reach it now", "error", "negative"),
 }
 
 
 def _spend_options(state: TabState, views: list[SiteView]) -> list[dict[str, str]]:
     used = [view.site.spend.ask for view in views] + [spend_ask(state.default("spend"))]
-    return spend_options(used)
+    shown: list[dict[str, str]] = []
+    for option in spend_options(used):
+        ask = spend_ask(option["value"])
+        if isinstance(ask, str):
+            words = {"label": _(option["label"]), "description": _(option["description"])}
+        else:
+            words = {
+                "label": _("Ask above {limit}", limit=f"{ask:g}"),
+                "description": _("Over {limit} node-hours, or no walltime", limit=f"{ask:g}"),
+            }
+        shown.append(option | words)
+    return shown
 
 
 def _columns(
     forms: dict[str, Form], views: list[SiteView], state: TabState
 ) -> list[dict[str, Any]]:
     listed = [name for name, item in forms.items() if item.listed]
-    names = protocol_order([*listed, *(view.site.adapter for view in views)])
+    used = [name for view in views for name in (view.site.adapter, *view.site.alternatives)]
     protocols: list[dict[str, Any]] = []
-    for name in names:
+    for name in protocol_order([*listed, *used]):
         option: dict[str, Any] = {"value": name, "label": protocol_name(name)}
         if name in _PROTOCOL_ICON:
             option["icon"] = _PROTOCOL_ICON[name]
         if PROTOCOLS.get(name):
-            option["description"] = PROTOCOLS[name][1]
+            option["description"] = _(PROTOCOLS[name][1])
         protocols.append(option)
     security = [
         {
             "value": value,
-            "label": label,
-            "description": description,
+            "label": _(label),
+            "description": _(description),
             "icon": _SECURITY_LOOK[value][0],
             "tone": _SECURITY_LOOK[value][1],
         }
         for value, (label, description) in SECURITY.items()
     ]
     status = [
-        {"value": value, "label": label, "description": description, "icon": icon, "tone": tone}
+        {
+            "value": value,
+            "label": _(label),
+            "description": _(description),
+            "icon": icon,
+            "tone": tone,
+        }
         for value, (label, description, icon, tone) in _STATUS.items()
     ]
     return [
         {
             "id": "protocol",
-            "title": "Protocol",
-            "help": "How relay reaches the endpoint.",
+            "title": _("Protocol"),
+            "help": _("How relay reaches the endpoint."),
             "options": protocols,
         },
-        {"id": "security", "title": "Security", "help": SECURITY_HELP, "options": security},
+        {"id": "security", "title": _("Security"), "help": _(SECURITY_HELP), "options": security},
         {
             "id": "spend",
-            "title": "Spending",
-            "help": SPEND_HELP,
+            "title": _("Spending"),
+            "help": _(SPEND_HELP),
             "options": _spend_options(state, views),
         },
-        {"id": "status", "title": "Status", "editable": False, "options": status},
+        {"id": "status", "title": _("Status"), "editable": False, "options": status},
     ]
 
 
 def _caption(view: SiteView) -> str | None:
-    """Return the row's second line: what the status needs, and the last probe."""
+    """Return the row's second line: what the status needs, and the last test."""
     parts: list[str] = []
     state = str(view.status.get("state", ""))
     if state == "needs_sign_in" and view.status.get("provider"):
-        parts.append(sign_in_text(str(view.status["provider"])))
+        parts.append(_("Needs your {provider} sign-in", provider=str(view.status["provider"])))
     elif state != "ready" and view.status.get("detail"):
         parts.append(str(view.status["detail"]))
     if view.probe:
-        found = probe_text(str(view.probe.get("state", ""))).lower()
-        parts.append(f"The last probe found it {found}")
+        found = _(probe_text(str(view.probe.get("state", "")))).lower()
+        parts.append(_("The last test found it {found}", found=found))
     return ". ".join(parts) or None
 
 
-def _menu(view: SiteView, state: TabState, tokens: ActionTokens) -> list[dict[str, Any]]:
+def _menu(view: SiteView, tokens: ActionTokens) -> list[dict[str, Any]]:
     site = view.site
     items: list[dict[str, Any]] = []
     signed_out = view.identity is not None and view.identity.get("state") != "signed_in"
@@ -146,69 +173,26 @@ def _menu(view: SiteView, state: TabState, tokens: ActionTokens) -> list[dict[st
             action = event(f"{HOST_SIGN_IN}{view.host_sign_in}", {})
         else:
             action = event(CONNECT_SITE, {"token": tokens.mint(CONNECT_SITE, site.id)})
-        items.append({"id": "connect", "label": "Connect", "action": action})
-    items.append(
+        items.append({"id": "connect", "label": _("Connect"), "action": action})
+    items += [
         {
-            "id": "probe",
-            "label": "Probe",
+            "id": "test",
+            "label": _("Test"),
             "action": event(PROBE_SITE, {"token": tokens.mint(PROBE_SITE, site.id)}),
-        }
-    )
-    if site.id not in state.editing:
-        items.append(
-            {
-                "id": "edit",
-                "label": "Edit",
-                "action": event(EDIT_SITE, {"token": tokens.mint(EDIT_SITE, site.id)}),
-            }
-        )
-    items.append(
+        },
+        {
+            "id": "edit",
+            "label": _("Edit"),
+            "action": event(EDIT_SITE, {"token": tokens.mint(EDIT_SITE, site.id)}),
+        },
         {
             "id": "remove",
-            "label": "Remove",
+            "label": _("Remove"),
             "destructive": True,
-            "action": event(REMOVE_SITE, {"token": tokens.mint(REMOVE_SITE, site.id)}),
-        }
-    )
+            "action": event(CONFIRM_REMOVE, {"token": tokens.mint(CONFIRM_REMOVE, site.id)}),
+        },
+    ]
     return items
-
-
-def _detail(
-    tree: Tree, view: SiteView, state: TabState, forms: dict[str, Form], tokens: ActionTokens
-) -> str | None:
-    """Add an endpoint's open card: a sign-in link, a remove confirmation, the edit form."""
-    site = view.site
-    base = f"s-{site.id}"
-    children: list[str] = []
-    link = state.links.get(site.id)
-    if link:
-        children.append(tree.button(f"{base}-open", "Open the sign-in page", open_url(link)))
-    if site.id in state.confirming:
-        question = tree.text(
-            f"{base}-confirm-q",
-            f"Remove {site.title} from your endpoints? Its operations stay on record.",
-        )
-        yes = tree.button(
-            f"{base}-confirm-yes",
-            "Remove endpoint",
-            event(CONFIRM_REMOVE, {"token": tokens.mint(CONFIRM_REMOVE, site.id)}),
-            "primary",
-        )
-        no = tree.button(
-            f"{base}-confirm-no", "Keep it", event(CANCEL, {"token": tokens.mint(CANCEL, site.id)})
-        )
-        children += [question, tree.row(f"{base}-confirm", [yes, no], justify="start")]
-    if site.id in state.editing:
-        facts = identity_rows(tree, base, view) + settings_rows(tree, base, view, fields=False)
-        errors = state.errors.get(site.id, {})
-        pending = state.pending.get(site.id, "")
-        children.append(edit_form(tree, site, forms, tokens, errors, pending, facts))
-    if not children:
-        return None
-    if site.id not in state.editing:
-        # The edit form has its own heading.
-        children.insert(0, tree.text(f"{base}-detail-title", site.title, "h4"))
-    return tree.card(f"{base}-detail", tree.column(f"{base}-detail-body", children))
 
 
 def _clip(text: str, limit: int) -> str:
@@ -226,67 +210,78 @@ def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any
     status = str(view.status.get("state", ""))
     if status in _STATUS:
         values["status"] = status
+    inherited = [
+        column for column in ("security", "spend") if values[column] == state.default(column)
+    ]
     row: dict[str, Any] = {
         "id": site.id,
         "title": _clip(site.title, _LABEL),
         "values": values,
+        "options": {"protocol": [site.adapter, *site.alternatives]},
         "context": {"token": tokens.mint(SET_VALUE, site.id)},
-        "menu": _menu(view, state, tokens),
+        "menu": _menu(view, tokens),
     }
+    if inherited:
+        row["inherited"] = inherited
     if site.address:
         row["subtitle"] = _clip(site.address, _LABEL)
     caption = _caption(view)
     if caption:
         row["caption"] = _clip(caption, _LABEL)
     error = state.errors.get(site.id, {}).get(FORM_ERROR)
-    if error and site.id not in state.editing:
+    if error and not state.dialog.startswith(EDIT_DIALOG):
         row["error"] = _clip(error, _TEXT)
     return row
 
 
+def _open_view(views: list[SiteView], state: TabState, prefix: str) -> SiteView | None:
+    if not state.dialog.startswith(prefix):
+        return None
+    site_id = state.dialog[len(prefix) :]
+    return next((view for view in views if view.site.id == site_id), None)
+
+
 def endpoints_surface(
-    views: list[SiteView], state: TabState, forms: dict[str, Form], tokens: ActionTokens
+    views: list[SiteView],
+    state: TabState,
+    forms: dict[str, Form],
+    tokens: ActionTokens,
+    inputs: DialogInputs | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return the endpoints surface as one table, and its data model."""
+    """Return the page as components, and its data model."""
     tree = Tree()
-    # The page header and the table's own label name the page, so there is no heading.
-    children: list[str] = []
-    if state.notice:
-        children.append(tree.text("sites-notice", state.notice))
-    rows = [_row(view, state, tokens) for view in views]
+    found = inputs or DialogInputs()
+    defaults = defaults_dialog(tree, state, forms, tokens)
+    adding = add_dialog(tree, state, forms, tokens, found, add_trigger(tree, tokens))
+    lead = tree.text(
+        "page-lead", _("Where relay runs jobs and services for your conversations."), "caption"
+    )
+    buttons = tree.row("page-buttons", [defaults, adding], align="center", justify="end")
+    children = [tree.row("page-head", [lead, buttons], align="center", justify="spaceBetween")]
     children.append(
         tree.add(
             "endpoints",
             TABLE,
-            label="Endpoints",
+            label=_("Endpoints"),
             columns=_columns(forms, views, state),
-            defaults={
-                "title": "Defaults for new endpoints",
-                "values": {column: state.default(column) for column in DEFAULTS},
-                "context": {"token": tokens.mint(SET_VALUE, DEFAULTS_SUBJECT)},
-            },
-            rows=rows,
+            rows=[_row(view, state, tokens) for view in views],
             onChoose=event(SET_VALUE, {}),
-            add={
-                "label": "Add endpoint",
-                "action": event(OPEN_ADD, {"token": tokens.mint(OPEN_ADD, ADD_SUBJECT)}),
-            },
-            empty="No endpoints yet.",
+            empty=_("No endpoints yet"),
         )
     )
-    for view in views:
-        detail = _detail(tree, view, state, forms, tokens)
-        if detail:
-            children.append(detail)
-    tree.column("root", children)
     data: dict[str, Any] = {
-        "drafts": {
-            view.site.id: {
-                **edit_draft(view.site, forms, state.pending.get(view.site.id, "")),
-                "valid": valid_map(state.errors.get(view.site.id, {}), EDIT_ERROR_PREFIXES),
-            }
-            for view in views
-            if view.site.id in state.editing
-        },
+        "dialogs": dialog_flags(state),
+        ADD.strip("/"): add_data(state, forms),
+        DEFAULTS_DRAFT.strip("/"): defaults_data(state),
+        "drafts": {},
     }
+    editing = _open_view(views, state, EDIT_DIALOG)
+    if editing is not None:
+        children.append(edit_dialog(tree, editing, state, forms, tokens))
+        data["drafts"][editing.site.id] = edit_data(editing, state, forms)
+    signing = _open_view(views, state, SIGN_IN_DIALOG)
+    link = state.links.get(signing.site.id) if signing is not None else None
+    if signing is not None and link:
+        children.append(sign_in_dialog(tree, signing, link, tokens))
+    tree.column("root", children)
     return tree.components, data

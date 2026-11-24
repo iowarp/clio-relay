@@ -5,6 +5,8 @@
 #   https://docs.alcf.anl.gov/services/iri-api/ (the IRI API)
 id: polaris
 name: ALCF Polaris
+summary: Argonne, PBS
+featured: 2
 address: polaris.alcf.anl.gov
 adapter: globus
 identity: globus
