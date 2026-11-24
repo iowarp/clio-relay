@@ -60,13 +60,38 @@ def test_an_archive_says_what_it_runs_without_running_it(tmp_path: Path) -> None
     assert describe_archive(data, "demo.hello", version="9").version == "9"
 
 
-def test_a_version_comes_from_the_contract_the_tag_or_the_caller(tmp_path: Path) -> None:
+def test_a_version_comes_from_the_contract_the_tag_the_commit_or_the_caller(
+    tmp_path: Path,
+) -> None:
     repo = make_repo(tmp_path)
     with pytest.raises(Refusal) as raised:
         describe_archive(archive_package(repo, "demo.hello"), "demo.hello")
     assert raised.value.reason == RefusalReason.INVALID_ARGUMENTS
     tagged = archive_package(repo, "demo.hello", source={"tag": "v1.2.0", "commit": "c" * 40})
     assert describe_archive(tagged, "demo.hello").version == "v1.2.0"
+    pinned = archive_package(repo, "demo.hello", source={"commit": "ab" * 20})
+    assert describe_archive(pinned, "demo.hello").version == "ab" * 6
+    modified = archive_package(repo, "demo.hello", source={"commit": "ab" * 20, "modified": True})
+    with pytest.raises(Refusal):
+        describe_archive(modified, "demo.hello")
+
+
+def test_a_menu_entry_built_by_a_call_keeps_its_literal_keys(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    (repo / "demo" / "hello" / "pkg.py").write_text(
+        "from jarvis_cd.core.pkg import Application\n\n\n"
+        "class Hello(Application):\n"
+        "    def _configure_menu(self):\n"
+        "        return [\n"
+        '            {"name": "inputs", "msg": "native input", "type": str, "default": "",\n'
+        '             "input_binding": Binding(kind="local_file").to_dict()},\n'
+        '            {"name": "steps", "msg": "how many", "type": int, "default": 10},\n'
+        "        ]\n"
+    )
+    data = archive_package(repo, "demo.hello", source={"commit": "ab" * 20})
+    properties = describe_archive(data, "demo.hello").parameters["properties"]
+    assert set(properties) == {"inputs", "steps"}
+    assert properties["steps"]["type"] == "integer"
 
 
 def test_the_catalog_pins_a_package_named_alone(tmp_path: Path) -> None:

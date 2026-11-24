@@ -113,8 +113,10 @@ def _menu(source: str) -> list[dict[str, Any]] | None:
                         if key == "type"
                         else ast.literal_eval(value_node)
                     )
-                except ValueError:
-                    return None
+                except (ValueError, TypeError, SyntaxError):
+                    # A value built by a call (an input binding) is not needed for the
+                    # schema; the entry keeps the keys that are literals.
+                    continue
             if isinstance(entry.get("name"), str):
                 entries.append(entry)
         return entries
@@ -162,7 +164,9 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
     """Return the catalog entry of the archive ``data`` of package ``name``.
 
     The version is ``version`` when given, else the contract's, else the git
-    tag the archive was built at. With none of these it refuses.
+    tag the archive was built at, else the first 12 characters of the commit its
+    source record names when that copy is unmodified (a pinned source such as
+    jarvis-cd's builtin repository). With none of these it refuses.
     """
     info = inspect_archive(data, name)
     repo, package = split_name(name)
@@ -176,11 +180,16 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
             loaded = None
         contract = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
     source = info.source or {}
-    chosen = version or contract.get("version") or source.get("tag")
+    commit = source.get("commit")
+    # An unmodified pinned commit names the files exactly, so it is a version too.
+    unmodified = isinstance(commit, str) and bool(commit) and not source.get("modified")
+    pinned = cast(str, commit)[:12] if unmodified else None
+    chosen = version or contract.get("version") or source.get("tag") or pinned
     if not chosen:
         raise Refusal(
             RefusalReason.INVALID_ARGUMENTS,
-            f"{name} has no contract.yaml version and no git tag; give one with --version",
+            f"{name} has no contract.yaml version, no git tag and no unmodified commit; "
+            "give one with --version",
             package=name,
         )
     outputs = [
