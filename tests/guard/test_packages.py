@@ -11,7 +11,8 @@ from clio_relay.jarvis_site import archive_package
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import PackageRef
-from clio_relay.packages import PackageCatalog, describe_archive, main, source_packages, stage
+from clio_relay.package_listing import source_packages
+from clio_relay.packages import PackageCatalog, describe_archive, main, stage
 
 from .conftest import make_repo
 

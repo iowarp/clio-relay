@@ -27,13 +27,8 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.packages import (
-    PackageEntry,
-    refresh_from_sources,
-    source_packages,
-    stage_dir,
-    stage_source,
-)
+from clio_relay.package_listing import source_packages
+from clio_relay.packages import PackageEntry, refresh_from_sources, stage_dir, stage_source
 
 if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService

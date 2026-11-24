@@ -99,7 +99,7 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: 93.63 (147/157) after the Slurm path patterns module.
 #: 89.59 (155/173) recorded in the middle-man refactor: the rework's merges had
 #: dropped the share below the floor, so the check already failed at 21fffaa5.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 91.66
+SRC_DISTRIBUTION_BASELINE_PERCENT = 91.70
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
