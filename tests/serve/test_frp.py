@@ -135,7 +135,12 @@ def test_visitor_command_keeps_secrets_in_the_environment(tmp_path: Path) -> Non
     plan = frp_plan(tmp_path)
     argv, env = visitor_command(plan, tmp_path / "fwd")
     config = (tmp_path / "fwd" / "visitor.toml").read_text(encoding="utf-8")
-    assert argv[1:] == ["-c", str(tmp_path / "fwd" / "visitor.toml")]
+    assert argv[1:] == [
+        "-m",
+        "clio_relay.frp_visitor",
+        "-c",
+        str(tmp_path / "fwd" / "visitor.toml"),
+    ]
     assert env[frp.ENV_TOKEN] == "frp-token-value"
     assert env[frp.ENV_SECRET_KEY] == "shared-key-value"
     assert "frp-token-value" not in config

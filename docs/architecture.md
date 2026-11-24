@@ -128,8 +128,9 @@ runs and tests alone; the real ones are in `guard/`, `asks/` and `serve/`.
 
 `serve` starts a long-running process on a site and forwards its ports to
 `127.0.0.1` on your machine. A site reached over ssh uses an `ssh -L` forward.
-Any other site uses a rendezvous host, where frp clients on both ends meet;
-see [rendezvous host](rendezvous-host.md).
+Any other site uses a rendezvous host, where an frp client beside the service
+and relay's own frp visitor on your machine meet; see
+[rendezvous host](rendezvous-host.md).
 
 ## The worker
 

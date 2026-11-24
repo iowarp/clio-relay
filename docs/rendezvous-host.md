@@ -4,7 +4,8 @@ A service that relay serves on a cluster, such as a ParaView `pvserver`, a
 dashboard or an MCP server, has to reach your desktop. Compute nodes rarely
 accept incoming connections, so both ends dial out to a meeting point instead:
 the rendezvous host. It runs the frp server (`frps`). Relay starts an frp
-client beside the service and another on your desktop, and frp joins them.
+client beside the service and its own frp visitor on your desktop, and frp
+joins them.
 
 The rendezvous host only carries bytes. It stores no jobs, no records and no
 secrets of the services it carries. Every service port relay gives you is
@@ -23,8 +24,16 @@ durable.
 
 - A machine with a public address that both your desktop and the cluster can
   reach: a small VM is enough.
-- frp 0.69 or later (`frps` there, `frpc` on your desktop and on the cluster).
+- frp 0.69 or later: `frps` there and `frpc` on the cluster.
 - A long random token, shared by the server and every client.
+
+Your desktop needs no frp program. Relay runs the desktop end itself, in
+Python, so nothing extra is installed and no antivirus has to allow an
+`frpc` binary. It speaks the `tcp`, `websocket` and `wss` transports, with or
+without frp's stream multiplexing. It doesn't speak `kcp` or `quic`, so with
+those `path: auto` uses `ssh -L`.
+
+## Run the server
 
 ## Run the server
 
@@ -59,8 +68,7 @@ from the file named by `CLIO_RELAY_RENDEZVOUS_FILE`:
     "address": "rendezvous.example.org",
     "port": 7000,
     "protocol": "tcp",
-    "token_file": "~/.config/frp/token",
-    "frpc": "frpc"
+    "token_file": "~/.config/frp/token"
   },
   "sites": {
     "my-cluster": {
@@ -78,10 +86,14 @@ For `wss`, set `"protocol": "wss"`, the port of the TLS endpoint, and
 `"ca_file"` when the certificate isn't signed by a public CA. Set
 `"server_name"` when the certificate carries a name other than `address`.
 
+An older file may still name a desktop `"frpc"`. Relay ignores it.
+
 Set `"direct": true` to try a direct peer-to-peer path (XTCP) first. When it
 can't be made, frp falls back to the path through the rendezvous host. Relay
 never switches silently: the service's status and `clio-relay connect` say
-which path is in use, and why the direct one failed.
+which path is in use, and why the direct one failed. Relay's desktop visitor
+doesn't make the direct path yet, so for now every connection goes through
+the rendezvous host and the status says so.
 
 Two settings shape the direct path:
 
@@ -109,7 +121,7 @@ host:
 | `hop_advertise` | The login node's address as compute nodes see it, when its host name doesn't resolve there. |
 | `hop_dir` | Where the login hop keeps its lock, leases and password on the site, one directory per site. `~/.clio-relay/hop` by default. |
 | `login_limits` | What the login hop may use: `cpu_quota_percent`, `memory_mb`, `address_space_mb` and `cpu_s`. |
-| `path` | `auto` (the default) uses frp when a rendezvous host is set and frp can work: the site has an `frpc` or `frpc_binary`, this machine has its `frpc`, and the token reads. Otherwise it uses `ssh -L`. `frp` or `ssh` forces one. |
+| `path` | `auto` (the default) uses frp when a rendezvous host is set and frp can work: the site has an `frpc` or `frpc_binary`, relay's visitor speaks the transport, and the token reads. Otherwise it uses `ssh -L`. `frp` or `ssh` forces one. |
 | `stun_server` | The STUN server for this site's frp client, when the site can't reach the rendezvous one. |
 | `stop_grace_s` | Seconds a service gets to write its final files after a stop. 30 by default. |
 
@@ -148,10 +160,11 @@ the frp token: your desktop's own `rendezvous.json` supplies it.
 
 ## Checking it works
 
-- `frpc` on your desktop logs `login to server success` when the address and
-  token are right.
-- A wrong CA for `wss` shows a certificate error in relay's forward log, under
-  `serve/forwards/<operation>/forward.log` in the state directory.
+- Relay's visitor writes its log to `serve/forwards/<operation>/forward.log`
+  in the state directory, in frpc's format. It logs `login to server success`
+  when the address and token are right, and frps's own reason when they
+  aren't.
+- A wrong CA for `wss` shows a certificate error in that log.
 - On the cluster, each service's job directory has `serve/frpc.log` and
   `serve/launch.log`, which say when the service's ports came up and when frp
   registered them.

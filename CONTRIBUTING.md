@@ -65,6 +65,7 @@ adapter carries it to the site.
 | `src/clio_relay/catalog/` | The sites and skills relay ships |
 | `src/clio_relay/asks/`, `identity/` | Questions for the person, and sign-ins |
 | `src/clio_relay/serve/` | The `serve` verb: services and port forwarding |
+| `src/clio_relay/frp_visitor/` | Relay's own desktop frp visitor (stcp over tcp, websocket and wss), run as its own process by `serve` |
 | `src/clio_relay/testing/conformance/` | The conformance kit every adapter passes |
 | `src/clio_relay/testing/fixture_adapter.py` | A simulated site for relay's own tests; `tests/conftest.py` registers it, since it is not a shipped entry point |
 | `tests/` | Tests, one directory per area |

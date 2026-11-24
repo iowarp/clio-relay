@@ -1,7 +1,9 @@
-"""frpc configuration for both ends of a served port (RL20).
+"""frp configuration for both ends of a served port (RL20).
 
-Secrets never enter these files. frpc fills ``{{ .Envs.NAME }}`` from its own
-environment, so the files can sit in a job directory or relay's state.
+Secrets never enter these files. frpc, and relay's own visitor on the desktop,
+fill ``{{ .Envs.NAME }}`` from their environment, so the files can sit in a job
+directory or relay's state. The site end runs frpc; the desktop end runs
+``clio_relay.frp_visitor``, which reads the same TOML.
 
 Over ``wss`` frpc 0.69 does not verify the server unless it is given a CA
 file, so relay always gives one: the rendezvous ``ca_file``, or the certifi
@@ -13,6 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+from clio_relay.frp_visitor import NO_DIRECT_MARKER, START_MARKER
 from clio_relay.serve.config import Rendezvous
 
 ENV_TOKEN = "CLIO_RELAY_FRP_TOKEN"
@@ -163,7 +166,7 @@ DIRECT_FAILED = (
     "keepTunnelOpenWorker get tunnel connection error",
 )
 FELL_BACK = "open tunnel error"
-RESTARTED = ("start frpc service", "relay: forward ended")
+RESTARTED = ("start frpc service", START_MARKER, "relay: forward ended")
 
 
 def direct_note(log_lines: list[str], wait_s: float) -> str:
@@ -173,6 +176,8 @@ def direct_note(log_lines: list[str], wait_s: float) -> str:
     for line in log_lines:
         if any(marker in line for marker in RESTARTED):
             state, reason = "trying", ""
+        elif NO_DIRECT_MARKER in line:
+            state, reason = "no_direct", ""
         elif DIRECT_OPEN in line:
             state, reason = "open", ""
         elif FELL_BACK in line:
@@ -181,6 +186,11 @@ def direct_note(log_lines: list[str], wait_s: float) -> str:
             state = "failed"
             reason = _frp_message(line)
     wait = f"{wait_s:g} s"
+    if state == "no_direct":
+        return (
+            "the direct path (XTCP) is not in relay's frp visitor yet; connections go "
+            "through the rendezvous host (STCP)"
+        )
     if state == "open":
         return "direct path (XTCP) open"
     if state == "trying":

@@ -221,6 +221,24 @@ command on the site and returns an `ExecResult` once it ends.
 starts a command, reports whether it has ended and how much it has printed,
 returns the first bytes of each stream, and stops it.
 
+### Services and ports
+
+`serve(spec, *, operation_id)` starts the service on the site and returns its
+`Endpoint`. The desktop end of each port belongs to relay, not to the adapter:
+
+- An adapter that gives `ssh_argv()` gets an `ssh -L` forward, started and
+  adopted by relay.
+- Otherwise relay uses the rendezvous host. The adapter's job runs `frpc`
+  beside the service with the config relay renders for it, and relay runs its
+  own frp visitor (`clio_relay.frp_visitor`) on the desktop as its own
+  process. That package is the whole desktop frp client: it reads the
+  `visitor.toml` relay writes, a subset of frpc's format, and refuses any
+  setting it doesn't run rather than ignoring it. Nothing else in relay speaks
+  frp's wire, and an adapter neither starts a desktop frp program nor imports
+  the visitor.
+
+See [rendezvous host](rendezvous-host.md) for the transports it speaks.
+
 ### Policy
 
 Each site is `open` or `guarded`. Relay's guard sits in front of every adapter

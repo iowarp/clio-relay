@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -20,6 +19,8 @@ from clio_relay.login_load import LoginLimits
 
 FrpProtocol = Literal["tcp", "kcp", "quic", "websocket", "wss"]
 Hop = Literal["none", "login", "http_proxy"]
+VISITOR_PROTOCOLS = ("tcp", "websocket", "wss")
+"""The transports relay's own frp visitor speaks to the rendezvous host."""
 
 SETTINGS_FILE = "rendezvous.json"
 # Nextcloud's public STUN server. frp's own default, stun.easyvoip.com, timed out on 3 of
@@ -44,7 +45,13 @@ class Rendezvous(BaseModel):
     server_name: str | None = Field(
         default=None, description="Name the wss certificate must carry. Defaults to address"
     )
-    frpc: str = Field(default="frpc", description="frpc on this machine")
+    frpc: str = Field(
+        default="frpc",
+        description=(
+            "Not used: relay's own frp visitor runs the desktop end. Kept so older "
+            "settings files still load"
+        ),
+    )
     direct: bool = Field(default=False, description="Try XTCP first, with STCP as the fallback")
     stun_server: str = Field(
         default=DEFAULT_STUN_SERVER,
@@ -161,16 +168,18 @@ def frp_unusable(site: SiteServe, rendezvous: Rendezvous) -> str | None:
     """Say why frp cannot carry a port for ``site`` now, or None when it can.
 
     ``auto`` falls back to ssh then. It reads only local state: the site's frpc
-    setting, the local frpc, and the token.
+    setting, the transport, and the token. The desktop end is relay's own visitor.
     """
     if not site.frpc:
         if not site.frpc_binary:
             return "has no client on the site (set its serve frpc or frpc_binary)"
         if not Path(os.path.expanduser(site.frpc_binary)).is_file():
             return f"has no client for the site: frpc_binary {site.frpc_binary} is missing"
-    local = os.path.expanduser(rendezvous.frpc)
-    if shutil.which(local) is None:
-        return f"has no client on this machine: {rendezvous.frpc} is not found"
+    if rendezvous.protocol not in VISITOR_PROTOCOLS:
+        return (
+            f"uses {rendezvous.protocol}, which relay's frp visitor does not speak "
+            f"(it speaks {', '.join(VISITOR_PROTOCOLS)})"
+        )
     try:
         rendezvous.token()
     except Refusal as refusal:

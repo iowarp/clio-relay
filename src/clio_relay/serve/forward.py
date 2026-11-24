@@ -1,6 +1,7 @@
 """The desktop end of a served port: a loopback bind that comes back (RL20, RL22, RL23).
 
-A forward is an frpc visitor, or one ``ssh -L`` held by the system ``ssh``.
+A forward is relay's own frp visitor (``clio_relay.frp_visitor``), or one ``ssh -L``
+held by the system ``ssh``.
 Relay watches its process and starts it again on the same port when it dies,
 counting each restart so the person can see it. Whether the port is bound is
 read by trying to bind it, never by connecting, because some services (a
@@ -41,7 +42,11 @@ CLOSED_MARKER = "closed"
 
 
 def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[str, str]]:
-    """Write the visitor configuration and return frpc's argv and environment."""
+    """Write the visitor configuration and return the visitor's argv and environment.
+
+    The visitor is relay's own (``clio_relay.frp_visitor``), run by this interpreter,
+    so the desktop needs no frpc program.
+    """
     rendezvous = plan.rendezvous
     if rendezvous is None:
         raise Refusal(RefusalReason.INVALID_CONFIG, "no rendezvous host is set")
@@ -64,7 +69,7 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
     env = dict(os.environ)
     env[frp.ENV_TOKEN] = rendezvous.token()
     env[frp.ENV_SECRET_KEY] = plan.secret_key
-    return [os.path.expanduser(rendezvous.frpc), "-c", str(path)], env
+    return [sys.executable, "-m", "clio_relay.frp_visitor", "-c", str(path)], env
 
 
 def ssh_command(
@@ -150,6 +155,23 @@ def _jump_command(base: list[str], destination: str, env: dict[str, str]) -> str
     return shlex.join([hop[0].replace("%", "%%"), *hop[1:]])
 
 
+def _windows_command_line(pid: int) -> str | None:
+    """Return a Windows process's command line, or None when Windows will not say."""
+    query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = result.stdout.strip()
+    return line if result.returncode == 0 and line else None
+
+
 def _is_ours(pid: int, marker: str) -> bool:
     if sys.platform.startswith("linux"):
         try:
@@ -158,13 +180,16 @@ def _is_ours(pid: int, marker: str) -> bool:
             return False
         return marker.encode() in cmdline
     if os.name == "nt":
+        command_line = _windows_command_line(pid)
+        if command_line is not None:
+            return marker in command_line
         result = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
             capture_output=True,
             text=True,
             check=False,
         )
-        return any(name in result.stdout.lower() for name in ("frpc", "ssh"))
+        return any(name in result.stdout.lower() for name in ("python", "ssh"))
     try:
         result = subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
