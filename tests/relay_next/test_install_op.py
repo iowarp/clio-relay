@@ -21,7 +21,7 @@ from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
-from clio_relay.surface import install_op, server
+from clio_relay.surface import install_op, installing, interrupted, server
 from clio_relay.surface.server import create_server
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -227,6 +227,65 @@ def test_the_install_ask_says_no_run_follows() -> None:
     assert "nothing runs after it" in alone
     assert "before the run" in before
     assert "before the run" not in alone
+
+
+def _left_by_a_dead_process(service: RelayService, operation_id: str, stage: str) -> None:
+    """Leave the record in ``submitting`` at ``stage``, as a relay that died there leaves it."""
+    with service.operations.locked(operation_id):
+        stored = service.operation(operation_id)
+        state = {**installing.state_of(stored), "stage": stage}
+        state.pop("handle", None)
+        stored.result = {**(stored.result or {}), installing.INSTALL_KEY: state}
+        stored.move(OperationState.SUBMITTING)
+        stored.updated_at = stored.updated_at - interrupted.GRACE * 2
+        service.operations.put(operation_id, stored)
+
+
+def test_a_check_a_dead_process_left_runs_again(relay_paths: RelayPaths, site: _Site) -> None:
+    async def scenario() -> None:
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        record = await install_op.start(service, "fx", SPEC)
+        await _approve(service, record.operation_id)
+        site.installed = True
+        _left_by_a_dead_process(service, record.operation_id, "done")
+        done = await service.refresh(record.operation_id)
+        assert done.state == OperationState.COMPLETED, done
+        assert site.calls == ["check", "install", "check"]
+        assert any("JARVIS checks again" in (change.note or "") for change in done.history)
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_an_install_start_a_dead_process_left_starts_again_once_no_job_is_listed(
+    relay_paths: RelayPaths, site: _Site, monkeypatch: pytest.MonkeyPatch, listed: bool
+) -> None:
+    async def live_jobs(self: FixtureAdapter, known: list[str]) -> list[dict[str, str]]:
+        jobs = [{"native_id": "9", "name": f"relay-{op}", "state": "RUNNING"} for op in ops]
+        return jobs if listed else []
+
+    monkeypatch.setattr(FixtureAdapter, "live_jobs", live_jobs, raising=False)
+    ops: list[str] = []
+
+    async def scenario() -> None:
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        record = await install_op.start(service, "fx", SPEC)
+        ops.append(record.operation_id)
+        await _approve(service, record.operation_id)
+        _left_by_a_dead_process(service, record.operation_id, "starting")
+        after = await service.refresh(record.operation_id)
+        if listed:
+            assert after.state == OperationState.SUBMITTING
+            assert site.calls == ["check", "install"]
+        else:
+            assert after.state == OperationState.QUEUED, after
+            assert site.calls == ["check", "install", "install"]
+        await service.close()
+
+    asyncio.run(scenario())
 
 
 def test_the_check_exit_is_the_install_report_or_a_typed_refusal() -> None:

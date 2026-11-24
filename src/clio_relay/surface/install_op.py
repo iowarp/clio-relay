@@ -20,12 +20,10 @@ No app is launched, and no service starts.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
@@ -36,9 +34,6 @@ if TYPE_CHECKING:
     from clio_relay.surface.service import RelayService
 
 logger = logging.getLogger(__name__)
-
-CHECK_GRACE = timedelta(minutes=30)
-"""How long ``ppl install +check`` may hold ``submitting`` before relay calls it lost."""
 
 
 def _label(spec: JobSpec) -> str:
@@ -114,17 +109,3 @@ async def check(
             }
             service.operations.put(operation_id, record)
     return service.finish(operation_id, OperationState.COMPLETED, None)
-
-
-def refresh(service: RelayService, operation_id: str, record: OperationRecord) -> OperationRecord:
-    """Fail an install whose check was interrupted; it holds no job to look for."""
-    if record.state != OperationState.SUBMITTING or utc_now() - record.updated_at <= CHECK_GRACE:
-        return record
-    return service.finish(
-        operation_id,
-        OperationState.FAILED,
-        Refusal(
-            RefusalReason.SUBMIT_FAILED,
-            "the install check was interrupted; ask for the install again",
-        ),
-    )

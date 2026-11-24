@@ -50,7 +50,14 @@ from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import Route, Routed, route, routes
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface import confirm as confirm_card
-from clio_relay.surface import exec_plan, held_services, install_op, installing, queue_switch
+from clio_relay.surface import (
+    exec_plan,
+    held_services,
+    install_op,
+    installing,
+    interrupted,
+    queue_switch,
+)
 from clio_relay.surface import plan_card as job_plan
 from clio_relay.surface.describing import relay_report, site_report
 from clio_relay.surface.endpoints import public_endpoint, service_ready
@@ -689,24 +696,24 @@ class RelayService:
         if install is not None:
             return await installing.refresh_install(self, operation_id, adapter, install)
         if installing.state_of(record).get("stage") == "starting":
-            # Another call is installing JARVIS or submitting the install job right now.
-            if utc_now() - record.updated_at <= installing.START_GRACE:
-                return record
-            return self.finish(
-                operation_id,
-                OperationState.FAILED,
-                Refusal(
-                    RefusalReason.SUBMIT_FAILED,
-                    "the install was interrupted before its job started; run the job again",
-                ),
-            )
+            # The process installing JARVIS or submitting the install job is gone.
+            return await interrupted.start_cut_short(self, operation_id, adapter, record)
         if record.kind == "serve":
             return await self._refresh_service(operation_id, site, adapter, record)
         if record.kind == "install":
-            return install_op.refresh(self, operation_id, record)
+            if record.state == OperationState.SUBMITTING:
+                return await interrupted.check_cut_short(self, operation_id)
+            return record
         handle = record.handle
         if handle is None:
             found = await adapter.find(operation_id)
+            if (
+                found is None
+                and record.state == OperationState.SUBMITTING
+                and utc_now() - record.updated_at > SUBMIT_GRACE
+                and interrupted.can_find(adapter)
+            ):
+                return await interrupted.submit_cut_short(self, operation_id)
             with self.operations.locked(operation_id):
                 record = self.operation(operation_id)
                 if record.handle is not None or record.state.final:

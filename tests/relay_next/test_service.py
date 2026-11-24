@@ -12,7 +12,8 @@ from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobAttributes, JobSpec
-from clio_relay.surface.service import RelayService
+from clio_relay.surface import interrupted
+from clio_relay.surface.service import SUBMIT_GRACE, RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
 
@@ -190,6 +191,57 @@ async def test_interrupted_submit_is_reconciled(relay_paths: RelayPaths) -> None
     reconciled = await service.refresh(record.operation_id)
     assert reconciled.state == OperationState.QUEUED
     assert reconciled.handle is not None
+
+
+def _cut_short(service: RelayService, operation_id: str, restarts: int = 0) -> None:
+    """Leave the record as a relay process that died mid-submit leaves it."""
+    with service.operations.locked(operation_id):
+        stored = service.operation(operation_id)
+        stored.move(OperationState.SUBMITTING)
+        stored.updated_at = stored.updated_at - SUBMIT_GRACE * 2
+        if restarts:
+            stored.result = {**(stored.result or {}), interrupted.RESTARTS_KEY: restarts}
+        service.operations.put(operation_id, stored)
+
+
+async def test_interrupted_submit_with_no_job_is_submitted_again(
+    relay_paths: RelayPaths,
+) -> None:
+    add_site(relay_paths, spend="always")
+    service = RelayService(relay_paths)
+    record = await service.start_run("fx", ECHO)
+    (ask,) = service.outstanding(record)
+    service.answer(ask.ask_id, "accept", {"approve": True}, by="test")
+    _cut_short(service, record.operation_id)
+    again = await service.refresh(record.operation_id)
+    assert again.state == OperationState.QUEUED, again
+    assert again.handle is not None
+    assert any("submits it again" in (change.note or "") for change in again.history)
+    done = await service.wait(record.operation_id, 20, poll_s=0.1)
+    assert done.state == OperationState.COMPLETED
+    await service.close()
+
+
+async def test_a_submit_cut_short_too_often_fails(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths, spend="always")
+    service = RelayService(relay_paths)
+    record = await service.start_run("fx", ECHO)
+    _cut_short(service, record.operation_id, restarts=interrupted.MAX_RESTARTS)
+    failed = await service.refresh(record.operation_id)
+    assert failed.state == OperationState.FAILED
+    assert "cut short" in (failed.error or {})["message"]
+    assert failed.handle is None
+
+
+async def test_a_live_submitter_is_left_alone(relay_paths: RelayPaths) -> None:
+    add_site(relay_paths, spend="always")
+    service = RelayService(relay_paths)
+    record = await service.start_run("fx", ECHO)
+    _cut_short(service, record.operation_id)
+    with service.operations.submitting(record.operation_id):
+        held = await service.refresh(record.operation_id)
+    assert held.state == OperationState.SUBMITTING
+    assert held.handle is None
 
 
 async def test_cancel_before_submit(relay_paths: RelayPaths) -> None:
