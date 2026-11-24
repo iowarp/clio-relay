@@ -1,7 +1,8 @@
-"""The Compute page's dialogs: add an endpoint, the defaults, edit one, sign in (RL32).
+"""The Compute page's add dialog (RL32). Editing and signing in are in site_dialogs.
 
-Each is one ``clio.dialog.v1`` whose ``open`` is bound under ``/dialogs``. The
-add dialog has three tabs (Catalog, Saved, Your own), each ending in Test. A
+Each dialog is one ``clio.dialog.v1`` whose ``open`` is bound under ``/dialogs``.
+The add dialog is a wide one with three tabs (Catalog, Saved, Your own), each
+ending in Test. A
 test that passes leads to the Save step: the name, Security and Spending, with
 the defaults marked. Save stays off until the test passes on what is shown.
 Every control calls one of the page's tools with a single-use token, as the
@@ -32,7 +33,6 @@ from clio_relay.surface.a2ui.surfaces import (
     ADD_SUBJECT,
     BACK,
     CLOSE_DIALOG,
-    DEFAULTS_DIALOG,
     EDIT_DIALOG,
     OPEN_DIALOG,
     PICK,
@@ -46,13 +46,11 @@ from clio_relay.surface.a2ui.surfaces import (
     TabState,
     protocol_name,
     protocol_order,
-    spend_draft,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
 from clio_relay.surface.a2ui.values import as_dict
 
 ADD = "/add"
-DEFAULTS_DRAFT = "/defaultsDraft"
 ADD_ERRORS = ("site.", "config.", "own.")
 _TAB_ICONS = {CATALOG_TAB: "book", SAVED_TAB: "bookmark", OWN_TAB: "link"}
 _SITES_SHOWN = 4
@@ -72,7 +70,6 @@ def dialog_flags(state: TabState) -> dict[str, bool]:
     """Return ``/dialogs``: which dialog is open."""
     return {
         "add": state.dialog == ADD_DIALOG,
-        "defaults": state.dialog == DEFAULTS_DIALOG,
         "edit": state.dialog.startswith(EDIT_DIALOG),
         "signin": state.dialog.startswith(SIGN_IN_DIALOG),
     }
@@ -114,19 +111,6 @@ def add_data(state: TabState, forms: dict[str, Form]) -> dict[str, Any]:
     errors = state.errors.get(ADD_DIALOG, {})
     data["valid"] = valid_map(errors, ADD_ERRORS)
     return data
-
-
-def defaults_data(state: TabState) -> dict[str, Any]:
-    """Return ``/defaultsDraft``: the defaults dialog's fields, from the saved defaults."""
-    from clio_relay.surface.a2ui.surfaces import SPEND, SPEND_LIMIT_FIELD
-    from clio_relay.surface.a2ui.values import spend_ask
-
-    return {
-        "protocol": [state.default("protocol")],
-        "policy": [state.default("security")],
-        # As the fields bind them: Spending is a picker's list, like the two above.
-        **draft((SPEND, SPEND_LIMIT_FIELD), spend_draft(spend_ask(state.default("spend")))),
-    }
 
 
 # The add dialog
@@ -411,6 +395,7 @@ def add_dialog(
         title=_("Add endpoint"),
         open=bound("/dialogs/add"),
         trigger=trigger,
+        width="wide",
         onClose=event(CLOSE_DIALOG, {"token": tokens.mint(CLOSE_DIALOG, ADD_SUBJECT)}),
         **{key: value for key, value in props.items() if value is not None},
     )
@@ -423,15 +408,8 @@ def add_trigger(tree: Tree, tokens: ActionTokens, component_id: str = "add-open"
     return tree.add(component_id, "Button", child=child, action=action, variant="primary")
 
 
-# The defaults dialog
-
-
-# Edit and sign in
-
-
 __all__ = [
     "ADD",
-    "DEFAULTS_DRAFT",
     "SECURITY",
     "SECURITY_HELP",
     "SPEND_PRESETS",
@@ -439,7 +417,6 @@ __all__ = [
     "add_data",
     "add_dialog",
     "add_trigger",
-    "defaults_data",
     "dialog_flags",
     "passed",
 ]

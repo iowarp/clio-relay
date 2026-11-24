@@ -1,12 +1,13 @@
 """The Compute page, for a client that renders relay's catalog (RL32).
 
 Laid out like CLIO's Settings > Tools. Under the page's heading, a line says what
-the page is for, with the gear (the defaults for new endpoints) and Add endpoint
-beside it. Then one ``clio.choice-table.v1`` lists the person's endpoints, with
-its column headers even when there are none. Each row has inline Protocol,
-Security and Spending pickers, its Status, and a menu of Connect, Test, Edit and
-Remove. Protocol offers only the ways that endpoint has. A value the endpoint
-takes from the defaults is marked inherited.
+the page is for, with Add endpoint beside it. Then one ``clio.choice-table.v1``
+lists the person's endpoints, with its column headers even when there are none,
+and above them a row of the defaults new endpoints start with, picked in place.
+Each endpoint's row has inline Protocol, Security and Spending pickers, its
+Status, and a menu of Connect, Test, Edit and Remove. Protocol offers only the
+ways that endpoint has. A value the endpoint takes from the defaults is marked
+inherited.
 
 Everything else opens in a dialog (:mod:`clio_relay.surface.a2ui.dialog`), and
 what an action did shows as a toast, with Undo when it can be undone. Nothing
@@ -23,18 +24,15 @@ from typing import Any
 from clio_relay.surface.a2ui.components import TABLE, Tree, event
 from clio_relay.surface.a2ui.dialog import (
     ADD,
-    DEFAULTS_DRAFT,
     DialogInputs,
     add_data,
     add_dialog,
     add_trigger,
-    defaults_data,
     dialog_flags,
 )
 from clio_relay.surface.a2ui.forms import FORM_ERROR, Form
 from clio_relay.surface.a2ui.i18n import _
 from clio_relay.surface.a2ui.site_dialogs import (
-    defaults_dialog,
     edit_data,
     edit_dialog,
     sign_in_dialog,
@@ -42,6 +40,8 @@ from clio_relay.surface.a2ui.site_dialogs import (
 from clio_relay.surface.a2ui.surfaces import (
     CONFIRM_REMOVE,
     CONNECT_SITE,
+    DEFAULTS,
+    DEFAULTS_SUBJECT,
     EDIT_DIALOG,
     EDIT_SITE,
     HOST_SIGN_IN,
@@ -251,13 +251,11 @@ def endpoints_surface(
     """Return the page as components, and its data model."""
     tree = Tree()
     found = inputs or DialogInputs()
-    defaults = defaults_dialog(tree, state, forms, tokens)
     adding = add_dialog(tree, state, forms, tokens, found, add_trigger(tree, tokens))
     lead = tree.text(
         "page-lead", _("Where relay runs jobs and services for your conversations."), "caption"
     )
-    buttons = tree.row("page-buttons", [defaults, adding], align="center", justify="end")
-    children = [tree.row("page-head", [lead, buttons], align="center", justify="spaceBetween")]
+    children = [tree.row("page-head", [lead, adding], align="center", justify="spaceBetween")]
     children.append(
         tree.add(
             "endpoints",
@@ -265,6 +263,11 @@ def endpoints_surface(
             label=_("Endpoints"),
             columns=_columns(forms, views, state),
             rows=[_row(view, state, tokens) for view in views],
+            defaults={
+                "title": _("Defaults for new endpoints"),
+                "values": {column: state.default(column) for column in DEFAULTS},
+                "context": {"token": tokens.mint(SET_VALUE, DEFAULTS_SUBJECT)},
+            },
             onChoose=event(SET_VALUE, {}),
             empty=_("No endpoints yet"),
         )
@@ -272,7 +275,6 @@ def endpoints_surface(
     data: dict[str, Any] = {
         "dialogs": dialog_flags(state),
         ADD.strip("/"): add_data(state, forms),
-        DEFAULTS_DRAFT.strip("/"): defaults_data(state),
         "drafts": {},
     }
     editing = _open_view(views, state, EDIT_DIALOG)

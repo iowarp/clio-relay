@@ -107,7 +107,6 @@ class TabActions(DialogActions):
             surfaces.SAVE_ENDPOINT: self.save_endpoint,
             surfaces.BACK: self.back,
             surfaces.CLOSE_DIALOG: self.close_dialog,
-            surfaces.SAVE_DEFAULTS: self.save_defaults,
             surfaces.UNDO: self.undo,
         }
 

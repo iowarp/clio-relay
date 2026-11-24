@@ -25,7 +25,6 @@ TITLES = {
     surfaces.SAVE_ENDPOINT: "Add a tested endpoint",
     surfaces.BACK: "Go back from a test in the add-endpoint dialog",
     surfaces.CLOSE_DIALOG: "Close a dialog",
-    surfaces.SAVE_DEFAULTS: "Save the defaults for new endpoints",
     surfaces.UNDO: "Undo the last addition or removal",
 }
 
@@ -69,6 +68,5 @@ ANNOTATIONS = {
     surfaces.CLOSE_DIALOG: PAGE_ONLY,
     surfaces.TEST_ENDPOINT: ADDS,
     surfaces.SAVE_ENDPOINT: ADDS,
-    surfaces.SAVE_DEFAULTS: REPLACES,
     surfaces.UNDO: REPLACES,
 }

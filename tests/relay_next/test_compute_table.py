@@ -2,7 +2,7 @@
 
 The table follows CLIO's Tools settings: column headers, then one row per
 endpoint with inline Protocol, Security and Spending pickers, its Status and a
-menu. The defaults for new endpoints sit behind a gear, in a dialog. Each pick
+menu. Above the endpoints, a row holds the defaults new ones start with. Each pick
 and menu item changes the same site store the CLI does.
 """
 
@@ -47,6 +47,7 @@ TABLE_KEYS = frozenset(
         "label",
         "columns",
         "rows",
+        "defaults",
         "onChoose",
         "rowMenu",
         "empty",
@@ -98,13 +99,19 @@ def test_the_table_has_headers_and_a_row_per_endpoint(relay_paths: RelayPaths) -
             status = [column for column in table["columns"] if column["id"] == "status"][0]
             assert status["editable"] is False
             assert all(option["icon"] and option["tone"] for option in status["options"])
-            assert "defaults" not in table and "add" not in table
-            # The gear and Add endpoint sit on the page's header line, each opening a dialog.
-            assert {"page-head", "defaults-open", "add-open"} <= host.visible("relay-sites")
-            assert not host.is_open("defaults-dialog") and not host.is_open("add-dialog")
-            assert host.get("relay-sites", "/defaultsDraft/protocol") == ["ssh"]
-            assert host.get("relay-sites", "/defaultsDraft/policy") == ["guarded"]
-            assert host.get("relay-sites", "/defaultsDraft/spend") == ["always"]
+            assert "add" not in table
+            # The defaults new endpoints start with are a row above the endpoints.
+            assert table["defaults"]["title"] == "Defaults for new endpoints"
+            assert table["defaults"]["values"] == {
+                "protocol": "ssh",
+                "security": "guarded",
+                "spend": "always",
+            }
+            # Add endpoint sits on the page's header line and opens a wide dialog.
+            assert {"page-head", "add-open"} <= host.visible("relay-sites")
+            assert "defaults-open" not in host.visible("relay-sites")
+            assert not host.is_open("add-dialog")
+            assert host.component("add-dialog")["width"] == "wide"
             row = host.row("fx")
             assert row["values"] == {
                 "protocol": "fixture",
@@ -264,15 +271,11 @@ def test_a_protocol_that_needs_settings_opens_them_in_a_dialog(relay_paths: Rela
     asyncio.run(scenario())
 
 
-async def _save_defaults(host: Host, protocol: str, policy: str) -> Any:
-    await host.press("relay-sites", "defaults-open")
-    assert host.is_open("defaults-dialog")
-    host.set("relay-sites", "/defaultsDraft/protocol", [protocol])
-    host.set("relay-sites", "/defaultsDraft/policy", [policy])
-    return await host.dialog("defaults-dialog", "confirm")
+def _shown_defaults(host: Host) -> dict[str, Any]:
+    return host.table()["defaults"]["values"]
 
 
-def test_the_gear_holds_the_defaults_for_new_endpoints(relay_paths: RelayPaths) -> None:
+def test_the_defaults_row_sets_what_new_endpoints_start_with(relay_paths: RelayPaths) -> None:
     store = SiteStore(relay_paths.sites_file)
 
     async def scenario() -> None:
@@ -282,31 +285,31 @@ def test_the_gear_holds_the_defaults_for_new_endpoints(relay_paths: RelayPaths) 
             assert host.table()["rows"] == []
             assert host.table()["empty"] == "No endpoints yet"
             assert [column["title"] for column in host.table()["columns"]][0] == "Protocol"
-            result = await _save_defaults(host, "fixture", "open")
+            assert "fixture" not in _options(host.table(), "protocol")
+            result = await host.choose("", "protocol", "fixture")
             assert result.structured_content["ok"] is False, "a test-only protocol is not offered"
-            assert host.is_open("defaults-dialog")
-            assert host.component("defaults-dialog")["status"]["tone"] == "negative"
+            refused = toast(result)
+            assert refused is not None and refused["tone"] == "negative"
+            assert store.defaults().adapter == "ssh"
 
-            result = await _save_defaults(host, "local", "open")
+            result = await host.choose("", "protocol", "local")
             assert result.structured_content["ok"] is True, said(result)
             assert toast(result) == {
                 "message": "Saved the defaults for new endpoints",
                 "tone": "positive",
             }
-            assert not host.is_open("defaults-dialog")
+            result = await host.choose("", "security", "open")
+            assert result.structured_content["ok"] is True, said(result)
             assert store.defaults().model_dump() == {
                 "adapter": "local",
                 "policy": "open",
                 "spend": "always",
             }
-            assert host.get("relay-sites", "/defaultsDraft/policy") == ["open"]
-
-            # Closing the dialog without saving changes nothing.
-            await host.press("relay-sites", "defaults-open")
-            host.set("relay-sites", "/defaultsDraft/policy", ["guarded"])
-            await host.dialog("defaults-dialog", "cancel")
-            assert not host.is_open("defaults-dialog")
-            assert store.defaults().policy == "open"
+            assert _shown_defaults(host) == {
+                "protocol": "local",
+                "security": "open",
+                "spend": "always",
+            }
 
         # A client with only the Basic catalog saves the same defaults from its form.
         async with basic_client(relay_paths) as client:
@@ -324,7 +327,7 @@ def test_the_gear_holds_the_defaults_for_new_endpoints(relay_paths: RelayPaths) 
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            assert host.get("relay-sites", "/defaultsDraft/policy") == ["guarded"]
+            assert _shown_defaults(host)["security"] == "guarded"
 
     asyncio.run(scenario())
 
@@ -341,15 +344,16 @@ def test_the_page_and_the_cli_share_the_defaults(
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            result = await _save_defaults(host, "local", "open")
-            assert result.structured_content["ok"] is True, said(result)
+            for column, value in (("protocol", "local"), ("security", "open")):
+                result = await host.choose("", column, value)
+                assert result.structured_content["ok"] is True, said(result)
 
     async def shown() -> dict[str, Any]:
         async with a2ui_client(relay_paths) as client:
             host = Host(client)
             await host.open()
-            found = host.get("relay-sites", "/defaultsDraft")
-            return {"protocol": found["protocol"], "policy": found["policy"]}
+            found = _shown_defaults(host)
+            return {"protocol": found["protocol"], "policy": found["security"]}
 
     asyncio.run(pick())
     assert store.defaults().model_dump() == {
@@ -376,7 +380,7 @@ def test_the_page_and_the_cli_share_the_defaults(
         "policy": "guarded",
         "spend": "always",
     }
-    assert asyncio.run(shown()) == {"protocol": ["local"], "policy": ["guarded"]}
+    assert asyncio.run(shown()) == {"protocol": "local", "policy": "guarded"}
 
 
 def test_the_row_menu_tests_edits_and_removes_with_undo(relay_paths: RelayPaths) -> None:

@@ -20,7 +20,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.a2ui.components import event
 from clio_relay.surface.a2ui.dialog import DialogInputs, passed
-from clio_relay.surface.a2ui.forms import FORM_ERROR, Form, FormError
+from clio_relay.surface.a2ui.forms import FORM_ERROR, Form
 from clio_relay.surface.a2ui.i18n import _
 from clio_relay.surface.a2ui.newsite import (
     CATALOG_TAB,
@@ -36,8 +36,6 @@ from clio_relay.surface.a2ui.newsite import (
 from clio_relay.surface.a2ui.surfaces import (
     ADD_DIALOG,
     ADD_SUBJECT,
-    DEFAULTS_DIALOG,
-    DEFAULTS_SUBJECT,
     EDIT_DIALOG,
     HOST_SIGN_IN,
     REMOVED_KEPT,
@@ -49,7 +47,7 @@ from clio_relay.surface.a2ui.surfaces import (
     protocol_name,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
-from clio_relay.surface.a2ui.values import as_dict, first, sentence, spend_choice
+from clio_relay.surface.a2ui.values import as_dict, first, sentence
 
 if TYPE_CHECKING:
     from clio_relay.surface.a2ui.actions import Outcome
@@ -61,7 +59,7 @@ TEST_TIMEOUT_S = 90.0
 """How long Test waits for an endpoint to answer before it calls it unreachable."""
 _DRAFT_KEYS = ("tab", "site", "saved", "savedProtocol", "protocol", "ownProtocol", "own", "config")
 _PICKED = {"site", "saved", "protocol", "ownProtocol"}
-DIALOG_PATHS = ("/dialogs", "/add", "/defaultsDraft")
+DIALOG_PATHS = ("/dialogs", "/add")
 """The page's dialog data, sent again after every action since a component update has none."""
 
 
@@ -130,9 +128,6 @@ class DialogActions:
                 self.state.add = {}
             self.state.dialog = ADD_DIALOG
             self.state.errors.pop(ADD_DIALOG, None)
-        elif subject == DEFAULTS_SUBJECT:
-            self.state.dialog = DEFAULTS_DIALOG
-            self.state.errors.pop(DEFAULTS_DIALOG, None)
         else:
             return _outcome(False)
         return _outcome(True)
@@ -142,10 +137,6 @@ class DialogActions:
             self.state.add = {}
             self.state.errors.pop(ADD_DIALOG, None)
             if self.state.dialog == ADD_DIALOG:
-                self.state.dialog = ""
-        elif subject == DEFAULTS_SUBJECT:
-            self.state.errors.pop(DEFAULTS_DIALOG, None)
-            if self.state.dialog == DEFAULTS_DIALOG:
                 self.state.dialog = ""
         return _outcome(True)
 
@@ -300,7 +291,7 @@ class DialogActions:
         tone = "positive" if message == done else "warning"
         return _outcome(True, self.toast(message, tone, {"kind": "added", "id": added.id}))
 
-    # Removing, the defaults and Undo
+    # Removing and Undo
 
     def remember_removed(self, entry: SiteEntry) -> None:
         """Offer ``entry`` back in the Saved tab, newest first."""
@@ -313,32 +304,6 @@ class DialogActions:
         self.state.removed = [
             item for item in self.state.removed if as_dict(item.get("entry")).get("id") != site_id
         ]
-
-    async def save_defaults(self, _subject: str, values: dict[str, Any]) -> Outcome:
-        picked: dict[str, Any] = {}
-        protocol = first(values.get("protocol"))
-        if protocol:
-            picked["protocol"] = protocol
-        policy = first(values.get("policy"))
-        if policy:
-            picked["security"] = policy
-        try:
-            spend = spend_choice(values.get("spend"), values.get("spend_limit"))
-        except FormError as exc:
-            self.state.errors[DEFAULTS_DIALOG] = {exc.key: str(exc), FORM_ERROR: str(exc)}
-            return _outcome(False)
-        if spend is not None:
-            picked["spend"] = spend
-        outcome = self._set_defaults(picked)
-        if not outcome.ok:
-            self.state.errors[DEFAULTS_DIALOG] = {FORM_ERROR: self.state.notice}
-            self.state.notice = ""
-            return _outcome(False)
-        self.state.errors.pop(DEFAULTS_DIALOG, None)
-        self.state.dialog = ""
-        message = self.state.notice.rstrip(".")
-        self.state.notice = ""
-        return _outcome(True, self.toast(message))
 
     async def undo(self, _subject: str, _values: dict[str, Any]) -> Outcome:
         undo, self.state.undo = self.state.undo, {}

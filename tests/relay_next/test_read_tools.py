@@ -32,7 +32,6 @@ REPLACES = {
     surfaces.SWITCH_ADAPTER,
     surfaces.SET_VALUE,
     surfaces.CONFIRM_REMOVE,
-    surfaces.SAVE_DEFAULTS,
     surfaces.UNDO,
 }
 

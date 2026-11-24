@@ -2282,6 +2282,11 @@ Branch `jaimecernuda-relay-rework-w14`. Marketplace: `plugins/clio-relay/` on cl
     - A test that passes fills the Save step's empty name, Security and Spending, not only missing keys, so the defaults show selected.
     - `/defaultsDraft/spend` is a picker's list like protocol and policy, so the defaults dialog shows the saved Spending.
     - "Saved the defaults for new endpoints" is translated.
+  - **Follow-up: the defaults are a row again, and the add dialog is wide (user-directed).** The user's words: "the defauls can still be there, as a row, there is no problem with that" and "maybe the scrreen view could be a bi bigger, the window feels a big crammed".
+    - The table's `defaults` row ("Defaults for new endpoints") sits above the endpoints. A pick on it calls `compute_set_value` with the `@defaults` subject, which saves that one default and toasts "Saved the defaults for new endpoints". This supersedes the gear above.
+    - The gear had no purpose left, so it is gone, with `defaults-dialog`, `/defaultsDraft` and the `compute_save_defaults` tool. An A2UI client now sees one tool fewer.
+    - What that drops: a custom spending limit as the default. The row offers the Spending column's options, as each endpoint's row does. The CLI's `site defaults --spend` still takes any node-hour threshold.
+    - `add-dialog` has `width: "wide"`, which clio-schemas b20595a0 (0.8.0b5) and gact-tui d296a4df5 add: up to 880 px across and a taller body. Under 600 px a tabbed dialog still fills the window.
 
 ### Facts
 

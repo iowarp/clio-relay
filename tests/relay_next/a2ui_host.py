@@ -220,10 +220,13 @@ class Host:
     def choice(
         self, row_id: str, column: str, value: str, sid: str = "relay-sites"
     ) -> tuple[str, dict[str, Any]]:
-        """Return the call a pick makes: the event's context, the row's, then the pick."""
+        """Return the call a pick makes: the event's context, the row's, then the pick.
+
+        A ``row_id`` of "" is the defaults row, as CLIO's renderer sends it.
+        """
         component = self.table(sid)
         event = component["onChoose"]["event"]
-        owner = self.row(row_id, sid)
+        owner = component["defaults"] if row_id == "" else self.row(row_id, sid)
         context = self._context(sid, event) | owner.get("context", {})
         return str(event["name"]), context | {"row": row_id, "column": column, "value": value}
 

@@ -47,7 +47,6 @@ TEST_ENDPOINT = "compute_test_endpoint"
 SAVE_ENDPOINT = "compute_save_endpoint"
 BACK = "compute_back"
 CLOSE_DIALOG = "compute_close_dialog"
-SAVE_DEFAULTS = "compute_save_defaults"
 UNDO = "compute_undo"
 ACTIONS = (
     OPEN_ADD,
@@ -68,7 +67,6 @@ ACTIONS = (
     SAVE_ENDPOINT,
     BACK,
     CLOSE_DIALOG,
-    SAVE_DEFAULTS,
     UNDO,
 )
 
@@ -80,7 +78,6 @@ DIALOG_SUBJECT = "@dialog"
 
 # The page's dialogs: which one is open is TabState.dialog.
 ADD_DIALOG = "add"
-DEFAULTS_DIALOG = "defaults"
 EDIT_DIALOG = "edit:"
 SIGN_IN_DIALOG = "signin:"
 # The add dialog's tabs, by the id of each tab's child.
