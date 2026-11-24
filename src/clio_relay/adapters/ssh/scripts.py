@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import posixpath
 import shlex
+import textwrap
 from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
@@ -506,7 +507,9 @@ def graph_script(remote_dir: str, jarvis: str = "") -> str:
         'if [ -x "$JB" ]; then\n'
         '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
         '  echo "@@graph"\n'
-        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" $T "$JB" rg net show +json </dev/null 2>&1\n'
+        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" '
+        f"{jarvis_graph.NO_BUILTIN_ENV}=1 "
+        '$T "$JB" rg net show +json </dev/null 2>&1\n'
         "fi\n"
     )
 
@@ -542,7 +545,7 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
         f"S={root_expression(site)}; R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
         '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
-        + _INIT_SITE_ROOT
+        + _init_site_root(jarvis)
         + jarvis_graph.write_lines('"$S"')
         + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
@@ -563,14 +566,21 @@ def _jarvis_env(home: str, jarvis: str) -> str:
     )
 
 
-# The site-level JARVIS root (``$R``) is set up once, the first time a site-level
-# call needs it; a run's own root is set up by the run script. It never keeps
-# jarvis-cd's builtin repository.
-_INIT_SITE_ROOT = (
-    'mkdir -p "$R"\n'
-    '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init '
-    '"$R/config" "$R/private" "$R/shared" >/dev/null 2>&1\n' + jarvis_graph.DROP_BUILTIN
-)
+# The site-level JARVIS root (``$R``) is set up the first time a site-level call needs
+# it; a run's own root is set up by the run script. Every call leaves jarvis-cd's builtin
+# out, and relay's pinned JARVIS records that in the root: a root an earlier relay set up,
+# without the record, is set up again once (init keeps its repositories and graph).
+def _init_site_root(jarvis: str) -> str:
+    config = '"$R/jarvis_config.yaml"'
+    made = f"grep -qsx {q(jarvis_graph.NO_BUILTIN_CONFIG)} {config}"
+    if jarvis:
+        # Another jarvis may predate the record and would be set up again on every call.
+        made = f"[ -f {config} ]"
+    return (
+        jarvis_graph.NO_BUILTIN + 'mkdir -p "$R"\n'
+        f'{made} || JARVIS_ROOT="$R" "$JB" init '
+        '"$R/config" "$R/private" "$R/shared" >/dev/null 2>&1\n'
+    )
 
 
 _JARVIS_EXPORTS = (
@@ -591,7 +601,7 @@ def jarvis_command(remote_dir: str, jarvis: str = "") -> list[str]:
     script = (
         _jarvis_env(home, jarvis)
         + '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
-        + _INIT_SITE_ROOT
+        + _init_site_root(jarvis)
         + _JARVIS_EXPORTS
         + 'exec "$JB" "$@"\n'
     )
@@ -610,8 +620,7 @@ def sched_script(remote_dir: str, jarvis: str = "") -> str:
         "(\n"
         + _jarvis_env(home, jarvis)
         + 'if [ -x "$JB" ]; then\n'
-        + "  "
-        + _INIT_SITE_ROOT.replace("\n[", "\n  [")
+        + textwrap.indent(_init_site_root(jarvis), "  ")
         + '  T=; command -v timeout >/dev/null 2>&1 && T="timeout 90"\n'
         + "  "
         + _JARVIS_EXPORTS.replace("\nif", "\n  if")

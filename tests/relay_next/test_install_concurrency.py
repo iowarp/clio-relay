@@ -229,12 +229,7 @@ case "$1" in
             sleep 1
             [ -d "$(dirname "$0")" ] || { echo "venv removed under the install" >&2; exit 1; }
             printf '#!/bin/sh\n' > "$(dirname "$0")/jarvis"
-            chmod +x "$(dirname "$0")/jarvis"
-            # The wheel's two top-level packages.
-            site="$(dirname "$(dirname "$0")")/lib/python3.12/site-packages"
-            mkdir -p "$site/builtin/builtin/lammps" "$site/jarvis_cd"
-            : > "$site/builtin/__init__.py"; : > "$site/builtin/builtin/__init__.py"
-            : > "$site/jarvis_cd/__init__.py" ;;
+            chmod +x "$(dirname "$0")/jarvis" ;;
         esac
         exit 0 ;;
     esac ;;
@@ -273,14 +268,3 @@ def test_two_bootstraps_at_once_build_jarvis_once(tmp_path: Path) -> None:
     jarvis = Path(home) / "jarvis-cd" / "jarvis"
     assert jarvis.is_file()
     assert (Path(home) / "jarvis-cd" / "pin").read_text().strip() == jarvis_submit.JARVIS_PIN
-    site = Path(home) / "jarvis-cd" / "venv" / "lib" / "python3.12" / "site-packages"
-    assert (site / "jarvis_cd").is_dir()
-    assert not (site / "builtin").exists()
-    # A venv an older relay built still holds builtin: the reuse path removes it.
-    (site / "builtin" / "builtin").mkdir(parents=True)
-    (site / "builtin" / "builtin" / "__init__.py").write_text("", encoding="utf-8")
-    again = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
-    assert again.returncode == 0, again.stderr
-    assert '"from":"reused"' in again.stdout
-    assert not (site / "builtin").exists()
-    assert builds.read_text(encoding="utf-8").splitlines() == ["build"]

@@ -295,8 +295,8 @@ The site's cluster facts, such as which network MPI uses, are JARVIS's
 resource graph, kept for the site at `jarvis-cd/site/resource_graph.yaml` in the
 CLIO site home and exported as `JARVIS_RESOURCE_GRAPH` on every JARVIS call.
 JARVIS collects its `net` section on compute nodes (with relay's own
-`clio_relay_site.net_graph` package; relay never installs or registers
-jarvis-cd's builtin packages), picks the fastest network that reaches every node, and applies it
+`clio_relay_site.net_graph` package; relay runs JARVIS with `JARVIS_NO_BUILTIN=1`,
+so jarvis-cd's builtin packages are never registered), picks the fastest network that reaches every node, and applies it
 when it launches MPI, for each MPI flavour. Relay sets no MPI variables itself.
 `describe(site=...)` shows `info.facts.resource_graph`: the graph's path, the
 decisions file, JARVIS's net report (`jarvis rg net show`), and `collect`, the

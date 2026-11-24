@@ -114,7 +114,9 @@ fi
 plans=; [ -n "$jarvis" ] || [ -z "$pin" ] || plans=1
 printf '%s\n' "$found" > "$job/relay.jarvis"
 root="$job/.relay-jarvis"
-export JARVIS_ROOT="$root"
+# jarvis-cd's builtin is never registered or resolved, and init records that in the root
+# (no_builtin: true) for JARVIS's own jobs there.
+export JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1
 # What the pipeline writes (JARVIS's shared directory) lives in the site's outputs
 # directory, outside relay's own: a site clean removes the link, never the outputs.
 shared="$root/shared"
@@ -160,8 +162,6 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
   done
   printf '%s\n' "$steps" > "$root/.relay-setup"
 fi
-# jarvis init lists jarvis-cd's builtin repository; the job's root never keeps it.
-! grep -qs builtin "$root/repos.yaml" || "$found" repo remove builtin >/dev/null 2>&1 || :
 # Where the outputs really are, so relay names them there, never through the link.
 printf '%s\n' "$shared" > "$job/relay.shared"
 printf '{"schema_version":"clio-relay.shared.v1","path":"%s"}\n' \

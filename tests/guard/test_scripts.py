@@ -46,8 +46,8 @@ echo "JARVIS_ROOT=${JARVIS_ROOT:-} $*" >> "$JARVIS_LOG"
 [ -z "${JARVIS_INSTALL_ANSWERS:-}" ] || echo "answers $JARVIS_INSTALL_ANSWERS" >> "$JARVIS_LOG"
 case "$1 $2" in
   "init "*)
-    [ -z "${JARVIS_INIT_BUILTIN:-}" ] \\
-      || printf 'repos:\\n- %s/builtin\\n' "$JARVIS_ROOT" > "$JARVIS_ROOT/repos.yaml" ;;
+    [ "${JARVIS_NO_BUILTIN:-}" != 1 ] \\
+      || echo "no_builtin: true" > "$JARVIS_ROOT/jarvis_config.yaml" ;;
   "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
   "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
   "ppl run") echo "ran in $(pwd)" ;;
@@ -195,21 +195,19 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert not (root / "src" / "demo" / "demo" / "other").exists()
 
 
-def test_the_job_root_drops_the_builtin_repository_jarvis_init_lists(tmp_path: Path) -> None:
+def test_the_job_root_leaves_jarvis_builtin_out(tmp_path: Path) -> None:
+    """The user: builtins "should not even be installed for relay to use"."""
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
     (job / PIPELINE_FILE).write_text(PIPELINE)
-    env = _env(tmp_path, tmp_path / "bin", JARVIS_INIT_BUILTIN="1")
+    env = _env(tmp_path, tmp_path / "bin")
+    env.pop("JARVIS_NO_BUILTIN", None)
     done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
     assert done.returncode == 0, done.stderr
     root = job / ".relay-jarvis"
-    log = (tmp_path / "jarvis.log").read_text().splitlines()
-    assert log[:3] == [
-        f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
-        f"JARVIS_ROOT={root} repo add {root}/src/demo +force",
-        f"JARVIS_ROOT={root} repo remove builtin",
-    ]
-    assert log[3].startswith(f"JARVIS_ROOT={root} ppl install ")
+    assert (root / "jarvis_config.yaml").read_text() == "no_builtin: true\n"
+    log = (tmp_path / "jarvis.log").read_text()
+    assert "repo remove builtin" not in log
 
 
 def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> None:

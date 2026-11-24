@@ -1,9 +1,10 @@
 """Relay's own JARVIS package that collects a site's networks on compute nodes.
 
 jarvis-cd's wheel ships a ``builtin`` repository of packages. Relay never
-installs, registers or runs it: the bootstrap removes it from relay's jarvis-cd
-environment, and every JARVIS root relay sets up drops it from its repositories
-(:data:`DROP_BUILTIN`). So relay's network collection is a package of its own: a
+registers or runs it: every JARVIS call relay makes sets :data:`NO_BUILTIN_ENV`,
+and every JARVIS root relay sets up records ``no_builtin: true`` at ``init``, so
+JARVIS never lists or resolves builtin. Relay's network collection is a
+package of its own: a
 one-package JARVIS repository, :data:`REPO`, that the collect script writes
 beside the site graph (:func:`write_lines`) and registers in the site-level
 JARVIS root. Its job calls jarvis-cd's own ``ResourceGraphManager.build`` with
@@ -11,6 +12,18 @@ JARVIS root. Its job calls jarvis-cd's own ``ResourceGraphManager.build`` with
 """
 
 from shlex import quote
+
+NO_BUILTIN_ENV = "JARVIS_NO_BUILTIN"
+"""jarvis-cd's switch (1.9.1 and later) that leaves its builtin repository out.
+
+Set to 1 on a JARVIS call, builtin is never registered or resolved and ``builtin.*``
+is not found. Set at ``jarvis init``, the root records ``no_builtin: true``
+(:data:`NO_BUILTIN_CONFIG`), so JARVIS's own jobs in that root leave it out too.
+"""
+NO_BUILTIN_CONFIG = "no_builtin: true"
+"""The line ``jarvis init`` writes in ``jarvis_config.yaml`` with :data:`NO_BUILTIN_ENV` set."""
+NO_BUILTIN = f"export {NO_BUILTIN_ENV}=1\n"
+"""The shell line that sets :data:`NO_BUILTIN_ENV` for the rest of a script."""
 
 REPO = "clio_relay_site"
 """The JARVIS repository of relay's own site packages."""
@@ -51,16 +64,6 @@ class NetGraph(Application):
         pass
 '''
 """The package's ``pkg.py``."""
-
-DROP_BUILTIN = (
-    '! grep -qs builtin "$R/repos.yaml" '
-    '|| JARVIS_ROOT="$R" "$JB" repo remove builtin >/dev/null 2>&1 || :\n'
-)
-"""The shell line that drops jarvis-cd's builtin repository from the JARVIS root ``$R``.
-
-``jarvis init`` lists it in every new root, and a root an earlier relay set up
-still has it. ``$JB`` is the ``jarvis`` that owns the root.
-"""
 
 
 def write_lines(site: str) -> str:

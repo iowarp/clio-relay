@@ -17,6 +17,7 @@ from clio_relay.adapters.sched_info import site_facts as sched_facts
 from clio_relay.adapters.ssh.scripts import (
     exec_script,
     graph_collect_command,
+    graph_script,
     jarvis_command,
     relay_jarvis,
     sched_script,
@@ -484,21 +485,37 @@ def test_a_bare_jarvis_in_exec_is_relays_jarvis_with_its_arguments_unparsed() ->
     assert exec_script(read).startswith('cd "$HOME" 2>/dev/null\nset -- jarvis rg')
 
 
-def test_site_level_jarvis_calls_initialize_the_site_root_once() -> None:
+def test_site_level_jarvis_calls_initialize_the_site_root_without_builtin() -> None:
     """sched info, the graph collection and the exec prefix run JARVIS with the
-    site-level root, which JARVIS refuses until ``jarvis init`` has made it."""
+    site-level root, which JARVIS refuses until ``jarvis init`` has made it. The
+    user: builtins "should not even be installed for relay to use"."""
     home = "/home/me/.clio-relay"
     scripts = {
         "exec": jarvis_command(home)[2],
         "sched": sched_script(home),
         "collect": graph_collect_command(home, "slurm")[2],
     }
+    init = 'JARVIS_ROOT="$R" "$JB" init "$R/config" "$R/private" "$R/shared"'
     for name, script in scripts.items():
-        guard = '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init'
+        # A root without the record, from an earlier relay, is set up again once.
+        guard = "grep -qsx 'no_builtin: true' \"$R/jarvis_config.yaml\" || " + init
         assert guard in script, name
-        assert '"$R/config" "$R/private" "$R/shared"' in script, name
-        assert script.index(guard) < script.rindex('"$JB"'), name
-        drop = 'JARVIS_ROOT="$R" "$JB" repo remove builtin'
-        assert script.index(guard) < script.index(drop) < script.rindex('"$JB"'), name
+        option = script.index("export JARVIS_NO_BUILTIN=1\n")
+        assert option < script.index(guard) < script.rindex('"$JB"'), name
+        assert "repo remove builtin" not in script, name
     assert 'ppl submit "$S/site_net.yaml" +json' in scripts["collect"]
     assert 'ppl run yaml "$S/site_net.yaml" +json' in graph_collect_command(home, "none")[2]
+    assert "JARVIS_NO_BUILTIN=1 " in graph_script(home)
+
+
+def test_a_site_named_jarvis_initializes_its_root_only_once() -> None:
+    """An older site jarvis never writes the record, so only a missing root is set up."""
+    home = "/home/me/.clio-relay"
+    for script in (
+        jarvis_command(home, "/opt/jarvis")[2],
+        sched_script(home, "/opt/jarvis"),
+        graph_collect_command(home, "slurm", "/opt/jarvis")[2],
+    ):
+        assert '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init' in script
+        assert "no_builtin: true" not in script
+        assert "export JARVIS_NO_BUILTIN=1\n" in script

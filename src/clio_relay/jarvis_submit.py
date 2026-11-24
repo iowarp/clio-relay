@@ -58,6 +58,7 @@ import yaml
 from clio_relay.jarvis_bootstrap import BOOTSTRAP_SCRIPT as BOOTSTRAP_SCRIPT
 from clio_relay.jarvis_bootstrap import PYTHON_SETTING_HELP as PYTHON_SETTING_HELP
 from clio_relay.jarvis_bootstrap import explicit_python as explicit_python
+from clio_relay.jarvis_graph import NO_BUILTIN_ENV
 from clio_relay.jarvis_graph import PKG_TYPE as GRAPH_PKG_TYPE
 from clio_relay.jarvis_record import install_progress, scheduler_start
 from clio_relay.jarvis_site_script import SITE_SCRIPT as SITE_SCRIPT
@@ -112,11 +113,11 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_VERSION = "1.9.0"
+JARVIS_VERSION = "1.9.1"
 """The jarvis-cd release relay installs under the CLIO site home and runs."""
-JARVIS_PIN = "4b76ee357384ee8c4f2a7249aff7fa77448ea788"
+JARVIS_PIN = "f9077e22800e0d42414c45655dff54776b724279"
 """The commit the jarvis-cd :data:`JARVIS_VERSION` tag names. It is written to the pin file."""
-JARVIS_WHEEL_SHA256 = "1959a6109b3f4666604d2d97b027f5daf50f3e8c674a9376a0f1ee5ec8e8a374"
+JARVIS_WHEEL_SHA256 = "91f357b892ae822be9c726305b8e07cef4f30969b7afdbedee369be82040e49f"
 JARVIS_SOURCE = (
     f"https://github.com/grc-iit/jarvis-cd/releases/download/v{JARVIS_VERSION}/"
     f"jarvis_cd-{JARVIS_VERSION}-py3-none-any.whl#sha256={JARVIS_WHEEL_SHA256}"
@@ -924,6 +925,7 @@ def execution_argv(
     return [
         "env",
         f"JARVIS_ROOT={jarvis_root(job_dir)}",
+        f"{NO_BUILTIN_ENV}=1",
         jarvis,
         "execution",
         verb,

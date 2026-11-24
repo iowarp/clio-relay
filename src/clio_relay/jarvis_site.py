@@ -84,10 +84,12 @@ JARVIS_BUILTIN = "builtin"
 """jarvis-cd's own repository, which relay never installs, registers, stages, lists or runs.
 
 They hardcode a case or a site's setup and are meant for a person to drive, so
-they are a reference for writing a generic package, not packages to run. The
-bootstrap removes them from relay's jarvis-cd environment, every JARVIS root
-relay sets up drops the repository ``jarvis init`` lists, and relay collects the
-site's networks with its own package (:mod:`clio_relay.jarvis_graph`).
+they are a reference for writing a generic package, not packages to run.
+jarvis-cd's wheel still ships them, but relay runs every JARVIS call with
+``JARVIS_NO_BUILTIN=1`` and every root it sets up records ``no_builtin: true``
+(:data:`clio_relay.jarvis_graph.NO_BUILTIN_ENV`), so JARVIS never registers or
+resolves them. Relay collects the site's networks with its own package
+(:mod:`clio_relay.jarvis_graph`).
 """
 
 
