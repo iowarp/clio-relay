@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import socket
 import struct
 import tomllib
@@ -14,7 +15,7 @@ import pytest
 from clio_relay.frp_visitor import START_MARKER, nathole
 from clio_relay.frp_visitor.config import DEFAULT_STUN_SERVER, ConfigError, load, parse
 from clio_relay.frp_visitor.pipe import BufferedPipe, Pipe, ProtocolError
-from clio_relay.frp_visitor.quic import DirectPath
+from clio_relay.frp_visitor.quic import RECEIVE_WINDOW, DirectPath, QuicTunnel
 from clio_relay.frp_visitor.wire import (
     LOGIN,
     NAT_HOLE_SID,
@@ -329,6 +330,82 @@ def test_two_sides_punch_to_each_other_over_loopback() -> None:
         finally:
             sender.close()
             receiver.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_stalled_reader_holds_the_peer_back_and_loses_nothing(tmp_path: Path) -> None:
+    import datetime
+
+    from aioquic.asyncio.server import serve  # pyright: ignore[reportUnknownVariableType]
+    from aioquic.quic.configuration import QuicConfiguration
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "frpc")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(1)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    (tmp_path / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (tmp_path / "key.pem").write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    blob = random.randbytes(4 * RECEIVE_WINDOW)
+
+    async def scenario() -> None:
+        configuration = QuicConfiguration(is_client=False, alpn_protocols=["frp"])
+        configuration.load_cert_chain(  # pyright: ignore[reportUnknownMemberType]
+            str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
+        )
+        tasks: list[asyncio.Task[None]] = []
+
+        def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            async def send() -> None:
+                await reader.readexactly(2)
+                writer.write(blob)
+                writer.write_eof()
+
+            tasks.append(asyncio.create_task(send()))
+
+        server = await serve("127.0.0.1", 0, configuration=configuration, stream_handler=handle)
+        sock = nathole.udp_socket()
+        transport = server._transport  # pyright: ignore[reportPrivateUsage]
+        assert transport is not None
+        port = transport.get_extra_info("sockname")[1]
+        tunnel = await QuicTunnel.open(sock, ("127.0.0.1", port))
+        try:
+            pipe = await tunnel.open_stream()
+            await pipe.write(b"go")
+            # Nothing reads for a while, as when the local writer is stuck: the
+            # peer may send only the first credit, however much it has queued.
+            await asyncio.sleep(3)
+            paced = tunnel._protocol.paced  # pyright: ignore[reportPrivateUsage]
+            assert 0 < sum(paced.unread.values()) <= RECEIVE_WINDOW
+            got = bytearray()
+            while data := await pipe.read():
+                got += data
+            assert hashlib.sha256(got).digest() == hashlib.sha256(blob).digest()
+            await pipe.close()
+            assert paced.unread == {}
+        finally:
+            await tunnel.close()
+            server.close()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(scenario())
 

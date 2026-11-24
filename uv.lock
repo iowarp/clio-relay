@@ -396,7 +396,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aioquic", specifier = ">=1.9.1" },
+    { name = "aioquic", specifier = ">=1.9.1,<1.10" },
     { name = "clio-schemas", specifier = "==0.2.1" },
     { name = "cryptography", specifier = ">=50.0.0" },
     { name = "fastapi", specifier = ">=0.115" },

@@ -16,6 +16,13 @@ Two things differ from a plain aioquic client, both for durability:
   one, which would freeze the tunnel. Here that read is skipped.
 - A write waits while its stream has more than ``SEND_WINDOW`` bytes the peer
   has not acknowledged, since aioquic never pauses a writer.
+- Credit to the peer follows the bytes the visitor has read, not the bytes
+  aioquic has delivered. aioquic hands every received byte to the stream's
+  reader at once and raises MAX_STREAM_DATA and MAX_DATA from that, so a slow
+  local writer would let the reader grow without limit. ``_PacedConnection``
+  holds those raises back while bytes sit unread, and a read sends them. The
+  peer then waits under QUIC flow control; nothing is dropped. See
+  ``RECEIVE_BOUND``.
 
 ``DirectPath`` runs the punches (``nathole``) and keeps the tunnel, as frp's
 ``XTCPVisitor`` does; the visitor only asks it for a stream and, when there is
@@ -35,8 +42,12 @@ from typing import Any, cast
 
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection
-from aioquic.quic.events import ConnectionTerminated, QuicEvent
+from aioquic.quic.connection import MAX_WINDOW_GROWTH, QuicConnection
+from aioquic.quic.events import ConnectionTerminated, QuicEvent, StreamDataReceived
+from aioquic.quic.exceptions import QuicError
+from aioquic.quic.packet_builder import QuicPacketBuilder
+from aioquic.quic.recovery import QuicPacketSpace
+from aioquic.quic.stream import QuicStream
 
 from clio_relay.frp_visitor import nathole
 from clio_relay.frp_visitor.config import Visitor
@@ -49,6 +60,18 @@ IDLE_S = 30.0
 KEEPALIVE_S = 10.0
 SEND_WINDOW = 1 << 20
 """Unacknowledged bytes one stream may hold before its writer waits."""
+
+RECEIVE_WINDOW = 1 << 20
+"""The first credit, per stream and for the whole tunnel; aioquic grows it as reads keep up."""
+
+RECEIVE_BOUND = 3 * MAX_WINDOW_GROWTH * RECEIVE_WINDOW // 2
+"""The most bytes the tunnel ever holds unread, across all its streams (24 MiB).
+
+New credit goes out only while less than half the current window is granted
+past what the visitor has read, and the window grows to at most
+``MAX_WINDOW_GROWTH`` times ``RECEIVE_WINDOW``, so unread bytes stay under one
+and a half of the largest window.
+"""
 
 PUNCH_SPACING_S = 10.0
 """frp starts punches at least this far apart."""
@@ -80,11 +103,104 @@ class _Datagrams(asyncio.DatagramTransport):
         return self._sock.fileno() == -1
 
 
+class _PacedConnection(QuicConnection):
+    """aioquic's connection, granting the peer credit only for bytes the visitor has read.
+
+    aioquic raises a limit when less than half its window is left past the bytes
+    it has delivered. Here the same test runs against the bytes read, and while
+    it fails the raise waits (``withheld``) until a read sends it. Only the raise
+    is held: a limit already decided, or one to send again after a loss, still
+    goes out.
+    """
+
+    def __init__(self, configuration: QuicConfiguration) -> None:
+        super().__init__(configuration=configuration)
+        missing = [name for name in _FLOW_STATE if not hasattr(self, name)]
+        if missing:
+            raise RuntimeError(
+                "this aioquic keeps its flow control differently (no "
+                + ", ".join(missing)
+                + "); relay's direct path cannot bound what it receives"
+            )
+        self.unread: dict[int, int] = {}
+        self.withheld = False
+
+    def track(self, stream_id: int) -> None:
+        """Count what ``stream_id`` delivers until the visitor reads it."""
+        self.unread[stream_id] = 0
+
+    def delivered(self, stream_id: int, size: int) -> None:
+        """Note ``size`` bytes handed to ``stream_id``'s reader."""
+        if stream_id in self.unread:
+            self.unread[stream_id] += size
+
+    def taken(self, stream_id: int, size: int) -> None:
+        """Note ``size`` bytes the visitor read from ``stream_id``."""
+        if stream_id in self.unread:
+            self.unread[stream_id] = max(0, self.unread[stream_id] - size)
+
+    def forget(self, stream_id: int) -> None:
+        """Stop counting ``stream_id``, whose reader is done."""
+        self.unread.pop(stream_id, None)
+
+    def _hold(self, limit: int, delivered: int, unread: int, window: int) -> bool:
+        """Return whether aioquic would raise ``limit`` now, but the reads don't allow it."""
+        hold = (limit - delivered) * 2 < window <= (limit - delivered + unread) * 2
+        self.withheld = self.withheld or hold
+        return hold
+
+    def _write_connection_limits(self, builder: QuicPacketBuilder, space: QuicPacketSpace) -> None:
+        window = self._local_max_data_window
+        if not self._hold(
+            self._local_max_data.value,
+            self._local_max_data_consumed,
+            sum(self.unread.values()),
+            window,
+        ):
+            super()._write_connection_limits(builder, space)
+            return
+        self._local_max_data_window = 0
+        try:
+            super()._write_connection_limits(builder, space)
+        finally:
+            self._local_max_data_window = window
+
+    def _write_stream_limits(
+        self, builder: QuicPacketBuilder, space: QuicPacketSpace, stream: QuicStream
+    ) -> None:
+        window = stream.max_stream_data_local_window
+        sid = stream.stream_id
+        if not stream.max_stream_data_local or not self._hold(
+            stream.max_stream_data_local,
+            stream.receiver.starting_offset(),
+            0 if sid is None else self.unread.get(sid, 0),
+            window,
+        ):
+            super()._write_stream_limits(builder, space, stream)
+            return
+        stream.max_stream_data_local_window = 0
+        try:
+            super()._write_stream_limits(builder, space, stream)
+        finally:
+            stream.max_stream_data_local_window = window
+
+
+_FLOW_STATE = (
+    "_local_max_data",
+    "_local_max_data_consumed",
+    "_local_max_data_window",
+    "_write_connection_limits",
+    "_write_stream_limits",
+)
+"""The aioquic flow control ``_PacedConnection`` steers; checked when a tunnel opens."""
+
+
 class _Protocol(QuicConnectionProtocol):
     """aioquic's protocol, telling writers when acknowledgements may have arrived."""
 
-    def __init__(self, quic: QuicConnection) -> None:
+    def __init__(self, quic: _PacedConnection) -> None:
         super().__init__(quic)
+        self.paced = quic
         self._progress = asyncio.Event()
 
     def datagram_received(self, data: bytes | str, addr: Any) -> None:
@@ -92,9 +208,17 @@ class _Protocol(QuicConnectionProtocol):
         self._wake()
 
     def quic_event_received(self, event: QuicEvent) -> None:
+        if isinstance(event, StreamDataReceived):
+            self.paced.delivered(event.stream_id, len(event.data))
         super().quic_event_received(event)
         if isinstance(event, ConnectionTerminated):
             self._wake()
+
+    def release(self) -> None:
+        """Send the credit held back while bytes sat unread, if any is due now."""
+        if self.paced.withheld:
+            self.paced.withheld = False
+            self.transmit()
 
     def _wake(self) -> None:
         self._progress.set()
@@ -123,7 +247,10 @@ class QuicPipe(Pipe):
         self._id = int(writer.get_extra_info("stream_id"))
 
     async def read(self, n: int = CHUNK) -> bytes:
-        return await self._reader.read(n)
+        data = await self._reader.read(n)
+        self._protocol.paced.taken(self._id, len(data))
+        self._protocol.release()
+        return data
 
     async def write(self, data: bytes) -> None:
         self._writer.write(data)
@@ -133,6 +260,14 @@ class QuicPipe(Pipe):
             await self._writer.drain()
 
     async def close(self) -> None:
+        # What is left unread is no longer wanted: ask the peer to stop sending it,
+        # and give its credit back to the tunnel's other streams.
+        if self._protocol.paced.unread.get(self._id) is not None:
+            self._protocol.paced.forget(self._id)
+            if not self._reader.at_eof():
+                with contextlib.suppress(QuicError):
+                    self._protocol.paced.stop_stream(self._id, 0)
+            self._protocol.transmit()
         if self._writer.is_closing():
             return
         with contextlib.suppress(RuntimeError, *NETWORK_ERRORS):
@@ -150,8 +285,10 @@ class QuicTunnel:
             alpn_protocols=[ALPN],
             verify_mode=ssl.CERT_NONE,
             idle_timeout=IDLE_S,
+            max_data=RECEIVE_WINDOW,
+            max_stream_data=RECEIVE_WINDOW,
         )
-        self._protocol = _Protocol(QuicConnection(configuration=configuration))
+        self._protocol = _Protocol(_PacedConnection(configuration))
         self._protocol.connection_made(_Datagrams(sock))
         self._pings = itertools.count(1)
         self._tasks: list[asyncio.Task[None]] = []
@@ -182,6 +319,7 @@ class QuicTunnel:
         if not self.alive:
             raise ConnectionResetError("the direct path's tunnel is closed")
         reader, writer = await self._protocol.create_stream()
+        self._protocol.paced.track(int(writer.get_extra_info("stream_id")))
         return QuicPipe(self._protocol, reader, writer)
 
     async def check(self, timeout: float = 5.0) -> None:

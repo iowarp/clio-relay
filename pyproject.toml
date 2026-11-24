@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = { text = "MIT" }
 dependencies = [
-    "aioquic>=1.9.1",
+    "aioquic>=1.9.1,<1.10",
     "clio-schemas==0.2.1",
     "cryptography>=50.0.0",
     "fastapi>=0.115",
