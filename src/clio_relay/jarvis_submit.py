@@ -111,7 +111,7 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_PIN = "45e848e7a9a1daf457127aa2abebf01cead1dd47"
+JARVIS_PIN = "301f49eb4d7f76181f8be658b7c54e23a69f27f9"
 """The jarvis-cd commit relay installs under the CLIO site home and runs."""
 JARVIS_SOURCE = f"https://github.com/grc-iit/jarvis-cd/archive/{JARVIS_PIN}.tar.gz"
 BOOTSTRAP_DIR = "jarvis-cd"
