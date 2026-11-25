@@ -247,8 +247,8 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     message = install_wording.install_message(
         report, site="Ares", package="demo.tool", names={}, walltime=None
     )
-    assert "Built: lammps@2Aug2023." in message
-    assert "Installed: rich-cli pyyaml (with pip), alpine:3.20 (with container)." in message
+    assert "To build: lammps@2Aug2023." in message
+    assert "To install: rich-cli pyyaml (with pip), alpine:3.20 (with container)." in message
     refusal = jarvis_report.install_needed(report, site="Ares")
     assert "JARVIS installs 3 package(s)" in refusal.message
 

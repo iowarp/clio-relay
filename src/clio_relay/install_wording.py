@@ -69,9 +69,9 @@ def install_message(
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
     if built:
-        parts.append("Built: " + ", ".join(built) + ".")
+        parts.append("To build: " + ", ".join(built) + ".")
     if installed:
-        parts.append("Installed: " + ", ".join(installed) + ".")
+        parts.append("To install: " + ", ".join(installed) + ".")
     if asked:
         parts.append(f"JARVIS has {asked} question(s) for you after this.")
     if reuse:
