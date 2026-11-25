@@ -43,6 +43,8 @@ def test_the_manifest_names_the_page_the_server_serves() -> None:
     assert "tabs" not in clio
     page = clio["navigation"]
     assert (page["id"], page["title"], page["resource"]) == ("compute", "Compute", TAB_URI)
+    # The page's title in each language the relay's surfaces speak (clio-agent 544731897).
+    assert set(page["titles"]) == {"el", "es", "ja"}
     assert [row["provider"] for row in clio["accounts"]] == ["globus"]
     assert clio["elicitation"] == {"loopback": True, "origins": ["https://tacc.tapis.io"]}
     assert "server" not in page  # mcp.json has a single server

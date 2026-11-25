@@ -23,6 +23,11 @@
       "navigation": {
         "id": "compute",
         "title": "Compute",
+        "titles": {
+          "el": "Υπολογισμός",
+          "es": "Cómputo",
+          "ja": "コンピュート"
+        },
         "icon": "cpu",
         "resource": "a2ui://clio-relay/compute"
       },
