@@ -361,6 +361,26 @@ def test_the_page_speaks_the_locale_the_request_names(relay_paths: RelayPaths) -
     asyncio.run(scenario())
 
 
+def test_the_table_words_local_and_this_computer_in_the_locale(relay_paths: RelayPaths) -> None:
+    el = _locale("el")
+    store = SiteStore(relay_paths.sites_file)
+    store.add(SiteEntry(id="local", name="This computer", adapter="local"))
+    # A local site the person renamed keeps the name they gave it.
+    store.add(SiteEntry(id="mine", name="My laptop", adapter="local"))
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client, locale="el")
+            await host.open()
+            table = host.table()
+            titles = {row["id"]: row["title"] for row in table["rows"]}
+            assert titles == {"local": el["This computer"], "mine": "My laptop"}
+            labels = {o["value"]: o["label"] for o in table["columns"][0]["options"]}
+            assert labels["local"] == el["Local"]
+
+    asyncio.run(scenario())
+
+
 def test_a_locale_tag_picks_a_language() -> None:
     assert i18n.language("es-ES") == "es"
     assert i18n.language("ja_JP") == "ja"
