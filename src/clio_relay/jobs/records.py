@@ -8,16 +8,17 @@ Records are JSON files written atomically under a per-id file lock.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from filelock import FileLock, Timeout
 from pydantic import BaseModel, Field
@@ -26,6 +27,8 @@ from clio_relay.jobs.handles import JobHandle, OutputRef, utc_now
 from clio_relay.jobs.ownership import Owner
 
 OperationKind = Literal["run", "serve", "files", "install"]
+
+logger = logging.getLogger(__name__)
 
 
 class OperationState(StrEnum):
@@ -79,6 +82,32 @@ class OperationRecord(BaseModel):
     owner: Owner | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    """When the state last moved. The submit grace and cut-short checks time from it."""
+    changed_at: datetime | None = None
+    """When anything a reader sees last changed: a component, a message, the state."""
+
+    @property
+    def last_change(self) -> datetime:
+        """When the record last changed in a way a reader sees: a job card's revision."""
+        if self.changed_at is None or self.changed_at < self.updated_at:
+            return self.updated_at
+        return self.changed_at
+
+    def note_changes(self, previous: BaseModel | None) -> bool:
+        """Stamp :attr:`changed_at` if this differs from ``previous``; say whether it does.
+
+        A look that only finds the job as it was (``observed_at`` and the like)
+        is no change. The stamp rises by at least a millisecond, so two changes
+        never share a revision.
+        """
+        if not isinstance(previous, OperationRecord):
+            return True
+        if _seen(self) == _seen(previous):
+            return False
+        now = utc_now()
+        floor = previous.last_change + timedelta(milliseconds=1)
+        self.changed_at = max(now, floor, self.updated_at)
+        return True
 
     def move(self, state: OperationState, note: str | None = None) -> None:
         """Change state and append to the history. A final state never changes."""
@@ -87,6 +116,22 @@ class OperationRecord(BaseModel):
         self.state = state
         self.updated_at = utc_now()
         self.history.append(StateChange(state=state, at=self.updated_at, note=note))
+
+
+_LOOK_KEYS = frozenset({"observed_at", "observation_failed_at"})
+"""Result keys every look rewrites; they alone are no change."""
+
+
+def _seen(record: OperationRecord) -> dict[str, Any]:
+    seen = record.model_dump(mode="json", exclude={"updated_at", "changed_at"})
+    result = seen.get("result")
+    if isinstance(result, dict):
+        seen["result"] = {
+            key: value
+            for key, value in cast(dict[str, Any], result).items()
+            if key not in _LOOK_KEYS
+        }
+    return seen
 
 
 def new_id(prefix: str) -> str:
@@ -113,6 +158,8 @@ class RecordStore[RecordT: BaseModel]:
         self.root = root
         self.model = model
         self._locks = root / ".locks"
+        self.on_change: Callable[[RecordT], None] | None = None
+        """Told of each record :meth:`put` writes that changed (see ``note_changes``)."""
 
     def _path(self, record_id: str) -> Path:
         return self.root / f"{_safe_id(record_id)}.json"
@@ -192,9 +239,20 @@ class RecordStore[RecordT: BaseModel]:
         return self.model.model_validate_json(text)
 
     def put(self, record_id: str, record: RecordT) -> None:
-        """Write the record atomically. Call under :meth:`locked` when racing is possible."""
+        """Write the record atomically. Call under :meth:`locked` when racing is possible.
+
+        An :class:`OperationRecord` that changed is stamped first, and
+        :attr:`on_change` hears of it once it is written.
+        """
         self._ensure()
         path = self._path(record_id)
+        changed = True
+        if isinstance(record, OperationRecord):
+            try:
+                previous = self.get(record_id)
+            except (OSError, ValueError):
+                previous = None
+            changed = record.note_changes(previous)
         fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=self.root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -206,6 +264,11 @@ class RecordStore[RecordT: BaseModel]:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+        if changed and self.on_change is not None:
+            try:
+                self.on_change(record)
+            except Exception:  # a listener must never undo a write
+                logger.warning("telling of a change to %s", record_id, exc_info=True)
 
     def delete(self, record_id: str) -> bool:
         """Remove the record. Return whether it was there."""

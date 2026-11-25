@@ -15,9 +15,12 @@ so a host keeps the newest one per ``operation_id``. It rides as optional data:
   as ``jobs``;
 - in each task status a task-shaped ``run`` or ``serve`` reports, in its ``_meta``;
 - as the resource :data:`JOB_URI`. A ``serve`` task ends at readiness, so a
-  host that keeps a service's card follows it there: relay looks at every open
-  job itself and announces the resource updated when its card changes
-  (``notifications/resources/updated``, or the ``subscriptions/listen`` stream).
+  host that keeps a service's card follows it there. Relay announces the
+  resource updated (``notifications/resources/updated``, or the
+  ``subscriptions/listen`` stream) on every write that changes the operation,
+  whoever made it: a host's ``tasks/get``, relay's own look at open jobs, an
+  answer, a cancel. A ``serve`` task's last status carries the card as it was
+  then; the job's end, outcome and ``ended_at`` arrive on the resource.
 
 The text of each message stays the same, so a host that ignores the snapshot
 loses nothing. ``source`` says where the plan came from:
@@ -440,8 +443,8 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         "resource": job_uri(record.operation_id),
         "kind": record.kind,
         "job_id": record.handle.native_id if record.handle else None,
-        "revision": int(record.updated_at.timestamp() * 1000),
-        "updated_at": record.updated_at.isoformat(),
+        "revision": int(record.last_change.timestamp() * 1000),
+        "updated_at": record.last_change.isoformat(),
         "source": "jarvis" if plan else "relay",
         "site": _site(service, record.site),
         "scheduler": plan.get("scheduler") or _scheduler(service, record),

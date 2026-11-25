@@ -190,7 +190,7 @@ def _fields(record: OperationRecord, found: list[dict[str, Any]]) -> dict[str, A
         "status": "cancelled" if wait_state.get("cancelled_at") else status,
         "status_message": message(record, found),
         "created_at": wait_state.get("armed_at") or record.created_at.isoformat(),
-        "last_updated_at": record.updated_at.isoformat(),
+        "last_updated_at": record.last_change.isoformat(),
         "ttl_ms": TTL_MS,
         "poll_interval_ms": POLL_INTERVAL_MS,
     }

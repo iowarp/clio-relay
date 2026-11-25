@@ -189,7 +189,7 @@ class RelayTasksExtension(ServerExtension):
             "status": self._status(record),
             "status_message": self._message(record),
             "created_at": record.created_at.isoformat(),
-            "last_updated_at": record.updated_at.isoformat(),
+            "last_updated_at": record.last_change.isoformat(),
             "ttl_ms": TASK_TTL_MS,
             "poll_interval_ms": TASK_POLL_INTERVAL_MS,
         }

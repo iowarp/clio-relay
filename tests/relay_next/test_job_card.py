@@ -364,4 +364,77 @@ def test_the_snapshot_follows_the_job(relay_paths: RelayPaths) -> None:
         await service.close()
 
     asyncio.run(scenario())
+
+
+def test_the_revision_rises_with_a_change_that_keeps_the_state(relay_paths: RelayPaths) -> None:
+    """A component finishing while the job still runs is a new revision; a bare look is not."""
+    add_site(relay_paths)
+
+    async def scenario() -> None:
+        service = RelayService(relay_paths)
+        record = await service.start_run("fx", JobSpec.model_validate(LONG))
+        operation_id = record.operation_id
+        first = job_card.snapshot(service, service.operation(operation_id))
+        assert first is not None
+
+        with service.operations.locked(operation_id):
+            looked = service.operation(operation_id)
+            looked.result = {**(looked.result or {}), "observed_at": "2030-01-01T00:00:00+00:00"}
+            service.operations.put(operation_id, looked)
+        same = job_card.snapshot(service, service.operation(operation_id))
+        assert same is not None and same["revision"] == first["revision"]
+
+        with service.operations.locked(operation_id):
+            moved = service.operation(operation_id)
+            state = moved.state
+            moved.result = {**(moved.result or {}), "message": "lammps done"}
+            service.operations.put(operation_id, moved)
+        later = service.operation(operation_id)
+        card = job_card.snapshot(service, later)
+        assert later.state == state
+        assert card is not None and card["revision"] > first["revision"]
+        assert card["updated_at"] == later.last_change.isoformat()
+        status = await RelayServer(service).tasks.task_result(later)
+        meta = status.model_dump(by_alias=True, mode="json", exclude_none=True)["_meta"]
+        assert meta[job_card.JOB_META]["revision"] == card["revision"]
+        await service.cancel(operation_id)
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_every_change_to_a_job_announces_its_resource(relay_paths: RelayPaths) -> None:
+    """The job's end reaches ``relay://jobs/{op}`` whoever observed it, not only the watcher."""
+    add_site(relay_paths, config={"queue_s": 0.2, "run_s": 0.2})
+
+    async def scenario() -> None:
+        service = RelayService(relay_paths)
+        relay = RelayServer(service)
+        relay.build()
+        announced: list[str] = []
+
+        async def updated(uri: str) -> None:
+            announced.append(uri)
+
+        relay.changes.resource_updated = updated  # type: ignore[method-assign]
+        record = await service.start_run("fx", JobSpec.model_validate(ECHO))
+        uri = job_card.job_uri(record.operation_id)
+        for _ in range(60):
+            record = await service.refresh(record.operation_id)
+            if record.state.final:
+                break
+            await asyncio.sleep(0.05)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert record.state == OperationState.COMPLETED
+        assert announced and set(announced) == {uri}
+        count = len(announced)
+        await service.refresh(record.operation_id)
+        await asyncio.sleep(0)
+        assert len(announced) == count
+        ended = job_card.snapshot(service, record)
+        assert ended is not None and ended["phase"] == "ended" and ended["ended_at"]
+        await service.close()
+
+    asyncio.run(scenario())
     _ = mcp_types

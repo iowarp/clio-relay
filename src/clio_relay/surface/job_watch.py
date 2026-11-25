@@ -4,8 +4,9 @@ A ``serve`` task completes at readiness, and a host stops asking about a task
 once it ends, so a service whose job ended later would still read ``running``
 on its card, in the site's job list and in a later confirm that names it.
 :func:`current` looks at each open job nobody observed lately, with the same
-:meth:`RelayService.refresh` a host's ``tasks/get`` makes, and announces
-``relay://jobs/{operation_id}`` updated when the card changes. Each surface
+:meth:`RelayService.refresh` a host's ``tasks/get`` makes. Every write that
+changes a job's operation, this look's or anyone's, announces
+``relay://jobs/{operation_id}`` updated (:func:`install` hooks the store). Each surface
 that reports a job's state reads it after :func:`current`. The resource holds
 the newest card as JSON, the same as ``structuredContent.job``.
 """
@@ -42,11 +43,18 @@ WATCHED_STATES = (OperationState.SUBMITTING, OperationState.QUEUED, OperationSta
 
 _ANNOUNCE: WeakKeyDictionary[RelayService, ServerChanges] = WeakKeyDictionary()
 _LOOKS: WeakKeyDictionary[RelayService, dict[str, asyncio.Future[bool]]] = WeakKeyDictionary()
+_LOOP: WeakKeyDictionary[RelayService, asyncio.AbstractEventLoop] = WeakKeyDictionary()
+_SENDING: set[asyncio.Future[None]] = set()
 
 
 def install(server: FastMCP[Any], service: RelayService, changes: ServerChanges) -> None:
-    """Add the ``relay://jobs/{operation_id}`` resource template, announced on ``changes``."""
+    """Add the ``relay://jobs/{operation_id}`` resource template, announced on ``changes``.
+
+    Every write that changes a job's operation announces the resource, whoever
+    wrote it, so a host following a card after its task ended hears the end.
+    """
     _ANNOUNCE[service] = changes
+    service.operations.on_change = lambda record: _announce(service, record)
 
     @server.resource(
         job_card.JOB_URI,
@@ -65,6 +73,7 @@ def install(server: FastMCP[Any], service: RelayService, changes: ServerChanges)
 
 async def watch(service: RelayService, interval_s: float = JOB_WATCH_S) -> None:
     """Bring the open jobs up to date every ``interval_s``, with nobody asking."""
+    _LOOP[service] = asyncio.get_running_loop()
     while True:
         await asyncio.sleep(interval_s)
         try:
@@ -123,15 +132,39 @@ def _forget(looks: dict[str, asyncio.Future[bool]], operation_id: str) -> Callab
 
 
 async def _look(service: RelayService, record: OperationRecord) -> bool:
+    """Observe one open job; say whether its card changed. The write announces it."""
     before = job_card.snapshot(service, record)
     try:
         after = await service.refresh(record.operation_id)
     except Exception:
         logger.warning("observing job %s", record.operation_id, exc_info=True)
         return False
-    if job_card.snapshot(service, after) == before:
-        return False
+    return job_card.snapshot(service, after) != before
+
+
+def _announce(service: RelayService, record: OperationRecord) -> None:
+    """Announce a job's resource updated, from the event loop, without waiting on it."""
     changes = _ANNOUNCE.get(service)
-    if changes is not None:
-        await changes.resource_updated(job_card.job_uri(after.operation_id))
-    return True
+    if changes is None or record.kind not in WATCHED_KINDS:
+        return
+    uri = job_card.job_uri(record.operation_id)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:  # a write from a worker thread
+        loop = _LOOP.get(service)
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(_send, changes, uri)
+        return
+    _send(changes, uri)
+
+
+def _send(changes: ServerChanges, uri: str) -> None:
+    sending = asyncio.ensure_future(changes.resource_updated(uri))
+    _SENDING.add(sending)
+    sending.add_done_callback(_sent)
+
+
+def _sent(sending: asyncio.Future[None]) -> None:
+    _SENDING.discard(sending)
+    if not sending.cancelled() and sending.exception() is not None:
+        logger.warning("announcing a job change", exc_info=sending.exception())
