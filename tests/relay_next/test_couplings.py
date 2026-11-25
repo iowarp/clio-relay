@@ -62,7 +62,7 @@ def test_a_service_that_feeds_points_out_and_a_named_coupling_wins() -> None:
     ]
 
 
-def test_nocontract_data_flow_and_one_step_give_no_couplings() -> None:
+def test_no_data_flow_and_one_step_give_no_couplings() -> None:
     spec = JobSpec(packages=[PVSERVER, SOLVER])
     assert with_contract_couplings(spec, [_entry(PVSERVER), FIELDS]) is spec
     assert contract_couplings([PVSERVER], [VIEWER]) == []
@@ -70,7 +70,7 @@ def test_nocontract_data_flow_and_one_step_give_no_couplings() -> None:
     assert "couplings" not in jarvis_submit.pipeline_document(spec, pipeline="relay_x")
 
 
-def test_a_contractcontract_data_flow_is_read_only_when_well_formed() -> None:
+def test_a_contract_data_flow_is_read_only_when_well_formed() -> None:
     assert contract_data_flow({"direction": "in", "kind": "stream", "label": " a  b "}) == {
         "direction": "in",
         "kind": "stream",
