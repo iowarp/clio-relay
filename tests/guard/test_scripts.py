@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -193,6 +194,64 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert (root / "src" / "demo" / "demo" / "hello" / "pkg.py").is_file()
     assert (root / "src" / "schemas" / "package-contract.v1.json").is_file()
     assert not (root / "src" / "demo" / "demo" / "other").exists()
+
+
+def _job_with_requirements(tmp_path: Path, *requirements: str) -> tuple[Path, str]:
+    repo = make_repo(tmp_path / "src")
+    listed = ", ".join(f'"{text}"' for text in requirements)
+    (repo / "pyproject.toml").write_text(f'[project]\nname = "demo"\ndependencies = [{listed}]\n')
+    data = archive_package(repo, "demo.hello")
+    job = tmp_path / "job"
+    digest = ContentStore(tmp_path / "content").put(data)
+    (job / ".relay-package").mkdir(parents=True)
+    (job / ".relay-package" / f"{digest}.tar.gz").write_bytes(data)
+    return job, digest
+
+
+def _site_python(bin_dir: Path) -> None:
+    # The site-named JARVIS's environment is this test's own interpreter.
+    _program(bin_dir, "python", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+
+
+def test_a_site_named_jarvis_without_the_package_requirements_says_which(
+    tmp_path: Path,
+) -> None:
+    """The a21 release check: a site venv without jsonschema failed only inside JARVIS."""
+    job, digest = _job_with_requirements(tmp_path, "pytest>=1", "clio-relay-absent-dist>=4.18")
+    _jarvis(tmp_path)
+    _site_python(tmp_path / "bin")
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 1
+    assert "without the Python requirements of demo: clio-relay-absent-dist>=4.18." in done.stderr
+    assert "remove the site's jarvis setting" in done.stderr
+    log = (tmp_path / "jarvis.log").read_text()
+    assert "repo add" not in log and "ppl " not in log
+    assert not (job / "relay.requirements.log").exists()
+
+
+def test_a_site_named_jarvis_with_the_package_requirements_runs(tmp_path: Path) -> None:
+    job, digest = _job_with_requirements(tmp_path, "pytest>=1")
+    _jarvis(tmp_path)
+    _site_python(tmp_path / "bin")
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 0, done.stderr
+    assert not (job / "relay.requirements.log").exists()
+    assert "ppl submit" in (tmp_path / "jarvis.log").read_text()
+
+
+def test_a_site_named_jarvis_at_an_older_requirement_says_its_version(tmp_path: Path) -> None:
+    job, digest = _job_with_requirements(tmp_path, "pytest>=999")
+    _jarvis(tmp_path)
+    _site_python(tmp_path / "bin")
+    (job / PIPELINE_FILE).write_text(PIPELINE)
+    env = _env(tmp_path, tmp_path / "bin")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
+    assert done.returncode == 1
+    assert re.search(r"of demo: pytest>=999 \(has [0-9][^)]*\)\.", done.stderr), done.stderr
 
 
 def test_the_job_root_leaves_jarvis_builtin_out(tmp_path: Path) -> None:

@@ -162,6 +162,40 @@ if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
         listed_now=$(tr '\n' ' ' < "$requirements")
         fail 1 "installing the Python requirements of $repo failed: $listed_now"
       }
+    elif [ -n "$jarvis" ] && [ -s "$requirements" ]; then
+      # A JARVIS the site names is the site's environment: relay installs nothing there,
+      # but says which of the repository's requirements it lacks before JARVIS loads it.
+      py="${found%/*}/python"
+      [ -x "$py" ] || py="${found%/*}/venv/bin/python"
+      if [ -x "$py" ]; then
+        lacking=$("$py" -c 'import re, sys
+from importlib import metadata
+try:
+    from packaging.requirements import Requirement
+except ImportError:
+    Requirement = None
+lacking = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    text = line.strip()
+    name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", text)
+    if not name:
+        continue
+    try:
+        version = metadata.version(name.group(0))
+    except metadata.PackageNotFoundError:
+        lacking.append(text)
+        continue
+    if Requirement is not None:
+        try:
+            if not Requirement(text).specifier.contains(version, prereleases=True):
+                lacking.append(text + " (has " + version + ")")
+        except Exception:
+            pass
+print(", ".join(lacking))' "$requirements") || lacking=
+        [ -z "$lacking" ] || fail 1 "the site's jarvis setting $found runs in an environment \
+without the Python requirements of $repo: $lacking. Install them there, or remove the \
+site's jarvis setting so relay uses its own jarvis-cd, which installs them."
+      fi
     fi
     # +force, in this job's own root only, so a staged archive always replaces any
     # repository of its name. builtin never arrives here: relay refuses to stage it.
