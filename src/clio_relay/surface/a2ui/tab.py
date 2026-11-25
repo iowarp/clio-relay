@@ -338,7 +338,9 @@ class ComputeTab(TabActions):
         if self._known is None:
             await asyncio.to_thread(self._known_views)
         tasks = {site.id: self._start(site, identities, again=budget_s is None) for site in sites}
-        if budget_s is None:
+        if not tasks:  # asyncio.wait refuses an empty set: no sites, nothing to read
+            pass
+        elif budget_s is None:
             await asyncio.wait(tasks.values())
         else:
             await asyncio.wait(tasks.values(), timeout=budget_s)
