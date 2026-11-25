@@ -152,6 +152,7 @@ class WorkerConfig(BaseModel):
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+    jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
     install_walltime_s: int = Field(
         default=jarvis_submit.INSTALL_WALLTIME_S,
@@ -197,6 +198,11 @@ class WorkerConfig(BaseModel):
     @classmethod
     def _jarvis_path(cls, value: str) -> str:
         return jarvis_submit.explicit_jarvis(value)
+
+    @field_validator("jarvis_graph")
+    @classmethod
+    def _jarvis_graph(cls, value: str) -> str:
+        return jarvis_submit.published_graph(value)
 
     @field_validator("jarvis_python")
     @classmethod
@@ -763,11 +769,13 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return [stopped, {"kind": "frp visitor", "detail": "relay's link visitor to the worker"}]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
-        """The worker's directory and job homes; each home's Spack store and JARVIS answers stay."""
+        """The worker's directory and job homes; each home's Spack store and JARVIS answers stay,
+        and so does a published resource graph."""
         link = self.load_link()
         remote_dir = link.remote_dir if link is not None and link.remote_dir else self._remote_dir()
         targets = [remote_dir]
-        keep = site_keeps(posixpath.join(remote_dir, "adapter", "*"))
+        graph = self.config.jarvis_graph
+        keep = site_keeps(posixpath.join(remote_dir, "adapter", "*"), graph)
         if self.config.work_dir is not None:
             work_dir = self.config.work_dir
             targets += [
@@ -775,8 +783,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 posixpath.join(work_dir, "jobs"),
                 posixpath.join(work_dir, "psij"),
             ]
-            keep += site_keeps(work_dir)
-        return targets, keep
+            keep += site_keeps(work_dir, graph)
+        return targets, list(dict.fromkeys(keep))
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
         """Prune over a plain ``ssh``: the worker is stopped by then, so its link is gone."""
@@ -804,6 +812,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         }
         if self.config.jarvis_python:
             config["jarvis_python"] = self.config.jarvis_python
+        if self.config.jarvis_graph:
+            config["jarvis_graph"] = self.config.jarvis_graph
         if self.config.install_walltime_s != jarvis_submit.INSTALL_WALLTIME_S:
             config["install_walltime_s"] = self.config.install_walltime_s
         if self.config.work_dir is not None:

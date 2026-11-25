@@ -165,8 +165,11 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return [stopped]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
-        """Relay's directory on the site; Spack and JARVIS's recorded answers stay."""
-        return [self.config.remote_dir], site_keeps(self.config.remote_dir)
+        """Relay's directory on the site; Spack, JARVIS's recorded answers and a published
+        resource graph stay."""
+        return [self.config.remote_dir], site_keeps(
+            self.config.remote_dir, self.config.jarvis_graph
+        )
 
     async def clean(self, targets: list[str], keep: list[str]) -> dict[str, Any]:
         """Prune over this adapter's own ``ssh``; a prune that fails is refused, never empty."""
@@ -216,7 +219,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
     async def describe(self) -> SiteInfo:
         text = await self._ssh(
             scripts.describe_script(
-                self.config.scheduler, self.config.remote_dir, self.config.jarvis
+                self.config.scheduler,
+                self.config.remote_dir,
+                self.config.jarvis,
+                self.config.jarvis_graph,
             ),
             "describe",
         )
@@ -242,11 +248,16 @@ class SshAdapter(BaseAdapter[SshConfig]):
         )
         graph: dict[str, Any] = {
             "path": first("graph_path"),
+            # The site's published graph (its jarvis_graph setting), else the home's own.
+            "published": bool(self.config.jarvis_graph),
             "decisions": first("decisions_path"),
             "net": jarvis_submit.graph_report(graph_text),
             "collect": {
                 "exec": scripts.graph_collect_command(
-                    self.config.remote_dir, scheduler, self.config.jarvis
+                    self.config.remote_dir,
+                    scheduler,
+                    self.config.jarvis,
+                    self.config.jarvis_graph,
                 ),
                 "pipeline": pipeline,
                 "plan": {"kind": "resource_graph", "summary": summary, "submits": job is not None},
@@ -292,7 +303,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
     def _jarvis_facts(self) -> dict[str, Any]:
         home = self.config.remote_dir.rstrip("/") or "/"
         return {
-            "exec": scripts.jarvis_command(self.config.remote_dir, self.config.jarvis),
+            "exec": scripts.jarvis_command(
+                self.config.remote_dir, self.config.jarvis, self.config.jarvis_graph
+            ),
             "read": ["jarvis"],
             "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
             "note": (
@@ -380,6 +393,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                     job_dir=str(job_dir),
                     home=self.config.remote_dir,
                     site=self.config.ssh_profile,
+                    graph=self.config.jarvis_graph,
                 )
             elif scheduler == "slurm":
                 jarvis_mode = True
@@ -569,6 +583,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             jarvis=self.config.jarvis,
             home=self.config.remote_dir,
             mode=mode,
+            graph=self.config.jarvis_graph,
         )
         return rendered
 
@@ -1028,6 +1043,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 document, spec, self.config.install_walltime_s, answers
             ),
             home=self.config.remote_dir,
+            graph=self.config.jarvis_graph,
         )
         script = scripts.jarvis_install_script(str(job_dir), command)
         result = await self.transport.ssh(script, timeout_s=None, what="submitting the install")
@@ -1087,7 +1103,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if not command:
             raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a command")
         result = await self.transport.ssh(
-            scripts.exec_script(command, self.config.remote_dir, self.config.jarvis),
+            scripts.exec_script(
+                command, self.config.remote_dir, self.config.jarvis, self.config.jarvis_graph
+            ),
             timeout_s=timeout_s,
             max_output_bytes=max_output_bytes,
             what="exec",

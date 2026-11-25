@@ -136,6 +136,13 @@ JARVIS_SETTING_HELP = (
     "never runs a jarvis found on the site's PATH"
 )
 """The description of an adapter's ``jarvis`` setting (:func:`explicit_jarvis`)."""
+GRAPH_SETTING_HELP = (
+    "Leave empty: JARVIS keeps the site's resource graph under the CLIO site home. A site "
+    "that publishes its graph names that file here, absolute or from ~/. JARVIS reads and "
+    "writes it, including the install answers it shares with other homes, and site clean "
+    "keeps it"
+)
+"""The description of an adapter's ``jarvis_graph`` setting (:func:`published_graph`)."""
 PIPELINES_DIR = "pipelines"
 """Where the Spack env of each set of archives is kept, under :data:`BOOTSTRAP_DIR`."""
 SITE_DIR = "site"
@@ -278,9 +285,28 @@ def explicit_jarvis(value: str) -> str:
     return value
 
 
-def site_graph(home: str) -> str:
-    """Return the site's JARVIS resource graph under the CLIO site home ``home``."""
-    return posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
+def published_graph(value: str) -> str:
+    """Check an adapter's ``jarvis_graph`` setting; empty means the home's own graph.
+
+    The site's published resource graph is named by path on the site: absolute,
+    or from the home directory with a leading ``~/``.
+    """
+    value = value.strip()
+    if value and not value.startswith(("/", "~/")):
+        raise ValueError(
+            f"jarvis_graph must be a path on the site (absolute or ~/...), not {value!r}. "
+            "Leave it empty to keep the graph under the CLIO site home"
+        )
+    return value
+
+
+def site_graph(home: str, published: str = "") -> str:
+    """Return the site's JARVIS resource graph: the published one, else the home's own.
+
+    ``published`` is the site's ``jarvis_graph`` setting (:func:`published_graph`).
+    Without it the graph is kept under the CLIO site home ``home``.
+    """
+    return published or posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
 
 
 def site_decisions(home: str) -> str:
@@ -325,7 +351,7 @@ def graph_report(text: str) -> dict[str, Any] | None:
     return cast(dict[str, Any], found) if isinstance(found, dict) else None
 
 
-def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
+def site_environment(spec: JobSpec, home: str | None, graph: str = "") -> dict[str, str]:
     """Return the site script's settings for ``spec`` and the CLIO site home ``home``.
 
     Relay's pinned JARVIS there (:func:`bootstrap_path`) is the one the script
@@ -349,6 +375,9 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     ``JARVIS_SPACK_ROOT`` only when the checkout has ``bin/spack``, so a site
     without one keeps JARVIS's own lookup, and JARVIS asks ``spack_missing``
     when it finds none.
+
+    ``graph`` is the site's published resource graph (``jarvis_graph``), which
+    replaces the home's own when the site names one.
     """
     if not home:
         return {}
@@ -356,7 +385,7 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     return {
         FALLBACK_ENV: bootstrap_path(home),
         PIN_ENV: JARVIS_PIN,
-        GRAPH_ENV: site_graph(home),
+        GRAPH_ENV: site_graph(home, graph),
         DECISIONS_ENV: site_decisions(home),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
         INSTALL_ENV_ENV: posixpath.join(kept, "install-envs"),
@@ -743,8 +772,10 @@ def site_arguments(
     return arguments if pipeline is None else [*arguments, pipeline]
 
 
-def _site_command(spec: JobSpec, arguments: list[str], *, script: str, home: str | None) -> str:
-    settings = {**spec.environment, **site_environment(spec, home)}
+def _site_command(
+    spec: JobSpec, arguments: list[str], *, script: str, home: str | None, graph: str = ""
+) -> str:
+    settings = {**spec.environment, **site_environment(spec, home, graph)}
     environment = [f"{key}={value}" for key, value in settings.items()]
     prefix = ["env", *environment] if environment else []
     return shlex.join([*prefix, "bash", script, *arguments])
@@ -758,6 +789,7 @@ def submit_command(
     script: str = SCRIPT_FILE,
     home: str | None = None,
     mode: SiteMode = "submit",
+    graph: str = "",
 ) -> str:
     """Return the shell command that submits ``spec`` from its job directory.
 
@@ -765,10 +797,11 @@ def submit_command(
     pipeline it seals. ``home`` is the CLIO site home, for
     :func:`site_environment`: the JARVIS relay installed there is used when
     ``jarvis`` points to nothing, and the person's install answers are kept there.
+    ``graph`` is the site's published resource graph, when it names one.
     ``mode="check"`` checks the software instead, for an install ahead of a run.
     """
     arguments = site_arguments(spec, mode=mode, jarvis=jarvis, execution=operation_id)
-    return _site_command(spec, arguments, script=script, home=home)
+    return _site_command(spec, arguments, script=script, home=home, graph=graph)
 
 
 INSTALL_WALLTIME_S = 4 * 3600
@@ -838,13 +871,14 @@ def install_command(
     pipeline: str | None = None,
     script: str = SCRIPT_FILE,
     home: str | None = None,
+    graph: str = "",
 ) -> str:
     """Return the shell command that submits the install job for ``spec``'s software.
 
     It runs in the job directory after a submit exited 3, with the person's ``answers``
     (:func:`answers_document`). The install job is ``install_execution_id(operation_id)``
-    in the operation's pipeline; ``home`` is as in :func:`submit_command`. ``pipeline``
-    is the YAML of :func:`install_pipeline`, which the site script keeps as
+    in the operation's pipeline; ``home`` and ``graph`` are as in :func:`submit_command`.
+    ``pipeline`` is the YAML of :func:`install_pipeline`, which the site script keeps as
     :data:`INSTALL_PIPELINE_FILE`; without it the install builds with the run's.
 
     Answers with :data:`RECHECK` set make it a ``recheck`` instead: a job in which
@@ -860,7 +894,7 @@ def install_command(
         answers={key: value for key, value in answers.items() if key != RECHECK},
         pipeline=pipeline,
     )
-    return _site_command(spec, arguments, script=script, home=home)
+    return _site_command(spec, arguments, script=script, home=home, graph=graph)
 
 
 def bootstrap_arguments(home: str, python: str = "") -> list[str]:
@@ -878,6 +912,7 @@ def direct_job(
     job_dir: str | None = None,
     home: str | None = None,
     site: str = "this site",
+    graph: str = "",
 ) -> JobSpec:
     """Lower a package job to the bash job that runs it with JARVIS's direct run.
 
@@ -886,7 +921,7 @@ def direct_job(
     because there ``jarvis ppl submit`` owns the job. The archive becomes an
     input, so the adapter stages it by digest; the pipeline YAML travels as an
     argument. ``job_dir`` resolves input names as in :func:`pipeline_document`,
-    and ``home`` is as in :func:`submit_command`. A package service is
+    and ``home`` and ``graph`` are as in :func:`submit_command`. A package service is
     refused: it needs ``jarvis execution stop``, which only a submitted job has.
     """
     steps = spec.steps()
@@ -908,7 +943,7 @@ def direct_job(
         "clio-relay-jarvis",
         *site_arguments(spec, mode="run", jarvis=jarvis, pipeline=pipeline),
     ]
-    settings = site_environment(spec, home)
+    settings = site_environment(spec, home, graph)
     if settings:
         data["environment"] = {**spec.environment, **settings}
     data["name"] = spec.name or steps[0].name.replace(".", "-")

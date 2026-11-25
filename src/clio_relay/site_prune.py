@@ -44,14 +44,17 @@ def spack_keeps(home: str) -> list[str]:
     ]
 
 
-def site_keeps(home: str) -> list[str]:
+def site_keeps(home: str, graph: str = "") -> list[str]:
     """What clean keeps under a site home: the Spack store, and JARVIS's recorded answers.
 
     The answers (which MPI, which compiler) are facts about the cluster the
-    person confirmed; without them the next install asks again.
+    person confirmed; without them the next install asks again. ``graph`` is the
+    site's published resource graph (its ``jarvis_graph`` setting): a site fact
+    too, kept wherever it is.
     """
     base = home.rstrip("/") or "/"
-    return [*spack_keeps(home), posixpath.join(base, DECISIONS_TAIL)]
+    keeps = [*spack_keeps(home), posixpath.join(base, DECISIONS_TAIL)]
+    return [*keeps, graph] if graph else keeps
 
 
 def is_decisions(path: str) -> bool:
@@ -59,11 +62,25 @@ def is_decisions(path: str) -> bool:
     return path.endswith("/" + DECISIONS_TAIL)
 
 
-def kept(keep: list[str], *, spack: bool = True, decisions: bool = True) -> list[str]:
-    """Return ``keep`` without the Spack store or the decisions, as asked."""
-    return list(
-        dict.fromkeys(path for path in keep if (decisions if is_decisions(path) else spack))
+def is_spack(path: str) -> bool:
+    """Say whether a keep is part of the Spack store (:func:`spack_keeps`)."""
+    return path.endswith(("/" + SPACK_DIR, "/" + SPACK_CONFIG_DIR)) or path.endswith(
+        "/" + posixpath.join(BOOTSTRAP_DIR, SITE_DIR, MINIFORGE_DIR)
     )
+
+
+def kept(keep: list[str], *, spack: bool = True, decisions: bool = True) -> list[str]:
+    """Return ``keep`` without the Spack store or the decisions, as asked.
+
+    Any other keep, such as a published resource graph, always stays.
+    """
+
+    def stays(path: str) -> bool:
+        if is_decisions(path):
+            return decisions
+        return spack if is_spack(path) else True
+
+    return list(dict.fromkeys(path for path in keep if stays(path)))
 
 
 def _jobs_bash(known: list[str]) -> str:

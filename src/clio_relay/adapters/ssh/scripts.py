@@ -490,16 +490,17 @@ def find_script(remote_dir: str, operation_id: str) -> str:
     )
 
 
-def graph_script(remote_dir: str, jarvis: str = "") -> str:
+def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
     """Print where JARVIS keeps the site's record, and its net report when JARVIS is placed.
 
     ``jarvis rg net show +json`` only reads the site graph, so it is safe on a
     login host. ``jarvis`` is the site's ``jarvis`` setting; empty is relay's pin.
+    ``graph`` is the site's published graph (``jarvis_graph``); empty is the home's own.
     """
     home = remote_dir.rstrip("/") or "/"
     program = root_expression(jarvis or jarvis_submit.bootstrap_path(home))
     return (
-        f"G={root_expression(jarvis_submit.site_graph(home))}\n"
+        f"G={root_expression(jarvis_submit.site_graph(home, graph))}\n"
         f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={program}\n"
@@ -514,15 +515,18 @@ def graph_script(remote_dir: str, jarvis: str = "") -> str:
     )
 
 
-def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> list[str]:
+def graph_collect_command(
+    remote_dir: str, scheduler: str, jarvis: str = "", graph: str = ""
+) -> list[str]:
     """Return the ``exec`` argv that submits relay's network collection on ``scheduler``.
 
     It writes relay's collection package (:mod:`clio_relay.jarvis_graph`) and
-    :func:`jarvis_submit.graph_pipeline` beside the site graph, registers the
+    :func:`jarvis_submit.graph_pipeline` under the site home's JARVIS site directory, registers the
     package in the site-level JARVIS root, and runs ``jarvis ppl submit`` (``ppl
     run`` with no scheduler), with the site graph and a site-level JARVIS root,
     printing JARVIS's handle as JSON. An argument after the argv's own (``$1``)
-    is the queue the job goes to; with none, the scheduler's default.
+    is the queue the job goes to; with none, the scheduler's default. ``graph``
+    is the site's published graph, which the collection then writes to.
     """
     home = remote_dir.rstrip("/") or "/"
     pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
@@ -539,8 +543,9 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
         if verb == "submit"
         else ""
     )
-    graph = jarvis_submit.site_graph(home)
-    site = posixpath.dirname(graph)
+    graph_file = jarvis_submit.site_graph(home, graph)
+    # Relay's own collection files stay under the site home, even beside a published graph.
+    site = posixpath.dirname(jarvis_submit.site_graph(home))
     script = (
         f"S={root_expression(site)}; R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
@@ -549,16 +554,18 @@ def graph_collect_command(remote_dir: str, scheduler: str, jarvis: str = "") -> 
         + jarvis_graph.write_lines('"$S"')
         + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
-        + f'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH={root_expression(graph)} '
+        + f"G={root_expression(graph_file)}\n"
+        + 'mkdir -p "$(dirname "$G")"\n'
+        + 'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" '
         f'exec "$JB" ppl {verb} {source}"$S/site_net.yaml" +json\n'
     )
     return ["sh", "-c", script, "site_net"]
 
 
-def _jarvis_env(home: str, jarvis: str) -> str:
+def _jarvis_env(home: str, jarvis: str, graph: str = "") -> str:
     """Shell lines that name relay's JARVIS (``JB``) and the site's JARVIS record."""
     return (
-        f"G={root_expression(jarvis_submit.site_graph(home))}\n"
+        f"G={root_expression(jarvis_submit.site_graph(home, graph))}\n"
         f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"SR={root_expression(posixpath.join(home, jarvis_submit.SPACK_DIR))}\n"
@@ -584,22 +591,24 @@ def _init_site_root(jarvis: str) -> str:
 
 
 _JARVIS_EXPORTS = (
+    'mkdir -p "$(dirname "$G")" 2>/dev/null\n'
     'export JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" JARVIS_SPACK_DECISIONS="$D"\n'
     'if [ -x "$SR/bin/spack" ]; then export JARVIS_SPACK_ROOT="$SR"; fi\n'
 )
 
 
-def jarvis_command(remote_dir: str, jarvis: str = "") -> list[str]:
+def jarvis_command(remote_dir: str, jarvis: str = "", graph: str = "") -> list[str]:
     """Return the ``exec`` argv prefix that runs relay's JARVIS with the site's record.
 
     The caller appends JARVIS's own arguments (``sched info +json``, ``spack
     prepare ... +json``, ``rg skill show NAME +json``, ``rg net set ...``). It
-    exports the site graph, the decisions file, a site-level JARVIS root and,
+    exports the site graph (the published one when ``graph`` names it), the
+    decisions file, a site-level JARVIS root and,
     when it has ``bin/spack``, the site's JARVIS Spack, as every relay job does.
     """
     home = remote_dir.rstrip("/") or "/"
     script = (
-        _jarvis_env(home, jarvis)
+        _jarvis_env(home, jarvis, graph)
         + '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
         + _init_site_root(jarvis)
         + _JARVIS_EXPORTS
@@ -608,7 +617,7 @@ def jarvis_command(remote_dir: str, jarvis: str = "") -> list[str]:
     return ["sh", "-c", script, "jarvis"]
 
 
-def sched_script(remote_dir: str, jarvis: str = "") -> str:
+def sched_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
     """Print ``jarvis sched info +json`` under ``@@sched`` when JARVIS is placed.
 
     JARVIS reads the scheduler, the MPI candidates, the network and the site
@@ -618,7 +627,7 @@ def sched_script(remote_dir: str, jarvis: str = "") -> str:
     home = remote_dir.rstrip("/") or "/"
     return (
         "(\n"
-        + _jarvis_env(home, jarvis)
+        + _jarvis_env(home, jarvis, graph)
         + 'if [ -x "$JB" ]; then\n'
         + textwrap.indent(_init_site_root(jarvis), "  ")
         + '  T=; command -v timeout >/dev/null 2>&1 && T="timeout 90"\n'
@@ -633,7 +642,9 @@ def sched_script(remote_dir: str, jarvis: str = "") -> str:
     )
 
 
-def describe_script(scheduler: str, remote_dir: str | None = None, jarvis: str = "") -> str:
+def describe_script(
+    scheduler: str, remote_dir: str | None = None, jarvis: str = "", graph: str = ""
+) -> str:
     """Report the host, JARVIS's site graph and JARVIS's scheduler facts.
 
     Short reads only. The graph part is :func:`graph_script` and the scheduler
@@ -649,7 +660,9 @@ def describe_script(scheduler: str, remote_dir: str | None = None, jarvis: str =
     )
     jarvis_part = ""
     if remote_dir is not None:
-        jarvis_part = graph_script(remote_dir, jarvis) + sched_script(remote_dir, jarvis)
+        jarvis_part = graph_script(remote_dir, jarvis, graph) + sched_script(
+            remote_dir, jarvis, graph
+        )
     return (
         jarvis_part + 'echo "@@host $(hostname 2>/dev/null)"\n'
         'echo "@@os $(uname -s 2>/dev/null)"\n'
@@ -659,7 +672,9 @@ def describe_script(scheduler: str, remote_dir: str | None = None, jarvis: str =
     )
 
 
-def relay_jarvis(command: Sequence[str], remote_dir: str, jarvis: str = "") -> list[str]:
+def relay_jarvis(
+    command: Sequence[str], remote_dir: str, jarvis: str = "", graph: str = ""
+) -> list[str]:
     """Return ``command`` with a bare ``jarvis`` program run as relay's JARVIS.
 
     ``jarvis`` in ``exec`` names relay's JARVIS with the site's record
@@ -671,10 +686,12 @@ def relay_jarvis(command: Sequence[str], remote_dir: str, jarvis: str = "") -> l
     at = 4 if argv[:2] == ["sh", "-c"] and argv[3:4] == ["clio-light"] else 0
     if argv[at : at + 1] != ["jarvis"]:
         return argv
-    return [*argv[:at], *jarvis_command(remote_dir, jarvis), *argv[at + 1 :]]
+    return [*argv[:at], *jarvis_command(remote_dir, jarvis, graph), *argv[at + 1 :]]
 
 
-def exec_script(command: Sequence[str], remote_dir: str | None = None, jarvis: str = "") -> str:
+def exec_script(
+    command: Sequence[str], remote_dir: str | None = None, jarvis: str = "", graph: str = ""
+) -> str:
     """Run one command from the home directory, stopped when relay lets go.
 
     Relay holds the session's standard input open. When it closes, because the
@@ -687,7 +704,7 @@ def exec_script(command: Sequence[str], remote_dir: str | None = None, jarvis: s
     With ``remote_dir``, a bare ``jarvis`` is relay's JARVIS (:func:`relay_jarvis`).
     """
     if remote_dir is not None:
-        command = relay_jarvis(command, remote_dir, jarvis)
+        command = relay_jarvis(command, remote_dir, jarvis, graph)
     joined = shlex.join(list(command))
     program = shlex.quote(command[0])
     return (

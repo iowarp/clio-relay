@@ -149,6 +149,7 @@ class LocalConfig(BaseModel):
     outputs_dir: str | None = Field(default=None, description=site_outputs.HELP)
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
+    jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
     install_walltime_s: int = Field(
         default=jarvis_submit.INSTALL_WALLTIME_S,
@@ -160,6 +161,11 @@ class LocalConfig(BaseModel):
     @classmethod
     def _jarvis_path(cls, value: str) -> str:
         return jarvis_submit.explicit_jarvis(value)
+
+    @field_validator("jarvis_graph")
+    @classmethod
+    def _jarvis_graph(cls, value: str) -> str:
+        return jarvis_submit.published_graph(value)
 
     @field_validator("jarvis_python")
     @classmethod
@@ -285,6 +291,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                     job_dir=job_dir.as_posix(),
                     home=self._home(),
                     site=self.context.site_id,
+                    graph=self.config.jarvis_graph,
                 )
             elif scheduler == "slurm":
                 spec = jarvis_submit.with_archive(spec)
@@ -363,7 +370,12 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         await asyncio.to_thread(_write)
         out = site_outputs.with_outputs(spec, self.config.outputs_dir)
         command = jarvis_submit.submit_command(
-            out, operation_id=operation_id, jarvis=self.config.jarvis, home=self._home(), mode=mode
+            out,
+            operation_id=operation_id,
+            jarvis=self.config.jarvis,
+            home=self._home(),
+            mode=mode,
+            graph=self.config.jarvis_graph,
         )
         result = await run_bounded(
             shlex.split(command),
@@ -415,6 +427,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                     document, spec, self.config.install_walltime_s, answers
                 ),
                 home=self._home(),
+                graph=self.config.jarvis_graph,
             )
         )
         result = await run_bounded(

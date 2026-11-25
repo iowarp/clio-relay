@@ -41,6 +41,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
+| `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty keeps the graph under `remote_dir`. Set it once the person confirms the site publishes one: every CLIO home then shares the install answers JARVIS writes there, `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. JARVIS owns its content |
 | `install_walltime_s` | 14400 | The walltime of the job that builds a package's software. The run's walltime is used when it is longer |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
