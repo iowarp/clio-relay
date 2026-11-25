@@ -408,6 +408,50 @@ def test_the_card_fills_from_jarvis_component_states(
     asyncio.run(scenario())
 
 
+def test_without_a_plan_the_card_shows_a_crashed_service_apart(
+    relay_paths: RelayPaths, jarvis: _Jarvis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def run(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> JobHandle:
+        jarvis.submitted.append(spec)
+        return JobHandle(adapter="fixture", native_id="78", data={})
+
+    monkeypatch.setattr(FixtureAdapter, "run", run)
+    guard: Any = RelayService(relay_paths).guard
+    guard.reviews.put(
+        Review(site="fx", package="demo.view", version="1", sha256=SHA, answered_by="test")
+    )
+    spec = JobSpec(
+        packages=[
+            PackageRef(name="demo.view", version="1", sha256=SHA, service=True),
+            PackageRef(name="demo.hello", version="1", sha256=SHA),
+        ]
+    )
+
+    async def scenario() -> None:
+        service = RelayService(relay_paths)
+        record = await service.start_run("fx", spec)
+        lines = "\n".join(
+            [
+                _state("view", "failed", ["n1"], reason="service crashed: signal 11"),
+                _state("hello", "done", ["n1"], reason="returned"),
+            ]
+        )
+        jarvis.status = JobStatus(
+            state=JobState.COMPLETED, exit_code=0, components=jarvis_plan.component_states(lines)
+        )
+        record = await service.refresh(record.operation_id)
+        ended = job_card.snapshot(service, record) or {}
+        assert ended["source"] == "relay" and ended["outcome"] == "succeeded"
+        view, hello = ended["components"]
+        assert (view["id"], view["role"], view["state"]) == ("view", "service", "failed")
+        assert view["reason"] == "service crashed: signal 11"
+        assert view["hosts"] == ["n1"] and view["nodes_running"] == 0
+        assert (hello["state"], hello["reason"]) == ("done", "returned")
+        await service.close()
+
+    asyncio.run(scenario())
+
+
 def test_an_unplanned_record_has_no_plan() -> None:
     record = OperationRecord(
         operation_id="op_1",

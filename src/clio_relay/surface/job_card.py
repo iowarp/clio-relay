@@ -198,6 +198,33 @@ def _components(
                 host_slice=step.nodes(),
             )
         )
+    return _reported(record, found, state)
+
+
+def _reported(
+    record: OperationRecord, found: list[dict[str, Any]], state: str
+) -> list[dict[str, Any]]:
+    """Each step in the state JARVIS last wrote for it, so a crashed service shows apart."""
+    lines = {
+        str(line.get("component")): line
+        for line in cast(list[dict[str, Any]], (record.result or {}).get("components") or [])
+    }
+    if not lines or state == "planned":
+        return found
+    for item in found:
+        line = lines.get(str(item["id"]))
+        if line is None:
+            continue
+        current = str(line.get("state") or state)
+        if state in jarvis_plan.TERMINAL and current not in jarvis_plan.TERMINAL:
+            current = state
+        hosts = cast(list[str], line.get("hosts") or [])
+        if hosts:
+            item["hosts"] = hosts
+            item["nodes_allocated"] = len(hosts) if state in ("running", "starting") else 0
+        item["state"] = current
+        item["nodes_running"] = item["nodes_allocated"] if current == "running" else 0
+        item["reason"] = line.get("reason")
     return found
 
 
