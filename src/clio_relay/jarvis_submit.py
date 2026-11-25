@@ -1166,9 +1166,17 @@ def record_status(
         error if isinstance(error, str) and error else None
     )
     if state.final and issues:
-        said = "; ".join(str(item.get("message")) for item in issues if item.get("message"))
-        if said:
-            message = f"{message}. {said}" if message else said
+        said = "; ".join(
+            dict.fromkeys(
+                text
+                for text in (str(item.get("message") or "").strip() for item in issues)
+                if text and text != message
+            )
+        )
+        if said and message:
+            message = f"{message}{'' if message.endswith(('.', '!', '?')) else '.'} {said}"
+        elif said:
+            message = said
     elif waiting and queue and message is None:
         message = queue_message(queue)
     exit_code = 0 if state == JobState.COMPLETED and exit_code is None else exit_code

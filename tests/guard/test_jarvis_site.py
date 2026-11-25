@@ -377,6 +377,16 @@ def test_a_failed_job_says_jarvis_typed_issues() -> None:
     assert "ranks reached the wrong node" in status.message
 
 
+def test_a_failed_job_says_jarvis_error_once() -> None:
+    said = "podman could not start the container on every node, so no package was started."
+    issue = {"kind": "container_start_failed", "message": said}
+    record = {"state": "failed", "return_code": 1, "error": said, "metadata": {"issues": [issue]}}
+    assert record_status(record).message == said
+    other = {"kind": "mpi_network", "message": "ranks reached the wrong node"}
+    record["metadata"] = {"issues": [issue, other, other]}
+    assert record_status(record).message == f"{said} ranks reached the wrong node"
+
+
 def test_only_decisions_jarvis_replayed_are_applied() -> None:
     report = {
         "applied_decisions": [
