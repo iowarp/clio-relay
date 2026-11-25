@@ -155,7 +155,7 @@ async def approve(
     """Return the accepted ask for this exact command, asking the person first when there is none.
 
     Raises :class:`~clio_relay.surface.files_approval.NeedsPerson` while the ask
-    is pending, and refuses with ``policy_refused`` when the person said no.
+    is pending, and the typed ``declined`` outcome when the person said no.
     ``typed`` makes the ask a choice, for a call whose host left the confirm to relay.
     A command that submits a job carries its planned card (:func:`snapshot`).
     """
@@ -166,7 +166,7 @@ async def approve(
         binding=_binding(site, command, plan),
         message=_message(site, command, plan),
         plain=not typed,
-        refused=f"the person did not approve the {plan.kind} plan",
+        not_done="Relay did not run the command.",
         meta={job_card.JOB_META: card} if card else None,
     )
 

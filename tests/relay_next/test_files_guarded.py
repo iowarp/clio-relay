@@ -150,7 +150,10 @@ def test_a_no_keeps_the_file(relay_paths: RelayPaths, mode: str) -> None:
             refused = await client.call_tool(
                 "files", _call("delete", path="keep.txt"), raise_on_error=False
             )
-            assert _structured(refused)["refusal"]["reason"] == "policy_refused"
+            assert not refused.is_error
+            declined = _structured(refused)["declined"]
+            assert declined["not_done"] == "Relay left keep.txt as it was."
+            assert declined["question"].startswith("Delete keep.txt on ")
             kept = await client.call_tool("files", _call("read", path="keep.txt"))
             assert _structured(kept)["text"] == "x"
 

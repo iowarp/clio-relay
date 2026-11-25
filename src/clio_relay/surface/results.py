@@ -39,6 +39,12 @@ def text(value: dict[str, Any]) -> str:
 
 
 def _summary(view: dict[str, Any]) -> str:
+    declined: dict[str, Any] | None = view.get("declined")
+    if declined:
+        return (
+            f"Operation {view['operation_id']} on {view['site']} was declined: "
+            f"{declined['question']}\n{declined['not_done']}"
+        )
     line = f"Operation {view['operation_id']} on {view['site']} is {view['state']}"
     if view.get("exit_code") is not None:
         line += f" with exit code {view['exit_code']}"
@@ -120,7 +126,7 @@ def _computing(view: dict[str, Any]) -> str:
 
 
 def operation_result(view: dict[str, Any]) -> ToolResult:
-    """Render an operation. A failed job is an error result; a cancelled one is not.
+    """Render an operation. A failed job is an error result; a cancelled or declined one is not.
 
     So is a service relay could not bring to the desktop, though its job runs on.
     """

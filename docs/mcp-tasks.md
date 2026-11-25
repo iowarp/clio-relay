@@ -15,7 +15,7 @@ operation id, so the same work can be followed through either.
 | --- | --- |
 | `working` | The job is queued or running, or the service is starting |
 | `input_required` | The site asked something and is waiting for an answer |
-| `completed` | The job reached a final state, whether it succeeded or failed, or the service is ready |
+| `completed` | The job reached a final state, whether it succeeded or failed, the service is ready, or the person declined (see below) |
 | `cancelled` | The work was cancelled |
 
 `tasks/get` returns the status and a status message that carries the latest
@@ -115,11 +115,28 @@ relay asks the person exactly once, with a typed form:
   asks for that command on a site with no guard. `exec_read` never asks.
 - `site_clean` always asks, flagged or not, naming what goes and what stays.
 
-A declined form cancels the job before anything is submitted. A client
+A declined form stops the job before anything is submitted. A client
 without form elicitation gets a `needs_approval` refusal and nothing runs.
 When a flagged call only observes, or acts on answers given earlier, its
 result's `_meta` carries `io.iowarp/confirm: "not_needed"`, so the host knows
 no form was due.
+
+### when the person declines
+
+A decline is the person's answer, not an error. Every call whose question the
+person declines, in any of the ways above, returns a result that is not an
+error, with `structuredContent.declined`:
+
+| Field | What it is |
+| --- | --- |
+| `operation_id` | The operation the question belonged to, or null for a call that has none (`exec`, `files`, `site_clean`) |
+| `ask_id` | The question the person declined |
+| `question` | The question, as one sentence |
+| `not_done` | What relay therefore did not do, such as "Relay submitted nothing, so the job did not run." |
+
+An operation the person declined keeps the state `cancelled`, with `error`
+null, and its job card's outcome is `declined`. Its task completes rather than
+being cancelled, and the status message says what was declined.
 
 ## the job card
 

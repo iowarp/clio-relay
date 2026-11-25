@@ -162,7 +162,8 @@ def test_site_clean_does_nothing_on_a_no(
         server = create_server(relay_paths)
         async with Client(server, mode="legacy", elicitation_handler=_decline) as client:
             refused = await client.call_tool("site_clean", {"site": "fx"}, raise_on_error=False)
-            assert _structured(refused)["refusal"]["reason"] == "policy_refused"
+            assert not refused.is_error
+            assert _structured(refused)["declined"]["not_done"] == "Relay cleaned nothing on fx."
 
     asyncio.run(scenario())
     assert cleaned == []

@@ -50,6 +50,7 @@ from pydantic import Field
 
 from clio_relay import jarvis_graph, jarvis_plan, jarvis_submit
 from clio_relay.adapters.hooks import Charge
+from clio_relay.jobs import declines
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec, flow_order, step_id
 from clio_relay.packages import person_name
@@ -111,7 +112,7 @@ def _outcome(record: OperationRecord) -> str | None:
     if record.state == OperationState.FAILED:
         return "failed"
     if record.state == OperationState.CANCELLED:
-        return "cancelled"
+        return "declined" if declines.outcome(record) is not None else "cancelled"
     return None
 
 

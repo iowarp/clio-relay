@@ -31,11 +31,18 @@ from fastmcp.tools import InputRequiredToolResult, ToolResult
 
 from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, ask_detail, explain_approval
+from clio_relay.adapters.hooks import (
+    Ask,
+    Charge,
+    GuardDecision,
+    ask_detail,
+    explain_approval,
+    split_question,
+)
 from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import JobSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import held_services, job_card, plan_card
@@ -199,13 +206,15 @@ async def one_shot(
     binding: dict[str, Any],
     message: str,
     plain: bool,
-    refused: str,
+    not_done: str,
+    operation_id: str | None = None,
     meta: dict[str, Any] | None = None,
 ) -> Ask:
     """Return the accepted ask for ``binding``, asking the person first when there is none.
 
-    Raises :class:`NeedsPerson` while the ask is pending, and refuses with
-    ``policy_refused`` when the person said no. :func:`used` spends the yes.
+    Raises :class:`NeedsPerson` while the ask is pending, and raises the typed
+    ``declined`` outcome, saying ``not_done``, when the person said no.
+    :func:`used` spends the yes.
     """
     digest = canonical_digest(binding)
     found = [a for a in service.asks.all() if a.binding_digest == digest and a.completed_at is None]
@@ -222,7 +231,10 @@ async def one_shot(
         raise NeedsPerson(ask)
     if ask.state != "accepted":
         used(service, ask)
-        raise Refusal(RefusalReason.POLICY_REFUSED, refused, site=site.id, ask_id=ask.ask_id)
+        question = split_question(ask.message)[0]
+        raise declined(
+            question, not_done, ask_id=ask.ask_id, operation_id=operation_id, site=site.id
+        )
     return ask
 
 
@@ -249,7 +261,7 @@ async def exec_confirm(service: RelayService, site: SiteEntry, command: list[str
         binding=binding,
         message=message,
         plain=False,
-        refused="the person did not approve the command",
+        not_done="Relay did not run the command.",
     )
 
 
@@ -281,7 +293,12 @@ async def cancel_confirm(service: RelayService, record: OperationRecord, verb: s
         binding=binding,
         message=message,
         plain=False,
-        refused=f"the person did not approve the {verb}",
+        not_done=(
+            "Relay did not stop it, so the service keeps running."
+            if record.kind == "serve" and record.state == OperationState.RUNNING
+            else f"Relay did not {verb} it, so it goes on."
+        ),
+        operation_id=record.operation_id,
         meta={job_card.JOB_META: snapshot} if snapshot else None,
     )
 

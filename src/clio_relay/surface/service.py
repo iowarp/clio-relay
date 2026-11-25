@@ -27,8 +27,10 @@ from clio_relay.adapters.hooks import (
     ask_detail,
     hook_factory,
     said_yes,
+    split_question,
 )
 from clio_relay.jarvis_submit import not_run_here
+from clio_relay.jobs import declines
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import Endpoint, JobState, JobStatus, StallReport, utc_now
 from clio_relay.jobs.ownership import ServeLease
@@ -40,7 +42,7 @@ from clio_relay.jobs.records import (
     StateChange,
     new_id,
 )
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import (
     JobSpec,
     ServiceSpec,
@@ -578,11 +580,15 @@ class RelayService:
             if ask.ask_id in relayed or (ask.ask_id in kept and ask.state != "pending"):
                 continue
             if ask.state in ("declined", "cancelled"):
-                message = f"the person declined: {ask.message}"
                 return self.finish(
                     operation_id,
                     OperationState.CANCELLED,
-                    Refusal(RefusalReason.DECLINED, message),
+                    declined(
+                        split_question(ask.message)[0],
+                        declines.not_done(record),
+                        ask_id=ask.ask_id,
+                        operation_id=operation_id,
+                    ),
                 )
             if ask.state == "pending":
                 if ask.kind == "url" and await self._signed_in_elsewhere(ask, record):
@@ -1080,6 +1086,7 @@ class RelayService:
                 shown["url"] = ask.url
                 shown["completed"] = ask.completed_at is not None
             asks.append(shown)
+        declined_as = declines.outcome(record)
         return {
             "operation_id": record.operation_id,
             "kind": record.kind,
@@ -1094,7 +1101,8 @@ class RelayService:
             "steps": _steps_view(record),
             "couplings": _couplings_view(record),
             "result": record.result,
-            "error": record.error,
+            "error": None if declined_as else record.error,
+            "declined": declined_as,
             "spec_digest": record.spec_digest,
             "owner": self.lease.shown(record.owner, final=record.state.final),
             "job": job_snapshot(self, record),

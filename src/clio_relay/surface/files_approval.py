@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal
 
 from clio_relay.adapters.hooks import Ask
 from clio_relay.jobs.handles import FileAccess, utc_now
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import canonical_digest
 from clio_relay.sites.models import SiteEntry
 
@@ -69,8 +69,8 @@ async def approve(
 ) -> Ask:
     """Return the accepted ask for this op, asking the person first when there is none.
 
-    Raises :class:`NeedsPerson` while the ask is pending, and refuses with
-    ``policy_refused`` when the person said no.
+    Raises :class:`NeedsPerson` while the ask is pending, and the typed
+    ``declined`` outcome when the person said no.
     """
     binding = _binding(site, op, path, recursive)
     digest = canonical_digest(binding)
@@ -93,12 +93,12 @@ async def approve(
         raise NeedsPerson(ask)
     if ask.state != "accepted":
         used(service, ask)
-        raise Refusal(
-            RefusalReason.POLICY_REFUSED,
-            f"the person did not approve: {action}",
+        raise declined(
+            f"{action} on {site.title}?",
+            f"Relay left {path} as it was.",
+            ask_id=ask.ask_id,
             site=site.id,
             path=path,
-            ask_id=ask.ask_id,
         )
     return ask
 

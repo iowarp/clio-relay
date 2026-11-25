@@ -8,9 +8,9 @@ from typing import Any
 
 import pytest
 
-from clio_relay.adapters.hooks import Ask, ask_text
+from clio_relay.adapters.hooks import Ask, ask_text, split_question
 from clio_relay.jobs.records import OperationState
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.jobs.refusals import Refusal, RefusalReason, declined_outcome
 from clio_relay.jobs.spec import JobAttributes, JobSpec
 from clio_relay.surface import interrupted
 from clio_relay.surface.service import SUBMIT_GRACE, RelayService
@@ -111,6 +111,25 @@ async def test_declined_approval_cancels(relay_paths: RelayPaths, how: str) -> N
     assert final.error is not None
     assert final.error["reason"] == RefusalReason.DECLINED.value
     assert final.handle is None
+    view = service.view(final)
+    assert view["error"] is None
+    assert view["declined"] == {
+        "operation_id": record.operation_id,
+        "ask_id": ask.ask_id,
+        "question": split_question(ask.message)[0],
+        "not_done": "Relay submitted nothing, so the job did not run.",
+    }
+
+
+def test_a_decline_recorded_before_the_outcome_still_reads_as_declined() -> None:
+    old = {"reason": "declined", "message": "the person declined: Run it?"}
+    assert declined_outcome(old, operation_id="op_1", not_done="Nothing ran.") == {
+        "operation_id": "op_1",
+        "ask_id": None,
+        "question": "Run it?",
+        "not_done": "Nothing ran.",
+    }
+    assert declined_outcome({"reason": "policy_refused", "message": "no"}) is None
 
 
 async def test_answer_is_recorded_once(relay_paths: RelayPaths) -> None:

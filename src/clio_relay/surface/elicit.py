@@ -19,14 +19,31 @@ from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from clio_relay.adapters.hooks import ASK_META, CHOICE_META, READS_ASK_META, Ask, short_ask
-from clio_relay.jobs.refusals import Refusal
+from clio_relay.jobs.refusals import Refusal, declined_outcome
 
 _BY_ASK = (CHOICE_META, ASK_META)
 _LOOKUP_ERRORS = (AttributeError, RuntimeError, LookupError, TypeError)
+DECLINED_KEY = "declined"
+
+
+def declined_text(outcome: dict[str, Any]) -> str:
+    """The line a person reads for a ``declined`` outcome."""
+    return f"Declined: {outcome['question']}\n{outcome['not_done']}"
 
 
 def refusal_result(refusal: Refusal) -> ToolResult:
-    """Render a refusal as an error tool result with a typed reason."""
+    """Render a refusal as an error tool result with a typed reason.
+
+    A decline is the person's answer, not an error: it renders as a result
+    whose ``structuredContent.declined`` says what was asked and not done.
+    """
+    outcome = declined_outcome(refusal.to_dict())
+    if outcome is not None:
+        return ToolResult(
+            content=[mcp_types.TextContent(type="text", text=declined_text(outcome))],
+            structured_content={DECLINED_KEY: outcome},
+            is_error=False,
+        )
     return ToolResult(
         content=[
             mcp_types.TextContent(type="text", text=f"{refusal.reason.value}: {refusal.message}")

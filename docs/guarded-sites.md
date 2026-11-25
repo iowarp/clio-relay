@@ -40,7 +40,9 @@ anywhere else the site lets relay write, does not ask.
   `needs_approval` with the ask and its page; answer it there or with
   `clio-relay asks answer`, and the agent calls `files` again with the same
   arguments.
-- If you say no, the call is refused with `policy_refused` and the file stays.
+- If you say no, nothing is deleted or replaced, and the call returns a
+  `declined` result (see [MCP tasks](mcp-tasks.md#when-the-person-declines)),
+  not an error.
 
 ## Running a package
 

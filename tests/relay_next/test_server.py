@@ -231,7 +231,7 @@ def test_task_asks_with_input_required_and_takes_tasks_update(relay_paths: Relay
     assert _ask_answers(relay_paths) == ["tasks/update"]
 
 
-def test_task_decline_cancels(relay_paths: RelayPaths) -> None:
+def test_task_decline_completes_as_declined(relay_paths: RelayPaths) -> None:
     add_site(relay_paths, spend="always")
 
     async def scenario() -> None:
@@ -248,7 +248,15 @@ def test_task_decline_cancels(relay_paths: RelayPaths) -> None:
                 ),
                 mcp_types.Result,
             )
-            assert (await task.status()).status == "cancelled"
+            done = await task.status()
+            assert done.status == "completed"
+            assert (done.status_message or "").startswith("the person declined: ")
+            service = RelayService(relay_paths)
+            view = service.view(service.operation(task.task_id))
+            assert view["state"] == "cancelled"
+            assert view["error"] is None
+            assert view["declined"]["ask_id"] == ask_id
+            assert view["declined"]["operation_id"] == task.task_id
 
     asyncio.run(scenario())
 
@@ -312,7 +320,7 @@ def test_form_elicitation_approves(relay_paths: RelayPaths, mode: str) -> None:
 
 
 @pytest.mark.parametrize("mode", ["legacy", "modern"])
-def test_form_elicitation_decline_cancels(relay_paths: RelayPaths, mode: str) -> None:
+def test_form_elicitation_decline_is_declined(relay_paths: RelayPaths, mode: str) -> None:
     add_site(relay_paths, spend="always")
 
     async def scenario() -> None:
@@ -324,9 +332,14 @@ def test_form_elicitation_decline_cancels(relay_paths: RelayPaths, mode: str) ->
         )
         async with client:
             result = await client.call_tool("run", {"site": "fx", "spec": ECHO})
+            assert not result.is_error
             view = _structured(result)
             assert view["state"] == "cancelled"
-            assert view["error"]["reason"] == "declined"
+            assert view["error"] is None
+            assert set(view["declined"]) == {"operation_id", "ask_id", "question", "not_done"}
+            assert view["declined"]["not_done"] == (
+                "Relay submitted nothing, so the job did not run."
+            )
 
     asyncio.run(scenario())
 

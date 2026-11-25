@@ -46,6 +46,7 @@ from pydantic import Field
 
 from clio_relay import shutdown as shutdown_ops
 from clio_relay.adapters.hooks import Ask, MountsPages, Transport, ask_detail
+from clio_relay.jobs import declines
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -161,7 +162,8 @@ class RelayTasksExtension(ServerExtension):
         return record
 
     def _status(self, record: OperationRecord) -> str:
-        if service_done(record):
+        if service_done(record) or declines.outcome(record) is not None:
+            # A decline is the person's answer: the call completed, with that outcome.
             return "completed"
         if record.state == OperationState.AWAITING_INPUT and self.service.outstanding(record):
             return "input_required"
@@ -172,6 +174,8 @@ class RelayTasksExtension(ServerExtension):
         return "working"
 
     def _message(self, record: OperationRecord) -> str:
+        if (declined := declines.outcome(record)) is not None:
+            return f"the person declined: {declined['question']}"
         if record.state == OperationState.AWAITING_INPUT:
             if self.service.outstanding(record):
                 return "waiting for the person to answer"

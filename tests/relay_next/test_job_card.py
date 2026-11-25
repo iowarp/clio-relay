@@ -169,7 +169,9 @@ def test_a_declined_card_cancels_the_job(relay_paths: RelayPaths) -> None:
             result = await client.call_tool("run", {"site": "fx", "spec": ECHO}, meta=FLAG)
             view = _structured(result)
             assert view["state"] == "cancelled"
-            assert view["error"]["reason"] == "declined"
+            assert view["error"] is None
+            assert view["declined"]["operation_id"] == view["operation_id"]
+            assert view["job"]["outcome"] == "declined"
 
     asyncio.run(scenario())
 
@@ -248,7 +250,9 @@ def test_a_flagged_exec_asks_once_for_that_command(relay_paths: RelayPaths, answ
                 assert view["stdout"] == "hi\n"
                 assert view["ask_id"]
             else:
-                assert view["refusal"]["reason"] == "policy_refused"
+                assert not result.is_error
+                assert view["declined"]["not_done"] == "Relay did not run the command."
+                assert view["declined"]["operation_id"] is None
             plain = await client.call_tool("exec", {"site": "fx", "command": ["echo", "hi"]})
             assert _structured(plain)["stdout"] == "hi\n"
 

@@ -23,8 +23,8 @@ from fastmcp.tools import InputRequiredToolResult, ToolResult
 from pydantic import Field
 
 from clio_relay import site_clean as cleaning
-from clio_relay.adapters.hooks import Ask, ask_detail
-from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.adapters.hooks import Ask, ask_detail, split_question
+from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import canonical_digest
 from clio_relay.surface import exec_plan, job_card
 from clio_relay.surface.elicit import (
@@ -75,11 +75,11 @@ async def _approve(service: RelayService, planned: dict[str, Any]) -> Ask:
         raise NeedsPerson(ask)
     if ask.state != "accepted":
         exec_plan.used(service, ask)
-        raise Refusal(
-            RefusalReason.POLICY_REFUSED,
-            f"cleaning {planned['site']} was not approved",
-            site=planned["site"],
+        raise declined(
+            split_question(ask.message)[0],
+            f"Relay cleaned nothing on {planned['site']}.",
             ask_id=ask.ask_id,
+            site=planned["site"],
         )
     return ask
 
