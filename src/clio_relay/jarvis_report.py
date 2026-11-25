@@ -588,14 +588,6 @@ def _split_question(issue: Mapping[str, Any]) -> tuple[str, str]:
     )
     if not isinstance(question, str) or not question.strip():
         return f"Which option should JARVIS use for {subject}?", ""
-    if issue.get("kind") == SITE_COPY_KIND:
-        # The copies JARVIS found are the fact the question rests on, so they stay in it.
-        head, rest = split_question(question)
-        start = question.find(head)
-        if start > 0:
-            before = question[:start].strip()
-            return f"{before} {head}", question[start + len(head) :].strip()
-        return head, rest
     return split_question(question)
 
 

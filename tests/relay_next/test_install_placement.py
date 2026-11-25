@@ -295,9 +295,9 @@ def test_a_site_copy_question_offers_the_site_s_copies_or_a_spack_build() -> Non
         "Plan and build the query with Spack. A site copy fits; building with Spack is "
         "still possible."
     )
-    assert jarvis_report.choice_message(issue) == (
-        f"This site already has 1 copy of ior: {module}. Use the site's copy, or build ior "
-        "with Spack?"
+    assert jarvis_report.choice_message(issue) == "Use the site's copy, or build ior with Spack?"
+    assert (jarvis_report.choice_detail(issue) or "").startswith(
+        f"This site already has 1 copy of ior: {module}.\n\nRecommended: {module}"
     )
     assert jarvis_report.choice_title(issue) == "Site copy or Spack build for ior"
     note = jarvis_report.choice_note(issue) or ""
