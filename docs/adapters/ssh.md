@@ -228,6 +228,13 @@ once the person confirms, answers through `facts.jarvis.exec` (`rg facts answer
 <issue_id> --value ... --reason ... --set_by <person> --proposed_by <agent>
 +json`), then runs again. An advisory one goes ahead, and the operation carries
 JARVIS's `site_facts`.
+A job's background service can crash while its steps finish, such as a
+pvserver beside a solver. JARVIS then completes the job and records the
+application's result and each service's result apart, in its
+`metadata.outcomes` (`jarvis.execution.outcomes.v1`). The operation carries it
+untouched as `result.outcomes`, its text says the application finished but the
+service crashed, and the card shows that service's component `failed`. A
+service kept as the job's purpose (`after_steps: keep`) still fails the job.
 The Spack environment is kept under the CLIO site home, at
 `jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
 archives, so the next run of the same packages reuses it. Two installs into

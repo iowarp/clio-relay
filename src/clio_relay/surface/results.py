@@ -70,8 +70,34 @@ def _summary(view: dict[str, Any]) -> str:
             f"\n\nThe service cannot reach this desktop: {unreachable.get('reason')}: "
             f"{unreachable.get('message')}"
         )
+    line += crashed_services(result.get("outcomes") or {})
     if view.get("error"):
         line += f"\n\n{view['error'].get('reason')}: {view['error'].get('message')}"
+    return line
+
+
+_APPLICATION = {"completed": "finished", "failed": "failed", "cancelled": "was cancelled"}
+
+
+def crashed_services(outcomes: dict[str, Any]) -> str:
+    """Say which services crashed, apart from how the application itself ended.
+
+    ``outcomes`` is JARVIS's ``jarvis.execution.outcomes.v1``; a service that served
+    the steps can crash while the application finishes, and the job still completes.
+    """
+    services: list[dict[str, Any]] = outcomes.get("services") or []
+    crashed = [item for item in services if item.get("outcome") == "crashed"]
+    if not crashed:
+        return ""
+    application: dict[str, Any] = outcomes.get("application") or {}
+    state = str(application.get("state") or "")
+    said = _APPLICATION.get(state, f"is {state}" if state else "ended")
+    line = ""
+    for item in crashed:
+        name = str(item.get("pkg_id") or item.get("package") or "service")
+        when = " while the steps ran" if item.get("during_steps") else ""
+        error = f": {item['error']}" if item.get("error") else ""
+        line += f"\n\nThe application {said}, but its service {name} crashed{when}{error}"
     return line
 
 

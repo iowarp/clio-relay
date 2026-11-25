@@ -129,6 +129,14 @@ class JobStatus(BaseModel):
             "desktop, such as host_key_unverified. The job itself runs on"
         ),
     )
+    outcomes: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "JARVIS's metadata.outcomes on the execution (jarvis.execution.outcomes.v1), "
+            "untouched: the application's result and each background service's result, "
+            "separately, so a service that crashed while the application finished says so"
+        ),
+    )
     started_at: datetime | None = Field(
         default=None,
         description=(

@@ -1108,6 +1108,7 @@ def record_status(
             progress=progress,
             issues=issues,
             site_facts=_dict(metadata.get("site_facts")) or None,
+            outcomes=_dict(metadata.get("outcomes")) or None,
             started_at=scheduler_start(record, job_id),
         )
     state = _STATES[native]
@@ -1133,6 +1134,7 @@ def record_status(
         queue=queue if waiting and queue else None,
         issues=issues,
         site_facts=_dict(metadata.get("site_facts")) or None,
+        outcomes=_dict(metadata.get("outcomes")) or None,
         started_at=scheduler_start(record, job_id),
     )
 
