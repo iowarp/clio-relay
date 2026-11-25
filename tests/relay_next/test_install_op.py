@@ -51,6 +51,7 @@ class _Site:
 
     jarvis: bool = True
     installed: bool = False
+    stuck: bool = False
     refuse: Refusal | None = None
     calls: list[str] = field(default_factory=list[str])
 
@@ -85,7 +86,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
     async def status(self: FixtureAdapter, handle: JobHandle) -> JobStatus:
         if handle.native_id != "install-1":
             return await real_status(self, handle)
-        state.installed = True
+        state.installed = not state.stuck
         return JobStatus(state=JobState.COMPLETED, exit_code=0)
 
     async def run(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> JobHandle:
@@ -152,6 +153,55 @@ def test_missing_software_is_asked_then_installed_as_a_job(
         await service.close()
 
     asyncio.run(scenario())
+
+
+def test_an_install_the_check_still_finds_missing_ends_without_asking_again(
+    relay_paths: RelayPaths, site: _Site
+) -> None:
+    async def scenario() -> None:
+        site.stuck = True
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        record = await install_op.start(service, "fx", SPEC)
+        await _approve(service, record.operation_id)
+        done = await service.refresh(record.operation_id)
+        assert done.state == OperationState.FAILED, done
+        assert site.calls == ["check", "install", "check"]
+        assert service.outstanding(done) == []
+        assert len(done.asks) == 1
+        error = done.error or {}
+        data: dict[str, Any] = error.get("data") or {}
+        assert data["kind"] == jarvis_report.STILL_MISSING
+        assert data["subject"] == "hello@2.12"
+        assert "but its check still finds it missing: hello@2.12" in error["message"]
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_still_missing_refusal_keeps_jarvis_s_subject_and_question() -> None:
+    issue = {
+        "kind": "not_installed",
+        "method": "container",
+        "package": "pkg",
+        "subject": "docker.io/library/alpine:3.20",
+        "question": "pkg needs 1 container package(s) installed into podman image store "
+        "before it can run.",
+        "answerable": False,
+    }
+    report: dict[str, Any] = {"installers": {}, "issues": [issue]}
+    keys = jarvis_report.missing_keys(report)
+    assert keys == ["container:pkg:docker.io/library/alpine:3.20"]
+    refusal = jarvis_report.still_missing(report, keys, site="Ares")
+    assert refusal.reason == RefusalReason.SUBMIT_FAILED
+    assert refusal.data["kind"] == jarvis_report.STILL_MISSING
+    assert refusal.data["issues"] == [issue]
+    assert refusal.message == (
+        "JARVIS installed the package's software on Ares, but its check still finds it "
+        "missing: docker.io/library/alpine:3.20. pkg needs 1 container package(s) installed "
+        "into podman image store before it can run."
+    )
+    assert installing.install_kind(refusal) is None
 
 
 def test_a_site_without_jarvis_gets_it_first(relay_paths: RelayPaths, site: _Site) -> None:

@@ -184,6 +184,23 @@ async def ask_install(
                 OperationState.FAILED,
                 jarvis_report.install_blocked(blocking, site=site.title),
             )
+        missing_keys = jarvis_report.missing_keys(report)
+        found = state_of(record).get("installed")
+        installed = (
+            [str(key) for key in cast(list[object], found)] if isinstance(found, list) else []
+        )
+        repeated = set(installed) & set(missing_keys)
+        if repeated:
+            # An install job succeeded, yet JARVIS's check reports the same software
+            # missing: asking the same approval again would loop the person.
+            return service.finish(
+                operation_id,
+                OperationState.FAILED,
+                jarvis_report.still_missing(report, repeated, site=site.title),
+            )
+        state["missing_keys"] = missing_keys
+        if installed:
+            state["installed"] = installed
         names = jarvis_submit.package_names(job_of(record).steps())
         state["summary"] = jarvis_report.install_summary(report, names)
         state["report_digest"] = jarvis_report.report_digest(report)
@@ -428,7 +445,16 @@ async def _job_done(
     if status.state != JobState.COMPLETED:
         return await _ended(service, operation_id, status, job, tail or state.get("log_tail"))
     checked = bool(state.get("recheck"))
-    _update(service, operation_id, stage="done", job_ended=True, log_offset=offset, log_tail=tail)
+    installed: dict[str, Any] = {} if checked else {"installed": state.get("missing_keys") or []}
+    _update(
+        service,
+        operation_id,
+        stage="done",
+        job_ended=True,
+        log_offset=offset,
+        log_tail=tail,
+        **installed,
+    )
     then = (
         "JARVIS checks it"
         if service.operation(operation_id).kind == "install"

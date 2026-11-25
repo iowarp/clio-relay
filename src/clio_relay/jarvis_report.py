@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
 from clio_relay.adapters.hooks import ChoiceOption
@@ -154,6 +154,67 @@ def software_missing(report: Mapping[str, Any]) -> bool:
     if install_summary(report)["build"]:
         return True
     return any(issue.get("kind") == "not_installed" for issue in _issues(report))
+
+
+def _missing_key(method: object, package: object, subject: object) -> str:
+    return f"{method}:{package}:{subject}"
+
+
+def missing_keys(report: Mapping[str, Any]) -> list[str]:
+    """Return what the report says is not installed, as ``method:package:subject`` keys.
+
+    One key per ``not_installed`` issue and per package to build, so a later
+    report can be compared with this one.
+    """
+    keys = {
+        _missing_key(issue.get("method"), issue.get("package"), issue.get("subject"))
+        for issue in _issues(report)
+        if issue.get("kind") == "not_installed"
+    }
+    keys.update(
+        _missing_key(entry["method"], entry["package"], entry["spec"])
+        for entry in install_summary(report)["build"]
+    )
+    return sorted(keys)
+
+
+STILL_MISSING = "installed_still_missing"
+"""Relay's kind when an install job succeeded and JARVIS's check still finds it missing."""
+
+
+def still_missing(report: Mapping[str, Any], repeated: Iterable[str], *, site: str) -> Refusal:
+    """The refusal when JARVIS's check reports missing what an install job just installed.
+
+    Asking the same approval again would loop the person on a JARVIS fault, so
+    the operation ends with JARVIS's own subject and message.
+    """
+    repeated = sorted(set(repeated))
+    issues = [
+        issue
+        for issue in _issues(report)
+        if issue.get("kind") == "not_installed"
+        and _missing_key(issue.get("method"), issue.get("package"), issue.get("subject"))
+        in repeated
+    ]
+    first = issues[0] if issues else {}
+    subject = first.get("subject") or ", ".join(key.split(":", 2)[2] for key in repeated)
+    message = (
+        f"JARVIS installed the package's software on {site}, but its check still finds "
+        f"it missing: {subject}"
+    )
+    detail = first.get("question") or first.get("detail")
+    if isinstance(detail, str) and detail:
+        message = then(message, detail)
+    return Refusal(
+        RefusalReason.SUBMIT_FAILED,
+        message,
+        kind=STILL_MISSING,
+        subject=subject,
+        still_missing=repeated,
+        issues=issues,
+        needs=NEEDS_INSTALL,
+        retry=False,
+    )
 
 
 def applied_decisions(report: Mapping[str, Any]) -> list[dict[str, Any]]:
