@@ -343,7 +343,7 @@ wheels = [
 
 [[package]]
 name = "clio-relay"
-version = "2.0.0a22"
+version = "2.0.0a23"
 source = { editable = "." }
 dependencies = [
     { name = "aioquic" },
@@ -427,7 +427,7 @@ provides-extras = ["tapis", "globus", "iri", "testing"]
 [package.metadata.requires-dev]
 dev = [
     { name = "hatchling", specifier = "==1.31.0" },
-    { name = "jarvis-cd", url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.5/jarvis_cd-1.9.5-py3-none-any.whl" },
+    { name = "jarvis-cd", url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.6/jarvis_cd-1.9.6-py3-none-any.whl" },
     { name = "pip-audit", specifier = ">=2.10.0" },
     { name = "pyright", specifier = ">=1.1.390" },
     { name = "pytest", specifier = ">=8.3" },
@@ -955,8 +955,8 @@ wheels = [
 
 [[package]]
 name = "jarvis-cd"
-version = "1.9.5"
-source = { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.5/jarvis_cd-1.9.5-py3-none-any.whl" }
+version = "1.9.6"
+source = { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.6/jarvis_cd-1.9.6-py3-none-any.whl" }
 dependencies = [
     { name = "pandas" },
     { name = "podman-compose" },
@@ -964,7 +964,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.5/jarvis_cd-1.9.5-py3-none-any.whl", hash = "sha256:22ef9e9f108d87466c94be5d94eed8d97344011730f3a3d43bedd731cbe83842" },
+    { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.6/jarvis_cd-1.9.6-py3-none-any.whl", hash = "sha256:61a481ab58bdc9d9b550d41b4b51bb3d5cd7ccac9d03d1bc97b8c68dfe6030f7" },
 ]
 
 [package.metadata]
