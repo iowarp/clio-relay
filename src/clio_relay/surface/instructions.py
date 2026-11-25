@@ -44,20 +44,23 @@ GENERAL = (
     "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
     "it is also the resource relay://sites/<site>/skill, which files cannot read."
 )
+NO_SITES = (
+    "No compute sites are configured yet: the person adds one on the Compute page, "
+    "and relay names it here."
+)
 MAX_LISTED = 12
 SUMMARY_CHARS = 100
 REFRESH_S = 5.0
 
 
 def site_line(site: SiteEntry) -> str:
-    """``ares (Ares; ssh, slurm, guarded)``."""
-    traits = [site.adapter]
-    scheduler = site.config.get("scheduler")
-    if isinstance(scheduler, str) and scheduler:
-        traits.append(scheduler)
-    traits.append(site.policy)
+    """``ares (ssh)``, or ``ares (Ares cluster; ssh)`` when the site has its own name.
+
+    The site and how relay reaches it, so a search for the site's name finds relay;
+    describe(site=...) gives the rest.
+    """
     named = f"{site.name}; " if site.name and site.name.lower() != site.id.lower() else ""
-    return f"{site.id} ({named}{', '.join(traits)})"
+    return f"{site.id} ({named}{site.adapter})"
 
 
 def package_line(entry: PackageEntry) -> str:
@@ -80,7 +83,7 @@ def _listed(lines: Iterable[str]) -> str:
 def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
     """The instructions for these sites and packages."""
     if not sites:
-        return f"{GENERAL} No compute sites are configured yet."
+        return f"{GENERAL} {NO_SITES}"
     parts = [GENERAL, f"Compute sites configured for relay: {_listed(map(site_line, sites))}."]
     if packages:
         ordered = sorted(packages, key=lambda entry: entry.name)
@@ -113,9 +116,11 @@ async def keep_current(
 ) -> None:
     """Refresh ``server.instructions`` until cancelled.
 
-    The CLI edits the sites file and stages packages from another process, so
-    relay looks again every ``interval_s`` seconds. A client reads the text when
-    it connects or discovers the server.
+    The CLI and the Compute page edit the sites file, and packages are staged, from
+    any process, so relay looks again every ``interval_s`` seconds. A client reads the
+    text when it connects (``initialize``) or asks again (``server/discover``, which
+    answers with the current text), so a site added or removed reaches it there: MCP
+    has no notification for changed instructions.
     """
     while True:
         await asyncio.sleep(interval_s)

@@ -43,10 +43,7 @@ def test_the_text_names_each_site_and_package() -> None:
         [_package(), _package("lab_kit.echo", summary=None)],
     )
     assert text.startswith(instructions.GENERAL)
-    assert (
-        "Compute sites configured for relay: ares (Ares cluster; ssh, slurm, guarded); "
-        "lab (ssh, open)." in text
-    )
+    assert "Compute sites configured for relay: ares (Ares cluster; ssh); lab (ssh)." in text
     assert (
         "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
         "(Xcompact3d (Incompact3d v5.0) incompressible flow simulation); lab_kit.echo 0.2.1."
@@ -58,7 +55,7 @@ def test_the_text_names_each_site_and_package() -> None:
 def test_long_lists_and_summaries_are_cut() -> None:
     sites = [_site(f"s{index:02d}") for index in range(instructions.MAX_LISTED + 3)]
     text = instructions.compose(sites, [_package(summary="word " * 60)])
-    assert "s11 (ssh, guarded); and 3 more (describe lists them all)." in text
+    assert "s11 (ssh); and 3 more (describe lists them all)." in text
     assert "s12" not in text
     described = text.split("clio_jarvis.xcompact3d 0.2.1 (", 1)[1].split(")", 1)[0]
     assert len(described) == instructions.SUMMARY_CHARS and described.endswith("...")
@@ -66,14 +63,15 @@ def test_long_lists_and_summaries_are_cut() -> None:
 
 def test_no_sites_says_so() -> None:
     text = instructions.compose([], [_package()])
-    assert text == f"{instructions.GENERAL} No compute sites are configured yet."
+    assert text == f"{instructions.GENERAL} {instructions.NO_SITES}"
+    assert "Compute page" in text
 
 
 def test_a_broken_sites_file_still_gives_instructions(relay_paths: RelayPaths) -> None:
     relay_paths.sites_file.parent.mkdir(parents=True, exist_ok=True)
     relay_paths.sites_file.write_text("- {id: [\n", encoding="utf-8")
     service = RelayService(relay_paths)
-    assert instructions.current(service).endswith("No compute sites are configured yet.")
+    assert instructions.current(service).endswith(instructions.NO_SITES)
 
 
 @pytest.mark.asyncio
@@ -90,7 +88,7 @@ async def test_the_text_follows_the_sites_file(relay_paths: RelayPaths) -> None:
             if "clio_jarvis.xcompact3d" in server.instructions:
                 break
             await asyncio.sleep(0.01)
-        assert "later (fixture, open)" in server.instructions
+        assert "later (fixture)" in server.instructions
         assert "clio_jarvis.xcompact3d 0.2.1" in server.instructions
     finally:
         refreshing.cancel()
@@ -118,5 +116,5 @@ def test_a_plain_client_reads_them_when_it_connects(relay_paths: RelayPaths, mod
 
     text = asyncio.run(scenario())
     assert text is not None
-    assert "Compute sites configured for relay: ares (fixture, guarded)." in text
+    assert "Compute sites configured for relay: ares (fixture)." in text
     assert "clio_jarvis.xcompact3d 0.2.1 (Xcompact3d (Incompact3d v5.0)" in text
