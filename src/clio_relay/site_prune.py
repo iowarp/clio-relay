@@ -24,14 +24,24 @@ from clio_relay.jarvis_submit import (
 
 DECISIONS_TAIL = posixpath.join(BOOTSTRAP_DIR, SITE_DIR, DECISIONS_FILE)
 """Where JARVIS records the person's install answers, under a site home."""
+MINIFORGE_DIR = "miniforge3"
+"""The Miniforge JARVIS installs beside its site record (``conda_missing``)."""
 JOB_PREFIX = "relay-"
 """The scheduler job names relay's adapters give an operation's job."""
 
 
 def spack_keeps(home: str) -> list[str]:
-    """The person's Spack store and config under a site home, which clean keeps."""
+    """The person's package stores under a site home, which clean keeps.
+
+    The Spack store and config, and the Miniforge JARVIS installs for conda
+    packages once the person confirms it (``<home>/jarvis-cd/site/miniforge3``).
+    """
     base = home.rstrip("/") or "/"
-    return [posixpath.join(base, SPACK_DIR), posixpath.join(base, SPACK_CONFIG_DIR)]
+    return [
+        posixpath.join(base, SPACK_DIR),
+        posixpath.join(base, SPACK_CONFIG_DIR),
+        posixpath.join(base, BOOTSTRAP_DIR, SITE_DIR, MINIFORGE_DIR),
+    ]
 
 
 def site_keeps(home: str) -> list[str]:

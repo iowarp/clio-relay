@@ -150,6 +150,9 @@ DECISIONS_ENV = "CLIO_RELAY_JARVIS_DECISIONS"
 """The file the site script exports as ``JARVIS_SPACK_DECISIONS``."""
 SPACK_ENV_ENV = "CLIO_RELAY_JARVIS_SPACK_ENV"
 """The directory the site script exports as ``JARVIS_SPACK_ENV_DIR``."""
+INSTALL_ENV_ENV = "CLIO_RELAY_JARVIS_INSTALL_ENV"
+"""The directory the site script exports as ``JARVIS_INSTALL_ENV_DIR``: the pip venvs and
+conda envs, shared by the install job and the runs as the Spack env is."""
 SPACK_DIR = "spack"
 """The site's JARVIS Spack, relative to the CLIO site home (``jarvis spack prepare --root``)."""
 SPACK_CONFIG_DIR = "spack-config"
@@ -334,7 +337,9 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
     ``JARVIS_RESOURCE_GRAPH``) and the install decisions JARVIS records and
     replays (:func:`site_decisions`, exported as ``JARVIS_SPACK_DECISIONS``).
     Relay keeps no record of its own of either. The pipeline's Spack
-    environment is kept at ``<home>/jarvis-cd/pipelines/<steps digest>/``,
+    environment, and its pip venvs and conda envs (``install-envs``, exported
+    as ``JARVIS_INSTALL_ENV_DIR``), are kept at
+    ``<home>/jarvis-cd/pipelines/<steps digest>/``,
     keyed by the set of archives (:func:`steps_digest`), so a repeat run does
     not concretize again.
 
@@ -354,6 +359,7 @@ def site_environment(spec: JobSpec, home: str | None) -> dict[str, str]:
         GRAPH_ENV: site_graph(home),
         DECISIONS_ENV: site_decisions(home),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
+        INSTALL_ENV_ENV: posixpath.join(kept, "install-envs"),
         SPACK_ROOT_ENV: posixpath.join(home, SPACK_DIR),
     }
 

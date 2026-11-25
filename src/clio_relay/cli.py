@@ -490,7 +490,10 @@ def site_clean(
     extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
     yes: Annotated[bool, typer.Option("--yes", help="Skip the ask: you approve here")] = False,
     remove_spack: Annotated[
-        bool, typer.Option(help="Delete the Spack store too; rebuilding it takes hours")
+        bool,
+        typer.Option(
+            help="Delete the Spack store and JARVIS's Miniforge too; rebuilding them takes hours"
+        ),
     ] = False,
     forget_decisions: Annotated[
         bool,

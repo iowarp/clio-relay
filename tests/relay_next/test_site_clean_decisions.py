@@ -27,7 +27,7 @@ from clio_relay.testing.fixture_adapter import FixtureAdapter
 from .conftest import add_site
 
 HOME = "/home/me/.relay"
-SPACK = [f"{HOME}/spack", f"{HOME}/spack-config"]
+SPACK = [f"{HOME}/spack", f"{HOME}/spack-config", f"{HOME}/jarvis-cd/site/miniforge3"]
 DECISIONS = f"{HOME}/jarvis-cd/site/decisions.yaml"
 
 

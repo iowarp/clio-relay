@@ -59,12 +59,13 @@ pin=${CLIO_RELAY_JARVIS_PIN:-}
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
 graph=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
+install_env=$(home "${CLIO_RELAY_JARVIS_INSTALL_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
 bind=${CLIO_RELAY_PLAN:-}
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
 unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_OUTPUTS CLIO_RELAY_PLAN
-unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_SPACK_ROOT
+unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_JARVIS_INSTALL_ENV CLIO_RELAY_SPACK_ROOT
 unset JARVIS_ALLOW_LOCAL_BUILD
 # Where checks and builds run is the site's choice: JARVIS asks it (install_placement),
 # relay relays it and sets no placement and no limits of its own.
@@ -87,6 +88,12 @@ fi
 if [ -n "$spack_env" ]; then
   mkdir -p "$spack_env"
   export JARVIS_SPACK_ENV_DIR="$spack_env"
+fi
+# The pip venvs and conda envs JARVIS installs: shared by the install job and the runs,
+# as the Spack env is, since each job has its own JARVIS root.
+if [ -n "$install_env" ]; then
+  mkdir -p "$install_env"
+  export JARVIS_INSTALL_ENV_DIR="$install_env"
 fi
 refuse() {
   tried=$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')
@@ -388,9 +395,10 @@ names one, else ``$CLIO_RELAY_JARVIS_FALLBACK``, relay's pinned jarvis-cd,
 whose ``pin`` file must say ``$CLIO_RELAY_JARVIS_PIN``. When that JARVIS is
 missing or at another pin it writes ``relay.refusal.json`` (with ``explicit``
 or ``pin`` when they apply) and exits 69. A relative path is from the home
-directory. ``$CLIO_RELAY_JARVIS_GRAPH``, ``$CLIO_RELAY_JARVIS_DECISIONS`` and
-``$CLIO_RELAY_JARVIS_SPACK_ENV`` become ``JARVIS_RESOURCE_GRAPH``,
-``JARVIS_SPACK_DECISIONS`` and ``JARVIS_SPACK_ENV_DIR`` (:func:`site_environment`).
+directory. ``$CLIO_RELAY_JARVIS_GRAPH``, ``$CLIO_RELAY_JARVIS_DECISIONS``,
+``$CLIO_RELAY_JARVIS_SPACK_ENV`` and ``$CLIO_RELAY_JARVIS_INSTALL_ENV`` become
+``JARVIS_RESOURCE_GRAPH``, ``JARVIS_SPACK_DECISIONS``, ``JARVIS_SPACK_ENV_DIR``
+and ``JARVIS_INSTALL_ENV_DIR`` (:func:`site_environment`).
 When the CLIO Spack is on the site,
 ``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
 ``bin/spack`` is there). The script unsets

@@ -1,14 +1,16 @@
 """JARVIS's typed install failures (exit 6), passed on as asks or errors.
 
-When ``spack concretize`` or ``spack install`` fails, JARVIS classifies the
-output into one typed issue and exits 6: ``compiler_unavailable``,
-``fetch_failed``, ``build_failed``, ``variant_conflict``, ``no_recipe``,
-``concretize_failed`` or ``install_failed``. Each carries the ``host``, the
-``stage``, the ``failed_node``, the ``log_tail`` and a ``remedy``. It is the
-last line of a ``ppl install`` or ``ppl submit``'s output, and, for an install
-job, in ``<execution>/install/issues.jsonl``.
+When an installer fails, JARVIS classifies the output into one typed issue and
+exits 6. Spack's are ``compiler_unavailable``, ``fetch_failed``,
+``build_failed``, ``variant_conflict``, ``no_recipe``, ``concretize_failed`` and
+``install_failed``; the other methods' end in ``_failed`` too
+(``pip_install_failed``, ``conda_install_failed``, ``conda_bootstrap_failed``,
+``container_pull_failed``, ``venv_failed``). Each carries the ``host``, the
+``stage``, the ``log_tail`` and a ``remedy`` (Spack's also the
+``failed_node``). It is the last line of a ``ppl install`` or ``ppl submit``'s
+output, and, for an install job, in ``<execution>/install/issues.jsonl``.
 
-Relay does not read Spack's log itself. A failure the person answers (a
+Relay does not read the installer's log itself. A failure the person answers (a
 usable compiler, a spec constraint) becomes the usual install asks; any
 other becomes an error with JARVIS's kind, message and remedy.
 """
@@ -23,7 +25,7 @@ from clio_relay import jarvis_report, jarvis_submit, site_facts
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 EXIT_INSTALL_FAILED = 6
-"""``ppl install`` or ``ppl submit`` exit: Spack itself failed, with a typed issue."""
+"""``ppl install`` or ``ppl submit`` exit: an installer failed, with a typed issue."""
 
 KINDS = frozenset(
     {
@@ -37,9 +39,17 @@ KINDS = frozenset(
     }
 )
 CONCRETIZE_KINDS = frozenset({"variant_conflict", "no_recipe", "concretize_failed"})
+
+
+def is_failure(kind: object) -> bool:
+    """Say whether an issue kind is a typed install failure, of any install method."""
+    return kind in KINDS or (isinstance(kind, str) and kind.endswith("_failed"))
+
+
 KEPT = (
     "kind",
     "issue_id",
+    "method",
     "host",
     "stage",
     "packages",
@@ -64,7 +74,7 @@ def failures(issues: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Return the failure issues, one per ``issue_id`` (the last one written wins)."""
     found: dict[str, dict[str, Any]] = {}
     for issue in issues:
-        if issue.get("kind") in KINDS:
+        if is_failure(issue.get("kind")):
             found[str(issue.get("issue_id") or len(found))] = dict(issue)
     return list(found.values())
 
@@ -166,7 +176,8 @@ def refusal(text: str, *, site: str) -> Refusal:
     tail = "\n".join(text.strip().splitlines()[-5:]) or "no output"
     return Refusal(
         RefusalReason.SUBMIT_FAILED,
-        f"JARVIS on {site} exited {EXIT_INSTALL_FAILED} (Spack failed) with no typed issue: {tail}",
+        f"JARVIS on {site} exited {EXIT_INSTALL_FAILED} (the install failed) with no typed "
+        f"issue: {tail}",
         exit_code=EXIT_INSTALL_FAILED,
     )
 

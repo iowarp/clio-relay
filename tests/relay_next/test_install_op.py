@@ -229,6 +229,30 @@ def test_the_install_ask_says_no_run_follows() -> None:
     assert "before the run" not in alone
 
 
+def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
+    report: dict[str, Any] = {
+        "installers": {
+            "spack": {"packages": {"sim": {"status": "missing", "spec": "lammps@2Aug2023"}}},
+            "pip": {"packages": {"tool": {"status": "missing", "query": ["rich-cli", "pyyaml"]}}},
+            "container": {"packages": {"box": {"status": "missing", "query": ["alpine:3.20"]}}},
+        },
+        "issues": [],
+    }
+    summary = jarvis_report.install_summary(report)
+    assert {item["method"]: item["spec"] for item in summary["build"]} == {
+        "spack": "lammps@2Aug2023",
+        "pip": "rich-cli pyyaml",
+        "container": "alpine:3.20",
+    }
+    message = install_wording.install_message(
+        report, site="Ares", package="demo.tool", names={}, walltime=None
+    )
+    assert "Built: lammps@2Aug2023." in message
+    assert "Installed: rich-cli pyyaml (with pip), alpine:3.20 (with container)." in message
+    refusal = jarvis_report.install_needed(report, site="Ares")
+    assert "JARVIS installs 3 package(s)" in refusal.message
+
+
 def _left_by_a_dead_process(service: RelayService, operation_id: str, stage: str) -> None:
     """Leave the record in ``submitting`` at ``stage``, as a relay that died there leaves it."""
     with service.operations.locked(operation_id):

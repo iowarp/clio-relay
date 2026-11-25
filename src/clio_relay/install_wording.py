@@ -33,11 +33,15 @@ def install_message(
     applied = applied_decisions(report)
     asked = len(choice_issues(report))
     built: list[str] = []
+    installed: list[str] = []
     for item in summary["build"]:
         detail = item["spec"] or item["package"]
         if item["missing"]:
             detail = f"{detail} ({item['missing']} missing)"
-        built.append(detail)
+        if item["method"] in (None, "", "spack"):
+            built.append(detail)
+        else:
+            installed.append(f"{detail} (with {item['method']})")
     reuse = ""
     if applied:
         named = ", ".join(
@@ -50,21 +54,24 @@ def install_message(
     before = f"before {package} runs" if run else f"for {package}"
     then = "then the run goes ahead" if run else "and nothing runs after it"
     last = "before the run" if run else "ahead of any run; nothing runs after it"
-    if not built and asked:
+    if not built and not installed and asked:
         return (
             f"JARVIS needs {asked} choice(s) from you {before} on {site}; nothing has to be "
-            f"built. It applies your answers in a short job on the site, {then}.{reuse} Go ahead?"
+            f"installed. It applies your answers in a short job on the site, {then}.{reuse} "
+            "Go ahead?"
         )
-    if not built:
+    if not built and not installed:
         return (
             f"JARVIS applies its recorded choices for {site} in a short job {before}; "
-            f"nothing has to be built.{reuse} Go ahead?"
+            f"nothing has to be installed.{reuse} Go ahead?"
         )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
         parts.append("Reused: " + ", ".join(summary["reuse"]) + ".")
     if built:
         parts.append("Built: " + ", ".join(built) + ".")
+    if installed:
+        parts.append("Installed: " + ", ".join(installed) + ".")
     if asked:
         parts.append(f"JARVIS has {asked} question(s) for you after this.")
     if reuse:

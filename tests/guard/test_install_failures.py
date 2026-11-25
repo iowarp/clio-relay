@@ -76,6 +76,36 @@ def test_each_kind_keeps_its_name_and_a_reason(kind: str, reason: RefusalReason)
     assert refusal.data["kind"] == kind
 
 
+@pytest.mark.parametrize(
+    ("kind", "method"),
+    [
+        ("pip_install_failed", "pip"),
+        ("conda_install_failed", "conda"),
+        ("conda_bootstrap_failed", "conda"),
+        ("container_pull_failed", "container"),
+        ("venv_failed", "pip"),
+    ],
+)
+def test_every_install_method_fails_the_same_typed_way(kind: str, method: str) -> None:
+    failed = {
+        "issue_id": "m1",
+        "kind": kind,
+        "method": method,
+        "host": "ares-comp-05",
+        "stage": "install",
+        "packages": ["tool"],
+        "message": f"{method} could not install tool",
+        "remedy": "Read log_tail.",
+        "log_tail": "ERROR: no such thing",
+    }
+    refusal = install_failures.refusal(_report(failed), site="ares")
+    assert refusal.reason == RefusalReason.SUBMIT_FAILED
+    assert refusal.data["kind"] == kind
+    assert refusal.data["issues"][0]["method"] == method
+    assert f"{method} could not install tool" in refusal.message
+    assert "Spack" not in refusal.message
+
+
 def test_a_compiler_the_person_picks_becomes_the_install_asks() -> None:
     refusal = install_failures.refusal(_report(COMPILER), site="ares")
     assert refusal.data["needs"] == NEEDS_INSTALL

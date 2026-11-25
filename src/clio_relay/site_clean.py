@@ -7,8 +7,9 @@ venv with JARVIS's resource graph, and the login hop. Nothing outside it goes, s
 another relay home on the same account (its own ``remote_dir``) is untouched; a
 ``hop_dir`` setting elsewhere adds only this site's hop directory. The person's
 Spack store (``<site home>/spack`` and
-``<site home>/spack-config``) is kept unless ``remove_spack`` says otherwise;
-rebuilding it takes hours. JARVIS's recorded install answers
+``<site home>/spack-config``), and the Miniforge JARVIS installed for conda
+packages (``<site home>/jarvis-cd/site/miniforge3``), are kept unless
+``remove_spack`` says otherwise; rebuilding them takes hours. JARVIS's recorded install answers
 (``<site home>/jarvis-cd/site/decisions.yaml``: which MPI, which compiler) are
 facts about the cluster the person confirmed, so they are kept too unless
 ``forget_decisions`` says otherwise; the next install then asks them again. Then it

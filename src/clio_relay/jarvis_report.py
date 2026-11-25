@@ -90,12 +90,13 @@ REUSED_STATUSES = frozenset({"satisfied", "installed"})
 def install_summary(
     report: Mapping[str, Any], names: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    """Return what the install reuses and what it builds, per package.
+    """Return what the install reuses and what it installs, per package.
 
     ``reuse`` names the packages the site already has; ``undecided`` the ones
     JARVIS cannot tell about until a question is answered (``needs_decision``);
-    ``build`` lists the others, with the spec and how many of its dependencies are
-    missing. JARVIS reports a package by its pipeline step (``pkg_name``);
+    ``build`` lists the others, with their install method, the spec (for pip,
+    conda and container, the joined install query) and how many of its
+    dependencies are missing. JARVIS reports a package by its pipeline step (``pkg_name``);
     ``names`` (:func:`~clio_relay.jarvis_submit.package_names`) turns that back into the package.
     """
     names = names or {}
@@ -114,12 +115,16 @@ def install_summary(
                 continue
             missing = entry.get("missing")
             count = len(cast(list[object], missing)) if isinstance(missing, list) else None
+            spec = entry.get("spec")
+            query = entry.get("query")
+            if not spec and isinstance(query, list):
+                spec = " ".join(str(item) for item in cast(list[object], query)) or None
             build.append(
                 {
                     "package": name,
                     "method": method,
                     "status": entry.get("status"),
-                    "spec": entry.get("spec"),
+                    "spec": spec,
                     "missing": count,
                 }
             )
@@ -288,7 +293,7 @@ def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None
     """
     summary = install_summary(report)
     message = (
-        f"the package's software is not installed on {site}: JARVIS builds "
+        f"the package's software is not installed on {site}: JARVIS installs "
         f"{len(summary['build'])} package(s) once you approve"
     )
     if not summary["build"] and choice_issues(report):
