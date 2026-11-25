@@ -459,7 +459,15 @@ def summary(plan: Mapping[str, Any]) -> str:
     shown = ", then ".join(
         f"{c.get('label') or c.get('id')} on {_nodes(c.get('nodes'))}" for c in components
     )
+    labels = {str(c.get("id")): str(c.get("label") or c.get("id")) for c in components}
+    flows = "; ".join(
+        f"{labels.get(str(e.get('from')), e.get('from'))} feeds "
+        f"{labels.get(str(e.get('to')), e.get('to'))} ({e.get('label') or e.get('kind')})"
+        for e in cast(list[dict[str, Any]], plan.get("couplings") or [])
+        if e.get("kind") != "interceptor"
+    )
     line = "JARVIS's plan: " + ", ".join(parts)
-    line = f"{line}; {shown}" if shown else line
+    line = f"{line}; starts {shown}" if shown else line
+    line = f"{line}; {flows}" if flows else line
     notes = [f"JARVIS notes: {a['message']}" for a in advisories(plan) if a.get("message")]
     return "\n".join([line, *notes])

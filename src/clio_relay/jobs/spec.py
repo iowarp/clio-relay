@@ -229,6 +229,90 @@ class PackageRef(_Spec):
         return self.version, self.sha256
 
 
+COUPLING_KINDS = ("stream", "file", "service", "interceptor", "control", "other")
+
+
+class Coupling(_Spec):
+    """Data moving from one pipeline step to another: producer to consumer.
+
+    The direction is the data's, not the order JARVIS starts the steps in: JARVIS
+    starts a service before the solver that feeds it. Relay declares each
+    coupling to JARVIS as the pipeline's ``couplings:``.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", validate_by_alias=True, validate_by_name=True, serialize_by_alias=True
+    )
+
+    producer: str = Field(
+        alias="from",
+        min_length=1,
+        description=(
+            "The step whose data flows out: its package, e.g. clio_jarvis.gray_scott, or its "
+            "step name when the package appears twice (gray_scott_2)"
+        ),
+    )
+    consumer: str = Field(alias="to", min_length=1, description="The step that reads it")
+    kind: Literal["stream", "file", "service", "interceptor", "control", "other"] = "stream"
+    label: str | None = Field(default=None, max_length=120)
+
+
+def step_ids(steps: list[PackageRef]) -> list[str]:
+    """Return each step's ``pkg_name`` in the pipeline.
+
+    One step is ``pkg``. Several are named by their package, with ``_2``, ``_3``
+    for a package that appears again.
+    """
+    if len(steps) == 1:
+        return ["pkg"]
+    names: list[str] = []
+    for step in steps:
+        base = step.name.partition(".")[2] or step.name
+        name, count = base, 1
+        while name in names:
+            count += 1
+            name = f"{base}_{count}"
+        names.append(name)
+    return names
+
+
+def step_id(steps: list[PackageRef], end: str) -> str:
+    """Return the step id a coupling's end names: a step id, else one step's package."""
+    ids = step_ids(steps)
+    if end in ids:
+        return end
+    found = [
+        id_
+        for id_, step in zip(ids, steps, strict=True)
+        if end in (step.name, step.name.partition(".")[2])
+    ]
+    if len(found) != 1:
+        named = "names no step" if not found else "names more than one step"
+        raise ValueError(f"coupling end {end!r} {named}; use one of {', '.join(ids)}")
+    return found[0]
+
+
+def flow_order(ids: list[str], edges: list[tuple[str, str]]) -> list[str]:
+    """Return ``ids`` producer before consumer along ``edges``, else in their given order.
+
+    ``ids`` come in launch order, which keeps ties and anything a cycle leaves.
+    """
+    feeds = {id_: 0 for id_ in ids}
+    for _producer, consumer in edges:
+        if consumer in feeds:
+            feeds[consumer] += 1
+    ordered: list[str] = []
+    left = list(ids)
+    while left:
+        ready = next((id_ for id_ in left if feeds[id_] == 0), left[0])
+        left.remove(ready)
+        ordered.append(ready)
+        for producer, consumer in edges:
+            if producer == ready and consumer in left:
+                feeds[consumer] -= 1
+    return ordered
+
+
 class Layout(_Spec):
     """A way to lay a job out on the allocation: what the agent chose, or an alternative."""
 
@@ -289,6 +373,15 @@ class JobSpec(_Spec):
             "alternatives. The person sees them in the spend ask"
         ),
     )
+    couplings: list[Coupling] = Field(
+        default_factory=list[Coupling],
+        description=(
+            "Which way data moves between a pipeline's steps, producer to consumer, e.g. "
+            "{from: clio_jarvis.gray_scott, to: clio_jarvis.pvserver}. Optional: relay "
+            "takes them from the packages' contracts when left out. The packages' order is "
+            "the order JARVIS starts them in, not the data's direction"
+        ),
+    )
 
     @model_validator(mode="after")
     def _one_entry_point(self) -> Self:
@@ -296,6 +389,13 @@ class JobSpec(_Spec):
             raise ValueError("give package or packages, not both")
         if (self.executable is None) == (not self.steps()):
             raise ValueError("give exactly one of executable or package(s)")
+        if self.couplings:
+            steps = self.steps()
+            if len(steps) < 2:
+                raise ValueError("couplings join the steps of a pipeline of two or more")
+            for edge in self.couplings:
+                if step_id(steps, edge.producer) == step_id(steps, edge.consumer):
+                    raise ValueError(f"coupling {edge.producer!r} feeds itself")
         return self
 
     def steps(self) -> list[PackageRef]:
@@ -311,11 +411,13 @@ class JobSpec(_Spec):
         return self.model_copy(update={"package": None, "packages": steps})
 
     def dump(self) -> dict[str, Any]:
-        """Return the JSON form. Empty ``packages`` and ``sizing`` are left out, so older
-        digests hold."""
+        """Return the JSON form. Empty ``packages``, ``couplings`` and ``sizing`` are left
+        out, so older digests hold."""
         data = self.model_dump(mode="json")
         if not data.get("packages"):
             data.pop("packages", None)
+        if not data.get("couplings"):
+            data.pop("couplings", None)
         if data.get("sizing") is None:
             data.pop("sizing", None)
         return data

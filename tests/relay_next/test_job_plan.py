@@ -168,7 +168,7 @@ def test_the_summary_names_the_directives_and_components() -> None:
     line = jarvis_plan.summary(_document())
     assert line == (
         "JARVIS's plan: partition compute, account the site default, time 01:00:00; "
-        "Hello solver on 2 nodes, then Viewer on 1 node"
+        "starts Hello solver on 2 nodes, then Viewer on 1 node; Hello solver feeds Viewer (BP)"
     )
 
 

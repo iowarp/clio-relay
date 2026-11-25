@@ -46,7 +46,7 @@ from pydantic import Field
 from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.hooks import Charge
 from clio_relay.jobs.records import OperationRecord, OperationState
-from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec
+from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec, flow_order, step_id
 from clio_relay.surface.endpoints import service_ready
 
 if TYPE_CHECKING:
@@ -246,10 +246,39 @@ def _planned(record: OperationRecord, plan: dict[str, Any], state: str) -> list[
     return found
 
 
-def _couplings(plan: dict[str, Any]) -> list[dict[str, Any]]:
+def _couplings(plan: dict[str, Any], job: JobSpec | None) -> list[dict[str, Any]]:
+    """JARVIS's couplings, else the job's own: producer to consumer, by component id."""
     keys = ("from", "to", "kind", "label", "source")
     couplings = cast(list[dict[str, Any]], plan.get("couplings") or [])
-    return [{key: edge.get(key) for key in keys} for edge in couplings]
+    if couplings:
+        return [{key: edge.get(key) for key in keys} for edge in couplings]
+    if job is None or not job.couplings:
+        return []
+    steps = job.steps()
+    return [
+        {
+            "from": step_id(steps, edge.producer),
+            "to": step_id(steps, edge.consumer),
+            "kind": edge.kind,
+            "label": edge.label or edge.kind,
+            "source": "relay",
+        }
+        for edge in job.couplings
+    ]
+
+
+def _in_flow_order(
+    components: list[dict[str, Any]], couplings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Order ``components`` producer before consumer; each keeps its ``launch_order``."""
+    ids = [str(item.get("id")) for item in components]
+    for index, item in enumerate(components, start=1):
+        item["launch_order"] = index
+    edges = [(str(edge.get("from")), str(edge.get("to"))) for edge in couplings]
+    if not edges or len(set(ids)) < len(ids):
+        return components
+    by_id = dict(zip(ids, components, strict=True))
+    return [by_id[id_] for id_ in flow_order(ids, edges)]
 
 
 def _scheduler(service: RelayService, record: OperationRecord) -> str | None:
@@ -325,6 +354,8 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     plan = _plan(record) or {}
     walltime = plan.get("time_limit_s") or walltime
     facts = cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
+    couplings = _couplings(plan, job)
+    components = _planned(record, plan, state) if plan else _components(record, job, charge, state)
     return {
         "version": VERSION,
         "operation_id": record.operation_id,
@@ -355,10 +386,8 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
             if phase == "queued" and queue
             else None
         ),
-        "components": _planned(record, plan, state)
-        if plan
-        else _components(record, job, charge, state),
-        "couplings": _couplings(plan),
+        "components": _in_flow_order(components, couplings),
+        "couplings": couplings,
         "advisories": jarvis_plan.advisories(plan, facts),
         "settled_at_launch": jarvis_plan.advisories(plan, facts, settled=True),
         "script": plan.get("script"),

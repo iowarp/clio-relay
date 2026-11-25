@@ -64,7 +64,7 @@ from clio_relay.jarvis_record import install_progress, scheduler_start
 from clio_relay.jarvis_site_script import SITE_SCRIPT as SITE_SCRIPT
 from clio_relay.jobs.handles import VIEW_METADATA, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef
+from clio_relay.jobs.spec import CustomValue, InputRef, JobSpec, PackageRef, step_id, step_ids
 
 ARCHIVE_DIR = ".relay-package"
 """Where the site script finds the package archive, relative to the job directory."""
@@ -431,22 +431,25 @@ def package_names(steps: list[PackageRef]) -> dict[str, str]:
 
 
 def step_names(steps: list[PackageRef]) -> list[str]:
-    """Return each step's ``pkg_name`` in the pipeline.
+    """Return each step's ``pkg_name`` in the pipeline (:func:`~clio_relay.jobs.spec.step_ids`)."""
+    return step_ids(steps)
 
-    One step is ``pkg``. Several are named by their package, with ``_2``, ``_3``
-    for a package that appears again.
-    """
-    if len(steps) == 1:
-        return ["pkg"]
-    names: list[str] = []
-    for step in steps:
-        base = step.name.partition(".")[2] or step.name
-        name, count = base, 1
-        while name in names:
-            count += 1
-            name = f"{base}_{count}"
-        names.append(name)
-    return names
+
+def pipeline_couplings(spec: JobSpec) -> list[dict[str, str]]:
+    """Return the job's couplings as JARVIS's ``couplings:``, each end a step's ``pkg_name``."""
+    steps = spec.steps()
+    found: list[dict[str, str]] = []
+    for edge in spec.couplings:
+        item = {
+            "from": step_id(steps, edge.producer),
+            "to": step_id(steps, edge.consumer),
+            "kind": edge.kind,
+        }
+        if edge.label:
+            item["label"] = edge.label
+        if item not in found:
+            found.append(item)
+    return found
 
 
 # The pipeline
@@ -655,7 +658,9 @@ def pipeline_document(
     """Return the JARVIS pipeline for ``spec``'s packages, with typed parameters.
 
     Each package is one ``pkgs:`` entry, in order (:func:`step_names`), and all
-    share the one ``scheduler:`` block. ``host_slice``, ``start_mode`` and the
+    share the one ``scheduler:`` block. The order is the order JARVIS starts
+    them in; which way data moves between them is the pipeline's ``couplings:``
+    (:func:`pipeline_couplings`). ``host_slice``, ``start_mode`` and the
     package's other parameters pass through as they are. The pipeline names no
     ``env``, so JARVIS captures the environment it is loaded in, which is where
     the site script exports the job's environment.
@@ -690,6 +695,9 @@ def pipeline_document(
     if scheduler is not None:
         document["scheduler"] = dict(scheduler)
     document["pkgs"] = entries
+    couplings = pipeline_couplings(spec)
+    if couplings:
+        document["couplings"] = couplings
     return document
 
 

@@ -139,6 +139,22 @@ from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
 cannot plan, and an install job show the card as relay records it, with
 `source: relay`.
 
+A pipeline's couplings say which way data moves, producer to consumer, and a
+host draws its arrows from them alone. The order of the packages is the order
+JARVIS starts them in, which runs against the data: JARVIS starts a service
+before the solver that feeds it, so a pvserver watching gray_scott starts
+first while gray_scott feeds it. The card's components come producer first,
+each with its `launch_order` (1 starts first). Relay declares the couplings to
+JARVIS as the pipeline's `couplings:`. A job can name them
+(`couplings: [{from, to, kind, label}]`, each end a package or a step id), and
+when it names none relay takes them from the packages' contracts: a service
+whose contract's `service.data_flow` is `in`, as pvserver's is, is fed by every
+other step whose contract declares outputs; one whose `data_flow` is `out` feeds
+them. The text says the same, as in "Start the pipeline clio_jarvis.gray_scott
+feeding clio_jarvis.pvserver (clio_jarvis.pvserver starts first)". With no
+couplings, the card draws no arrows and the text names the packages in launch
+order, joined by "then".
+
 A card stays current after its task ends. A `serve` task completes at
 readiness, but the service's job runs on, and a host stops polling a finished
 task. So relay looks at each open job itself every 30 s, unless a poll looked

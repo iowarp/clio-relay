@@ -39,12 +39,20 @@ from clio_relay.jobs.records import (
     new_id,
 )
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
+from clio_relay.jobs.spec import (
+    JobSpec,
+    ServiceSpec,
+    canonical_digest,
+    flow_order,
+    step_id,
+    step_ids,
+)
 from clio_relay.login_load import light_argv
 from clio_relay.packages import (
     PackageCatalog,
     pipeline_conflict,
     stage_current,
+    with_contract_couplings,
     with_contract_resources,
 )
 from clio_relay.sites.models import SiteEntry
@@ -93,31 +101,76 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
 
 
 def _steps_label(spec: JobSpec) -> str | None:
-    """Name a package job: its package, or its pipeline's steps in order."""
-    names = [step.name for step in spec.steps()]
+    """Name a package job: its package, or its pipeline by the way data flows.
+
+    With couplings, each producer is named feeding its consumer, and when JARVIS
+    starts the steps in another order the label says which starts first, so no
+    one reads the launch order as the data's direction. Without couplings the
+    steps are named in launch order.
+    """
+    steps = spec.steps()
+    names = [step.name for step in steps]
     if len(names) <= 1:
         return names[0] if names else None
-    return "the pipeline " + " then ".join(names)
+    if not spec.couplings:
+        return "the pipeline " + " then ".join(names)
+    ids = step_ids(steps)
+    package = dict(zip(ids, names, strict=True))
+    if len(set(names)) < len(names):
+        package = {id_: id_ for id_ in ids}
+    edges = [(step_id(steps, e.producer), step_id(steps, e.consumer)) for e in spec.couplings]
+    parts = [f"{package[producer]} feeding {package[consumer]}" for producer, consumer in edges]
+    joined = {end for edge in edges for end in edge}
+    parts += [f"{package[id_]} beside them" for id_ in ids if id_ not in joined]
+    label = "the pipeline " + ", ".join(parts)
+    if flow_order(ids, edges)[0] != ids[0]:
+        label += f" ({package[ids[0]]} starts first)"
+    return label
+
+
+def _record_job(record: OperationRecord) -> JobSpec | None:
+    raw = record.spec.get("job") if record.kind == "serve" else record.spec
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return JobSpec.model_validate(raw)
+    except ValueError:
+        return None
 
 
 def _steps_view(record: OperationRecord) -> list[dict[str, Any]]:
-    """Return a package job's pipeline steps, in order, with the nodes each gets."""
-    raw = record.spec.get("job") if record.kind == "serve" else record.spec
-    if not isinstance(raw, dict):
+    """Return a package job's pipeline steps, in launch order, with the nodes each gets."""
+    job = _record_job(record)
+    if job is None:
         return []
-    try:
-        steps = JobSpec.model_validate(raw).steps()
-    except ValueError:
-        return []
+    steps = job.steps()
     return [
         {
+            "id": id_,
             "package": step.name,
             "version": step.version,
             "sha256": step.sha256,
             "nodes": step.nodes(),
             "service": step.service,
         }
-        for step in steps
+        for id_, step in zip(step_ids(steps), steps, strict=True)
+    ]
+
+
+def _couplings_view(record: OperationRecord) -> list[dict[str, Any]]:
+    """Return the pipeline's couplings, producer to consumer, each end a step's id."""
+    job = _record_job(record)
+    if job is None or not job.couplings:
+        return []
+    steps = job.steps()
+    return [
+        {
+            "from": step_id(steps, edge.producer),
+            "to": step_id(steps, edge.consumer),
+            "kind": edge.kind,
+            "label": edge.label or edge.kind,
+        }
+        for edge in job.couplings
     ]
 
 
@@ -256,6 +309,7 @@ class RelayService:
             if conflict is not None:
                 raise conflict
             spec = with_contract_resources(spec, entries)
+            spec = with_contract_couplings(spec, entries)
         attributes = spec.attributes
         changes: dict[str, Any] = {}
         if attributes.queue_name is None and site.defaults.queue is not None:
@@ -1012,6 +1066,7 @@ class RelayService:
             "provenance": run_provenance(record.outputs),
             "asks": asks,
             "steps": _steps_view(record),
+            "couplings": _couplings_view(record),
             "result": record.result,
             "error": record.error,
             "spec_digest": record.spec_digest,

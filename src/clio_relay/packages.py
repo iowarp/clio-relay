@@ -50,7 +50,7 @@ from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, PackageRef
+from clio_relay.jobs.spec import COUPLING_KINDS, Coupling, JobSpec, PackageRef, step_ids
 
 STAGE_COMMAND = (
     'the packages tool: packages(op="stage", package="<repository>.<package>"), from '
@@ -73,6 +73,9 @@ class PackageEntry(BaseModel):
     outputs: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     progress: dict[str, Any] | None = None
     resources: dict[str, Any] | None = None
+    data_flow: dict[str, Any] | None = None
+    """A service's ``service.data_flow``: ``direction`` (``in``, the other steps' outputs
+    feed it; ``out``, it feeds them), ``kind`` and ``label``."""
     source: dict[str, Any] | None = None
     origin: Literal["sources", "dir"] | None = None
     """``sources`` when staged by name from relay's package sources, ``dir`` when the
@@ -201,6 +204,8 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
     ]
     progress = contract.get("progress")
     resources = contract.get("resources")
+    service = contract.get("service")
+    flow = cast(dict[str, Any], service).get("data_flow") if isinstance(service, dict) else None
     return PackageEntry(
         name=name,
         version=str(chosen),
@@ -217,8 +222,62 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
         if isinstance(progress, dict)
         else None,
         resources=_json(resources) if isinstance(resources, dict) else None,
+        data_flow=contract_data_flow(flow),
         source=info.source,
     )
+
+
+def contract_data_flow(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    flow = cast(dict[str, Any], value)
+    if flow.get("direction") not in ("in", "out") or flow.get("kind") not in COUPLING_KINDS:
+        return None
+    found = {"direction": flow["direction"], "kind": flow["kind"]}
+    if isinstance(flow.get("label"), str) and flow["label"].strip():
+        found["label"] = " ".join(flow["label"].split())
+    return found
+
+
+def contract_couplings(
+    steps: Sequence[PackageRef], entries: Sequence[PackageEntry | None]
+) -> list[Coupling]:
+    """Return the couplings the steps' contracts declare, producer to consumer.
+
+    A service whose ``data_flow`` is ``in`` reads the outputs of every other step
+    whose contract declares outputs; one whose ``data_flow`` is ``out`` feeds every
+    other step. Each end is the step's id (:func:`~clio_relay.jobs.spec.step_ids`).
+    """
+    if len(steps) < 2:
+        return []
+    ids = step_ids(list(steps))
+    found: list[Coupling] = []
+    for index, entry in enumerate(entries):
+        flow = entry.data_flow if entry is not None else None
+        if flow is None:
+            continue
+        for other, peer in enumerate(entries):
+            if other == index:
+                continue
+            if flow["direction"] == "in" and not (peer is not None and peer.outputs):
+                continue
+            ends = (
+                (ids[other], ids[index]) if flow["direction"] == "in" else (ids[index], ids[other])
+            )
+            edge = Coupling.model_validate(
+                {"from": ends[0], "to": ends[1], "kind": flow["kind"], "label": flow.get("label")}
+            )
+            if all((e.producer, e.consumer) != ends for e in found):
+                found.append(edge)
+    return found
+
+
+def with_contract_couplings(spec: JobSpec, entries: Sequence[PackageEntry | None]) -> JobSpec:
+    """Fill the pipeline's couplings from its steps' contracts when the job names none."""
+    if spec.couplings:
+        return spec
+    found = contract_couplings(spec.steps(), entries)
+    return spec.model_copy(update={"couplings": found}) if found else spec
 
 
 # A contract's resources (RL15): PSI/J names whose values may read the parameters
@@ -522,17 +581,20 @@ class PackageCatalog:
     def entry(self, package: PackageRef, content: ContentStore) -> PackageEntry | None:
         """Return the entry of the pinned ``package``, or ``None`` if it was not staged here.
 
-        An entry staged before relay read the contract's resources is read again
-        from its archive in ``content``, and saved.
+        An entry staged before relay read the contract's resources and data flow is
+        read again from its archive in ``content``, and saved.
         """
         found = None if package.sha256 is None else self.records.get(package.sha256)
-        if found is None or "resources" in found.model_fields_set or not content.has(found.sha256):
+        current = found is not None and {"resources", "data_flow"} <= found.model_fields_set
+        if found is None or current or not content.has(found.sha256):
             return found
         try:
             fresh = describe_archive(content.get(found.sha256), found.name, version=found.version)
         except Refusal:
             return found
-        updated = found.model_copy(update={"resources": fresh.resources})
+        updated = found.model_copy(
+            update={"resources": fresh.resources, "data_flow": fresh.data_flow}
+        )
         self.put(updated)
         return updated
 
