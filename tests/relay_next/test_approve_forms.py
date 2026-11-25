@@ -17,6 +17,8 @@ from clio_relay.adapters.hooks import (
     said_yes,
     with_choice_meta,
 )
+from clio_relay.adapters.ssh import pricing as ssh_pricing
+from clio_relay.jobs.spec import JobSpec
 from clio_relay.surface.guarding import cost_text, node_hours_text
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -86,6 +88,16 @@ def test_the_cost_names_the_walltime_the_nodes_and_the_node_hours() -> None:
     wide = Charge(site="ares", nodes=2, walltime_s=5400, node_hours=3)
     assert cost_text(wide) == "up to 1 h 30 min on 2 nodes (3 node-hours)"
     assert cost_text(Charge(site="ares", nodes=1)) is None
+
+
+def test_the_cost_takes_the_nodes_and_walltime_from_the_job() -> None:
+    # The live LAMMPS run: 2 nodes for 5 minutes is the 0.1667 node-hours it asked for.
+    spec = JobSpec.model_validate(
+        {"executable": "x", "resources": {"node_count": 2}, "attributes": {"duration": "PT5M"}}
+    )
+    charge = ssh_pricing.charge("ares", spec)
+    assert charge.node_hours == 0.1667
+    assert cost_text(charge) == "up to 5 min on 2 nodes (about 0.17 node-hours)"
 
 
 def test_an_approval_says_what_each_answer_does() -> None:
