@@ -346,8 +346,14 @@ def install_blocked(issues: list[dict[str, Any]], *, site: str) -> Refusal:
     hint = first.get("hint")
     message = f"JARVIS cannot install the package's software on {site}: {detail}"
     if isinstance(hint, str) and hint:
-        message = f"{message}. {hint}"
+        message = then(message, hint)
     return Refusal(RefusalReason.SUBMIT_FAILED, message, issues=issues, needs=NEEDS_INSTALL)
+
+
+def then(sentence: str, more: str) -> str:
+    """``sentence``, ended once, followed by ``more``."""
+    sentence = sentence.rstrip()
+    return f"{sentence} {more}" if sentence.endswith((".", "!", "?")) else f"{sentence}. {more}"
 
 
 def answers_document(choices: Mapping[str, tuple[str, str]]) -> dict[str, Any]:

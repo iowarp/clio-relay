@@ -119,7 +119,7 @@ def install_failed(issues: list[dict[str, Any]], *, site: str, **extra: Any) -> 
     if first.get("message"):
         message = f"{message}: {first['message']}"
     if first.get("remedy"):
-        message = f"{message}. {first['remedy']}"
+        message = jarvis_report.then(message, str(first["remedy"]))
     reason = RefusalReason.SUBMIT_FAILED
     if kind == "fetch_failed":
         reason = RefusalReason.UNREACHABLE

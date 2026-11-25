@@ -61,6 +61,13 @@ def test_a_build_failure_is_a_typed_error_without_the_raw_log() -> None:
     assert tail[0] == "line 20" and tail[-1] == "line 39"
 
 
+def test_a_message_that_ends_its_sentence_gets_one_period() -> None:
+    pulled = dict(BUILD_FAILED, kind="container_pull_failed", message="podman could not pull x:3.")
+    refusal = install_failures.refusal(_report(pulled), site="ares")
+    assert "could not pull x:3. Read the build log" in refusal.message
+    assert ".." not in refusal.message
+
+
 @pytest.mark.parametrize(
     ("kind", "reason"),
     [
