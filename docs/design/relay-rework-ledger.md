@@ -632,6 +632,15 @@ All runs are in `~/clio-relay-rework/clio-relay-w1`, branch `jaimecernuda-relay-
 - **An install the check still finds missing ends the operation.** On Ares with jarvis-cd f6d9d90 (op_6dab49add34e3992598cb1a6), the container install job on ares-comp-18 pulled alpine:3.20 into its node-local store and archived it on the shared FS. JARVIS's check on the login host then reported the same `not_installed` (the login host's /home is local xfs, so its own store isn't node-local and the check didn't read the archive). Relay asked the same approval again. The jarvis owner fixed the check in 4491832.
   - Decision: relay remembers what each completed install job was asked to install (`missing_keys`: `method:package:subject` per `not_installed` issue and package to build). If the next check reports any of them missing again, the operation ends with `kind: installed_still_missing`, JARVIS's subject and question, and `retry` false (`jarvis_report.still_missing`). It doesn't ask again. A check job (`recheck`) installs nothing, so it isn't counted. Other software missing after an install is still asked. A JARVIS fault can't loop the person.
   - Tests (not run locally): tests/relay_next/test_install_op.py (the stuck check, the refusal's text).
+- **Container rows at jarvis-cd 4491832, by path (Ares, 2026-11-25, relay 646ec721).** Evidence is in the W1 session files (container-4491832-out.log, run2-*).
+  - Install (op_2fdd3bcda1b5170a95acab18, job 28960 on ares-comp-18). The approval named the image, the job pulled and archived it, and the login check then gave reuse, so the op completed. No loop.
+  - Check: a second install (op_5f788fd97d0d00e2f091ad61) is satisfied, with no asks and no job.
+  - Install pinned to ares-comp-19 with the archive removed (op_e99e93492d78f8f0014a005e, job 28962). `/` was 100% used with 32 MB free, but the 8 MB alpine pull fit, so the engine was usable and JARVIS rightly raised no `container_engine_unusable`. Proving that error would mean filling a shared node's disk, so it's left to JARVIS's own tests.
+  - 2-node run (op_88f5ba0a214b11aced7e5dcf, job 28961 on ares-comp-10/11, exit 1). Both nodes loaded the image from the shared archive. JARVIS findings, sent to the jarvis owner:
+    - The node wrapper runs `podman-compose` by bare name, but it exists only in the JARVIS venv's bin, so it's `not found` on the nodes.
+    - The generated compose uses `/bin/bash` and `/usr/sbin/sshd`, which a plain image like alpine lacks.
+    - JARVIS logs "Containers started (SSH ready)" even when `up` failed.
+    - Relay reported the failed job and its logs as they were.
 
   Branch `jaimecernuda-relay-rework-w2`. Files: `tests/fixtures/sites/` (one Dockerfile and entrypoint per site, the two services, a README), `scripts/ares/fixtures.sh`, `tests/test_fixtures_smoke.py`.
 
