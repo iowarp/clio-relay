@@ -18,7 +18,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from clio_relay.adapters.hooks import Ask, ChoiceOption, choice_field, choice_meta
+from clio_relay.adapters.hooks import (
+    Ask,
+    ChoiceOption,
+    choice_field,
+    choice_meta,
+    with_choice_meta,
+)
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.sites.models import SiteEntry
@@ -152,10 +158,7 @@ def fold(
     properties[FIELD] = field(message)
     schema["properties"] = properties
     into.requested_schema = schema
-    into.meta = {
-        **(into.meta or {}),
-        **choice_meta(into.ask_id, FIELD, OPTIONS, title=TITLE),
-    }
+    into.meta = with_choice_meta(into.meta, choice_meta(into.ask_id, FIELD, OPTIONS, title=TITLE))
     service.asks.put(into.ask_id, into)
     state = {"ask_id": into.ask_id, "operations": operations, "in_card": True}
     record.result = {**(record.result or {}), KEY: state}

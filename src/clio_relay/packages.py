@@ -9,7 +9,7 @@ such as a plugin's copy of clio-jarvis). Staging runs no git and fetches
 nothing. ``python -m clio_relay.packages`` does the same from a shell. The
 entry says what the archive holds, read from the archive itself and never by
 running it: the parameters of ``_configure_menu`` in ``pkg.py``, and the
-summary, version, outputs, progress and resources of a ``contract.yaml``
+title, summary, version, outputs, progress and resources of a ``contract.yaml``
 beside it when the package has one.
 
 ``describe(site=...)`` lists the catalog, so an agent finds a package by name.
@@ -29,7 +29,7 @@ import json
 import re
 import sys
 import tarfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -68,6 +68,8 @@ class PackageEntry(BaseModel):
     version: str
     sha256: str
     kind: str | None = None
+    title: str | None = None
+    """The contract's ``title``: the software's name as a person knows it (LAMMPS)."""
     summary: str | None = None
     parameters: dict[str, Any] = Field(default_factory=dict[str, Any])
     outputs: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
@@ -211,6 +213,7 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
         version=str(chosen),
         sha256=info.sha256,
         kind=str(contract["kind"]) if contract.get("kind") else None,
+        title=" ".join(str(contract["title"]).split()) if contract.get("title") else None,
         summary=" ".join(str(contract["summary"]).split()) if contract.get("summary") else None,
         parameters=_parameters(_menu(texts.get(f"{base}/pkg.py", "")), contract),
         outputs=outputs,
@@ -456,6 +459,11 @@ def pipeline_conflict(entries: Sequence[PackageEntry | None]) -> Refusal | None:
     return None
 
 
+def person_name(package: str, titles: Mapping[str, str] | None = None) -> str:
+    """The name a person knows a package by: its contract's title, else its short name."""
+    return (titles or {}).get(package) or package.partition(".")[2] or package
+
+
 class PackageCatalog:
     """The package archives staged on this relay host."""
 
@@ -498,6 +506,10 @@ class PackageCatalog:
             if entry.superseded_by is None:
                 latest[entry.name] = entry
         return list(latest.values())
+
+    def titles(self) -> dict[str, str]:
+        """Each staged package's contract title, by package name, newest entry first."""
+        return {entry.name: entry.title for entry in self.newest() if entry.title}
 
     def supersede(self, current: PackageEntry) -> list[PackageEntry]:
         """Mark the other archives of ``current``'s name staged from the sources as superseded.
@@ -581,11 +593,13 @@ class PackageCatalog:
     def entry(self, package: PackageRef, content: ContentStore) -> PackageEntry | None:
         """Return the entry of the pinned ``package``, or ``None`` if it was not staged here.
 
-        An entry staged before relay read the contract's resources and data flow is
-        read again from its archive in ``content``, and saved.
+        An entry staged before relay read the contract's resources, data flow and title
+        is read again from its archive in ``content``, and saved.
         """
         found = None if package.sha256 is None else self.records.get(package.sha256)
-        current = found is not None and {"resources", "data_flow"} <= found.model_fields_set
+        current = (
+            found is not None and {"resources", "data_flow", "title"} <= found.model_fields_set
+        )
         if found is None or current or not content.has(found.sha256):
             return found
         try:
@@ -593,7 +607,11 @@ class PackageCatalog:
         except Refusal:
             return found
         updated = found.model_copy(
-            update={"resources": fresh.resources, "data_flow": fresh.data_flow}
+            update={
+                "resources": fresh.resources,
+                "data_flow": fresh.data_flow,
+                "title": fresh.title,
+            }
         )
         self.put(updated)
         return updated

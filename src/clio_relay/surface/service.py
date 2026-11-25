@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any, cast
 
@@ -50,6 +51,7 @@ from clio_relay.jobs.spec import (
 from clio_relay.login_load import light_argv
 from clio_relay.packages import (
     PackageCatalog,
+    person_name,
     pipeline_conflict,
     stage_current,
     with_contract_couplings,
@@ -100,16 +102,18 @@ def _job_name(adapter: BaseAdapter[Any], operation_id: str) -> str | None:
     return name if isinstance(name, str) else None
 
 
-def _steps_label(spec: JobSpec) -> str | None:
+def _steps_label(spec: JobSpec, titles: Mapping[str, str] | None = None) -> str | None:
     """Name a package job: its package, or its pipeline by the way data flows.
 
-    With couplings, each producer is named feeding its consumer, and when JARVIS
-    starts the steps in another order the label says which starts first, so no
-    one reads the launch order as the data's direction. Without couplings the
-    steps are named in launch order.
+    Each package is named as a person knows it (:func:`person_name`), so the
+    question reads "Run LAMMPS", not "Run clio_jarvis.lammps". With couplings,
+    each producer is named feeding its consumer, and when JARVIS starts the
+    steps in another order the label says which starts first, so no one reads
+    the launch order as the data's direction. Without couplings the steps are
+    named in launch order.
     """
     steps = spec.steps()
-    names = [step.name for step in steps]
+    names = [person_name(step.name, titles) for step in steps]
     if len(names) <= 1:
         return names[0] if names else None
     if not spec.couplings:
@@ -330,7 +334,7 @@ class RelayService:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
         spec = await self.prepared_run(site, spec)
-        what = spec.executable or _steps_label(spec) or "a job"
+        what = spec.executable or _steps_label(spec, self.step_titles(spec)) or "a job"
         digest, dumped = spec.digest(), spec.model_dump(mode="json")
         return await self.open_operation(
             site, "run", spec, dumped, digest, f"Run {what}", task=task, confirm=confirm
@@ -339,6 +343,15 @@ class RelayService:
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
         """Return the run's job as relay records and digests it."""
         return self.apply_defaults(site, spec)
+
+    def step_titles(self, spec: JobSpec) -> dict[str, str]:
+        """Each staged step's contract title, by package name, for the person's question."""
+        titles: dict[str, str] = {}
+        for step in spec.steps():
+            entry = self.packages.entry(step, self.content)
+            if entry is not None and entry.title:
+                titles[step.name] = entry.title
+        return titles
 
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Fill the service job's site defaults.
@@ -368,7 +381,9 @@ class RelayService:
             )
         spec = await self.prepared_serve(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
-        what = spec.job.executable or _steps_label(spec.job) or "a service"
+        what = (
+            spec.job.executable or _steps_label(spec.job, self.step_titles(spec.job)) or "a service"
+        )
         return await self.open_operation(
             site,
             "serve",

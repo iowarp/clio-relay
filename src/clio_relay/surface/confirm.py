@@ -31,7 +31,7 @@ from fastmcp.tools import InputRequiredToolResult, ToolResult
 
 from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import Ask, Charge, GuardDecision
+from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, explain_approval
 from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
@@ -51,6 +51,7 @@ from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.guarding import (
     approval_message,
     bootstraps_jarvis,
+    cost_text,
     jarvis_line,
     review_asks,
 )
@@ -97,15 +98,19 @@ async def operation_asks(
             "spec_digest": record.spec_digest,
             "charge": charge.model_dump(mode="json"),
         }
-        asks.append(
-            await service.ask_provider.approve(
-                site=site,
-                operation_id=record.operation_id,
-                message=approval_message(action, site, charge, job.steps()),
-                binding=binding,
-                plain=False,
-            )
+        spend = await service.ask_provider.approve(
+            site=site,
+            operation_id=record.operation_id,
+            message=approval_message(action, site, charge, job.steps()),
+            binding=binding,
+            plain=False,
         )
+        _explain(spend, action, site, charge, spends=True)
+        snapshot = job_card.snapshot(service, record)
+        if snapshot:
+            spend.meta = {**(spend.meta or {}), job_card.JOB_META: snapshot}
+        service.asks.put(spend.ask_id, spend)
+        asks.append(spend)
     if held is not None:
         # The job's last yes-or-no ask carries the choice; one ask, not two.
         own = [a for a in asks if a.kind == "approve"]
@@ -167,9 +172,23 @@ async def _card(
     )
     if held is not None:
         held_services.fold(service, ask, record, held)
+    _explain(ask, action, site, charge, spends=spends)
     ask.meta = {**(ask.meta or {}), job_card.JOB_META: job_card.snapshot(service, record)}
     service.asks.put(ask.ask_id, ask)
     return ask
+
+
+def _explain(ask: Ask, action: str, site: SiteEntry, charge: Charge, *, spends: bool) -> None:
+    """Say what approving and declining a submit do, beside the Approve and Decline labels."""
+    cost = cost_text(charge) if spends else None
+    queue = f"the {charge.queue} queue" if charge.queue else "the scheduler's default queue"
+    yes = f"Relay submits it to {queue}" + (f"; it may use {cost}." if cost else ".")
+    explain_approval(
+        ask,
+        title=f"{action} on {site.title}",
+        yes=yes,
+        no="Nothing is submitted and nothing is spent.",
+    )
 
 
 async def one_shot(

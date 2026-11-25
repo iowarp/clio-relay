@@ -140,7 +140,7 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
         assert {"const": "compute_job", "title": "Compute node job"}.items() <= field["oneOf"][
             1
         ].items()
-        typed = (choice.meta or {})[CHOICE_META][choice.ask_id]
+        typed = (choice.meta or {})[CHOICE_META][choice.ask_id][CHOICE_FIELD]
         assert typed["recommended"] == "login_limited"
         assert [item["label"] for item in typed["options"]][:3] == [
             "Login host, now",
@@ -223,7 +223,7 @@ def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
         "default": "a",
     }
     assert schema_options(ask.requested_schema) == options
-    typed = (ask.meta or {})[CHOICE_META]["ask_1"]
+    typed = (ask.meta or {})[CHOICE_META]["ask_1"]["pick"]
     assert typed["field"] == "pick" and typed["recommended_reason"] == "A is cheaper"
     other = choice_ask(
         ask_id="ask_2", site="fx", operation_id="op", message="m", field_name="x", options=["y"]

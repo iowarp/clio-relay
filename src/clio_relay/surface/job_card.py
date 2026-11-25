@@ -49,6 +49,7 @@ from clio_relay import jarvis_graph, jarvis_plan, jarvis_submit
 from clio_relay.adapters.hooks import Charge
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec, flow_order, step_id
+from clio_relay.packages import person_name
 from clio_relay.surface.endpoints import service_ready
 
 if TYPE_CHECKING:
@@ -151,7 +152,11 @@ def _step_nodes(charge: Charge | None, steps: list[PackageRef], index: int) -> i
 
 
 def _components(
-    record: OperationRecord, job: JobSpec | None, charge: Charge | None, state: str
+    record: OperationRecord,
+    job: JobSpec | None,
+    charge: Charge | None,
+    state: str,
+    titles: dict[str, str],
 ) -> list[dict[str, Any]]:
     held = state in ("running", "starting")
     serve = record.kind == "serve"
@@ -192,7 +197,7 @@ def _components(
         found.append(
             component(
                 name,
-                step.name.partition(".")[2] or step.name,
+                person_name(step.name, titles),
                 step.name,
                 role,
                 _step_nodes(charge, steps, index),
@@ -237,8 +242,15 @@ def _plan(record: OperationRecord) -> dict[str, Any] | None:
     return cast(dict[str, Any], found) if isinstance(found, dict) else None
 
 
-def _planned(record: OperationRecord, plan: dict[str, Any], state: str) -> list[dict[str, Any]]:
-    """The components of JARVIS's plan, each in the state JARVIS last wrote for it."""
+def _planned(
+    record: OperationRecord, plan: dict[str, Any], state: str, titles: dict[str, str]
+) -> list[dict[str, Any]]:
+    """The components of JARVIS's plan, each in the state JARVIS last wrote for it.
+
+    A component JARVIS gives no label is named as the person knows its package
+    (:func:`~clio_relay.packages.person_name`): its contract's title, else its
+    short name.
+    """
     held = state in ("running", "starting")
     lines = {
         str(line.get("component")): line
@@ -257,10 +269,14 @@ def _planned(record: OperationRecord, plan: dict[str, Any], state: str) -> list[
             current = state
         hosts = cast(list[str], (line or {}).get("hosts") or [])
         allocated = len(hosts) if hosts else (nodes or 0) if held else 0
+        package = item.get("package")
+        label = item.get("label") or (
+            person_name(str(package), titles) if package else item.get("id")
+        )
         found.append(
             {
                 "id": item.get("id"),
-                "label": item.get("label") or item.get("package") or item.get("id"),
+                "label": label,
                 "package": item.get("package"),
                 "role": jarvis_plan.role(plan, item),
                 "nodes": nodes,
@@ -367,6 +383,17 @@ def _started(record: OperationRecord) -> datetime | None:
     return running
 
 
+def _titles(service: RelayService, job: JobSpec | None) -> dict[str, str]:
+    """The job's packages' contract titles, by package name, for the components' labels."""
+    if job is None:
+        return {}
+    try:
+        return service.step_titles(job)
+    except (OSError, ValueError):
+        # A card is drawn on every status; an unreadable archive leaves short names.
+        return {}
+
+
 def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] | None:
     """Return the operation's job card, or ``None`` for an operation that is not a job."""
     if record.kind not in ("run", "serve", "install"):
@@ -386,7 +413,12 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     walltime = plan.get("time_limit_s") or walltime
     facts = cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
     couplings = _couplings(plan, job)
-    components = _planned(record, plan, state) if plan else _components(record, job, charge, state)
+    titles = _titles(service, job)
+    components = (
+        _planned(record, plan, state, titles)
+        if plan
+        else _components(record, job, charge, state, titles)
+    )
     return {
         "version": VERSION,
         "operation_id": record.operation_id,
@@ -461,10 +493,14 @@ def command_snapshot(
     nodes = directives.get("nodes")
     nodes = nodes if isinstance(nodes, int) else None
     components: list[dict[str, Any]] = []
+    titles = service.packages.titles() if pkgs else {}
     for pkg in pkgs:
         pkg_type = str(pkg.get("pkg_type") or "")
         id_ = str(pkg.get("pkg_name") or pkg_type.rpartition(".")[2] or pkg_type)
-        label = jarvis_graph.LABEL if pkg_type == jarvis_graph.PKG_TYPE else id_
+        if pkg_type == jarvis_graph.PKG_TYPE:
+            label = jarvis_graph.LABEL
+        else:
+            label = titles.get(pkg_type) or id_
         components.append(_command_component(id_, label, pkg_type or None, nodes, len(pkgs)))
     if not components:
         components.append(_command_component(plan_kind, plan_kind, None, nodes, 1))

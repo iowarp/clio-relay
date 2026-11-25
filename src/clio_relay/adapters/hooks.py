@@ -72,7 +72,7 @@ def said_yes(content: dict[str, Any] | None) -> bool:
 
 
 CHOICE_META = "io.iowarp.clio-relay/choice"
-"""The ``_meta`` key of a choose ask's typed options, keyed by ask id."""
+"""The ``_meta`` key of a choose ask's typed options, keyed by ask id, then by field."""
 
 
 class ChoiceOption(BaseModel):
@@ -127,7 +127,11 @@ def choice_meta(
     title: str,
     recommended_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Return a choose ask's ``_meta``: its options typed, under :data:`CHOICE_META`."""
+    """Return a choose ask's ``_meta``: its options typed, under :data:`CHOICE_META`.
+
+    The entry is keyed by ask id, then by field, since one ask can hold two
+    choices (a job's approval and the choice about the site's running services).
+    """
     recommended = next((item.value for item in options if item.recommended), None)
     entry: dict[str, Any] = {
         "field": field_name,
@@ -136,7 +140,21 @@ def choice_meta(
         "recommended": recommended,
         "recommended_reason": recommended_reason if recommended is not None else None,
     }
-    return {CHOICE_META: {ask_id: entry}}
+    return {CHOICE_META: {ask_id: {field_name: entry}}}
+
+
+def with_choice_meta(meta: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:
+    """Return ``meta`` with ``extra``'s :data:`CHOICE_META` entries added, per ask and field."""
+    merged = dict(meta or {})
+    entries = {
+        ask_id: dict(cast(dict[str, Any], fields))
+        for ask_id, fields in cast(dict[str, Any], merged.get(CHOICE_META) or {}).items()
+    }
+    for ask_id, fields in cast(dict[str, Any], extra.get(CHOICE_META) or {}).items():
+        entries.setdefault(ask_id, {}).update(cast(dict[str, Any], fields))
+    merged.update({key: value for key, value in extra.items() if key != CHOICE_META})
+    merged[CHOICE_META] = entries
+    return merged
 
 
 def choice_ask(
@@ -169,6 +187,28 @@ def choice_ask(
             ask_id, field_name, typed, title=heading, recommended_reason=recommended_reason
         ),
     )
+
+
+def explain_approval(ask: Ask, *, title: str, yes: str, no: str) -> None:
+    """Title an approval's choice and say what each answer does, as a choose ask does.
+
+    The values stay ``approve`` and ``decline``; only the labels' meanings and the
+    typed copy under :data:`CHOICE_META` are added. A plain approval is left as is.
+    """
+    schema: dict[str, Any] = ask.requested_schema or {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    field_: Any = cast(dict[str, Any], properties).get("approve")
+    if not isinstance(field_, dict) or "oneOf" not in field_:
+        return
+    options = [
+        ChoiceOption(value=APPROVE_YES, label="Approve", description=yes),
+        ChoiceOption(value=APPROVE_NO, label="Decline", description=no),
+    ]
+    fields = {**cast(dict[str, Any], properties), "approve": choice_field(options, title=title)}
+    ask.requested_schema = {**schema, "properties": fields}
+    ask.meta = with_choice_meta(ask.meta, choice_meta(ask.ask_id, "approve", options, title=title))
 
 
 def schema_options(schema: dict[str, Any] | None) -> list[ChoiceOption]:

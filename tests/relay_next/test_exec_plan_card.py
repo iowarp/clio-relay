@@ -19,7 +19,11 @@ def _service() -> tuple[Any, Any]:
     def found(_id: str) -> Any:
         return site
 
-    return SimpleNamespace(offered_plans={}, site=found), site
+    def titles() -> dict[str, str]:
+        return {"repo.solver": "Solver"}
+
+    packages = SimpleNamespace(titles=titles)
+    return SimpleNamespace(offered_plans={}, site=found, packages=packages), site
 
 
 def _described(pipeline: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +64,8 @@ def test_the_card_lists_a_pipeline_producer_first() -> None:
         ("solver", 2),
         ("viewer", 1),
     ]
+    # A package is named by its contract's title, else by its step name.
+    assert [c["label"] for c in card["components"]] == ["Solver", "viewer"]
     assert card["couplings"] == [
         {"from": "solver", "to": "viewer", "kind": "data", "label": "data", "source": "relay"}
     ]

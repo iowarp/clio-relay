@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,6 +14,7 @@ from clio_relay.packages import (
     PackageEntry,
     contract_couplings,
     contract_data_flow,
+    person_name,
     with_contract_couplings,
 )
 from clio_relay.surface import job_card
@@ -97,16 +99,40 @@ def test_a_coupling_must_join_two_steps(couplings: list[dict[str, str]], message
 
 def test_the_label_names_the_data_direction_and_who_starts_first() -> None:
     spec = JobSpec(packages=[PVSERVER, SOLVER])
-    assert _steps_label(spec) == "the pipeline clio_jarvis.pvserver then clio_jarvis.gray_scott"
+    assert _steps_label(spec) == "the pipeline pvserver then gray_scott"
     coupled = with_contract_couplings(spec, [VIEWER, FIELDS])
     assert _steps_label(coupled) == (
-        "the pipeline clio_jarvis.gray_scott feeding clio_jarvis.pvserver "
-        "(clio_jarvis.pvserver starts first)"
+        "the pipeline gray_scott feeding pvserver (pvserver starts first)"
     )
     solver_first = with_contract_couplings(JobSpec(packages=[SOLVER, PVSERVER]), [FIELDS, VIEWER])
-    assert _steps_label(solver_first) == (
-        "the pipeline clio_jarvis.gray_scott feeding clio_jarvis.pvserver"
+    assert _steps_label(solver_first) == "the pipeline gray_scott feeding pvserver"
+
+
+def test_the_label_names_each_package_by_its_contract_title() -> None:
+    titles = {PVSERVER.name: "ParaView server", SOLVER.name: "Gray-Scott"}
+    coupled = with_contract_couplings(JobSpec(packages=[PVSERVER, SOLVER]), [VIEWER, FIELDS])
+    assert _steps_label(coupled, titles) == (
+        "the pipeline Gray-Scott feeding ParaView server (ParaView server starts first)"
     )
+    assert _steps_label(JobSpec(package=SOLVER), titles) == "Gray-Scott"
+    assert person_name("clio_jarvis.lammps", {"clio_jarvis.lammps": "LAMMPS"}) == "LAMMPS"
+    assert person_name("clio_jarvis.lammps") == "lammps"
+    assert person_name("plain") == "plain"
+
+
+def test_the_card_names_each_component_by_its_contract_title() -> None:
+    record: Any = SimpleNamespace(result={})
+    plan = {
+        "components": [
+            {"id": "lammps", "package": "clio_jarvis.lammps", "nodes": 1, "role": "batch"},
+            {"id": "pv", "package": "clio_jarvis.pvserver", "label": "Viewer", "role": "service"},
+            {"id": "pvserver", "package": "clio_jarvis.pvserver", "role": "service"},
+            {"id": "bare"},
+        ]
+    }
+    titles = {"clio_jarvis.lammps": "LAMMPS"}
+    found = job_card._planned(record, plan, "planned", titles)  # pyright: ignore[reportPrivateUsage]
+    assert [c["label"] for c in found] == ["LAMMPS", "Viewer", "pvserver", "bare"]
 
 
 def test_the_card_draws_producer_first_and_keeps_the_launch_order() -> None:

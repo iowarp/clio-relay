@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -18,13 +19,40 @@ if TYPE_CHECKING:
 
 
 def _duration(seconds: float) -> str:
-    """Say a walltime in the largest whole unit, such as ``2 h`` or ``90 min``."""
-    for size, unit in ((3600, "h"), (60, "min")):
-        if seconds >= size and seconds % size == 0:
-            return f"{seconds / size:g} {unit}"
-    if seconds >= 60:
-        return f"{seconds / 60:.4g} min"
-    return f"{seconds:g} s"
+    """Say a walltime as a person reads it, such as ``2 h``, ``1 h 30 min`` or ``10 min``."""
+    if seconds < 60:
+        return f"{seconds:g} s"
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} h" if rest == 0 else f"{hours} h {rest} min"
+
+
+def node_hours_text(value: float) -> str:
+    """Say a node-hour count the way a person reads it: ``1 node-hour``, ``about 0.17 node-hours``.
+
+    Two significant digits under one, one decimal under ten, whole numbers above;
+    a rounded count says "about".
+    """
+    if 0 < value < 0.01:
+        return "under 0.01 node-hours"
+    if value >= 10:
+        shown = f"{round(value):d}"
+    elif value >= 1:
+        shown = f"{round(value, 1):g}"
+    else:
+        shown = f"{value:.2g}"
+    about = "" if math.isclose(float(shown), value, rel_tol=1e-9) else "about "
+    return f"{about}{shown} node-hour{'' if shown == '1' else 's'}"
+
+
+def cost_text(charge: Charge) -> str | None:
+    """Say a job's most use in words: ``up to 10 min on 1 node (about 0.17 node-hours)``."""
+    if charge.walltime_s is None or charge.node_hours is None:
+        return None
+    nodes = _plural(charge.nodes, "node")
+    return f"up to {_duration(charge.walltime_s)} on {nodes} ({node_hours_text(charge.node_hours)})"
 
 
 def _plural(count: int, word: str) -> str:
@@ -86,9 +114,9 @@ def approval_message(
     Markdown, kept short so a client's question card shows it without
     scrolling.
     """
-    known = charge.walltime_s is not None and charge.node_hours is not None
+    known = (cost := cost_text(charge)) is not None
     if known:
-        title = f"{action} on {site.title}? It may use up to {charge.node_hours:g} {charge.unit}."
+        title = f"{action} on {site.title}? It may use {cost}."
     else:
         title = f"{action} on {site.title}? It sets no walltime, so its cost is unknown."
     nodes = f"- Nodes: {charge.nodes}"
@@ -107,8 +135,7 @@ def approval_message(
     else:
         walltime = f"- Walltime: {_duration(charge.walltime_s)}"
         if charge.node_hours is not None:
-            hours = f"{charge.node_hours:g} node-hour{'' if charge.node_hours == 1 else 's'}"
-            walltime += f", up to {hours} in all"
+            walltime += f", up to {node_hours_text(charge.node_hours)} in all"
     if charge.amount is not None and charge.unit != "node-hours":
         walltime += f"; up to {charge.amount:g} {charge.unit}"
     queue = f"- Queue: {charge.queue or 'the scheduler default'}"
