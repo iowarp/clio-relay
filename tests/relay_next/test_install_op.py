@@ -307,6 +307,27 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     assert "relay asks them" in refusal.message
 
 
+def test_the_install_ask_states_jarvis_s_no_site_copy_fact() -> None:
+    fact = (
+        "No site copy of fio was found (modules, site Spack and resource graph searched); "
+        "JARVIS installs fio with Spack."
+    )
+    report: dict[str, Any] = {
+        "installers": {
+            "spack": {"packages": {"io": {"status": "missing", "spec": "fio@3.37"}}},
+        },
+        "site_copies": {
+            "packages": {"io": {"status": "none_found"}},
+            "facts": [
+                {"kind": "site_copy_none", "package": "fio", "answerable": False, "question": fact}
+            ],
+        },
+        "issues": [],
+    }
+    message = install_wording.install_message(report, site="Ares", package="demo.fio", names={})
+    assert message.startswith(fact + " JARVIS's Spack check finds no installed fio@3.37 on Ares")
+
+
 def test_the_install_ask_states_what_jarvis_found_and_what_each_answer_does() -> None:
     report: dict[str, Any] = {
         "installers": {

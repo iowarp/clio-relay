@@ -15,6 +15,7 @@ from clio_relay.jarvis_report import (
     build_facts,
     choice_issues,
     install_summary,
+    site_copy_facts,
 )
 
 
@@ -62,6 +63,7 @@ def install_message(
             f"nothing has to be installed.{reuse} Apply them for {package} on {site}?"
         )
     parts = [_finding(item, site=site) for item in found]
+    parts[:0] = _no_site_copy(report)
     if summary["reuse"]:
         parts.append(f"Already on {site}: " + ", ".join(summary["reuse"]) + ".")
     if asked:
@@ -72,6 +74,21 @@ def install_message(
     parts.append(_where_built(report, site=site, job=job, last=last))
     parts.append(f"Install the software {package} needs on {site}?")
     return " ".join(parts)
+
+
+def _no_site_copy(report: Mapping[str, Any]) -> list[str]:
+    """State JARVIS's ``site_copy_none`` facts: where it searched and found no site copy."""
+    stated: list[str] = []
+    for fact in site_copy_facts(report):
+        text = fact.get("question") or fact.get("detail")
+        if not isinstance(text, str) or not text.strip():
+            package = fact.get("package") or fact.get("subject")
+            if not isinstance(package, str) or not package:
+                continue
+            text = f"No site copy of {package} was found; JARVIS installs {package} with Spack."
+        text = text.strip()
+        stated.append(text if text.endswith((".", "!", "?")) else text + ".")
+    return stated
 
 
 def _finding(item: Mapping[str, Any], *, site: str) -> str:

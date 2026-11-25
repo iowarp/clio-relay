@@ -240,6 +240,71 @@ def test_a_spack_candidate_says_where_it_comes_from_in_words() -> None:
     assert jarvis_report.choice_title(issue) == "Spack to use"
 
 
+def test_a_site_copy_question_offers_the_site_s_copies_or_a_spack_build() -> None:
+    module = "ior 3.3.0 (module ior/3.3.0-fihmxeb, after openmpi/5.0.5-x2kvx5l)"
+    issue = {
+        "kind": "site_copy",
+        "subject": "site_copy",
+        "scope": "package",
+        "package": "ior",
+        "answerable": True,
+        "recommended": "site-1",
+        "previous_answer": "module:ior/3.2.1",
+        "question": (
+            f"This site already has 1 copy of ior: {module}. Use the site's copy, or build "
+            f"ior with Spack? Recommended: {module} ({module} fits: version 3.3.0)."
+        ),
+        "candidates": [
+            {
+                "id": "site-1",
+                "constraint": "module:ior/3.3.0-fihmxeb",
+                "label": module,
+                "source": "module",
+                "version": "3.3.0",
+                "does": "use the site's copy: `module load ior/3.3.0-fihmxeb` when the "
+                "package runs; JARVIS builds nothing",
+                "why": "version 3.3.0 (any version fits); it uses openmpi@5.0.5",
+            },
+            {
+                "id": "spack_build",
+                "constraint": "spack",
+                "label": "build ior with Spack",
+                "source": "spack_build",
+                "does": "Plan and build the query with Spack.",
+                "why": "A site copy fits; building with Spack is still possible.",
+            },
+        ],
+    }
+    assert jarvis_report.choice_issues({"issues": [issue]}) == [issue]
+    copy, build = jarvis_report.choice_details(issue)
+    assert (copy.value, copy.label, copy.recommended) == (
+        "module:ior/3.3.0-fihmxeb",
+        module,
+        True,
+    )
+    assert copy.description == (
+        "Use the site's copy: `module load ior/3.3.0-fihmxeb` when the package runs; "
+        "JARVIS builds nothing. Version 3.3.0 (any version fits); it uses openmpi@5.0.5."
+    )
+    assert (build.value, build.label, build.recommended) == (
+        "spack",
+        "build ior with Spack",
+        False,
+    )
+    assert build.description == (
+        "Plan and build the query with Spack. A site copy fits; building with Spack is "
+        "still possible."
+    )
+    assert jarvis_report.choice_message(issue) == (
+        f"This site already has 1 copy of ior: {module}. Use the site's copy, or build ior "
+        "with Spack?"
+    )
+    assert jarvis_report.choice_title(issue) == "Site copy or Spack build for ior"
+    note = jarvis_report.choice_note(issue) or ""
+    assert "The earlier answer, module:ior/3.2.1," in note
+    assert "JARVIS records the answer for ior on this site" in note
+
+
 def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     options = [
         ChoiceOption(value="a", label="Option A", description="Does A.", recommended=True),

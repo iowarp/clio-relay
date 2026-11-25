@@ -192,7 +192,13 @@ job, or asking each time, with its recommendation, the login host's
 measurements and the queue estimate, and per-package options when one package
 is costlier than the rest. Relay shows the question and JARVIS's evidence as
 they are, records the answer with the site's decisions through `--answers`,
-and has no placement policy of its own. When the site chose the login host for
+and has no placement policy of its own. Before a Spack build, JARVIS also
+searches the site's modules, its Spack and its resource graph for a copy of the
+package (`site_copy`). When it finds one, the question is whether to use the
+site's copy or build with Spack: each option's meaning is JARVIS's `does` and
+`why`, the recommended one is JARVIS's, and JARVIS records the answer for that
+package on the site. When it finds none, the install approval says so first.
+When the site chose the login host for
 checks, the check runs there and relay submits no check job. Where JARVIS
 builds is the same choice, and relay declares no default for it, so a site
 that has not answered gets JARVIS's own recommendation in the question.

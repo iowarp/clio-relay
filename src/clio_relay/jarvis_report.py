@@ -374,6 +374,22 @@ def choice_offers(issue: Mapping[str, Any]) -> list[str]:
 
 
 PLACEMENT_KIND = "install_placement"
+SITE_COPY_KIND = "site_copy"
+"""JARVIS's question (jarvis-cd 1.9.7, ``jarvis.site-copies.v1``): use a copy the site
+already has of the package (a module, a site Spack install), or build it with Spack."""
+SITE_COPY_NONE = "site_copy_none"
+"""JARVIS's fact that its search found no site copy, so Spack builds the package."""
+
+
+def site_copy_facts(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return JARVIS's ``site_copy_none`` facts: the packages it found no site copy of.
+
+    They are in the report's ``site_copies.facts``, not its issues: nothing is asked.
+    """
+    found = _dict(report.get("site_copies")).get("facts")
+    listed = cast(list[object], found) if isinstance(found, list) else []
+    return [item for item in map(_dict, listed) if item.get("kind") == SITE_COPY_NONE]
+
 
 _TITLES = {
     "spack_missing": "Spack to use",
@@ -387,7 +403,9 @@ _TITLES = {
     "install_method": "How to install",
     "variant_conflict": "Constraint to add",
     "concretize_failed": "How to resolve the Spack spec",
+    SITE_COPY_KIND: "Site copy or Spack build",
 }
+_NAMED_TITLES = frozenset({"ambiguous_provider", "install_method", SITE_COPY_KIND})
 
 _LABELS = {
     "pip": "pip, in a Python venv",
@@ -421,7 +439,7 @@ def choice_title(issue: Mapping[str, Any]) -> str:
         return f"Where JARVIS runs Spack {phase}s at this site"
     found = _TITLES.get(kind)
     if found is not None:
-        return found + (named if kind in ("ambiguous_provider", "install_method") else "")
+        return found + (named if kind in _NAMED_TITLES else "")
     return (kind.replace("_", " ").capitalize() or "Choice") + named
 
 
@@ -466,12 +484,26 @@ def _placement_meaning(issue: Mapping[str, Any], constraint: str) -> tuple[str, 
     return None
 
 
-def _label(candidate: Mapping[str, Any], constraint: str) -> str:
+def _label(candidate: Mapping[str, Any], constraint: str, *, as_written: bool = False) -> str:
     for key in ("label", "summary"):
         found = candidate.get(key)
         if isinstance(found, str) and found:
-            return found[:1].upper() + found[1:]
+            return found if as_written else found[:1].upper() + found[1:]
     return _LABELS.get(constraint, constraint)
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+    text = text[:1].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _site_copy_meaning(candidate: Mapping[str, Any]) -> str:
+    """What picking a ``site_copy`` candidate does, and why it fits or not: JARVIS's words."""
+    parts = [candidate.get("does"), candidate.get("why")]
+    return " ".join(_sentence(part) for part in parts if isinstance(part, str) and part.strip())
 
 
 def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
@@ -482,6 +514,7 @@ def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
     else a candidate's own flag); relay recommends none of its own.
     """
     placement = issue.get("kind") == PLACEMENT_KIND
+    site_copy = issue.get("kind") == SITE_COPY_KIND
     pick = issue.get("recommended")
     typed: dict[str, ChoiceOption] = {}
     for raw in cast(list[object], issue.get("candidates") or []):
@@ -490,6 +523,11 @@ def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
         if not isinstance(constraint, str) or not constraint or constraint in typed:
             continue
         meaning = _placement_meaning(issue, constraint) if placement else None
+        if meaning is None and site_copy:
+            meaning = (
+                _label(candidate, constraint, as_written=True),
+                _site_copy_meaning(candidate),
+            )
         if meaning is None:
             facts = _candidate_facts(candidate)
             text = "; ".join(facts)
@@ -497,8 +535,11 @@ def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
                 _label(candidate, constraint),
                 text[:1].upper() + text[1:] + "." if text else "",
             )
+        # JARVIS names its pick by constraint, or (a site copy) by the candidate's id.
         recommended = (
-            constraint == pick if isinstance(pick, str) else candidate.get("recommended") is True
+            pick in (constraint, candidate.get("id"))
+            if isinstance(pick, str)
+            else candidate.get("recommended") is True
         )
         typed[constraint] = ChoiceOption(
             value=constraint,
@@ -547,6 +588,14 @@ def _split_question(issue: Mapping[str, Any]) -> tuple[str, str]:
     )
     if not isinstance(question, str) or not question.strip():
         return f"Which option should JARVIS use for {subject}?", ""
+    if issue.get("kind") == SITE_COPY_KIND:
+        # The copies JARVIS found are the fact the question rests on, so they stay in it.
+        head, rest = split_question(question)
+        start = question.find(head)
+        if start > 0:
+            before = question[:start].strip()
+            return f"{before} {head}", question[start + len(head) :].strip()
+        return head, rest
     return split_question(question)
 
 
@@ -564,16 +613,23 @@ def choice_message(issue: Mapping[str, Any]) -> str:
 def choice_note(issue: Mapping[str, Any]) -> str | None:
     """Return what an answer covers, and why JARVIS asks again when it does."""
     notes: list[str] = []
-    previous = _dict(issue.get("previous_answer"))
-    if previous.get("constraint"):
+    previous: object = issue.get("previous_answer")
+    earlier = (
+        cast(dict[str, Any], previous).get("constraint") if isinstance(previous, dict) else previous
+    )
+    if isinstance(earlier, str) and earlier:
         notes.append(
-            f"The earlier answer, {previous['constraint']}, no longer matches what JARVIS "
-            "finds, so it asks again."
+            f"The earlier answer, {earlier}, no longer matches what JARVIS finds, so it asks again."
         )
     if once(issue):
         notes.append("The answer is for this run only; JARVIS asks again next time.")
     elif issue.get("scope") == "site":
         notes.append("JARVIS records the answer for the site's later installs.")
+    elif issue.get("kind") == SITE_COPY_KIND and issue.get("package"):
+        notes.append(
+            f"JARVIS records the answer for {issue['package']} on this site, and later "
+            "installs use it without searching again."
+        )
     return " ".join(notes) or None
 
 
