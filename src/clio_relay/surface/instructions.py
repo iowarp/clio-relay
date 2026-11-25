@@ -24,6 +24,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+LEAD = (
+    "Relay is the way to reach a compute site. Never reach a site by ssh, scp or a "
+    "scheduler command (such as sbatch, squeue or qsub) in a shell, even when the host "
+    "is in an ssh config. If the site you need is not listed here, ask the person to "
+    "add it on the Compute page."
+)
+"""The opening line, before anything else, so no agent reaches a site around relay."""
 GENERAL = (
     "Relay runs work on the sites in its sites file. Call describe first. "
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
@@ -83,8 +90,12 @@ def _listed(lines: Iterable[str]) -> str:
 def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
     """The instructions for these sites and packages."""
     if not sites:
-        return f"{GENERAL} {NO_SITES}"
-    parts = [GENERAL, f"Compute sites configured for relay: {_listed(map(site_line, sites))}."]
+        return f"{LEAD} {GENERAL} {NO_SITES}"
+    parts = [
+        LEAD,
+        GENERAL,
+        f"Compute sites configured for relay: {_listed(map(site_line, sites))}.",
+    ]
     if packages:
         ordered = sorted(packages, key=lambda entry: entry.name)
         parts.append(f"Packages staged to run on them: {_listed(map(package_line, ordered))}.")

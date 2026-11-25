@@ -42,7 +42,8 @@ def test_the_text_names_each_site_and_package() -> None:
         ],
         [_package(), _package("lab_kit.echo", summary=None)],
     )
-    assert text.startswith(instructions.GENERAL)
+    assert text.startswith(f"{instructions.LEAD} {instructions.GENERAL}")
+    assert "Never reach a site by ssh, scp or a scheduler command" in text
     assert "Compute sites configured for relay: ares (Ares cluster; ssh); lab (ssh)." in text
     assert (
         "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
@@ -63,7 +64,7 @@ def test_long_lists_and_summaries_are_cut() -> None:
 
 def test_no_sites_says_so() -> None:
     text = instructions.compose([], [_package()])
-    assert text == f"{instructions.GENERAL} {instructions.NO_SITES}"
+    assert text == f"{instructions.LEAD} {instructions.GENERAL} {instructions.NO_SITES}"
     assert "Compute page" in text
 
 
