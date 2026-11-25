@@ -366,6 +366,77 @@ def test_a_broken_spack_question_says_what_each_way_out_does_and_leaves_out() ->
     assert "checking again records nothing" in (jarvis_report.choice_note(issue) or "")
 
 
+def test_a_broken_spack_recommends_leaving_out_only_the_failing_repos_as_jarvis_does() -> None:
+    root = "/home/me/spack"
+    issue = {
+        "kind": "spack_broken",
+        "subject": f"spack:{root}",
+        "scope": "site",
+        "package": "*",
+        "answerable": True,
+        "schema": "jarvis.install-issue.v1",
+        "recommended": "drop_failing_repos",
+        "question": (
+            f"The Spack at {root} fails on its own, before any package: `spack providers "
+            "mpi` exits 1: cannot unpack non-iterable NoneType object. Cause: the repo coeus "
+            "in ~/.spack/repos.yaml:3 (user scope). JARVIS recommends nothing from this "
+            "Spack and plans nothing with it until this is resolved. Leave out only the "
+            "failing repos, run JARVIS's Spack commands without your user config, skip this "
+            "Spack, or fix it yourself and check again? Recommended: run JARVIS's Spack "
+            f"commands for {root} without the failing repo(s) coeus (the failure is "
+            "confined to the named repos)."
+        ),
+        "candidates": [
+            {
+                "id": "drop_failing_repos",
+                "constraint": "drop_failing_repos",
+                "label": f"run JARVIS's Spack commands for {root} without the failing repo(s) "
+                "coeus",
+                "does": "JARVIS points SPACK_USER_CONFIG_PATH at its own copy of your scope "
+                "with only the failing repos removed",
+                "why": "`spack providers mpi` passes with JARVIS's scope copy without coeus",
+                "leaves_out": "the repo coeus; mochi stays",
+                "recommended": True,
+            },
+            {
+                "id": "no_user_config",
+                "constraint": "no_user_config",
+                "label": f"run JARVIS's Spack commands for {root} without your user config",
+                "does": "JARVIS sets SPACK_DISABLE_LOCAL_CONFIG=1 on its commands",
+                "leaves_out": "the repos mochi and coeus",
+                "recommended": False,
+            },
+            {
+                "id": "skip",
+                "constraint": "skip",
+                "label": f"skip the Spack at {root}",
+                "does": "JARVIS offers no site copies from this Spack",
+            },
+            {
+                "id": "recheck",
+                "constraint": "recheck",
+                "label": "I'll fix it myself; check again",
+                "does": "nothing is recorded",
+            },
+        ],
+    }
+    drop, plain, _skip, _recheck = jarvis_report.choice_details(issue)
+    assert (drop.value, drop.recommended) == ("drop_failing_repos", True)
+    assert drop.label == f"run JARVIS's Spack commands for {root} without the failing repo(s) coeus"
+    assert drop.description == (
+        "JARVIS points SPACK_USER_CONFIG_PATH at its own copy of your scope with only the "
+        "failing repos removed. `spack providers mpi` passes with JARVIS's scope copy without "
+        "coeus. The repo coeus; mochi stays."
+    )
+    assert (plain.value, plain.recommended) == ("no_user_config", False)
+    assert jarvis_report.choice_message(issue) == (
+        "Leave out only the failing repos, run JARVIS's Spack commands without your user "
+        "config, skip this Spack, or fix it yourself and check again?"
+    )
+    note = jarvis_report.choice_note(issue) or ""
+    assert "records the way out chosen for the site's later installs" in note
+
+
 def test_a_site_copy_that_does_not_load_offers_another_copy_a_build_or_forgetting() -> None:
     issue = {
         "kind": "site_copy_unusable",

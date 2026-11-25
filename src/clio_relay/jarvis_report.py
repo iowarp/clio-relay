@@ -632,8 +632,8 @@ def choice_note(issue: Mapping[str, Any]) -> str | None:
         notes.append("The answer is for this run only; JARVIS asks again next time.")
     elif issue.get("kind") == SPACK_BROKEN:
         notes.append(
-            "JARVIS records a choice to go on without the user config or to skip this Spack "
-            "for the site's later installs; checking again records nothing."
+            "JARVIS records the way out chosen for the site's later installs; checking "
+            "again records nothing."
         )
     elif issue.get("scope") == "site":
         notes.append("JARVIS records the answer for the site's later installs.")

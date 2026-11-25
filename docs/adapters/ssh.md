@@ -201,9 +201,10 @@ package on the site. When it finds none, the install approval says so first.
 When a chosen site copy does not load (`site_copy_unusable`), the question
 offers the site's other copies, a Spack build, or forgetting the choice so the
 site-copy question is asked again. When a Spack itself fails before any package
-(`spack_broken`), the question offers running JARVIS's Spack commands without
-the person's user config, with what that leaves out, skipping that Spack, or
-checking again after the person fixes it. Relay shows each option as JARVIS
+(`spack_broken`), the question offers leaving out only the failing repos (when
+the failure is confined to them, and then recommended), running JARVIS's Spack
+commands without the person's user config, each with what it leaves out,
+skipping that Spack, or checking again after the person fixes it. Relay shows each option as JARVIS
 wrote it and sends only the answers given in that round, so a check that still
 fails is asked again.
 When the site chose the login host for
