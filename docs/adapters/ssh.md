@@ -42,7 +42,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
 | `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty keeps the graph under `remote_dir`. Set it once the person confirms the site publishes one: every CLIO home then shares the install answers JARVIS writes there, `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. JARVIS owns its content |
-| `install_walltime_s` | 14400 | The walltime of the job that builds a package's software. The run's walltime is used when it is longer |
+| `install_walltime_s` | unset | The walltime of the job that builds a package's software. Unset, JARVIS sizes it from its estimate of the build, within the partition's limit. Set it only to override JARVIS |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
 | `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run. A bare name is looked up on the PATH relay hands the child, with PATHEXT on Windows, so an `ssh.cmd` early on the PATH wins. A path is used as given |
@@ -198,9 +198,11 @@ builds is the same choice, and relay declares no default for it, so a site
 that has not answered gets JARVIS's own recommendation in the question.
 When the site chose a compute job, JARVIS installs the software as its own
 job, `jarvis ppl install +submit`, on a compute node, and sizes that job
-itself. Relay only gives it `install_walltime_s` as `scheduler.install.time`
-(4 hours by default, or the run's walltime when longer), since a build often
-takes longer than the run, and the approval says how long it may take. When
+itself, its walltime included, from its own estimate of the build within the
+partition's limit. Relay drops the run's walltime from that job, since a
+build is not the run, and gives `install_walltime_s` as
+`scheduler.install.time` only when the site sets it; then the approval says
+how long the build may take. When
 the site chose the login host, relay starts JARVIS's own
 `jarvis ppl install --answers` there, detached, under the operation's
 `relay.login-build/` folder. JARVIS sets and applies its limits; relay sets

@@ -253,9 +253,24 @@ def test_a_recheck_command_is_a_check_job_with_the_answers() -> None:
 
 def test_a_check_job_gets_a_short_walltime() -> None:
     document: dict[str, object] = {"name": "p", "scheduler": {"type": "slurm"}}
-    check = jarvis_submit.install_pipeline(
-        document, XCOMPACT, 4 * 3600, {jarvis_submit.RECHECK: True}
-    )
-    build = jarvis_submit.install_pipeline(document, XCOMPACT, 4 * 3600, {})
+    check = jarvis_submit.install_pipeline(document, 4 * 3600, {jarvis_submit.RECHECK: True})
+    build = jarvis_submit.install_pipeline(document, 4 * 3600, {})
     assert "time: 01:00:00" in check
     assert "time: 04:00:00" in build
+
+
+def test_jarvis_sizes_the_build_job_unless_the_site_sets_a_walltime() -> None:
+    document: dict[str, object] = {
+        "name": "p",
+        "scheduler": {"type": "slurm", "time": "00:02:00", "pre_cmds": ["connect"]},
+    }
+    for answers in ({}, {jarvis_submit.RECHECK: True}):
+        pipeline = jarvis_submit.install_pipeline(document, None, answers)
+        assert "time" not in pipeline and "connect" not in pipeline and "install" not in pipeline
+    own: dict[str, object] = {
+        "name": "p",
+        "scheduler": {"type": "slurm", "install": {"time": "08:00:00"}},
+    }
+    assert "time: 08:00:00" in jarvis_submit.install_pipeline(own, 4 * 3600, {})
+    assert jarvis_submit.install_walltime(None) is None
+    assert jarvis_submit.install_walltime(3 * 3600) == "03:00:00"

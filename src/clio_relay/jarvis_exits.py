@@ -29,7 +29,7 @@ def refuse(
     *,
     spec: JobSpec,
     site: str,
-    install_walltime_s: int,
+    install_walltime_s: int | None,
     what: str = "the pipeline",
 ) -> None:
     """Raise the refusal for one of the site script's typed exits; return on any other."""
@@ -48,7 +48,7 @@ def refuse(
                 needs=jarvis_submit.NEEDS_INSTALL,
             )
         raise jarvis_report.install_needed(
-            report, site=site, walltime=jarvis_submit.install_walltime(spec, install_walltime_s)
+            report, site=site, walltime=jarvis_submit.install_walltime(install_walltime_s)
         )
     if code == jarvis_submit.EXIT_BUILD_REFUSED:
         raise build_refused(both, site=site)

@@ -52,8 +52,8 @@ class SshConfig(BaseModel):
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
-    install_walltime_s: int = Field(
-        default=jarvis_submit.INSTALL_WALLTIME_S,
+    install_walltime_s: int | None = Field(
+        default=None,
         ge=60,
         description=jarvis_submit.INSTALL_WALLTIME_HELP,
     )

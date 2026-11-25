@@ -151,8 +151,8 @@ class LocalConfig(BaseModel):
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
-    install_walltime_s: int = Field(
-        default=jarvis_submit.INSTALL_WALLTIME_S,
+    install_walltime_s: int | None = Field(
+        default=None,
         ge=60,
         description=jarvis_submit.INSTALL_WALLTIME_HELP,
     )
@@ -424,7 +424,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 jarvis=self.config.jarvis,
                 answers=answers,
                 pipeline=jarvis_submit.install_pipeline(
-                    document, spec, self.config.install_walltime_s, answers
+                    document, self.config.install_walltime_s, answers
                 ),
                 home=self._home(),
                 graph=self.config.jarvis_graph,

@@ -804,20 +804,17 @@ def submit_command(
     return _site_command(spec, arguments, script=script, home=home, graph=graph)
 
 
-INSTALL_WALLTIME_S = 4 * 3600
-"""The default walltime of the job JARVIS builds a package's software in."""
-
 INSTALL_WALLTIME_HELP = (
     "The walltime, in seconds, of the one-node job JARVIS builds a package's software in. "
-    "A build outlasts most runs, so it does not take the run's walltime, unless the run's "
-    "is longer. Keep it within the site's partition limit"
+    "Unset (the default), JARVIS sizes it from its own estimate of the build, within the "
+    "partition's limit. Set it only to override JARVIS, within the site's partition limit"
 )
 
 INSTALL_PIPELINE_FILE = "relay.install-pipeline.yaml"
 """The pipeline the install job builds with, beside the run's :data:`PIPELINE_FILE`."""
 
 INSTALL_CHECK_WALLTIME_S = 3600
-"""The longest walltime of a ``recheck`` job: JARVIS only checks there, which takes minutes."""
+"""The longest walltime of a ``recheck`` job when the site sets an install walltime."""
 
 
 def is_recheck(answers: Mapping[str, Any]) -> bool:
@@ -825,40 +822,43 @@ def is_recheck(answers: Mapping[str, Any]) -> bool:
     return bool(answers.get(RECHECK))
 
 
-def install_walltime(spec: JobSpec, walltime_s: int) -> str:
-    """Return the install job's Slurm walltime: ``walltime_s``, or the run's when longer."""
-    walltime = timedelta(seconds=walltime_s)
-    duration = spec.attributes.duration
-    if duration is not None and duration > walltime:
-        walltime = duration
-    return slurm_time(walltime)
+def install_walltime(walltime_s: int | None) -> str | None:
+    """Return the install job's Slurm walltime when the site sets one, else None (JARVIS's)."""
+    return slurm_time(timedelta(seconds=walltime_s)) if walltime_s else None
 
 
 def install_pipeline(
-    document: Mapping[str, object], spec: JobSpec, walltime_s: int, answers: Mapping[str, Any]
+    document: Mapping[str, object], walltime_s: int | None, answers: Mapping[str, Any]
 ) -> str:
     """Render the pipeline the install job builds with, from the run's ``document``.
 
     JARVIS sizes its own build job (``ppl install +submit``: one node, one task,
-    the whole node). Relay only drops its own ``pre_cmds`` (the install job
-    serves nothing, so a package service's connector does not start in it) and
-    gives the site's install walltime as ``scheduler.install.time``
-    (:func:`install_walltime`), which JARVIS applies to install jobs only. A
-    check job (``answers`` make it a ``recheck``) builds nothing, so its walltime
-    is the shorter of ``walltime_s`` and :data:`INSTALL_CHECK_WALLTIME_S`.
+    the whole node, and its walltime from its estimate of the build). Relay
+    drops its own ``pre_cmds`` (the install job serves nothing, so a package
+    service's connector does not start in it) and the run's ``time``, which is
+    the run's and not the build's. It gives a walltime as
+    ``scheduler.install.time`` only when the site sets one (``walltime_s``) and
+    the pipeline sets none; a check job (``answers`` make it a ``recheck``)
+    builds nothing, so then it gets the shorter of ``walltime_s`` and
+    :data:`INSTALL_CHECK_WALLTIME_S`.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
         return render_pipeline(document)
     scheduler = {
-        key: value for key, value in cast(Mapping[str, object], found).items() if key != "pre_cmds"
+        key: value
+        for key, value in cast(Mapping[str, object], found).items()
+        if key not in ("pre_cmds", "time")
     }
     install = scheduler.get("install")
     own = dict(cast(Mapping[str, object], install)) if isinstance(install, Mapping) else {}
-    check = timedelta(seconds=min(walltime_s, INSTALL_CHECK_WALLTIME_S))
-    walltime = slurm_time(check) if is_recheck(answers) else install_walltime(spec, walltime_s)
-    own.setdefault("time", walltime)
-    scheduler["install"] = own
+    if walltime_s:
+        seconds = min(walltime_s, INSTALL_CHECK_WALLTIME_S) if is_recheck(answers) else walltime_s
+        own.setdefault("time", slurm_time(timedelta(seconds=seconds)))
+    if own:
+        scheduler["install"] = own
+    else:
+        scheduler.pop("install", None)
     return render_pipeline({**document, "scheduler": scheduler})
 
 

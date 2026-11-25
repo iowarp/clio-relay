@@ -154,8 +154,8 @@ class WorkerConfig(BaseModel):
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
     jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
-    install_walltime_s: int = Field(
-        default=jarvis_submit.INSTALL_WALLTIME_S,
+    install_walltime_s: int | None = Field(
+        default=None,
         ge=60,
         description=jarvis_submit.INSTALL_WALLTIME_HELP,
     )
@@ -814,7 +814,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             config["jarvis_python"] = self.config.jarvis_python
         if self.config.jarvis_graph:
             config["jarvis_graph"] = self.config.jarvis_graph
-        if self.config.install_walltime_s != jarvis_submit.INSTALL_WALLTIME_S:
+        if self.config.install_walltime_s is not None:
             config["install_walltime_s"] = self.config.install_walltime_s
         if self.config.work_dir is not None:
             config["work_dir"] = self.config.work_dir

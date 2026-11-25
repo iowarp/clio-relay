@@ -1040,7 +1040,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             jarvis=self.config.jarvis,
             answers=answers,
             pipeline=jarvis_submit.install_pipeline(
-                document, spec, self.config.install_walltime_s, answers
+                document, self.config.install_walltime_s, answers
             ),
             home=self.config.remote_dir,
             graph=self.config.jarvis_graph,
