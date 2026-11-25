@@ -472,6 +472,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                     site=self.config.ssh_profile,
                     install_walltime_s=self.config.install_walltime_s,
                 )
+                error = jarvis_exits.failure_text(output, error)
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
                 f"{self.config.ssh_profile} refused the job: {error or 'no output'}",

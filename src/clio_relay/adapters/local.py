@@ -392,7 +392,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
                 f"{what} refused the job: "
-                f"{(result.stderr.strip() or result.stdout.strip())[-500:] or 'no output'}",
+                f"{jarvis_exits.failure_text(result.stdout, result.stderr)[-500:] or 'no output'}",
                 scheduler="jarvis",
                 exit_code=result.exit_code,
             )

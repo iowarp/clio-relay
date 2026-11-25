@@ -413,6 +413,19 @@ def test_the_check_exit_is_the_install_report_or_a_typed_refusal() -> None:
     assert refused.data["needs"] == "a Slurm site"
 
 
+def test_a_failed_jarvis_command_says_jarvis_error_not_its_notices() -> None:
+    printed = (
+        "Error: Failed to load package 'clio_jarvis.warpx': No module named 'jsonschema'\n\n"
+        "Command: ppl install\nDescription: Check or install the pipeline's packages\n"
+    )
+    notice = "Auto-built environment with 3 variables (no 'env' field in pipeline)"
+    assert jarvis_exits.failure_text(printed, notice) == (
+        "Error: Failed to load package 'clio_jarvis.warpx': No module named 'jsonschema'"
+    )
+    assert jarvis_exits.failure_text("usage only", " stderr says why \n") == "stderr says why"
+    assert jarvis_exits.failure_text(" only stdout \n", "") == "only stdout"
+
+
 @pytest.mark.parametrize("exit_code", [0, jarvis_submit.EXIT_DECISION])
 def test_concurrent_observers_of_an_ended_install_job_check_it_once(
     relay_paths: RelayPaths, site: _Site, monkeypatch: pytest.MonkeyPatch, exit_code: int

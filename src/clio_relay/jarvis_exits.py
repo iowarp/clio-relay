@@ -59,6 +59,16 @@ def refuse(
         raise jarvis_submit.jarvis_refused(both, site=site, what=what)
 
 
+def failure_text(output: str, error: str) -> str:
+    """Say why a JARVIS command failed: its ``Error:`` lines, else stderr, else stdout.
+
+    JARVIS prints a failed command's error on stdout, followed by the command's
+    usage, while stderr may hold only notices such as "Auto-built environment".
+    """
+    lines = [line.strip() for line in output.splitlines() if line.lstrip().startswith("Error:")]
+    return "\n".join(lines) or error.strip() or output.strip()
+
+
 def checked(output: str) -> dict[str, Any]:
     """Return the install report a ``check`` that exited 0 printed."""
     report = jarvis_report.parse_install_report(output)
