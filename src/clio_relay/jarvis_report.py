@@ -105,9 +105,8 @@ def install_summary(
     undecided: list[str] = []
     build: list[dict[str, Any]] = []
     for method, installer in _dict(report.get("installers")).items():
-        for step, package in _dict(_dict(installer).get("packages")).items():
+        for step, entry in _installer_packages(_dict(installer)):
             name = names.get(step, step)
-            entry = _dict(package)
             if entry.get("status") in REUSED_STATUSES:
                 reuse.append(name)
                 continue
@@ -116,7 +115,7 @@ def install_summary(
                 continue
             missing = entry.get("missing")
             count = len(cast(list[object], missing)) if isinstance(missing, list) else None
-            spec = entry.get("spec")
+            spec = entry.get("spec") or entry.get("image")
             query = entry.get("query")
             if not spec and isinstance(query, list):
                 spec = " ".join(str(item) for item in cast(list[object], query)) or None
@@ -135,6 +134,19 @@ def install_summary(
         "build": build,
         "issues": len(_issues(report)),
     }
+
+
+def _installer_packages(installer: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Return ``(step, state)`` per package an installer reports.
+
+    Spack, pip and conda give each step its own state. The container installer
+    lists its steps and keeps one state (``status``, ``image``) for the image they share.
+    """
+    packages = installer.get("packages")
+    if isinstance(packages, list):
+        shared = {key: value for key, value in installer.items() if key != "packages"}
+        return [(str(step), shared) for step in cast(list[object], packages) if step]
+    return [(str(step), _dict(state)) for step, state in _dict(packages).items()]
 
 
 def software_missing(report: Mapping[str, Any]) -> bool:

@@ -220,3 +220,127 @@ async def test_an_install_job_that_exits_6_fails_with_its_typed_issue() -> None:
     assert refusal.data["kind"] == "build_failed"
     assert refusal.data["install_job"] == "27990"
     assert "raw tail" not in refusal.message
+
+
+ENGINE_UNUSABLE: dict[str, Any] = {
+    "issue_id": "sha256:fc84",
+    "kind": "container_engine_unusable",
+    "answerable": False,
+    "candidates": [],
+    "method": "container",
+    "engine": "podman",
+    "host": "ares-comp-18",
+    "scope": "site",
+    "message": "podman is installed on ares-comp-18 but cannot run: `podman info` fails.",
+    "detail": "Error: error creating tmpdir: mkdir /run/user/1008: permission denied",
+    "remedy": "fix podman on this host (its own error is in the detail), or name another "
+    "container_engine in the pipeline",
+}
+
+
+def _decision_status() -> JobStatus:
+    return JobStatus(
+        state=JobState.FAILED, exit_code=3, observed_at=datetime.now(UTC), native_state="FAILED"
+    )
+
+
+def _handle() -> JobHandle:
+    return JobHandle(
+        adapter="ssh", native_id="28941", data={"execution_dir": "/home/u/jobs/op/executions/e1"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_install_job_that_needs_a_decision_no_answer_fixes_fails_with_its_issue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def resubmit(*args: object) -> str:
+        raise AssertionError("relay must not check again on the login host")
+
+    monkeypatch.setattr(installing, "_resubmit", resubmit)
+    adapter = _Adapter(json.dumps(ENGINE_UNUSABLE) + "\n")
+    service = _Service()
+    result = await installing._ended(  # pyright: ignore[reportPrivateUsage]
+        service,  # pyright: ignore[reportArgumentType]
+        "op",
+        _decision_status(),
+        (adapter, _handle()),  # pyright: ignore[reportArgumentType]
+        None,
+    )
+    assert result == "record"
+    state, refusal = service.finished[0]
+    assert state == OperationState.FAILED
+    assert refusal is not None
+    assert refusal.data["kind"] == "container_engine_unusable"
+    assert refusal.data["install_job"] == "28941"
+    assert "ares-comp-18" in refusal.message
+    assert "fix podman on this host" in refusal.message
+    assert installing.install_kind(refusal) is None
+
+
+@pytest.mark.asyncio
+async def test_an_install_job_with_a_blocking_question_fails_with_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def resubmit(*args: object) -> str:
+        raise AssertionError("relay must not check again on the login host")
+
+    monkeypatch.setattr(installing, "_resubmit", resubmit)
+    stuck: dict[str, Any] = {
+        "issue_id": "q1",
+        "kind": "mpi_unavailable",
+        "answerable": True,
+        "candidates": [],
+        "question": "Which MPI should JARVIS use?",
+        "detail": "no MPI on the compute nodes",
+    }
+    adapter = _Adapter(json.dumps(stuck) + "\n")
+    service = _Service()
+    await installing._ended(  # pyright: ignore[reportPrivateUsage]
+        service,  # pyright: ignore[reportArgumentType]
+        "op",
+        _decision_status(),
+        (adapter, _handle()),  # pyright: ignore[reportArgumentType]
+        None,
+    )
+    state, refusal = service.finished[0]
+    assert state == OperationState.FAILED
+    assert refusal is not None
+    assert "no MPI on the compute nodes" in refusal.message
+
+
+@pytest.mark.asyncio
+async def test_an_install_job_with_a_question_checks_again_on_the_login_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notes: list[str] = []
+
+    async def resubmit(service: object, operation_id: str, note: str) -> str:
+        notes.append(note)
+        return "resubmitted"
+
+    monkeypatch.setattr(installing, "_resubmit", resubmit)
+
+    def update(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(installing, "_update", update)
+    question = {
+        "issue_id": "q2",
+        "kind": "mpi_choice",
+        "answerable": True,
+        "question": "Which MPI should JARVIS use?",
+        "candidates": [{"id": "openmpi", "constraint": "^openmpi"}],
+    }
+    adapter = _Adapter(json.dumps(question) + "\n")
+    service = _Service()
+    result = await installing._ended(  # pyright: ignore[reportPrivateUsage]
+        service,  # pyright: ignore[reportArgumentType]
+        "op",
+        _decision_status(),
+        (adapter, _handle()),  # pyright: ignore[reportArgumentType]
+        None,
+    )
+    assert result == "resubmitted"
+    assert service.finished == []
+    assert notes == ["the install job needs a decision; JARVIS checks again"]

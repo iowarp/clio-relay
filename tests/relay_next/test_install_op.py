@@ -253,6 +253,41 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     assert "JARVIS installs 3 package(s)" in refusal.message
 
 
+def test_the_install_ask_reads_the_container_installers_shared_image_state() -> None:
+    # JARVIS's container installer lists its steps and reports one state for their image.
+    report: dict[str, Any] = {
+        "installers": {
+            "container": {
+                "engine": "podman",
+                "image": "docker.io/library/alpine:3.20",
+                "method": "container",
+                "packages": ["pkg"],
+                "status": "missing",
+            }
+        },
+        "issues": [{"kind": "not_installed", "answerable": False, "package": "pkg"}],
+    }
+    summary = jarvis_report.install_summary(report, {"pkg": "relay_proof.container_tool"})
+    assert summary["build"] == [
+        {
+            "package": "relay_proof.container_tool",
+            "method": "container",
+            "status": "missing",
+            "spec": "docker.io/library/alpine:3.20",
+            "missing": None,
+        }
+    ]
+    message = install_wording.install_message(
+        report, site="Ares", package="relay_proof.container_tool", names={}, run=False
+    )
+    assert "nothing has to be installed" not in message
+    assert "To install: docker.io/library/alpine:3.20 (with container)." in message
+    satisfied = {
+        "installers": {"container": {**report["installers"]["container"], "status": "satisfied"}}
+    }
+    assert jarvis_report.install_summary(satisfied)["reuse"] == ["pkg"]
+
+
 def _left_by_a_dead_process(service: RelayService, operation_id: str, stage: str) -> None:
     """Leave the record in ``submitting`` at ``stage``, as a relay that died there leaves it."""
     with service.operations.locked(operation_id):

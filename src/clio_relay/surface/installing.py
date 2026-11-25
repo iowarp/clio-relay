@@ -456,20 +456,34 @@ async def _ended(
         site = service.site(service.operation(operation_id).site).title
         refusal = build_refused(text or str(tail or ""), site=site)
         return service.finish(operation_id, OperationState.FAILED, refusal)
+    record = service.operation(operation_id)
+    site = service.site(record.site).title
+    issues = await install_logs.job_issues(adapter, handle)
+    found = install_failures.from_issues(
+        issues,
+        site=site,
+        install_log=install_logs.log_path(handle),
+        install_job=handle.native_id,
+    )
     if status.exit_code == jarvis_submit.EXIT_DECISION:
+        # An issue no answer fixes (a container engine that cannot run on the job's
+        # node) ends the operation with the job's own report: the login host may not
+        # see it, and checking there again would only ask the same approval again.
+        if found is not None and install_kind(found) is None:
+            return service.finish(operation_id, OperationState.FAILED, found)
+        blocking = jarvis_report.blocking_issues({"issues": issues})
+        if blocking:
+            return service.finish(
+                operation_id,
+                OperationState.FAILED,
+                jarvis_report.install_blocked(blocking, site=site),
+            )
         # The job found a question (which MPI, a compiler the build host lacks) and
         # recorded it: the light check on the login host reads that record and asks it.
         _update(service, operation_id, stage="done", job_ended=True)
         return await _resubmit(
             service, operation_id, "the install job needs a decision; JARVIS checks again"
         )
-    record = service.operation(operation_id)
-    found = install_failures.from_issues(
-        await install_logs.job_issues(adapter, handle),
-        site=service.site(record.site).title,
-        install_log=install_logs.log_path(handle),
-        install_job=handle.native_id,
-    )
     if found is not None and install_kind(found) is not None:
         return await ask_install(service, operation_id, service.site(record.site), found)
     if found is not None:
