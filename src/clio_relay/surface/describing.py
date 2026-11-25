@@ -11,7 +11,7 @@ from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import job_watch
+from clio_relay.surface import exec_plan, job_watch
 from clio_relay.surface.job_card import site_jobs
 from clio_relay.surface.skills import skill_link, skills
 
@@ -107,6 +107,7 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
         adapter = service.adapter_for(site, "describe")
         info = (await adapter.describe()).model_dump(mode="json")
         _collect_on_default_queue(info, site.defaults.queue)
+        exec_plan.offer(service, site.id, info)
         described["info"] = info
         need = await adapter.sign_in_needed()
         described["sign_in"] = None if need is None else need.model_dump(mode="json")

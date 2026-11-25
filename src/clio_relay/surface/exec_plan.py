@@ -11,7 +11,10 @@ the argument list the person approved is the one that runs. The ask is a plain
 confirm: it shows only the call's own command, plan and site, plus relay's own
 limits on it, so a host that confirms a call the person already allowed asks once.
 When the host left the call's confirm to relay (:mod:`clio_relay.surface.confirm`),
-the same ask is typed instead, as it is then the only one.
+the same ask is typed instead, as it is then the only one. A command that submits
+a job carries the job's planned card in the ask's ``_meta``
+(:data:`~clio_relay.surface.job_card.JOB_META`): for the collect command relay
+offered in ``describe``, its pipeline's packages, producer first.
 """
 
 from __future__ import annotations
@@ -19,14 +22,14 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.adapters.hooks import Ask
 from clio_relay.login_load import LoginLimits
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import confirm
+from clio_relay.surface import confirm, job_card
 from clio_relay.wording import with_article
 
 if TYPE_CHECKING:
@@ -102,6 +105,45 @@ def _message(site: SiteEntry, command: list[str], plan: ExecPlan) -> str:
     )
 
 
+def offer(service: RelayService, site_id: str, info: dict[str, Any]) -> None:
+    """Remember the collect command ``describe`` offered, so its ask can show the job.
+
+    ``info`` is the adapter's ``describe``. The command's pipeline, scheduler and
+    queue are relay's own words for it, kept by the digest of the exact argv.
+    """
+    facts = info.get("facts")
+    graph = cast(dict[str, Any], facts).get("resource_graph") if isinstance(facts, dict) else None
+    collect = cast(dict[str, Any], graph).get("collect") if isinstance(graph, dict) else None
+    if not isinstance(collect, dict):
+        return
+    offered = cast(dict[str, Any], collect)
+    command = offered.get("exec")
+    if not isinstance(command, list):
+        return
+    service.offered_plans[(site_id, argv_digest(cast(list[str], command)))] = {
+        "pipeline": offered.get("pipeline"),
+        "scheduler": info.get("scheduler"),
+        "queue": offered.get("queue"),
+    }
+
+
+def snapshot(
+    service: RelayService, site: SiteEntry, command: list[str], plan: ExecPlan
+) -> dict[str, Any] | None:
+    """Return the planned job card of a command that submits a job, else ``None``."""
+    if not plan.submits:
+        return None
+    digest = argv_digest(command)
+    return job_card.command_snapshot(
+        service,
+        site.id,
+        plan_kind=plan.kind,
+        summary=plan.summary,
+        argv_sha256=digest,
+        offer=service.offered_plans.get((site.id, digest)),
+    )
+
+
 async def approve(
     service: RelayService,
     site: SiteEntry,
@@ -115,7 +157,9 @@ async def approve(
     Raises :class:`~clio_relay.surface.files_approval.NeedsPerson` while the ask
     is pending, and refuses with ``policy_refused`` when the person said no.
     ``typed`` makes the ask a choice, for a call whose host left the confirm to relay.
+    A command that submits a job carries its planned card (:func:`snapshot`).
     """
+    card = snapshot(service, site, command, plan)
     return await confirm.one_shot(
         service,
         site,
@@ -123,6 +167,7 @@ async def approve(
         message=_message(site, command, plan),
         plain=not typed,
         refused=f"the person did not approve the {plan.kind} plan",
+        meta={job_card.JOB_META: card} if card else None,
     )
 
 

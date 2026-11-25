@@ -119,6 +119,13 @@ snapshot each time, and `revision` rises with each change, so a host keeps the
 newest one per `operation_id`. The text of every message stays as it is, so a
 host that ignores the snapshot loses nothing.
 
+On a guarded site, the ask for a command that submits a job carries a card
+too, before any operation exists: `kind` is `exec_plan`, `operation_id` and
+`resource` are empty, and `argv_sha256` binds it to the command. For the
+resource graph's collect command that `describe` offered, its components are
+the packages of the pipeline relay offered, producer first; for any other
+command, the card is the plan as one component.
+
 For a package job, the card is JARVIS's own plan of the job
 (`jarvis ppl submit +plan`), made before anything is submitted: the
 directives, each package with its nodes, ranks and node range, the couplings

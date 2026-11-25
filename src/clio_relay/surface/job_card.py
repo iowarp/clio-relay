@@ -7,7 +7,9 @@ so a host keeps the newest one per ``operation_id``. It rides as optional data:
 - on the ask that confirms a submit, with phase ``planned``: in the
   elicitation's ``params._meta`` on an older connection, and on the
   ``input_required`` result's own ``_meta`` on a ``2026-07-28`` one, whose
-  embedded requests carry no ``_meta``;
+  embedded requests carry no ``_meta``. The ask a guarded site raises for a
+  command that submits a job carries one too (:func:`command_snapshot`), with
+  kind ``exec_plan`` and no operation yet;
 - in the result of ``run``, ``serve`` and ``describe(job=...)`` as
   ``structuredContent.job``, and ``describe(site=...)`` lists the site's jobs
   as ``jobs``;
@@ -43,7 +45,7 @@ from fastmcp import Context
 from fastmcp_tasks.models import GetTaskResult
 from pydantic import Field
 
-from clio_relay import jarvis_plan, jarvis_submit
+from clio_relay import jarvis_graph, jarvis_plan, jarvis_submit
 from clio_relay.adapters.hooks import Charge
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef, ServiceSpec, flow_order, step_id
@@ -391,6 +393,108 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         "advisories": jarvis_plan.advisories(plan, facts),
         "settled_at_launch": jarvis_plan.advisories(plan, facts, settled=True),
         "script": plan.get("script"),
+    }
+
+
+def _seconds(value: object) -> int | None:
+    """Return a ``HH:MM:SS`` (or ``D-HH:MM:SS``) wall time in seconds."""
+    if not isinstance(value, str) or not value:
+        return None
+    days, _, clock = value.rpartition("-")
+    try:
+        hours, minutes, seconds = (int(part) for part in clock.split(":"))
+        return int(days or 0) * 86400 + hours * 3600 + minutes * 60 + seconds
+    except ValueError:
+        return None
+
+
+def command_snapshot(
+    service: RelayService,
+    site_id: str,
+    *,
+    plan_kind: str,
+    summary: str,
+    argv_sha256: str,
+    offer: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the planned card of a guarded command that submits a job.
+
+    The command is not an operation yet, so the card has no ``operation_id`` and no
+    ``resource``; ``kind`` is ``exec_plan`` and ``argv_sha256`` binds it to the command.
+    ``offer`` is the pipeline relay itself offered for this exact command in
+    ``describe`` (the resource graph's collect): its packages are the components,
+    producer first when its ``couplings`` say so. Without one, the card is the plan
+    as one component.
+    """
+    pipeline = cast(dict[str, Any], (offer or {}).get("pipeline") or {})
+    directives = cast(dict[str, Any], pipeline.get("scheduler") or {})
+    pkgs = cast(list[dict[str, Any]], pipeline.get("pkgs") or [])
+    nodes = directives.get("nodes")
+    nodes = nodes if isinstance(nodes, int) else None
+    components: list[dict[str, Any]] = []
+    for pkg in pkgs:
+        pkg_type = str(pkg.get("pkg_type") or "")
+        id_ = str(pkg.get("pkg_name") or pkg_type.rpartition(".")[2] or pkg_type)
+        label = jarvis_graph.LABEL if pkg_type == jarvis_graph.PKG_TYPE else id_
+        components.append(_command_component(id_, label, pkg_type or None, nodes, len(pkgs)))
+    if not components:
+        components.append(_command_component(plan_kind, plan_kind, None, nodes, 1))
+    keys = ("from", "to", "kind", "label")
+    couplings = [
+        {**{key: edge.get(key) for key in keys}, "source": "relay"}
+        for edge in cast(list[dict[str, Any]], pipeline.get("couplings") or [])
+    ]
+    for edge in couplings:
+        edge["label"] = edge["label"] or edge["kind"]
+    now = datetime.now(UTC)
+    return {
+        "version": VERSION,
+        "operation_id": None,
+        "resource": None,
+        "kind": "exec_plan",
+        "plan_kind": plan_kind,
+        "summary": summary,
+        "argv_sha256": argv_sha256,
+        "job_id": None,
+        "revision": int(now.timestamp() * 1000),
+        "updated_at": now.isoformat(),
+        "source": "relay",
+        "site": _site(service, site_id),
+        "scheduler": (offer or {}).get("scheduler"),
+        "phase": "planned",
+        "outcome": None,
+        "partition": (offer or {}).get("queue"),
+        "account": None,
+        "qos": None,
+        "time_limit_s": _seconds(directives.get("time")),
+        "started_at": None,
+        "ended_at": None,
+        "queue": None,
+        "components": _in_flow_order(components, couplings),
+        "couplings": couplings,
+        "advisories": [],
+        "settled_at_launch": [],
+        "script": None,
+    }
+
+
+def _command_component(
+    id_: str, label: str, package: str | None, nodes: int | None, count: int
+) -> dict[str, Any]:
+    return {
+        "id": id_,
+        "label": label,
+        "package": package,
+        "role": "compute",
+        "nodes": nodes if count == 1 else None,
+        "ranks": None,
+        "host_slice": None,
+        "node_range": None,
+        "state": "planned",
+        "nodes_allocated": 0,
+        "nodes_running": 0,
+        "hosts": [],
+        "reason": None,
     }
 
 

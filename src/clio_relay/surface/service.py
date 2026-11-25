@@ -206,6 +206,8 @@ class RelayService:
         self.guard = cast(GuardHook, hook_factory("guard", DefaultGuard)(context))
         self.serve_hook = cast(ServeHook, hook_factory("serve", StubServe)(context))
         self._adapters: dict[tuple[str, str, str], BaseAdapter[Any]] = {}
+        self.offered_plans: dict[tuple[str, str], dict[str, Any]] = {}
+        """Commands relay offered in ``describe``, by site and argv digest (:mod:`exec_plan`)."""
 
     async def close(self) -> None:
         """Release the hooks."""

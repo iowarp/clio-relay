@@ -30,6 +30,8 @@ REPO = "clio_relay_site"
 PACKAGE = "net_graph"
 PKG_TYPE = f"{REPO}.{PACKAGE}"
 """What the collect pipeline names (:func:`clio_relay.jarvis_submit.graph_pipeline`)."""
+LABEL = "network collection"
+"""The package's ``component_label``, as relay's card names it before JARVIS runs."""
 
 PKG_SOURCE = '''"""Collect the resource graph's net section on the hosts of relay's collect job."""
 
