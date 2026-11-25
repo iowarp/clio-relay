@@ -8,7 +8,7 @@ the name ``asks``, ``guard`` or ``serve``. A factory takes a
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from importlib.metadata import EntryPoint, entry_points
@@ -139,8 +139,24 @@ def choice_meta(
         "options": [item.model_dump() for item in options],
         "recommended": recommended,
         "recommended_reason": recommended_reason if recommended is not None else None,
+        "recommended_basis": None,
     }
     return {CHOICE_META: {ask_id: {field_name: entry}}}
+
+
+def with_recommended_basis(ask: Ask, field_name: str, basis: Mapping[str, Any] | None) -> None:
+    """Add to ``ask``'s typed choice what its recommendation rests on, as given.
+
+    ``basis`` is the producer's own record (JARVIS's ``recommendation_basis``:
+    a recorded answer, the resource graph, or its heuristic); relay adds nothing
+    and keeps it only where the choice recommends an option.
+    """
+    by_ask = cast(dict[str, Any], (ask.meta or {}).get(CHOICE_META) or {})
+    fields = cast(dict[str, Any], by_ask.get(ask.ask_id) or {})
+    entry = cast(dict[str, Any] | None, fields.get(field_name))
+    if entry is None or basis is None or entry.get("recommended") is None:
+        return
+    entry["recommended_basis"] = dict(basis)
 
 
 def with_choice_meta(meta: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:

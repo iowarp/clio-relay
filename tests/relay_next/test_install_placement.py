@@ -25,6 +25,7 @@ from clio_relay.adapters.hooks import (
     ChoiceOption,
     choice_ask,
     schema_options,
+    with_recommended_basis,
 )
 from clio_relay.jobs.handles import JobHandle, JobStatus
 from clio_relay.jobs.records import OperationState
@@ -191,6 +192,11 @@ def test_each_placement_option_says_where_it_runs_what_it_costs_and_its_limits()
     assert not alone_compute.recommended
     assert jarvis_report.choice_title(issue) == "Where JARVIS runs Spack checks at this site"
     assert jarvis_report.recommended_reason(issue) == issue["recommendation_reason"]
+    assert jarvis_report.recommendation_basis(issue) is None
+    recorded = {"source": "resource_graph", "constraint": "compute_job", "graph": "/g.yaml"}
+    assert jarvis_report.recommendation_basis({**issue, "recommendation_basis": recorded}) == (
+        recorded
+    )
     assert [item.value for item in jarvis_report.choice_details(issue)] == (
         jarvis_report.choice_offers(issue)
     )
@@ -250,6 +256,10 @@ def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     assert schema_options(ask.requested_schema) == options
     typed = (ask.meta or {})[CHOICE_META]["ask_1"]["pick"]
     assert typed["field"] == "pick" and typed["recommended_reason"] == "A is cheaper"
+    assert typed["recommended_basis"] is None
+    basis = {"source": "site_decision", "constraint": "a", "answered_by": "person"}
+    with_recommended_basis(ask, "pick", basis)
+    assert (ask.meta or {})[CHOICE_META]["ask_1"]["pick"]["recommended_basis"] == basis
     other = choice_ask(
         ask_id="ask_2", site="fx", operation_id="op", message="m", field_name="x", options=["y"]
     )

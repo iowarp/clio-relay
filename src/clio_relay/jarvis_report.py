@@ -407,6 +407,17 @@ def recommended_reason(issue: Mapping[str, Any]) -> str | None:
     return found if isinstance(found, str) and found else None
 
 
+def recommendation_basis(issue: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return what JARVIS's pick rests on, as JARVIS wrote it, when it says.
+
+    jarvis-cd d04b29e and later: a ``source`` (``site_decision``,
+    ``resource_graph``, ``heuristic``) and, for a recorded answer, who gave it,
+    when and why.
+    """
+    found = issue.get("recommendation_basis")
+    return dict(cast(dict[str, Any], found)) if isinstance(found, dict) and found else None
+
+
 def choice_message(issue: Mapping[str, Any]) -> str:
     """Return the question to ask for one of JARVIS's answerable issues.
 
