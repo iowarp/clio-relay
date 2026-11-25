@@ -49,7 +49,10 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         """Without arguments, list the sites. With site, describe it, its routes and
         the JARVIS packages relay can run there (packages, with their parameters),
         and return its guide (skill.text) when it has one: read it before the first
-        run there. With job, observe one operation, a service from serve included:
+        run there. describe reaches the site, and a site relay cannot reach comes
+        back with a refusal or the sign-in it needs; the site's config is how relay
+        reaches it, never a host or file to check yourself. With job, observe one
+        operation, a service from serve included:
         its state, when relay last looked (result.observed_at), the latest step
         (result.progress) and the outputs. With packages=true, list the staged
         packages, as packages_read does. This only reads."""

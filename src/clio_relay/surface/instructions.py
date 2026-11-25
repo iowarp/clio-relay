@@ -25,12 +25,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LEAD = (
-    "Relay is the way to reach a compute site. Never reach a site by ssh, scp or a "
-    "scheduler command (such as sbatch, squeue or qsub) in a shell, even when the host "
-    "is in an ssh config. If the site you need is not listed here, ask the person to "
-    "add it on the Compute page."
+    "Relay is the way to reach a compute site, and it owns the connection to each one, "
+    "whatever its transport. Reach a configured site only through relay's tools "
+    "(describe, run, exec, files, serve and their reads), never from a shell: run no "
+    "ssh, scp or scheduler command (such as sbatch, squeue or qsub) for it, and do not "
+    "check its connection, host or credentials yourself; describe(site=...) reaches the "
+    "site and says when relay cannot. If the site you need is not listed here, ask the "
+    "person to add it on the Compute page."
 )
-"""The opening line, before anything else, so no agent reaches a site around relay."""
+"""The opening line, before anything else, so no agent reaches or checks a site around relay.
+
+It names no transport's own files or commands to look at: a site's transport is how
+relay reaches it, never something the agent opens or tests itself.
+"""
+SITES_LEAD = "Compute sites configured for relay, each with the transport relay reaches it by"
 GENERAL = (
     "Relay runs work on the sites in its sites file. Call describe first. "
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
@@ -94,7 +102,7 @@ def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
     parts = [
         LEAD,
         GENERAL,
-        f"Compute sites configured for relay: {_listed(map(site_line, sites))}.",
+        f"{SITES_LEAD}: {_listed(map(site_line, sites))}.",
     ]
     if packages:
         ordered = sorted(packages, key=lambda entry: entry.name)

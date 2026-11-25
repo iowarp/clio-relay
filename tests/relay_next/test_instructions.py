@@ -43,8 +43,8 @@ def test_the_text_names_each_site_and_package() -> None:
         [_package(), _package("lab_kit.echo", summary=None)],
     )
     assert text.startswith(f"{instructions.LEAD} {instructions.GENERAL}")
-    assert "Never reach a site by ssh, scp or a scheduler command" in text
-    assert "Compute sites configured for relay: ares (Ares cluster; ssh); lab (ssh)." in text
+    assert "only through relay's tools (describe, run, exec, files, serve" in text
+    assert f"{instructions.SITES_LEAD}: ares (Ares cluster; ssh); lab (ssh)." in text
     assert (
         "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
         "(Xcompact3d (Incompact3d v5.0) incompressible flow simulation); lab_kit.echo 0.2.1."
@@ -66,6 +66,16 @@ def test_no_sites_says_so() -> None:
     text = instructions.compose([], [_package()])
     assert text == f"{instructions.LEAD} {instructions.GENERAL} {instructions.NO_SITES}"
     assert "Compute page" in text
+
+
+@pytest.mark.parametrize("sites", [[], [_site("ares")]])
+def test_the_text_sends_the_agent_to_no_transport_of_its_own(sites: list[SiteEntry]) -> None:
+    """A transport is how relay reaches a site: nothing points the agent at its files."""
+    text = instructions.compose(sites, []).lower()
+    assert "do not check its connection, host or credentials yourself" in text
+    assert "describe(site=...) reaches the site" in text
+    for pointer in ("ssh config", "ssh_config", "~/.ssh", "known_hosts", "ssh -g"):
+        assert pointer not in text
 
 
 def test_a_broken_sites_file_still_gives_instructions(relay_paths: RelayPaths) -> None:
@@ -117,5 +127,5 @@ def test_a_plain_client_reads_them_when_it_connects(relay_paths: RelayPaths, mod
 
     text = asyncio.run(scenario())
     assert text is not None
-    assert "Compute sites configured for relay: ares (fixture)." in text
+    assert f"{instructions.SITES_LEAD}: ares (fixture)." in text
     assert "clio_jarvis.xcompact3d 0.2.1 (Xcompact3d (Incompact3d v5.0)" in text
