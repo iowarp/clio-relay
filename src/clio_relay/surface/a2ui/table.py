@@ -80,6 +80,7 @@ _STATUS = {
     "ready": ("Ready", "Answers and needs nothing from you", "check", "positive"),
     "needs_sign_in": ("Sign-in needed", "Connect it from the row's menu", "warning", "warning"),
     "unavailable": ("Unavailable", "Relay cannot reach it now", "error", "negative"),
+    "checking": ("Checking", "Relay is reading its state now", "refresh", "neutral"),
 }
 
 

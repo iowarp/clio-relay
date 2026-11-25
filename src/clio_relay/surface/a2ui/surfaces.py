@@ -172,7 +172,12 @@ EDIT_FIELDS = (
     Field("queue", "Default queue", "text"),
 )
 
-_STATUS = {"ready": "Ready", "needs_sign_in": "Needs a sign-in", "unavailable": "Unavailable"}
+_STATUS = {
+    "ready": "Ready",
+    "needs_sign_in": "Needs a sign-in",
+    "unavailable": "Unavailable",
+    "checking": "Checking",
+}
 _PROBE = {
     "ready": "Ready",
     "missing_allocation": "Missing an allocation",

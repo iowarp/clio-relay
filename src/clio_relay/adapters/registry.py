@@ -32,8 +32,23 @@ def unregister(name: str) -> None:
     _registered.pop(name, None)
 
 
+_found: dict[str, EntryPoint] | None = None
+
+
 def _entry_points() -> dict[str, EntryPoint]:
-    return {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+    # Scanning every installed distribution takes tens of milliseconds, and routing
+    # one site loads several adapters. The installed set only changes with the
+    # environment, which restarts relay, so one scan serves the process.
+    global _found  # noqa: PLW0603
+    if _found is None:
+        _found = {point.name: point for point in entry_points(group=ENTRY_POINT_GROUP)}
+    return _found
+
+
+def rescan() -> None:
+    """Forget the installed adapters, so the next lookup reads the environment again."""
+    global _found  # noqa: PLW0603
+    _found = None
 
 
 def names() -> list[str]:

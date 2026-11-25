@@ -18,7 +18,10 @@ import hashlib
 import inspect
 import json
 import logging
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
+from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import mcp_types
@@ -34,6 +37,7 @@ from clio_relay import catalog
 from clio_relay.adapters import registry
 from clio_relay.identity.probe import load as load_probes
 from clio_relay.identity.probe import probes_file
+from clio_relay.identity.store import keyring_usable
 from clio_relay.jobs.records import write_json_atomic
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
@@ -71,10 +75,31 @@ logger = logging.getLogger(__name__)
 
 TAB_URI = "a2ui://clio-relay/compute"
 WATCH_INTERVAL_S = 2.0
+READ_BUDGET_S = 0.25
+"""How long a read waits for the sites' live state before showing what it last knew."""
+
+CHECKING = {"state": "checking"}
+"""The status of a site relay has never read and is reading now."""
+
+# The parts of a site's view that are not the site entry or its last test.
+_KNOWN_FIELDS = (
+    "status",
+    "identity",
+    "skill",
+    "reviewed",
+    "system_id",
+    "has_system_id",
+    "host_sign_in",
+)
 
 
 TOAST_META = "io.iowarp/toast"
 """The result ``_meta`` key of the toast a host shows for an action: message, tone, undo."""
+
+
+def _fingerprint(site: SiteEntry) -> str:
+    """Return what identifies the entry a site's view was read from."""
+    return hashlib.sha256(site.model_dump_json().encode()).hexdigest()[:16]
 
 
 class ComputeTab(TabActions):
@@ -90,6 +115,14 @@ class ComputeTab(TabActions):
         self._lock = asyncio.Lock()
         self._seen: str | None = None
         self._watching: asyncio.Task[None] | None = None
+        self._views_file = home / "compute-views.json"
+        self._forms: tuple[tuple[str, ...], dict[str, Form]] | None = None
+        # Each site's last read view, by id, with the fingerprint of the entry it read.
+        self._known: dict[str, tuple[str, SiteView]] | None = None
+        self._reading: dict[str, tuple[str, asyncio.Task[SiteView]]] = {}
+        self._shown: dict[str, SiteView] = {}
+        self._announcing: asyncio.Task[None] | None = None
+        self._identity_locks: dict[str, asyncio.Lock] = {}
 
     # What the tab remembers, shared by every relay process serving it
 
@@ -111,15 +144,38 @@ class ComputeTab(TabActions):
     # What the tab shows
 
     def forms(self) -> dict[str, Form]:
-        """Return a form for each installed adapter, by name, marking the test-only ones."""
+        """Return a form for each installed adapter, by name, marking the test-only ones.
+
+        The forms are built once for the adapters installed: building one imports its
+        adapter and walks its settings schema.
+        """
+        names = tuple(registry.names())
+        if self._forms is not None and self._forms[0] == names:
+            return self._forms[1]
         found: dict[str, Form] = {}
-        for name in registry.names():
+        for name in names:
             try:
                 cls = registry.load(name)
                 found[name] = form(name, cls.Config.model_json_schema(), listed=cls.listed)
             except Refusal:
                 continue
+        self._forms = (names, found)
         return found
+
+    def warm(self) -> None:
+        """Do the first read's one-time work ahead of it: adapter imports, forms and keyring."""
+        steps: list[Callable[[], object]] = [self.forms, keyring_usable]
+        try:
+            sites = self.service.sites.list()
+        except Refusal:
+            sites = []
+        for site in sites:
+            steps.append(partial(self.service.site_routes, site))
+        for step in steps:
+            try:
+                step()
+            except Exception:  # the read does the same work and reports what fails
+                logger.debug("warming the Compute page", exc_info=True)
 
     def _identities(self) -> Any:
         provider: Any = getattr(self.service.ask_provider, "identities", None)
@@ -178,36 +234,150 @@ class ComputeTab(TabActions):
 
     async def view(self, site: SiteEntry, identities: Any, probes: dict[str, Any]) -> SiteView:
         """Gather what the tab shows for one site."""
-        status = await site_status(self.service, site)
-        identity = await self._identity(identities, site.identity) if site.identity else None
-        has_system_id, system_id = await self._system_id(site)
+        found = await self._read_site(site, identities)
+        return replace(found, probe=cast(dict[str, Any] | None, probes.get(site.id)))
+
+    async def _read_site(self, site: SiteEntry, identities: Any) -> SiteView:
+        # Sites that share a sign-in read it in turn: two at once could each start a
+        # device code, or spend the same refresh token.
+        lock = self._identity_locks.setdefault(site.identity or f"site:{site.id}", asyncio.Lock())
+        async with lock:
+            try:
+                status = await site_status(self.service, site)
+                identity = (
+                    await self._identity(identities, site.identity) if site.identity else None
+                )
+                has_system_id, system_id = await self._system_id(site)
+                reviewed = await self._reviewed(site)
+            except Exception as exc:  # one site that cannot be read must not hide the others
+                logger.warning("reading site %s for the tab", site.id, exc_info=True)
+                detail = f"Relay could not read this endpoint's state ({type(exc).__name__})"
+                return SiteView(site=site, status={"state": "unavailable", "detail": detail})
         provider = str(status.get("provider") or site.identity or "").lower()
         host = provider if provider and provider in self.service.paths.grant_files else None
         return SiteView(
             site=site,
             status=status,
             identity=identity,
-            probe=cast(dict[str, Any] | None, probes.get(site.id)),
             skill=skill_link(site, self.service.paths.config_dir),
-            reviewed=await self._reviewed(site),
+            reviewed=reviewed,
             system_id=system_id,
             has_system_id=has_system_id,
             host_sign_in=host,
         )
 
-    async def views(self) -> list[SiteView]:
-        """Gather every site's view."""
+    def _start(self, site: SiteEntry, identities: Any, *, again: bool) -> asyncio.Task[SiteView]:
+        """Return a read of ``site``: the one in flight for this entry, unless ``again``."""
+        key = _fingerprint(site)
+        running = self._reading.get(site.id)
+        if not again and running is not None and running[0] == key and not running[1].done():
+            return running[1]
+        task = asyncio.get_running_loop().create_task(self._read_site(site, identities))
+        self._reading[site.id] = (key, task)
+        task.add_done_callback(lambda done: self._learn(site.id, key, done))
+        return task
+
+    def _learn(self, site_id: str, key: str, done: asyncio.Task[SiteView]) -> None:
+        running = self._reading.get(site_id)
+        if running is None or running[1] is not done:  # a later read replaced this one
+            return
+        if done.cancelled() or done.exception() is not None:
+            return
+        self._known_views()[site_id] = (key, done.result())
+
+    def _known_views(self) -> dict[str, tuple[str, SiteView]]:
+        if self._known is None:
+            self._known = {}
+            try:
+                data: Any = json.loads(self._views_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            stored = cast(dict[str, Any], data) if isinstance(data, dict) else {}
+            for site in self.service.sites.list():
+                entry: Any = stored.get(site.id)
+                if not isinstance(entry, dict):
+                    continue
+                item = cast(dict[str, Any], entry)
+                status: Any = item.get("status")
+                if not isinstance(status, dict):
+                    continue
+                view = SiteView(
+                    site=site,
+                    status=cast(dict[str, Any], status),
+                    identity=item.get("identity"),
+                    skill=item.get("skill"),
+                    reviewed=item.get("reviewed"),
+                    system_id=item.get("system_id"),
+                    has_system_id=bool(item.get("has_system_id")),
+                    host_sign_in=item.get("host_sign_in"),
+                )
+                self._known[site.id] = (str(item.get("fingerprint", "")), view)
+        return self._known
+
+    def _store_known(self) -> None:
+        known = self._known_views()
+        data = {
+            site_id: {"fingerprint": key, **{name: getattr(view, name) for name in _KNOWN_FIELDS}}
+            for site_id, (key, view) in known.items()
+        }
+        try:
+            write_json_atomic(self._views_file, data)
+        except (OSError, TypeError, ValueError):  # the next process reads the sites again
+            logger.debug("could not store the tab's site views", exc_info=True)
+
+    async def views(self, budget_s: float | None = None) -> list[SiteView]:
+        """Gather every site's view, reading the sites at once.
+
+        With a ``budget_s`` a site still being read after it shows what relay last
+        knew about it, and the page is announced again when the read changes that.
+        Without one, every site is read anew and waited for.
+        """
         identities = self._identities()
         probes = load_probes(self.service.paths)
+        sites = self.service.sites.list()
+        if self._known is None:
+            await asyncio.to_thread(self._known_views)
+        tasks = {site.id: self._start(site, identities, again=budget_s is None) for site in sites}
+        if budget_s is None:
+            await asyncio.wait(tasks.values())
+        else:
+            await asyncio.wait(tasks.values(), timeout=budget_s)
+        known = self._known_views()
         found: list[SiteView] = []
-        for site in self.service.sites.list():
-            try:
-                found.append(await self.view(site, identities, probes))
-            except Exception as exc:  # one site that cannot be read must not hide the others
-                logger.warning("reading site %s for the tab", site.id, exc_info=True)
-                detail = f"Relay could not read this endpoint's state ({type(exc).__name__})"
-                found.append(SiteView(site=site, status={"state": "unavailable", "detail": detail}))
+        late: list[asyncio.Task[SiteView]] = []
+        for site in sites:
+            task = tasks[site.id]
+            if task.done():
+                view = task.result()
+            else:
+                late.append(task)
+                last = known.get(site.id)
+                view = replace(last[1], site=site) if last is not None else None
+                if view is None or last is None or last[0] != _fingerprint(site):
+                    view = SiteView(site=site, status=dict(CHECKING))
+            found.append(replace(view, probe=cast(dict[str, Any] | None, probes.get(site.id))))
+        self._shown = {view.site.id: view for view in found}
+        if late:
+            if self._announcing is None or self._announcing.done():
+                self._announcing = asyncio.get_running_loop().create_task(self._announce(late))
+        else:
+            await asyncio.to_thread(self._store_known)
         return found
+
+    async def _announce(self, late: list[asyncio.Task[SiteView]]) -> None:
+        """Announce the page once the sites still being read differ from what it showed."""
+        await asyncio.wait(late)
+        await asyncio.to_thread(self._store_known)
+        changed = False
+        for task in late:
+            if task.cancelled() or task.exception() is not None:
+                continue
+            fresh = task.result()
+            shown = self._shown.get(fresh.site.id)
+            if shown is None or replace(shown, probe=None) != fresh:
+                changed = True
+        if changed:
+            await self.changes.resource_updated(TAB_URI)
 
     def _catalog(self) -> list[SiteEntry]:
         try:
@@ -241,7 +411,7 @@ class ComputeTab(TabActions):
     async def _read(self, client: A2UIClient | None) -> ResourceResult:
         self._watch()
         await asyncio.to_thread(self._load_state)
-        views = await self.views()
+        views = await self.views(READ_BUDGET_S)
         if client is None:
             return ResourceResult(
                 [ResourceContent(surfaces.summary(views, self.state.notice), "text/plain")]
@@ -431,6 +601,7 @@ def _action_tool(server: FastMCP[Any], tab: ComputeTab, action: str) -> None:
 def install(server: FastMCP[Any], service: RelayService, changes: ServerChanges) -> ComputeTab:
     """Add the Compute page's resource, its app-only tools and their listing rule to ``server``."""
     tab = ComputeTab(service, changes)
+    threading.Thread(target=tab.warm, name="compute-tab-warm", daemon=True).start()
 
     @server.resource(
         TAB_URI,
