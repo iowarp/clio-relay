@@ -379,6 +379,12 @@ SITE_COPY_KIND = "site_copy"
 already has of the package (a module, a site Spack install), or build it with Spack."""
 SITE_COPY_NONE = "site_copy_none"
 """JARVIS's fact that its search found no site copy, so Spack builds the package."""
+SITE_COPY_UNUSABLE = "site_copy_unusable"
+"""JARVIS's question (jarvis-cd 1.9.8) when the site copy chosen for a package does not
+load: another copy, a Spack build, or forget the choice and be asked again."""
+SPACK_BROKEN = "spack_broken"
+"""JARVIS's question (jarvis-cd 1.9.8) when a Spack fails before any package: run its
+commands without the person's user config, skip that Spack, or check again."""
 
 
 def site_copy_facts(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -404,8 +410,12 @@ _TITLES = {
     "variant_conflict": "Constraint to add",
     "concretize_failed": "How to resolve the Spack spec",
     SITE_COPY_KIND: "Site copy or Spack build",
+    SITE_COPY_UNUSABLE: "Site copy that does not load",
+    SPACK_BROKEN: "A Spack that fails",
 }
-_NAMED_TITLES = frozenset({"ambiguous_provider", "install_method", SITE_COPY_KIND})
+_NAMED_TITLES = frozenset(
+    {"ambiguous_provider", "install_method", SITE_COPY_KIND, SITE_COPY_UNUSABLE}
+)
 
 _LABELS = {
     "pip": "pip, in a Python venv",
@@ -500,9 +510,15 @@ def _sentence(text: str) -> str:
     return text if text.endswith((".", "!", "?")) else text + "."
 
 
-def _site_copy_meaning(candidate: Mapping[str, Any]) -> str:
-    """What picking a ``site_copy`` candidate does, and why it fits or not: JARVIS's words."""
-    parts = [candidate.get("does"), candidate.get("why")]
+def _written(candidate: Mapping[str, Any]) -> bool:
+    """Say whether JARVIS wrote what a candidate does (``site_copy``, ``spack_broken``...)."""
+    does = candidate.get("does")
+    return isinstance(does, str) and bool(does.strip())
+
+
+def _written_meaning(candidate: Mapping[str, Any]) -> str:
+    """What picking a candidate does, why, and what it leaves out: JARVIS's words."""
+    parts = [candidate.get("does"), candidate.get("why"), candidate.get("leaves_out")]
     return " ".join(_sentence(part) for part in parts if isinstance(part, str) and part.strip())
 
 
@@ -514,7 +530,6 @@ def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
     else a candidate's own flag); relay recommends none of its own.
     """
     placement = issue.get("kind") == PLACEMENT_KIND
-    site_copy = issue.get("kind") == SITE_COPY_KIND
     pick = issue.get("recommended")
     typed: dict[str, ChoiceOption] = {}
     for raw in cast(list[object], issue.get("candidates") or []):
@@ -523,10 +538,10 @@ def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
         if not isinstance(constraint, str) or not constraint or constraint in typed:
             continue
         meaning = _placement_meaning(issue, constraint) if placement else None
-        if meaning is None and site_copy:
+        if meaning is None and _written(candidate):
             meaning = (
                 _label(candidate, constraint, as_written=True),
-                _site_copy_meaning(candidate),
+                _written_meaning(candidate),
             )
         if meaning is None:
             facts = _candidate_facts(candidate)
@@ -615,12 +630,22 @@ def choice_note(issue: Mapping[str, Any]) -> str | None:
         )
     if once(issue):
         notes.append("The answer is for this run only; JARVIS asks again next time.")
+    elif issue.get("kind") == SPACK_BROKEN:
+        notes.append(
+            "JARVIS records a choice to go on without the user config or to skip this Spack "
+            "for the site's later installs; checking again records nothing."
+        )
     elif issue.get("scope") == "site":
         notes.append("JARVIS records the answer for the site's later installs.")
     elif issue.get("kind") == SITE_COPY_KIND and issue.get("package"):
         notes.append(
             f"JARVIS records the answer for {issue['package']} on this site, and later "
             "installs use it without searching again."
+        )
+    elif issue.get("kind") == SITE_COPY_UNUSABLE and issue.get("package"):
+        notes.append(
+            f"Another copy or the Spack build replaces the site copy JARVIS recorded for "
+            f"{issue['package']} on this site."
         )
     return " ".join(notes) or None
 

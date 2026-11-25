@@ -305,6 +305,131 @@ def test_a_site_copy_question_offers_the_site_s_copies_or_a_spack_build() -> Non
     assert "JARVIS records the answer for ior on this site" in note
 
 
+def test_a_broken_spack_question_says_what_each_way_out_does_and_leaves_out() -> None:
+    root = "/home/me/spack"
+    issue = {
+        "kind": "spack_broken",
+        "subject": f"spack:{root}",
+        "scope": "site",
+        "package": "*",
+        "answerable": True,
+        "schema": "jarvis.install-issue.v1",
+        "recommended": "no_user_config",
+        "question": (
+            f"The Spack at {root} fails on its own, before any package. Run JARVIS's Spack "
+            "commands without your user config, skip this Spack, or fix it yourself and "
+            "check again? Recommended: run without your user config."
+        ),
+        "candidates": [
+            {
+                "id": "no_user_config",
+                "constraint": "no_user_config",
+                "label": f"run JARVIS's Spack commands for {root} without your user config",
+                "does": "JARVIS sets SPACK_DISABLE_LOCAL_CONFIG=1 on its commands for this Spack",
+                "why": "`spack providers mpi` passes with it",
+                "leaves_out": "installs from the repo coeus can't be loaded",
+                "recommended": True,
+            },
+            {
+                "id": "skip",
+                "constraint": "skip",
+                "label": f"skip the Spack at {root}",
+                "does": "JARVIS offers no site copies from this Spack",
+                "why": "Nothing from a broken Spack is used.",
+            },
+            {
+                "id": "recheck",
+                "constraint": "recheck",
+                "label": "I'll fix it myself; check again",
+                "does": "Nothing is recorded: JARVIS checks again now, and asks again while "
+                "it still fails",
+            },
+        ],
+    }
+    assert jarvis_report.choice_issues({"issues": [issue]}) == [issue]
+    assert not jarvis_report.blocking_issues({"issues": [issue]})
+    plain, skip, recheck = jarvis_report.choice_details(issue)
+    assert (plain.value, plain.recommended) == ("no_user_config", True)
+    assert plain.label == f"run JARVIS's Spack commands for {root} without your user config"
+    assert plain.description == (
+        "JARVIS sets SPACK_DISABLE_LOCAL_CONFIG=1 on its commands for this Spack. "
+        "`spack providers mpi` passes with it. Installs from the repo coeus can't be loaded."
+    )
+    assert (skip.value, skip.recommended) == ("skip", False)
+    assert recheck.label == "I'll fix it myself; check again"
+    assert (recheck.description or "").startswith("Nothing is recorded")
+    assert jarvis_report.choice_message(issue) == (
+        "Run JARVIS's Spack commands without your user config, skip this Spack, or fix it "
+        "yourself and check again?"
+    )
+    assert jarvis_report.choice_title(issue) == "A Spack that fails"
+    assert "checking again records nothing" in (jarvis_report.choice_note(issue) or "")
+
+
+def test_a_site_copy_that_does_not_load_offers_another_copy_a_build_or_forgetting() -> None:
+    issue = {
+        "kind": "site_copy_unusable",
+        "subject": "site_copy",
+        "scope": "package",
+        "package": "ior",
+        "answerable": True,
+        "schema": "jarvis.install-issue.v1",
+        "recommended": "module:ior/3.3.0",
+        "question": (
+            "ior uses the site's copy ior 3.3.0, but `spack load /p26okkz` failed on this host. "
+            "Use another of the site's copies, build it with Spack, or forget the choice and "
+            "be asked again? Recommended: ior 3.3.0 (module ior/3.3.0)."
+        ),
+        "candidates": [
+            {
+                "id": "site-2",
+                "constraint": "module:ior/3.3.0",
+                "label": "ior 3.3.0 (module ior/3.3.0)",
+                "does": "Use the site's copy: `module load ior/3.3.0`; JARVIS builds nothing",
+                "why": "version 3.3.0 (any version fits)",
+                "recommended": True,
+            },
+            {
+                "id": "spack_build",
+                "constraint": "spack",
+                "label": "build ior with Spack",
+                "does": "Plan and build the query with Spack.",
+            },
+            {
+                "id": "forget",
+                "constraint": "forget",
+                "label": "forget the recorded choice and be asked again",
+                "does": "Drop the site's recorded site_copy answer for this package.",
+                "why": "The site_copy question is asked again.",
+            },
+        ],
+    }
+    assert jarvis_report.choice_issues({"issues": [issue]}) == [issue]
+    other, build, forget = jarvis_report.choice_details(issue)
+    assert (other.value, other.label, other.recommended) == (
+        "module:ior/3.3.0",
+        "ior 3.3.0 (module ior/3.3.0)",
+        True,
+    )
+    assert other.description == (
+        "Use the site's copy: `module load ior/3.3.0`; JARVIS builds nothing. "
+        "Version 3.3.0 (any version fits)."
+    )
+    assert (build.value, build.recommended) == ("spack", False)
+    assert forget.description == (
+        "Drop the site's recorded site_copy answer for this package. "
+        "The site_copy question is asked again."
+    )
+    assert jarvis_report.choice_message(issue) == (
+        "Use another of the site's copies, build it with Spack, or forget the choice and be "
+        "asked again?"
+    )
+    assert jarvis_report.choice_title(issue) == "Site copy that does not load for ior"
+    assert "replaces the site copy JARVIS recorded for ior" in (
+        jarvis_report.choice_note(issue) or ""
+    )
+
+
 def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     options = [
         ChoiceOption(value="a", label="Option A", description="Does A.", recommended=True),

@@ -198,6 +198,14 @@ package (`site_copy`). When it finds one, the question is whether to use the
 site's copy or build with Spack: each option's meaning is JARVIS's `does` and
 `why`, the recommended one is JARVIS's, and JARVIS records the answer for that
 package on the site. When it finds none, the install approval says so first.
+When a chosen site copy does not load (`site_copy_unusable`), the question
+offers the site's other copies, a Spack build, or forgetting the choice so the
+site-copy question is asked again. When a Spack itself fails before any package
+(`spack_broken`), the question offers running JARVIS's Spack commands without
+the person's user config, with what that leaves out, skipping that Spack, or
+checking again after the person fixes it. Relay shows each option as JARVIS
+wrote it and sends only the answers given in that round, so a check that still
+fails is asked again.
 When the site chose the login host for
 checks, the check runs there and relay submits no check job. Where JARVIS
 builds is the same choice, and relay declares no default for it, so a site
