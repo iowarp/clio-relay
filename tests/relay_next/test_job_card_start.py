@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_plan
 from clio_relay.jarvis_submit import record_status
@@ -12,6 +12,9 @@ from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
 from clio_relay.surface import job_card
 
 from .test_job_plan import _document  # pyright: ignore[reportPrivateUsage]
+
+if TYPE_CHECKING:
+    from clio_relay.surface.service import RelayService
 
 
 def _advisory(issue_id: str, message: str = "launching over TCP") -> dict[str, Any]:
@@ -188,3 +191,51 @@ def test_the_card_starts_with_the_job_not_with_an_install_before_it() -> None:
     assert started(_record((OperationState.QUEUED, 1))) is None
     ended = (*after_install, (OperationState.COMPLETED, 40))
     assert started(_record(*ended)) == _at(25)
+
+
+class _Titles:
+    """A service stand-in that knows the packages' contract titles."""
+
+    def __init__(self, titles: dict[str, str]) -> None:
+        self.titles = titles
+
+    def step_titles(self, spec: Any) -> dict[str, str]:
+        return self.titles
+
+
+def _install(spec: dict[str, Any], **result: Any) -> OperationRecord:
+    record = _record((OperationState.RUNNING, 1), **result)
+    record.kind = "install"
+    record.spec = spec
+    return record
+
+
+def test_an_install_is_labelled_with_what_it_installs() -> None:
+    label = job_card._label  # pyright: ignore[reportPrivateUsage]
+    service = cast("RelayService", _Titles({"clio_jarvis.lammps": "LAMMPS"}))
+    spec = {"package": {"name": "clio_jarvis.lammps"}}
+    assert label(service, _install(spec)) == "Install LAMMPS"
+    assert label(cast("RelayService", _Titles({})), _install(spec)) == "Install lammps"
+    built: dict[str, Any] = {
+        "summary": {
+            "build": [
+                {
+                    "package": "lammps",
+                    "method": "spack",
+                    "status": "missing",
+                    "spec": "lammps@20240829.1 +mpi ^openmpi",
+                    "missing": [],
+                },
+                {"package": "adios2", "method": "spack", "status": "missing", "spec": None},
+                {"package": "tool", "method": "pip", "status": "missing", "spec": "tool==2.1 x"},
+            ],
+            "reuse": ["openmpi"],
+            "undecided": [],
+        }
+    }
+    found = label(service, _install(spec, install=built))
+    assert found == "Install lammps@20240829.1, adios2, tool==2.1 x"
+    reused = {"summary": {"build": [], "reuse": ["lammps"], "undecided": []}}
+    assert label(service, _install(spec, install=reused)) == "Install LAMMPS"
+    assert label(service, _record((OperationState.RUNNING, 1))) is None
+    assert label(service, _install({"executable": "echo"})) is None

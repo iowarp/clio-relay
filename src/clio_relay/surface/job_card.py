@@ -40,6 +40,7 @@ its own ask for the call says so in the request's ``params._meta`` with
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
@@ -413,6 +414,43 @@ def _titles(service: RelayService, job: JobSpec | None) -> dict[str, str]:
         return {}
 
 
+_SPACK_SPEC_END = re.compile(r"[\s+~^%]")
+
+
+def _installed_what(item: dict[str, Any], titles: dict[str, str]) -> str:
+    """One thing an install builds: JARVIS's spec (for Spack, its root), else the package."""
+    spec = str(item.get("spec") or "").strip()
+    if spec and item.get("method") in (None, "", "spack"):
+        spec = _SPACK_SPEC_END.split(spec, maxsplit=1)[0]
+    return spec or person_name(str(item.get("package") or ""), titles)
+
+
+def _label(service: RelayService, record: OperationRecord) -> str | None:
+    """What an install job is called: "Install" and what it installs.
+
+    Once JARVIS's check has reported, that is the spec of each package it builds
+    (a Spack spec's root, such as ``lammps@20240829.1``); before, or when the site
+    already has every one, the packages the install names.
+    """
+    if record.kind != "install":
+        return None
+    install = cast(dict[str, Any], (record.result or {}).get("install") or {})
+    summary = cast(dict[str, Any], install.get("summary") or {})
+    builds = cast(list[Any], summary.get("build") or [])
+    built = [cast(dict[str, Any], item) for item in builds if isinstance(item, dict)]
+    try:
+        job: JobSpec | None = JobSpec.model_validate(record.spec)
+    except ValueError:
+        job = None
+    titles = _titles(service, job)
+    if built:
+        names = [_installed_what(item, titles) for item in built]
+    else:
+        names = [person_name(step.name, titles) for step in job.steps()] if job else []
+    names = list(dict.fromkeys(name for name in names if name))
+    return f"Install {', '.join(names)}" if names else None
+
+
 def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] | None:
     """Return the operation's job card, or ``None`` for an operation that is not a job."""
     if record.kind not in ("run", "serve", "install"):
@@ -443,6 +481,7 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
         "operation_id": record.operation_id,
         "resource": job_uri(record.operation_id),
         "kind": record.kind,
+        "label": _label(service, record),
         "job_id": record.handle.native_id if record.handle else None,
         "revision": int(record.last_change.timestamp() * 1000),
         "updated_at": record.last_change.isoformat(),
@@ -536,6 +575,7 @@ def command_snapshot(
         "operation_id": None,
         "resource": None,
         "kind": "exec_plan",
+        "label": None,
         "plan_kind": plan_kind,
         "summary": summary,
         "argv_sha256": argv_sha256,

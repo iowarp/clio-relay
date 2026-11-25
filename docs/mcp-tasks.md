@@ -143,7 +143,11 @@ being cancelled, and the status message says what was declined.
 Each job also travels as one typed snapshot under `io.iowarp.clio-relay/job`: its
 site, scheduler, phase (`planned`, `submitted`, `queued`, `running`, `ended`),
 outcome, partition, account, wall time, and its components with their node
-counts and state. A host can draw it as the job's card. Relay sends the whole
+counts and state. A host can draw it as the job's card. An install job's
+`label` names what it installs: "Install" and, once JARVIS's check reports,
+the spec of each package it builds (a Spack spec's root, such as
+`lammps@20240829.1`), else the packages the install names. Other jobs' `label`
+is null, and a host titles them from their components. Relay sends the whole
 snapshot each time, and `revision` rises with each change, so a host keeps the
 newest one per `operation_id`. The text of every message stays as it is, so a
 host that ignores the snapshot loses nothing.
