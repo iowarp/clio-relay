@@ -23,6 +23,7 @@ from typing import Any, cast
 from clio_relay.sites.models import SiteEntry, SpendAsk
 from clio_relay.sites.store import NewSiteDefaults
 from clio_relay.surface.a2ui.forms import Field
+from clio_relay.surface.a2ui.i18n import _
 from clio_relay.surface.a2ui.values import SPEND_ABOVE, SPEND_LIMIT, spend_value
 from clio_relay.wording import with_article
 
@@ -191,6 +192,25 @@ SIGN_IN_STATES = {"signed_in": "Signed in", "signed_out": "Signed out", "expired
 def protocol_name(adapter: str) -> str:
     """Return a protocol's name as a person reads it."""
     return PROTOCOLS.get(adapter, (adapter, ""))[0]
+
+
+# Protocols named with an ordinary word, which the page words in the person's language.
+_WORDED_PROTOCOLS = frozenset({"local"})
+# The catalog's name for the computer relay runs on (catalog/sites/local.yaml).
+LOCAL_SITE_NAME = "This computer"
+
+
+def protocol_label(adapter: str) -> str:
+    """Return a protocol's name in the page's language: "Local" is a word, "SSH" a name."""
+    name = protocol_name(adapter)
+    return _(name) if adapter in _WORDED_PROTOCOLS else name
+
+
+def site_label(site: SiteEntry) -> str:
+    """Return a site's name in the page's language when it is still the catalog's own."""
+    if site.adapter == "local" and site.title == LOCAL_SITE_NAME:
+        return _(LOCAL_SITE_NAME)
+    return site.title
 
 
 def protocol_order(names: Iterable[str], first: str = "") -> list[str]:

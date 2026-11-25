@@ -16,7 +16,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SIGN_IN_STATES,
     SiteView,
     duration_text,
-    protocol_name,
+    protocol_label,
     protocol_order,
     security_name,
     spend_draft,
@@ -107,7 +107,7 @@ def edit_form(
         )
         if not adapter_form.fields:
             rows.append(tree.text(f"{tab_base}-none", _("No settings"), "caption"))
-        title = protocol_name(name)
+        title = protocol_label(name)
         tabs.append({"title": title, "child": tree.column(f"{tab_base}-col", rows)})
     children.append(tree.add(f"{base}-tabs", "Tabs", tabs=tabs))
     if in_dialog:

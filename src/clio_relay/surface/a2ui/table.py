@@ -55,8 +55,9 @@ from clio_relay.surface.a2ui.surfaces import (
     SiteView,
     TabState,
     probe_text,
-    protocol_name,
+    protocol_label,
     protocol_order,
+    site_label,
     spend_options,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
@@ -107,7 +108,7 @@ def _columns(
     used = [name for view in views for name in (view.site.adapter, *view.site.alternatives)]
     protocols: list[dict[str, Any]] = []
     for name in protocol_order([*listed, *used]):
-        option: dict[str, Any] = {"value": name, "label": protocol_name(name)}
+        option: dict[str, Any] = {"value": name, "label": protocol_label(name)}
         if name in _PROTOCOL_ICON:
             option["icon"] = _PROTOCOL_ICON[name]
         if PROTOCOLS.get(name):
@@ -216,7 +217,7 @@ def _row(view: SiteView, state: TabState, tokens: ActionTokens) -> dict[str, Any
     ]
     row: dict[str, Any] = {
         "id": site.id,
-        "title": _clip(site.title, _LABEL),
+        "title": _clip(site_label(site), _LABEL),
         "values": values,
         "options": {"protocol": [site.adapter, *site.alternatives]},
         "context": {"token": tokens.mint(SET_VALUE, site.id)},

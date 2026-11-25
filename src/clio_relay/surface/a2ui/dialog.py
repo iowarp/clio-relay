@@ -44,7 +44,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SPEND_PRESETS,
     TEST_ENDPOINT,
     TabState,
-    protocol_name,
+    protocol_label,
     protocol_order,
 )
 from clio_relay.surface.a2ui.tokens import ActionTokens
@@ -145,7 +145,7 @@ def _catalog_tab(
             "value": site.id,
             "title": _(site.name),
             **({"subtitle": _(site.summary)} if site.summary else {}),
-            "chips": [protocol_name(way.adapter) for way in site.ways],
+            "chips": [protocol_label(way.adapter) for way in site.ways],
         }
         for site in inputs.sites
     ]
@@ -170,7 +170,7 @@ def _catalog_tab(
             ways = [
                 {
                     "value": item.adapter,
-                    "title": protocol_name(item.adapter),
+                    "title": protocol_label(item.adapter),
                     "subtitle": _(item.note)
                     if item.note
                     else _(PROTOCOLS[item.adapter][1])
@@ -201,7 +201,7 @@ def _saved_tab(tree: Tree, state: TabState, tokens: ActionTokens, inputs: Dialog
             "value": item.key,
             "title": item.title,
             **({"subtitle": item.subtitle} if item.subtitle else {}),
-            "chips": [protocol_name(item.adapter)],
+            "chips": [protocol_label(item.adapter)],
             "group": item.group,
         }
         for item in inputs.saved
@@ -227,7 +227,7 @@ def _own_tab(tree: Tree, state: TabState, forms: dict[str, Form], tokens: Action
     errors = state.errors.get(ADD_DIALOG, {})
     children = field_rows(tree, "add-o", OWN_FIELDS, f"{ADD}/own", errors, "own.", ADD)
     listed = protocol_order(name for name, item in forms.items() if item.listed)
-    names = [protocol_name(name) for name in listed if name != "local"]
+    names = [protocol_label(name) for name in listed if name != "local"]
     children.append(
         tree.add(
             "add-own-protocol",
@@ -240,7 +240,7 @@ def _own_tab(tree: Tree, state: TabState, forms: dict[str, Form], tokens: Action
             items=[
                 {
                     "value": name,
-                    "title": protocol_name(name),
+                    "title": protocol_label(name),
                     **({"subtitle": _(PROTOCOLS[name][1])} if name in PROTOCOLS else {}),
                 }
                 for name in listed
