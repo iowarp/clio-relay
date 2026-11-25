@@ -641,6 +641,7 @@ All runs are in `~/clio-relay-rework/clio-relay-w1`, branch `jaimecernuda-relay-
     - The generated compose uses `/bin/bash` and `/usr/sbin/sshd`, which a plain image like alpine lacks.
     - JARVIS logs "Containers started (SSH ready)" even when `up` failed.
     - Relay reported the failed job and its logs as they were.
+- **jarvis-cd 1.9.3 (coordinator).** `JARVIS_PIN` is the v1.9.3 tag's commit, 4491832 (`jarvis_cd-1.9.3-py3-none-any.whl`, SHA-256 ef83773c...4554, checked against the release download). It carries the placement recommendation from recorded answers with its `recommendation_basis`, the node-local podman store and runtime probe, and the container check that reads the shared archive, all proven by path above. Relay's dev dependency and uv.lock are the same wheel. Known issue, fixed in 1.9.4: containerized runs (the 2-node row above). A site at 1.9.2 is asked again, as for any pin change.
 
   Branch `jaimecernuda-relay-rework-w2`. Files: `tests/fixtures/sites/` (one Dockerfile and entrypoint per site, the two services, a README), `scripts/ares/fixtures.sh`, `tests/test_fixtures_smoke.py`.
 
