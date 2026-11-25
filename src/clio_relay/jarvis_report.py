@@ -136,6 +136,55 @@ def install_summary(
     }
 
 
+def build_facts(
+    report: Mapping[str, Any], names: Mapping[str, str] | None = None
+) -> list[dict[str, Any]]:
+    """Return what JARVIS's check found for each package it builds or installs.
+
+    One entry per :func:`install_summary` build item, with what JARVIS reported
+    beside it: for Spack, how many of the spec's packages the site already has
+    (``present`` of ``total``), the MPI it builds against (``mpi``: name,
+    version, prefix, modules), and JARVIS's build estimate from its build
+    placement (``placement.build.packages[step].estimate``). A fact JARVIS did
+    not report is ``None``.
+    """
+    names = names or {}
+    placement = _dict(report.get("placement"))
+    planned = _dict(_dict(placement.get("build")).get("packages"))
+    found: list[dict[str, Any]] = []
+    for method, installer in _dict(report.get("installers")).items():
+        for step, entry in _installer_packages(_dict(installer)):
+            if entry.get("status") in REUSED_STATUSES or entry.get("status") == "needs_decision":
+                continue
+            counts = _dict(entry.get("nodes_by_status"))
+            total = entry.get("nodes_total")
+            missing = counts.get("missing", 0) if counts else None
+            present = (
+                total - missing
+                if isinstance(total, int) and isinstance(missing, int) and total >= missing
+                else None
+            )
+            mpi = entry.get("mpi")
+            estimate = _dict(_dict(planned.get(step)).get("estimate"))
+            human = estimate.get("human")
+            spec = entry.get("spec") or entry.get("image")
+            query = entry.get("query")
+            if not spec and isinstance(query, list):
+                spec = " ".join(str(item) for item in cast(list[object], query)) or None
+            found.append(
+                {
+                    "package": names.get(step, step),
+                    "method": method,
+                    "spec": spec,
+                    "total": total if isinstance(total, int) else None,
+                    "present": present,
+                    "mpi": cast(dict[str, Any], mpi) if isinstance(mpi, dict) else None,
+                    "estimate": human if isinstance(human, str) and human != "unknown" else None,
+                }
+            )
+    return found
+
+
 def _installer_packages(installer: Mapping[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Return ``(step, state)`` per package an installer reports.
 
@@ -552,9 +601,11 @@ def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None
     ``walltime`` is the install job's (``jarvis_submit.install_walltime``), for the ask.
     """
     summary = install_summary(report)
+    found = ", ".join(str(item["spec"] or item["package"]) for item in summary["build"])
     message = (
-        f"the package's software is not installed on {site}: JARVIS installs "
-        f"{len(summary['build'])} package(s) once you approve"
+        f"JARVIS's check finds no installed {found or 'copy of the software'} on {site}; "
+        f"JARVIS installs {len(summary['build'])} package(s) once the person approves, "
+        "and relay asks them"
     )
     if not summary["build"] and choice_issues(report):
         kinds = sorted({str(issue.get("kind")) for issue in choice_issues(report)})

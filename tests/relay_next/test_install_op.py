@@ -298,10 +298,66 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     message = install_wording.install_message(
         report, site="Ares", package="demo.tool", names={}, walltime=None
     )
-    assert "To build: lammps@2Aug2023." in message
-    assert "To install: rich-cli pyyaml (with pip), alpine:3.20 (with container)." in message
+    assert "JARVIS's Spack check finds no installed lammps@2Aug2023 on Ares" in message
+    assert "JARVIS finds no rich-cli pyyaml on Ares and installs it with pip." in message
+    assert "JARVIS finds no alpine:3.20 on Ares and installs it with container." in message
+    assert "not installed" not in message
     refusal = jarvis_report.install_needed(report, site="Ares")
     assert "JARVIS installs 3 package(s)" in refusal.message
+    assert "relay asks them" in refusal.message
+
+
+def test_the_install_ask_states_what_jarvis_found_and_what_each_answer_does() -> None:
+    report: dict[str, Any] = {
+        "installers": {
+            "spack": {
+                "packages": {
+                    "sim": {
+                        "status": "missing",
+                        "spec": "lammps@20240829.1",
+                        "nodes_total": 40,
+                        "nodes_by_status": {"upstream": 30, "installed": 2, "missing": 8},
+                        "mpi": {
+                            "name": "openmpi",
+                            "version": "5.0.5",
+                            "prefix": "/site/openmpi",
+                            "modules": ["openmpi/5.0.5"],
+                        },
+                    }
+                }
+            }
+        },
+        "placement": {
+            "build": {
+                "choice": "compute_job",
+                "packages": {"sim": {"estimate": {"seconds": 1500.0, "human": "~25 min"}}},
+            }
+        },
+        "issues": [],
+    }
+    names = {"sim": "builtin.lammps"}
+    message = install_wording.install_message(
+        report, site="Ares", package="builtin.lammps", names=names
+    )
+    assert (
+        "JARVIS's Spack check finds no installed lammps@20240829.1 on Ares, so it builds one: "
+        "32 of the 40 Spack packages it needs are on Ares already and 8 are built, "
+        "~25 min by JARVIS's estimate. It builds against openmpi 5.0.5, the site module "
+        "openmpi/5.0.5." in message
+    )
+    title, yes, no = install_wording.install_meanings(
+        report, site="Ares", package="builtin.lammps", names=names
+    )
+    assert title == "Software for builtin.lammps on Ares"
+    assert yes == (
+        "JARVIS builds lammps@20240829.1 with Spack (~25 min) on Ares, in an install job, "
+        "then builtin.lammps runs."
+    )
+    assert no == "Nothing is built or installed on Ares and builtin.lammps does not run."
+    _, alone, kept = install_wording.install_meanings(
+        report, site="Ares", package="builtin.lammps", names=names, run=False
+    )
+    assert alone.endswith("; nothing runs after it.") and kept.endswith("on Ares.")
 
 
 def test_the_install_ask_reads_the_container_installers_shared_image_state() -> None:
@@ -332,7 +388,10 @@ def test_the_install_ask_reads_the_container_installers_shared_image_state() -> 
         report, site="Ares", package="relay_proof.container_tool", names={}, run=False
     )
     assert "nothing has to be installed" not in message
-    assert "To install: docker.io/library/alpine:3.20 (with container)." in message
+    assert (
+        "JARVIS finds no docker.io/library/alpine:3.20 on Ares and installs it with container."
+        in message
+    )
     satisfied = {
         "installers": {"container": {**report["installers"]["container"], "status": "satisfied"}}
     }

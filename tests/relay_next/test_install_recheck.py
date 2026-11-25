@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from clio_relay import jarvis_report, jarvis_submit
-from clio_relay.adapters.hooks import ask_text
+from clio_relay.adapters.hooks import CHOICE_META, ask_text
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
@@ -185,7 +185,11 @@ def test_a_check_job_that_finds_software_missing_asks_to_install_it(
         assert service.operation(operation_id).state == OperationState.AWAITING_INPUT
         (approve,) = service.outstanding(service.operation(operation_id))
         assert approve.kind == "approve"
-        assert "does not have yet" in ask_text(approve)
+        assert "JARVIS's Spack check finds no installed" in ask_text(approve)
+        typed = (approve.meta or {})[CHOICE_META][approve.ask_id]["approve"]
+        assert [option["label"] for option in typed["options"]] == ["Approve", "Decline"]
+        assert all(option.get("description") for option in typed["options"])
+        assert typed["recommended"] is None
         service.answer(approve.ask_id, "accept", {"approve": True}, by="test")
         await service.advance(operation_id)
         assert service.operation(operation_id).state == OperationState.QUEUED

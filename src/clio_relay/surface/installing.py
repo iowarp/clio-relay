@@ -70,7 +70,7 @@ from clio_relay import (
     jarvis_submit,
 )
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, explain_approval
 from clio_relay.asks.core import approval_covers as approval_covers
 from clio_relay.jarvis_exits import build_refused, built_here, ran_here
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
@@ -232,27 +232,33 @@ async def ask_install(
         if to_ask and not missing:
             state["recheck"] = True
         else:
-            asks.append(
-                await provider.approve(
-                    site=site,
-                    operation_id=operation_id,
-                    message=cast(str | None, refusal.data.get("ask_message"))
-                    or install_wording.install_message(
-                        report,
-                        site=site.title,
-                        package=_what(job_of(record)),
-                        names=names,
-                        walltime=cast(str | None, refusal.data.get("install_walltime")),
-                        run=record.kind != "install",
-                    ),
-                    binding={
-                        **binding,
-                        "kind": SOFTWARE_KIND,
-                        "report_digest": state["report_digest"],
-                    },
-                    plain=False,
-                )
+            package = _what(job_of(record))
+            runs = record.kind != "install"
+            approval = await provider.approve(
+                site=site,
+                operation_id=operation_id,
+                message=cast(str | None, refusal.data.get("ask_message"))
+                or install_wording.install_message(
+                    report,
+                    site=site.title,
+                    package=package,
+                    names=names,
+                    walltime=cast(str | None, refusal.data.get("install_walltime")),
+                    run=runs,
+                ),
+                binding={
+                    **binding,
+                    "kind": SOFTWARE_KIND,
+                    "report_digest": state["report_digest"],
+                },
+                plain=False,
             )
+            title, yes, no = install_wording.install_meanings(
+                report, site=site.title, package=package, names=names, run=runs
+            )
+            explain_approval(approval, title=title, yes=yes, no=no)
+            service.asks.put(approval.ask_id, approval)
+            asks.append(approval)
         choices: dict[str, str] = {}
         offers: dict[str, dict[str, tuple[str, str]]] = {}
         with service.asks.locked(site_lock_id(site.id)):
