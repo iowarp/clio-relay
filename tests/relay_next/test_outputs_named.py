@@ -31,7 +31,8 @@ async def test_progress_reads_the_shared_directory_the_site_script_wrote() -> No
     assert await _shared(files, job) == "/home/u/clio-relay-runs/op_x"
     assert files.read_paths == [f"{job}/relay.shared"]
     for said in (None, b"", b"relative/path"):
-        assert await _shared(_Files(said), job) == f"{job}/.relay-jarvis/shared"
+        other: Any = _Files(said)
+        assert await _shared(other, job) == f"{job}/.relay-jarvis/shared"
 
 
 def test_a_serve_artifact_with_an_absolute_name_keeps_its_path() -> None:
