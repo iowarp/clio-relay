@@ -19,11 +19,18 @@ from typing import Any
 import pytest
 
 from clio_relay import jarvis_exits, jarvis_report, jarvis_submit
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import (
+    CHOICE_META,
+    Ask,
+    ChoiceOption,
+    choice_ask,
+    schema_options,
+)
 from clio_relay.jobs.handles import JobHandle, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.surface import install_op
+from clio_relay.surface.elicit import input_required
 from clio_relay.surface.install_share import CHOICE_FIELD, choice_answers, choice_binding, offer_map
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
@@ -124,8 +131,22 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
         operation_id = (await install_op.start(service, "fx", PACKAGE)).operation_id
         (choice,) = service.outstanding(service.operation(operation_id))
         assert choice.kind == "choose"
-        assert "login_limited (check here; recommended)" in choice.message
+        assert "Login host, now (recommended): Runs on the login host" in choice.message
+        assert "login_limited" not in choice.message
         assert "compute_job for paraview only" in str(choice.requested_schema)
+        field = (choice.requested_schema or {})["properties"][CHOICE_FIELD]
+        assert field["title"] == "Where JARVIS runs Spack checks at this site"
+        assert field["default"] == "login_limited"
+        assert {"const": "compute_job", "title": "Compute node job"}.items() <= field["oneOf"][
+            1
+        ].items()
+        typed = (choice.meta or {})[CHOICE_META][choice.ask_id]
+        assert typed["recommended"] == "login_limited"
+        assert [item["label"] for item in typed["options"]][:3] == [
+            "Login host, now",
+            "Compute node job",
+            "Ask each time",
+        ]
         service.answer(choice.ask_id, "accept", {CHOICE_FIELD: "login_limited"}, by="test")
         done = await service.advance(operation_id)
         assert done.state == OperationState.COMPLETED, done
@@ -139,13 +160,80 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
 
 def test_the_question_shows_jarvis_evidence_and_what_each_choice_does() -> None:
     message = jarvis_report.choice_message(PLACEMENT)
-    assert message.startswith(PLACEMENT["question"])
-    assert "compute_job (check in a job)" in message
+    assert message.startswith(PLACEMENT["question"].replace("login_limited", "Login host, now"))
+    assert "Compute node job: Runs the check in a short 1-node batch job" in message
     assert "JARVIS records the answer for the site's later installs" in message
     assert "evidence 5" in message and "evidence 6" not in message
     assert "for <package> only" in message and "(paraview)" in message
     occasion = jarvis_report.choice_message(OCCASION)
     assert "for this run only" in occasion and "later installs" not in occasion
+
+
+def test_each_placement_option_says_where_it_runs_what_it_costs_and_its_limits() -> None:
+    issue = {
+        **PLACEMENT,
+        "recommended": "compute_job",
+        "recommendation_reason": "a short compute job keeps the login host light",
+        "login_host": {"host": "ares-login"},
+        "limits": {"nice": 10, "jobs": 2, "memory_mb": 4096, "defer": False},
+        "queue": {"measured": True, "wait": "2 min"},
+    }
+    login, compute, each, alone_login, alone_compute, _ = jarvis_report.choice_details(issue)
+    assert login.label == "Login host, now" and not login.recommended
+    assert "ares-login" in (login.description or "")
+    assert "nice 10, 2 job(s), up to 4096 MB" in (login.description or "")
+    assert "no queue wait" in (login.description or "")
+    assert compute.recommended and "about 2 min in the queue" in (compute.description or "")
+    assert "allocation" in (compute.description or "")
+    assert each.label == "Ask each time"
+    assert alone_login.value == "login_limited for paraview only"
+    assert alone_login.label == "Login host, now for paraview only"
+    assert not alone_compute.recommended
+    assert jarvis_report.choice_title(issue) == "Where JARVIS runs Spack checks at this site"
+    assert jarvis_report.recommended_reason(issue) == issue["recommendation_reason"]
+    assert [item.value for item in jarvis_report.choice_details(issue)] == (
+        jarvis_report.choice_offers(issue)
+    )
+    assert jarvis_report.choice_title(OCCASION) == "Where JARVIS runs this Spack check"
+
+
+def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
+    options = [
+        ChoiceOption(value="a", label="Option A", description="Does A.", recommended=True),
+        ChoiceOption(value="b", label="Option B"),
+    ]
+    ask = choice_ask(
+        ask_id="ask_1",
+        site="fx",
+        operation_id="op",
+        message="Pick",
+        field_name="pick",
+        options=options,
+        title="What to pick",
+        recommended_reason="A is cheaper",
+    )
+    field = (ask.requested_schema or {})["properties"]["pick"]
+    assert field == {
+        "type": "string",
+        "title": "What to pick",
+        "oneOf": [
+            {"const": "a", "title": "Option A", "description": "Does A."},
+            {"const": "b", "title": "Option B"},
+        ],
+        "default": "a",
+    }
+    assert schema_options(ask.requested_schema) == options
+    typed = (ask.meta or {})[CHOICE_META]["ask_1"]
+    assert typed["field"] == "pick" and typed["recommended_reason"] == "A is cheaper"
+    other = choice_ask(
+        ask_id="ask_2", site="fx", operation_id="op", message="m", field_name="x", options=["y"]
+    )
+    merged = input_required([ask, other], "state").meta or {}
+    assert set(merged[CHOICE_META]) == {"ask_1", "ask_2"}
+    # A form that names only values still reads, each its own label.
+    assert schema_options({"properties": {"x": {"type": "string", "enum": ["y"]}}}) == [
+        ChoiceOption(value="y", label="y")
+    ]
 
 
 def test_a_question_for_this_run_only_is_not_shared() -> None:

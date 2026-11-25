@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ChoiceOption, choice_field, choice_meta
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.sites.models import SiteEntry
@@ -113,17 +113,27 @@ async def question(
 
 TITLE = "The site's running services"
 
+OPTIONS = [
+    ChoiceOption(
+        value=END,
+        label="End them when this job is submitted",
+        description="Frees their nodes; their live view and review stop, their files stay.",
+    ),
+    ChoiceOption(
+        value=KEEP,
+        label="Keep them running",
+        description=(
+            "They keep holding their nodes beside this job's, so you can still review them."
+        ),
+        recommended=True,
+    ),
+]
+
 
 def field(message: str) -> dict[str, Any]:
     """Return the form field that holds the choice, titled for the person."""
-    return {
-        "type": "string",
-        "title": TITLE,
-        # A job card shows in place of the message, so the field says which services.
-        "description": message,
-        "enum": [END, KEEP],
-        "default": KEEP,
-    }
+    # A job card shows in place of the message, so the field says which services.
+    return choice_field(OPTIONS, title=TITLE, description=message)
 
 
 def fold(
@@ -142,6 +152,10 @@ def fold(
     properties[FIELD] = field(message)
     schema["properties"] = properties
     into.requested_schema = schema
+    into.meta = {
+        **(into.meta or {}),
+        **choice_meta(into.ask_id, FIELD, OPTIONS, title=TITLE),
+    }
     service.asks.put(into.ask_id, into)
     state = {"ask_id": into.ask_id, "operations": operations, "in_card": True}
     record.result = {**(record.result or {}), KEY: state}
@@ -160,14 +174,9 @@ async def ask(
         operation_id=record.operation_id,
         message=message,
         field_name=FIELD,
-        options=[END, KEEP],
+        options=OPTIONS,
+        title=TITLE,
     )
-    schema = dict(asked.requested_schema or {})
-    properties = dict(schema.get("properties") or {})
-    properties[FIELD] = {**cast(dict[str, Any], properties.get(FIELD) or {}), "title": TITLE}
-    schema["properties"] = properties
-    asked.requested_schema = schema
-    service.asks.put(asked.ask_id, asked)
     record.result = {
         **(record.result or {}),
         KEY: {"ask_id": asked.ask_id, "operations": operations},

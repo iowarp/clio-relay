@@ -13,6 +13,7 @@ import json
 from collections.abc import Mapping
 from typing import Any, cast
 
+from clio_relay.adapters.hooks import ChoiceOption
 from clio_relay.jarvis_submit import INSTALL_REPORT_SCHEMA, NEEDS_INSTALL, parse_document
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -168,10 +169,7 @@ def choice_options(issue: Mapping[str, Any]) -> list[str]:
     return options
 
 
-def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
-    constraint = candidate.get("constraint")
-    if not isinstance(constraint, str) or not constraint:
-        return None
+def _candidate_facts(candidate: Mapping[str, Any]) -> list[str]:
     facts: list[str] = []
     source = candidate.get("source")
     if isinstance(source, str) and source:
@@ -191,9 +189,7 @@ def _candidate_line(candidate: Mapping[str, Any]) -> str | None:
     does = candidate.get("does")
     if isinstance(does, str) and does:
         facts.append(does)
-    if candidate.get("recommended") is True:
-        facts.append("recommended")
-    return f"{constraint} ({'; '.join(facts)})" if facts else constraint
+    return facts
 
 
 MAX_EVIDENCE = 6
@@ -242,6 +238,158 @@ def choice_offers(issue: Mapping[str, Any]) -> list[str]:
     return [*choice_options(issue), *override_choices(issue)]
 
 
+PLACEMENT_KIND = "install_placement"
+
+_TITLES = {
+    "spack_missing": "Spack to use",
+    "compiler_unavailable": "Compiler to use",
+    "ambiguous_compiler": "Compiler to use",
+    "ambiguous_provider": "MPI to use",
+    "python_missing": "Python for pip packages",
+    "conda_select": "Conda to use",
+    "conda_missing": "Install conda",
+    "container_engine": "Container engine",
+    "install_method": "How to install",
+    "variant_conflict": "Constraint to add",
+    "concretize_failed": "How to resolve the Spack spec",
+}
+
+_LABELS = {
+    "pip": "pip, in a Python venv",
+    "conda": "conda",
+    "spack": "Spack",
+    "container": "Container image",
+    "podman": "Podman",
+    "apptainer": "Apptainer",
+    "singularity": "Singularity",
+    "docker": "Docker",
+}
+
+
+def _phase(issue: Mapping[str, Any]) -> str:
+    phase = issue.get("phase")
+    if isinstance(phase, str) and phase:
+        return phase
+    subject = str(issue.get("subject") or "")
+    return "build" if ".build" in subject else "check"
+
+
+def choice_title(issue: Mapping[str, Any]) -> str:
+    """Return the human label of a JARVIS question's field."""
+    kind = str(issue.get("kind") or "")
+    package = issue.get("package")
+    named = f" for {package}" if isinstance(package, str) and package not in ("", "*") else ""
+    if kind == PLACEMENT_KIND:
+        phase = _phase(issue)
+        if once(issue):
+            return f"Where JARVIS runs this Spack {phase}"
+        return f"Where JARVIS runs Spack {phase}s at this site"
+    found = _TITLES.get(kind)
+    if found is not None:
+        return found + (named if kind in ("ambiguous_provider", "install_method") else "")
+    return (kind.replace("_", " ").capitalize() or "Choice") + named
+
+
+def _placement_meaning(issue: Mapping[str, Any], constraint: str) -> tuple[str, str] | None:
+    """Return the label and one-line meaning of an ``install_placement`` option."""
+    phase = _phase(issue)
+    if constraint == "login_limited":
+        host = _dict(issue.get("login_host")).get("host")
+        limits = _dict(issue.get("limits"))
+        bounds = [
+            f"nice {limits['nice']}" if limits.get("nice") is not None else "",
+            f"{limits['jobs']} job(s)" if limits.get("jobs") is not None else "",
+            f"up to {limits['memory_mb']} MB" if limits.get("memory_mb") is not None else "",
+        ]
+        bounded = ", ".join(item for item in bounds if item)
+        busy = cast(list[object], limits.get("defer_reasons") or [])
+        text = (
+            f"Runs on the login host{f' {host}' if host else ''} right away"
+            f"{f', bounded ({bounded})' if bounded else ', bounded'}: no queue wait and no "
+            "allocation charge, but it shares the login host with everyone on it"
+        )
+        if limits.get("defer") and busy:
+            text += "; it is busy now (" + "; ".join(str(item) for item in busy) + ")"
+        return "Login host, now", text + "."
+    if constraint == "compute_job":
+        queue = _dict(issue.get("queue"))
+        wait = (
+            f"about {queue['wait']} in the queue now"
+            if queue.get("measured") and queue.get("wait")
+            else "a queue wait relay cannot measure here"
+        )
+        return (
+            "Compute node job",
+            f"Runs the {phase} in a short 1-node batch job: {wait} and a little allocation "
+            "time, and it keeps the login host light.",
+        )
+    if constraint == "ask_each_time":
+        return (
+            "Ask each time",
+            f"Records no standing answer: JARVIS asks before every Spack {phase} here.",
+        )
+    return None
+
+
+def _label(candidate: Mapping[str, Any], constraint: str) -> str:
+    for key in ("label", "summary"):
+        found = candidate.get(key)
+        if isinstance(found, str) and found:
+            return found[:1].upper() + found[1:]
+    return _LABELS.get(constraint, constraint)
+
+
+def choice_details(issue: Mapping[str, Any]) -> list[ChoiceOption]:
+    """Return a JARVIS question's options typed: label, one-line meaning, recommended.
+
+    The values are :func:`choice_offers`'s, so an answer reads as before. The
+    recommended option is the one JARVIS recommends (the issue's ``recommended``,
+    else a candidate's own flag); relay recommends none of its own.
+    """
+    placement = issue.get("kind") == PLACEMENT_KIND
+    pick = issue.get("recommended")
+    typed: dict[str, ChoiceOption] = {}
+    for raw in cast(list[object], issue.get("candidates") or []):
+        candidate = _dict(raw)
+        constraint = candidate.get("constraint")
+        if not isinstance(constraint, str) or not constraint or constraint in typed:
+            continue
+        meaning = _placement_meaning(issue, constraint) if placement else None
+        if meaning is None:
+            facts = _candidate_facts(candidate)
+            text = "; ".join(facts)
+            meaning = (
+                _label(candidate, constraint),
+                text[:1].upper() + text[1:] + "." if text else "",
+            )
+        recommended = (
+            constraint == pick if isinstance(pick, str) else candidate.get("recommended") is True
+        )
+        typed[constraint] = ChoiceOption(
+            value=constraint,
+            label=meaning[0],
+            description=meaning[1] or None,
+            recommended=recommended,
+        )
+    for option, (_issue_id, constraint) in override_choices(issue).items():
+        base = typed.get(constraint)
+        package = option.removeprefix(f"{constraint} for ").removesuffix(" only")
+        typed[option] = ChoiceOption(
+            value=option,
+            label=f"{base.label if base else constraint} for {package} only",
+            description=(
+                f"Places only {package} this way; JARVIS asks again for the other packages."
+            ),
+        )
+    return list(typed.values())
+
+
+def recommended_reason(issue: Mapping[str, Any]) -> str | None:
+    """Return why JARVIS recommends its pick, when it says."""
+    found = issue.get("recommendation_reason")
+    return found if isinstance(found, str) and found else None
+
+
 def choice_message(issue: Mapping[str, Any]) -> str:
     """Return the question to ask for one of JARVIS's answerable issues.
 
@@ -255,10 +403,16 @@ def choice_message(issue: Mapping[str, Any]) -> str:
         if isinstance(question, str) and question
         else f"JARVIS needs a choice for {subject}: pick one"
     )
+    details = choice_details(issue)
+    own = set(choice_options(issue))
+    pick = next((item for item in details if item.recommended), None)
+    if pick is not None and pick.label != pick.value:
+        text = text.replace(f"Recommended: {pick.value}", f"Recommended: {pick.label}")
     lines = [
-        line
-        for candidate in cast(list[object], issue.get("candidates") or [])
-        if (line := _candidate_line(_dict(candidate)))
+        f"{item.label}{' (recommended)' if item.recommended else ''}"
+        + (f": {item.description.rstrip('.')}" if item.description else "")
+        for item in details
+        if item.value in own
     ]
     previous = _dict(issue.get("previous_answer"))
     if previous.get("constraint"):

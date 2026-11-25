@@ -24,6 +24,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay.adapters.base import BaseAdapter
+from clio_relay.adapters.hooks import ChoiceOption
 from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal
@@ -134,6 +135,34 @@ async def consider(
     options = {keep: ""}
     for item in fitting:
         options[f"move to {item['partition']}"] = str(item["partition"])
+    start = facts.get("estimated_start") or "later"
+    typed = [
+        ChoiceOption(
+            value=keep,
+            label=f"Keep waiting in {partition}",
+            description=(
+                f"Nothing changes; the scheduler expects it to start at {start}, "
+                f"in about {_hours(starts_in)}."
+            ),
+        ),
+        *(
+            ChoiceOption(
+                value=f"move to {item['partition']}",
+                label=f"Move to {item['partition']}",
+                description=(
+                    "Has room now"
+                    + (
+                        f" ({item['idle_nodes']} idle nodes)"
+                        if isinstance(item.get("idle_nodes"), int)
+                        else ""
+                    )
+                    + "; the same job keeps its place in relay and starts when "
+                    f"{item['partition']} runs it, under that partition's limits."
+                ),
+            )
+            for item in fitting
+        ),
+    ]
     names = ", ".join(
         f"{item['partition']} ({item['idle_nodes']} idle nodes)"
         if isinstance(item.get("idle_nodes"), int)
@@ -141,7 +170,6 @@ async def consider(
         for item in fitting
     )
     site = service.site(record.site)
-    start = facts.get("estimated_start") or "later"
     message = (
         f"{_what(record, phase)} {handle.native_id} waits in the {partition} queue on "
         f"{site.title}{f' ({reason})' if reason else ''}. The scheduler expects it to start "
@@ -155,7 +183,8 @@ async def consider(
         operation_id=operation_id,
         message=message,
         field_name=FIELD,
-        options=list(options),
+        options=typed,
+        title="Where the job waits",
     )
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)

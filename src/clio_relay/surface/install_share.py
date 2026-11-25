@@ -195,7 +195,9 @@ async def choice_ask(
         operation_id=operation_id,
         message=jarvis_report.choice_message(issue),
         field_name=CHOICE_FIELD,
-        options=jarvis_report.choice_offers(issue),
+        options=jarvis_report.choice_details(issue),
+        title=jarvis_report.choice_title(issue),
+        recommended_reason=jarvis_report.recommended_reason(issue),
     )
     if binding is not None:
         ask.bind(binding)

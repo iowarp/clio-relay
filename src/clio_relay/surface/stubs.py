@@ -9,10 +9,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from clio_relay.adapters.base import BaseAdapter, SignInNeed
-from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, HookContext, approve_schema
+from clio_relay.adapters.hooks import (
+    Ask,
+    Charge,
+    ChoiceOption,
+    GuardDecision,
+    HookContext,
+    approve_schema,
+    choice_ask,
+)
 from clio_relay.jobs.handles import Endpoint, JobStatus
 from clio_relay.jobs.records import OperationRecord, new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -44,21 +53,20 @@ class StubAskProvider:
         operation_id: str | None,
         message: str,
         field_name: str,
-        options: list[str],
+        options: Sequence[str | ChoiceOption],
+        title: str | None = None,
+        recommended_reason: str | None = None,
     ) -> Ask:
-        schema = {
-            "type": "object",
-            "properties": {field_name: {"type": "string", "enum": list(options)}},
-            "required": [field_name],
-        }
         return self._store(
-            Ask(
+            choice_ask(
                 ask_id=new_id("ask"),
-                kind="choose",
                 site=site.id,
                 operation_id=operation_id,
                 message=message,
-                requested_schema=schema,
+                field_name=field_name,
+                options=options,
+                title=title,
+                recommended_reason=recommended_reason,
             )
         )
 

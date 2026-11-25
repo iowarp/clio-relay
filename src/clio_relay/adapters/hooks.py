@@ -71,6 +71,138 @@ def said_yes(content: dict[str, Any] | None) -> bool:
     return value is True or value == APPROVE_YES
 
 
+CHOICE_META = "io.iowarp.clio-relay/choice"
+"""The ``_meta`` key of a choose ask's typed options, keyed by ask id."""
+
+
+class ChoiceOption(BaseModel):
+    """One option of a choice, as the person reads it.
+
+    ``value`` is what the answer carries; ``label`` names it and ``description``
+    says in one line what it means (where it runs, what it costs, its limits).
+    """
+
+    value: str
+    label: str
+    description: str | None = None
+    recommended: bool = False
+
+
+def as_options(options: Sequence[str | ChoiceOption]) -> list[ChoiceOption]:
+    """Return ``options`` typed: a bare value is its own label."""
+    return [
+        item if isinstance(item, ChoiceOption) else ChoiceOption(value=item, label=item)
+        for item in options
+    ]
+
+
+def choice_field(
+    options: Sequence[ChoiceOption], *, title: str, description: str | None = None
+) -> dict[str, Any]:
+    """Return a choice's form field: a titled single select (``oneOf`` of ``const``).
+
+    Each branch carries its option's one-line meaning; the recommended option is
+    the field's ``default``.
+    """
+    branches: list[dict[str, Any]] = []
+    for item in options:
+        branch: dict[str, Any] = {"const": item.value, "title": item.label}
+        if item.description:
+            branch["description"] = item.description
+        branches.append(branch)
+    field_: dict[str, Any] = {"type": "string", "title": title, "oneOf": branches}
+    if description:
+        field_["description"] = description
+    recommended = next((item.value for item in options if item.recommended), None)
+    if recommended is not None:
+        field_["default"] = recommended
+    return field_
+
+
+def choice_meta(
+    ask_id: str,
+    field_name: str,
+    options: Sequence[ChoiceOption],
+    *,
+    title: str,
+    recommended_reason: str | None = None,
+) -> dict[str, Any]:
+    """Return a choose ask's ``_meta``: its options typed, under :data:`CHOICE_META`."""
+    recommended = next((item.value for item in options if item.recommended), None)
+    entry: dict[str, Any] = {
+        "field": field_name,
+        "title": title,
+        "options": [item.model_dump() for item in options],
+        "recommended": recommended,
+        "recommended_reason": recommended_reason if recommended is not None else None,
+    }
+    return {CHOICE_META: {ask_id: entry}}
+
+
+def choice_ask(
+    *,
+    site: str,
+    operation_id: str | None,
+    message: str,
+    field_name: str,
+    options: Sequence[str | ChoiceOption],
+    title: str | None = None,
+    recommended_reason: str | None = None,
+    ask_id: str,
+) -> Ask:
+    """Return a choose ask: a titled select whose options say what each means."""
+    typed = as_options(options)
+    heading = title or field_name.replace("_", " ").capitalize()
+    schema = {
+        "type": "object",
+        "properties": {field_name: choice_field(typed, title=heading)},
+        "required": [field_name],
+    }
+    return Ask(
+        ask_id=ask_id,
+        kind="choose",
+        site=site,
+        operation_id=operation_id,
+        message=message,
+        requested_schema=schema,
+        meta=choice_meta(
+            ask_id, field_name, typed, title=heading, recommended_reason=recommended_reason
+        ),
+    )
+
+
+def schema_options(schema: dict[str, Any] | None) -> list[ChoiceOption]:
+    """Return a choose ask's options from its form: ``oneOf`` titles, else a bare ``enum``."""
+    properties = (schema or {}).get("properties")
+    if not isinstance(properties, dict):
+        return []
+    for raw in cast(dict[str, Any], properties).values():
+        if not isinstance(raw, dict):
+            continue
+        prop = cast(dict[str, Any], raw)
+        branches = prop.get("oneOf")
+        if isinstance(branches, list):
+            found: list[ChoiceOption] = []
+            for item in cast(list[Any], branches):
+                if isinstance(item, dict) and "const" in item:
+                    branch = cast(dict[str, Any], item)
+                    value = str(branch["const"])
+                    found.append(
+                        ChoiceOption(
+                            value=value,
+                            label=str(branch.get("title") or value),
+                            description=cast(str | None, branch.get("description")),
+                            recommended=prop.get("default") == value,
+                        )
+                    )
+            if found:
+                return found
+        values = prop.get("enum")
+        if isinstance(values, list):
+            return as_options([str(item) for item in cast(list[Any], values)])
+    return []
+
+
 class Ask(BaseModel):
     """A question for the person, durable so any path can answer it.
 
@@ -139,9 +271,16 @@ class AskProvider(Protocol):
         operation_id: str | None,
         message: str,
         field_name: str,
-        options: list[str],
+        options: Sequence[str | ChoiceOption],
+        title: str | None = None,
+        recommended_reason: str | None = None,
     ) -> Ask:
-        """Build a form ask that picks one of ``options``."""
+        """Build a form ask that picks one of ``options``.
+
+        ``title`` is the field's human label. Each :class:`ChoiceOption` carries
+        its label, its one-line meaning and whether it is recommended here
+        (:func:`choice_ask` builds the form and its typed ``_meta``).
+        """
         ...
 
     async def approve(

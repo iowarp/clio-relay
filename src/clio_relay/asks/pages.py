@@ -26,7 +26,7 @@ from typing import Any, Literal, cast
 
 from filelock import FileLock
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, schema_options
 
 DEFAULT_PAGE_TTL_S = 24 * 3600.0
 MAX_LIVE_TOKENS = 8
@@ -250,16 +250,24 @@ def binding_table(ask: Ask) -> str:
 
 
 def options(ask: Ask) -> list[str]:
-    """Return a choose ask's options."""
-    properties = (ask.requested_schema or {}).get("properties")
-    if not isinstance(properties, dict):
-        return []
-    for prop in properties.values():  # pyright: ignore[reportUnknownVariableType]
-        if isinstance(prop, dict):
-            values = prop.get("enum")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-            if isinstance(values, list):
-                return [str(item) for item in values]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
-    return []
+    """Return a choose ask's option values."""
+    return [item.value for item in schema_options(ask.requested_schema)]
+
+
+def option_rows(ask: Ask) -> str:
+    """Return a choose ask's options as radio rows: label, meaning, the recommended one checked."""
+    typed = schema_options(ask.requested_schema)
+    picked = next((item.value for item in typed if item.recommended), None)
+    rows: list[str] = []
+    for index, item in enumerate(typed):
+        checked = item.value == picked if picked is not None else index == 0
+        mark = " (recommended)" if item.recommended else ""
+        meaning = f"<br><small>{e(item.description)}</small>" if item.description else ""
+        rows.append(
+            f"<label><input type='radio' name='value' value='{e(item.value)}'"
+            f"{' checked' if checked else ''}> {e(item.label)}{mark}{meaning}</label><br>"
+        )
+    return "".join(rows)
 
 
 def field_name(ask: Ask) -> str:

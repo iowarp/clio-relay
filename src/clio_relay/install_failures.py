@@ -5,7 +5,9 @@ exits 6. Spack's are ``compiler_unavailable``, ``fetch_failed``,
 ``build_failed``, ``variant_conflict``, ``no_recipe``, ``concretize_failed`` and
 ``install_failed``; the other methods' end in ``_failed`` too
 (``pip_install_failed``, ``conda_install_failed``, ``conda_bootstrap_failed``,
-``container_pull_failed``, ``venv_failed``). Each carries the ``host``, the
+``container_pull_failed``, ``container_archive_failed``, ``venv_failed``), and a
+container engine that cannot run here is ``container_engine_unusable``. Each
+carries the ``host``, the
 ``stage``, the ``log_tail`` and a ``remedy`` (Spack's also the
 ``failed_node``). It is the last line of a ``ppl install`` or ``ppl submit``'s
 output, and, for an install job, in ``<execution>/install/issues.jsonl``.
@@ -36,6 +38,8 @@ KINDS = frozenset(
         "no_recipe",
         "concretize_failed",
         "install_failed",
+        # A container engine that is installed but cannot run here (podman's own error).
+        "container_engine_unusable",
     }
 )
 CONCRETIZE_KINDS = frozenset({"variant_conflict", "no_recipe", "concretize_failed"})

@@ -21,6 +21,7 @@ from clio_relay.asks.pages import (
     e,
     field_name,
     hidden,
+    option_rows,
     options,
     response,
 )
@@ -181,11 +182,7 @@ class PageCore:
             )
             return response(200, "Relay asks for approval", body)
         if ask.kind == "choose":
-            choices = "".join(
-                f"<label><input type='radio' name='value' value='{e(item)}'"
-                f"{' checked' if index == 0 else ''}> {e(item)}</label><br>"
-                for index, item in enumerate(options(ask))
-            )
+            choices = option_rows(ask)
             body = (
                 intro
                 + f"<form method='post'>{fields}{choices}"

@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, schema_options
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 
@@ -202,11 +202,15 @@ def _form(ask: Ask, page: str, form: str) -> str:
         return _page("Already answered", body + f"<p>Answer: {html.escape(ask.state)}</p>")
     choice = ""
     if ask.kind == "choose":
-        options = _options(ask)
+        typed = schema_options(ask.requested_schema)
+        picked = next((item.value for item in typed if item.recommended), None)
         choice = "".join(
-            f"<label><input type='radio' name='value' value='{html.escape(item)}'"
-            f"{' checked' if index == 0 else ''}> {html.escape(item)}</label><br>"
-            for index, item in enumerate(options)
+            f"<label><input type='radio' name='value' value='{html.escape(item.value)}'"
+            f"{' checked' if (item.value == picked if picked else index == 0) else ''}> "
+            f"{html.escape(item.label)}{' (recommended)' if item.recommended else ''}"
+            + (f"<br><small>{html.escape(item.description)}</small>" if item.description else "")
+            + "</label><br>"
+            for index, item in enumerate(typed)
         )
     if ask.binding:
         rows = "".join(
@@ -230,16 +234,3 @@ def _field(ask: Ask) -> str:
     if isinstance(properties, dict) and properties:
         return str(next(iter(properties)))  # pyright: ignore[reportUnknownArgumentType]
     return "value"
-
-
-def _options(ask: Ask) -> list[str]:
-    schema = ask.requested_schema or {}
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        return []
-    for prop in properties.values():  # pyright: ignore[reportUnknownVariableType]
-        if isinstance(prop, dict):
-            values = prop.get("enum")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-            if isinstance(values, list):
-                return [str(item) for item in values]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
-    return []

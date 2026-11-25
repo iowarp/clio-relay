@@ -174,7 +174,9 @@ def _components(
         }
 
     if record.kind == "install":
-        return [component("install", "Software install", None, "install", 1)]
+        # An install's own job shows in JARVIS's plan once it is submitted; before
+        # that there is nothing to draw, and a lone "install" tile says nothing.
+        return []
     if job is None:
         return []
     steps = job.steps()

@@ -14,7 +14,7 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import CHOICE_META, Ask
 from clio_relay.jobs.refusals import Refusal
 
 
@@ -89,7 +89,12 @@ def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequir
     """
     meta: dict[str, Any] = {}
     for ask in asks:
-        meta.update(ask.meta or {})
+        for key, value in (ask.meta or {}).items():
+            if key == CHOICE_META and isinstance(meta.get(key), dict) and isinstance(value, dict):
+                # Keyed by ask id, so each ask's options survive beside the others'.
+                meta[key] = {**meta[key], **cast(dict[str, Any], value)}
+            else:
+                meta[key] = value
     return mcp_types.InputRequiredResult(
         input_requests={ask.ask_id: elicit_request(ask) for ask in asks},
         request_state=request_state,

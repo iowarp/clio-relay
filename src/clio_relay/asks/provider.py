@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -26,7 +27,14 @@ import httpx
 
 from clio_relay import identity
 from clio_relay.adapters.base import SignInNeed
-from clio_relay.adapters.hooks import Ask, AskState, HookContext, approve_schema
+from clio_relay.adapters.hooks import (
+    Ask,
+    AskState,
+    ChoiceOption,
+    HookContext,
+    approve_schema,
+    choice_ask,
+)
 from clio_relay.asks import askpass
 from clio_relay.asks.core import PageCore
 from clio_relay.asks.loopback import LoopbackServer
@@ -218,21 +226,20 @@ class RelayAskProvider:
         operation_id: str | None,
         message: str,
         field_name: str,
-        options: list[str],
+        options: Sequence[str | ChoiceOption],
+        title: str | None = None,
+        recommended_reason: str | None = None,
     ) -> Ask:
-        schema = {
-            "type": "object",
-            "properties": {field_name: {"type": "string", "enum": list(options)}},
-            "required": [field_name],
-        }
         return self._put(
-            Ask(
+            choice_ask(
                 ask_id=new_id("ask"),
-                kind="choose",
                 site=site.id,
                 operation_id=operation_id,
                 message=message,
-                requested_schema=schema,
+                field_name=field_name,
+                options=options,
+                title=title,
+                recommended_reason=recommended_reason,
             )
         )
 

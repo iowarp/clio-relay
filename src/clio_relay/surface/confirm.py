@@ -167,7 +167,7 @@ async def _card(
     )
     if held is not None:
         held_services.fold(service, ask, record, held)
-    ask.meta = {job_card.JOB_META: job_card.snapshot(service, record)}
+    ask.meta = {**(ask.meta or {}), job_card.JOB_META: job_card.snapshot(service, record)}
     service.asks.put(ask.ask_id, ask)
     return ask
 
