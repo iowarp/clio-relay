@@ -18,6 +18,7 @@ from clio_relay.asks.pages import (
     PageResponse,
     PageTokens,
     binding_table,
+    choice_context,
     e,
     field_name,
     hidden,
@@ -185,6 +186,7 @@ class PageCore:
             choices = option_rows(ask)
             body = (
                 intro
+                + choice_context(ask)
                 + f"<form method='post'>{fields}{choices}"
                 + _button("accept", "Choose")
                 + _button("decline", "Decline")

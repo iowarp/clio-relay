@@ -140,8 +140,41 @@ def choice_meta(
         "recommended": recommended,
         "recommended_reason": recommended_reason if recommended is not None else None,
         "recommended_basis": None,
+        "note": None,
+        "detail": None,
+        "evidence": [],
     }
     return {CHOICE_META: {ask_id: {field_name: entry}}}
+
+
+def with_choice_context(
+    ask: Ask,
+    field_name: str,
+    *,
+    note: str | None = None,
+    detail: str | None = None,
+    evidence: Sequence[str] = (),
+) -> None:
+    """Add what surrounds a choice's short question, so the question stays one line.
+
+    ``note`` says what the answer covers; it is also the field's ``description``,
+    so any form shows it. ``detail`` and ``evidence`` are the producer's own text,
+    passed unchanged in the typed choice for a host to show behind a disclosure.
+    """
+    schema: dict[str, Any] = ask.requested_schema or {}
+    properties = cast(dict[str, Any], schema.get("properties") or {})
+    field_ = cast(dict[str, Any] | None, properties.get(field_name))
+    if field_ is not None and note:
+        field_["description"] = note
+    by_ask = cast(dict[str, Any], (ask.meta or {}).get(CHOICE_META) or {})
+    entry = cast(
+        dict[str, Any] | None, cast(dict[str, Any], by_ask.get(ask.ask_id) or {}).get(field_name)
+    )
+    if entry is None:
+        return
+    entry["note"] = note or None
+    entry["detail"] = detail or None
+    entry["evidence"] = [item for item in evidence if item]
 
 
 def with_recommended_basis(ask: Ask, field_name: str, basis: Mapping[str, Any] | None) -> None:

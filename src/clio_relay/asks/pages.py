@@ -26,7 +26,7 @@ from typing import Any, Literal, cast
 
 from filelock import FileLock
 
-from clio_relay.adapters.hooks import Ask, schema_options
+from clio_relay.adapters.hooks import CHOICE_META, Ask, schema_options
 
 DEFAULT_PAGE_TTL_S = 24 * 3600.0
 MAX_LIVE_TOKENS = 8
@@ -276,3 +276,21 @@ def field_name(ask: Ask) -> str:
     if isinstance(properties, dict) and properties:
         return str(next(iter(properties)))  # pyright: ignore[reportUnknownArgumentType]
     return "value"
+
+
+def choice_context(ask: Ask) -> str:
+    """Return a choose ask's note, then the producer's detail and evidence, folded away."""
+    by_ask = cast(dict[str, Any], (ask.meta or {}).get(CHOICE_META) or {})
+    entry = cast(
+        dict[str, Any],
+        cast(dict[str, Any], by_ask.get(ask.ask_id) or {}).get(field_name(ask)) or {},
+    )
+    note, detail = entry.get("note"), entry.get("detail")
+    evidence = [str(item) for item in cast(list[object], entry.get("evidence") or [])]
+    parts = [f"<p class='note'>{e(note)}</p>"] if isinstance(note, str) and note else []
+    folded = [f"<p>{e(detail)}</p>"] if isinstance(detail, str) and detail else []
+    if evidence:
+        folded.append("<ul>" + "".join(f"<li>{e(item)}</li>" for item in evidence) + "</ul>")
+    if folded:
+        parts.append(f"<details><summary>Evidence</summary>{''.join(folded)}</details>")
+    return "".join(parts)

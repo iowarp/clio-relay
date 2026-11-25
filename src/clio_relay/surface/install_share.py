@@ -21,7 +21,7 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_report, jarvis_submit
-from clio_relay.adapters.hooks import Ask, with_recommended_basis
+from clio_relay.adapters.hooks import Ask, with_choice_context, with_recommended_basis
 from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.records import OperationRecord
 from clio_relay.jobs.spec import canonical_digest
@@ -200,6 +200,13 @@ async def choice_ask(
         recommended_reason=jarvis_report.recommended_reason(issue),
     )
     with_recommended_basis(ask, CHOICE_FIELD, jarvis_report.recommendation_basis(issue))
+    with_choice_context(
+        ask,
+        CHOICE_FIELD,
+        note=jarvis_report.choice_note(issue),
+        detail=jarvis_report.choice_detail(issue),
+        evidence=jarvis_report.choice_evidence(issue),
+    )
     if binding is not None:
         ask.bind(binding)
     service.asks.put(ask.ask_id, ask)

@@ -9,9 +9,9 @@ import httpx
 import pytest
 
 from clio_relay.adapters.base import SignInNeed
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, choice_ask, with_choice_context
 from clio_relay.asks.core import origin_ok
-from clio_relay.asks.pages import SECURITY_HEADERS, binding_table
+from clio_relay.asks.pages import SECURITY_HEADERS, binding_table, choice_context
 from clio_relay.asks.provider import base_file, read_base
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec
@@ -302,3 +302,20 @@ def test_a_package_review_shows_the_package() -> None:
     plain = Ask(ask_id="ask_job", kind="approve", site="fx", message="Run")
     plain.bind({"site": "fx", "spec_digest": "d"})
     assert "Package" not in binding_table(plain) and "Source" not in binding_table(plain)
+
+
+def test_a_choice_folds_its_evidence_away() -> None:
+    ask = choice_ask(
+        ask_id="ask_c",
+        site="fx",
+        operation_id="op",
+        message="Which?",
+        field_name="x",
+        options=["y"],
+    )
+    assert choice_context(ask) == ""
+    with_choice_context(ask, "x", note="For <site>.", detail="More.", evidence=["load 4<5"])
+    html = choice_context(ask)
+    assert html.startswith("<p class='note'>For &lt;site&gt;.</p><details>")
+    assert "<summary>Evidence</summary><p>More.</p><ul><li>load 4&lt;5</li></ul>" in html
+    assert "<details open" not in html

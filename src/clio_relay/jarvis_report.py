@@ -282,10 +282,6 @@ def _candidate_facts(candidate: Mapping[str, Any]) -> list[str]:
     return facts
 
 
-MAX_EVIDENCE = 6
-"""The most evidence lines of an issue (``install_placement``'s) a question repeats."""
-
-
 def once(issue: Mapping[str, Any]) -> bool:
     """Say whether an issue's answer is for this occasion only (``ask_each_time``)."""
     subject = issue.get("subject")
@@ -491,54 +487,67 @@ def recommendation_basis(issue: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(cast(dict[str, Any], found)) if isinstance(found, dict) and found else None
 
 
-def choice_message(issue: Mapping[str, Any]) -> str:
-    """Return the question to ask for one of JARVIS's answerable issues.
-
-    Each candidate is listed with where it comes from, its prefix and its modules
-    (an ``ambiguous_provider`` MPI that is a site module carries ``modules``).
-    """
+def _split_question(issue: Mapping[str, Any]) -> tuple[str, str]:
+    """Return JARVIS's question sentence and the rest of its text."""
     question = issue.get("question")
-    subject = issue.get("package") or issue.get("subject") or "the package"
-    text = (
-        question
-        if isinstance(question, str) and question
-        else f"JARVIS needs a choice for {subject}: pick one"
+    package = issue.get("package")
+    subject = (
+        package
+        if isinstance(package, str) and package not in ("", "*")
+        else issue.get("subject") or "this install"
     )
-    details = choice_details(issue)
-    own = set(choice_options(issue))
-    pick = next((item for item in details if item.recommended), None)
-    if pick is not None and pick.label != pick.value:
-        text = text.replace(f"Recommended: {pick.value}", f"Recommended: {pick.label}")
-    lines = [
-        f"{item.label}{' (recommended)' if item.recommended else ''}"
-        + (f": {item.description.rstrip('.')}" if item.description else "")
-        for item in details
-        if item.value in own
-    ]
+    if not isinstance(question, str) or not question.strip():
+        return f"Which option should JARVIS use for {subject}?", ""
+    head, mark, rest = question.strip().partition("?")
+    if mark:
+        return head.strip() + "?", rest.strip()
+    head, mark, rest = question.strip().partition(". ")
+    return (head.strip() + "." if mark else head.strip()), rest.strip()
+
+
+def choice_message(issue: Mapping[str, Any]) -> str:
+    """Return the short question to ask for one of JARVIS's answerable issues.
+
+    Only the question: each option's meaning is in its own description
+    (:func:`choice_details`), what the answer covers in :func:`choice_note`, and
+    JARVIS's other text and evidence in :func:`choice_detail` and
+    :func:`choice_evidence`.
+    """
+    return _split_question(issue)[0]
+
+
+def choice_note(issue: Mapping[str, Any]) -> str | None:
+    """Return what an answer covers, and why JARVIS asks again when it does."""
+    notes: list[str] = []
     previous = _dict(issue.get("previous_answer"))
     if previous.get("constraint"):
-        text = (
-            f"{text} The earlier answer, {previous['constraint']}, no longer matches "
-            "what JARVIS finds, so it asks again."
+        notes.append(
+            f"The earlier answer, {previous['constraint']}, no longer matches what JARVIS "
+            "finds, so it asks again."
         )
     if once(issue):
-        text = f"{text} The answer is for this run only; JARVIS asks again next time."
+        notes.append("The answer is for this run only; JARVIS asks again next time.")
     elif issue.get("scope") == "site":
-        text = f"{text} JARVIS records the answer for the site's later installs."
-    overrides = package_overrides(issue)
-    if overrides and not once(issue):
-        named = ", ".join(package for package, _ in overrides)
-        text = (
-            f"{text} An option ending in 'for <package> only' places that package alone "
-            f"({named}), and JARVIS asks again for the rest."
-        )
-    text = f"{text} Options: {'. '.join(lines)}." if lines else text
-    evidence = [
-        str(item)
-        for item in cast(list[object], issue.get("evidence") or [])[:MAX_EVIDENCE]
-        if isinstance(item, str) and item
+        notes.append("JARVIS records the answer for the site's later installs.")
+    return " ".join(notes) or None
+
+
+def choice_detail(issue: Mapping[str, Any]) -> str | None:
+    """Return JARVIS's text past its question, with option values read as their labels."""
+    rest = _split_question(issue)[1]
+    if not rest:
+        return None
+    pick = next((item for item in choice_details(issue) if item.recommended), None)
+    if pick is not None and pick.label != pick.value:
+        rest = rest.replace(f"Recommended: {pick.value}", f"Recommended: {pick.label}")
+    return rest
+
+
+def choice_evidence(issue: Mapping[str, Any]) -> list[str]:
+    """Return JARVIS's evidence for a question, as it wrote it."""
+    return [
+        item for item in cast(list[object], issue.get("evidence") or []) if isinstance(item, str)
     ]
-    return f"{text} Evidence: {'; '.join(evidence)}." if evidence else text
 
 
 def install_needed(report: Mapping[str, Any], *, site: str, walltime: str | None = None) -> Refusal:

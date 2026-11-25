@@ -25,6 +25,7 @@ from clio_relay.adapters.hooks import (
     ChoiceOption,
     choice_ask,
     schema_options,
+    with_choice_context,
     with_recommended_basis,
 )
 from clio_relay.jobs.handles import JobHandle, JobStatus
@@ -132,8 +133,9 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
         operation_id = (await install_op.start(service, "fx", PACKAGE)).operation_id
         (choice,) = service.outstanding(service.operation(operation_id))
         assert choice.kind == "choose"
-        assert "Login host, now (recommended): Runs on the login host" in choice.message
-        assert "login_limited" not in choice.message
+        assert choice.message == (
+            "Where should JARVIS run the Spack check of short packages at this site: pkg (~60 s)?"
+        )
         assert "compute_job for paraview only" in str(choice.requested_schema)
         field = (choice.requested_schema or {})["properties"][CHOICE_FIELD]
         assert field["title"] == "Where JARVIS runs Spack checks at this site"
@@ -141,8 +143,11 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
         assert {"const": "compute_job", "title": "Compute node job"}.items() <= field["oneOf"][
             1
         ].items()
+        assert field["description"] == "JARVIS records the answer for the site's later installs."
         typed = (choice.meta or {})[CHOICE_META][choice.ask_id][CHOICE_FIELD]
         assert typed["recommended"] == "login_limited"
+        assert typed["detail"] == "Recommended: Login host, now."
+        assert typed["evidence"] == PLACEMENT["evidence"]
         assert [item["label"] for item in typed["options"]][:3] == [
             "Login host, now",
             "Compute node job",
@@ -159,15 +164,21 @@ def test_a_login_check_answer_needs_no_check_job(relay_paths: RelayPaths, site: 
     asyncio.run(scenario())
 
 
-def test_the_question_shows_jarvis_evidence_and_what_each_choice_does() -> None:
+def test_the_question_is_one_short_question_and_the_rest_is_typed() -> None:
     message = jarvis_report.choice_message(PLACEMENT)
-    assert message.startswith(PLACEMENT["question"].replace("login_limited", "Login host, now"))
-    assert "Compute node job: Runs the check in a short 1-node batch job" in message
-    assert "JARVIS records the answer for the site's later installs" in message
-    assert "evidence 5" in message and "evidence 6" not in message
-    assert "for <package> only" in message and "(paraview)" in message
-    occasion = jarvis_report.choice_message(OCCASION)
-    assert "for this run only" in occasion and "later installs" not in occasion
+    assert message == PLACEMENT["question"].split("?")[0] + "?"
+    assert "Compute node job" not in message and "evidence" not in message
+    assert jarvis_report.choice_note(PLACEMENT) == (
+        "JARVIS records the answer for the site's later installs."
+    )
+    assert jarvis_report.choice_detail(PLACEMENT) == "Recommended: Login host, now."
+    assert jarvis_report.choice_evidence(PLACEMENT) == PLACEMENT["evidence"]
+    assert "for this run only" in (jarvis_report.choice_note(OCCASION) or "")
+    again = {**PLACEMENT, "previous_answer": {"constraint": "compute_job"}}
+    assert "compute_job, no longer matches" in (jarvis_report.choice_note(again) or "")
+    bare = {"kind": "spack_missing", "package": "*", "subject": "spack"}
+    assert jarvis_report.choice_message(bare) == "Which option should JARVIS use for spack?"
+    assert jarvis_report.choice_detail(bare) is None and jarvis_report.choice_evidence(bare) == []
 
 
 def test_each_placement_option_says_where_it_runs_what_it_costs_and_its_limits() -> None:
@@ -260,6 +271,14 @@ def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     basis = {"source": "site_decision", "constraint": "a", "answered_by": "person"}
     with_recommended_basis(ask, "pick", basis)
     assert (ask.meta or {})[CHOICE_META]["ask_1"]["pick"]["recommended_basis"] == basis
+    assert typed["note"] is None and typed["detail"] is None and typed["evidence"] == []
+    with_choice_context(ask, "pick", note="For this site.", detail="More.", evidence=["e1", ""])
+    assert field["description"] == "For this site."
+    assert (typed["note"], typed["detail"], typed["evidence"]) == (
+        "For this site.",
+        "More.",
+        ["e1"],
+    )
     other = choice_ask(
         ask_id="ask_2", site="fx", operation_id="op", message="m", field_name="x", options=["y"]
     )

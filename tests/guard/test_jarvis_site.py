@@ -25,6 +25,7 @@ from clio_relay.adapters.ssh.scripts import (
 from clio_relay.jarvis_report import (
     applied_decisions,
     blocking_issues,
+    choice_details,
     choice_issues,
     choice_message,
 )
@@ -402,9 +403,10 @@ def test_a_missing_spack_is_a_choice_of_the_site_spacks() -> None:
     report = {"issues": [issue]}
     assert choice_issues(report) == [issue]
     assert blocking_issues(report) == []
-    message = choice_message(issue)
-    assert root in message
-    assert "0.23.1" in message
+    assert choice_message(issue) == "Which Spack should JARVIS use on this site?"
+    (only,) = choice_details(issue)
+    assert only.label == root
+    assert "0.23.1" in (only.description or "")
 
 
 def test_no_site_spack_blocks_the_install() -> None:
