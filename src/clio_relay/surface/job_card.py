@@ -247,9 +247,10 @@ def _planned(
 ) -> list[dict[str, Any]]:
     """The components of JARVIS's plan, each in the state JARVIS last wrote for it.
 
-    A component JARVIS gives no label is named as the person knows its package
-    (:func:`~clio_relay.packages.person_name`): its contract's title, else its
-    short name.
+    A component JARVIS gives no label of its own (none, or its default: the
+    package's short name or the step id) is named as the person knows its
+    package (:func:`~clio_relay.packages.person_name`): its contract's title,
+    else its short name.
     """
     held = state in ("running", "starting")
     lines = {
@@ -269,10 +270,7 @@ def _planned(
             current = state
         hosts = cast(list[str], (line or {}).get("hosts") or [])
         allocated = len(hosts) if hosts else (nodes or 0) if held else 0
-        package = item.get("package")
-        label = item.get("label") or (
-            person_name(str(package), titles) if package else item.get("id")
-        )
+        label = _component_label(item, titles)
         found.append(
             {
                 "id": item.get("id"),
@@ -291,6 +289,23 @@ def _planned(
             }
         )
     return found
+
+
+def _component_label(item: dict[str, Any], titles: dict[str, str]) -> Any:
+    """A planned component's name for the person.
+
+    JARVIS writes its default label, the package's short name or the step id,
+    when nobody set one; relay names that component by its contract title
+    instead, as the run approval does. A label set on purpose is kept.
+    """
+    package = item.get("package")
+    label = item.get("label")
+    if not package:
+        return label or item.get("id")
+    defaults = {str(package).rsplit(".", 1)[-1], str(item.get("id"))}
+    if label and str(label) not in defaults:
+        return label
+    return person_name(str(package), titles)
 
 
 def _couplings(plan: dict[str, Any], job: JobSpec | None) -> list[dict[str, Any]]:

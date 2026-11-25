@@ -133,6 +133,16 @@ def test_the_card_names_each_component_by_its_contract_title() -> None:
     titles = {"clio_jarvis.lammps": "LAMMPS"}
     found = job_card._planned(record, plan, "planned", titles)  # pyright: ignore[reportPrivateUsage]
     assert [c["label"] for c in found] == ["LAMMPS", "Viewer", "pvserver", "bare"]
+    # JARVIS 1.9.2 writes its default label, the package's short name (live Ares plan).
+    defaulted = {
+        "components": [
+            {"id": "pkg", "package": "clio_jarvis.lammps", "label": "lammps", "nodes": 2},
+            {"id": "pkg2", "package": "clio_jarvis.lammps", "label": "pkg2"},
+            {"id": "install", "package": "jarvis.install", "label": "install check"},
+        ]
+    }
+    found = job_card._planned(record, defaulted, "planned", titles)  # pyright: ignore[reportPrivateUsage]
+    assert [c["label"] for c in found] == ["LAMMPS", "LAMMPS", "install check"]
 
 
 def test_the_card_draws_producer_first_and_keeps_the_launch_order() -> None:
