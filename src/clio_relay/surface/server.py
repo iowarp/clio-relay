@@ -60,7 +60,9 @@ from clio_relay.surface.elicit import (
     elicitation_modes,
     input_required,
     modern,
+    reads_ask_meta,
     refusal_result,
+    request_reads_ask_meta,
     response_parts,
     tasks_opted_in,
 )
@@ -198,8 +200,14 @@ class RelayTasksExtension(ServerExtension):
         """Return the task a ``run`` became."""
         return CreateTaskResult(**self._fields(record))
 
-    async def task_result(self, record: OperationRecord) -> GetTaskResult:
-        """Project an operation onto a task, with its job card in ``_meta``."""
+    async def task_result(
+        self, record: OperationRecord, *, reads_meta: bool = False
+    ) -> GetTaskResult:
+        """Project an operation onto a task, with its job card in ``_meta``.
+
+        Its input requests are worded for a client that does or doesn't read
+        relay's typed ask ``_meta`` (see :func:`elicit.reads_ask_meta`).
+        """
         fields = self._fields(record)
         if (card := job_card.snapshot(self.service, record)) is not None:
             fields["_meta"] = {job_card.JOB_META: card}
@@ -207,7 +215,8 @@ class RelayTasksExtension(ServerExtension):
             return job_card.JobTaskResult(
                 **fields,
                 input_requests={
-                    ask.ask_id: elicit_document(ask) for ask in self.service.outstanding(record)
+                    ask.ask_id: elicit_document(ask, reads_meta=reads_meta)
+                    for ask in self.service.outstanding(record)
                 },
             )
         if record.state.final or fields["status"] == "completed":
@@ -243,7 +252,7 @@ class RelayTasksExtension(ServerExtension):
             # its asks and their answers live on the record, which still stands.
             logger.exception("refreshing task %s", params.task_id)
             record = self._record(params.task_id)
-        return await self.task_result(record)
+        return await self.task_result(record, reads_meta=request_reads_ask_meta(ctx))
 
     async def _update(
         self, ctx: ServerRequestContext[Any, Any], params: UpdateTaskParams
@@ -360,7 +369,11 @@ class RelayServer:
                 modes = elicitation_modes(ctx)
                 if all(ask_mode(ask) in modes for ask in outstanding):
                     return InputRequiredToolResult(
-                        input_required(list(outstanding), record.operation_id)
+                        input_required(
+                            list(outstanding),
+                            record.operation_id,
+                            reads_meta=reads_ask_meta(ctx),
+                        )
                     )
             elif outstanding:
                 record = await self._ask_inline(ctx, record)

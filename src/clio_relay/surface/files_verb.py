@@ -15,15 +15,17 @@ import mcp_types
 from fastmcp import Context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 
-from clio_relay.adapters.hooks import Ask, ask_detail, ask_text
+from clio_relay.adapters.hooks import Ask, ask_detail
 from clio_relay.jobs.file_rules import CHUNK_BYTES
 from clio_relay.jobs.handles import FileAccess
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.elicit import (
-    elicit_request,
+    elicit_inline,
     elicitation_modes,
+    input_required,
     modern,
+    reads_ask_meta,
     refusal_result,
     response_parts,
 )
@@ -215,16 +217,9 @@ async def files_tool(
                 return _needs_person(service, ask)
             if modern(ctx):
                 return InputRequiredToolResult(
-                    mcp_types.InputRequiredResult(
-                        input_requests={ask.ask_id: elicit_request(ask)},
-                        request_state=ask.ask_id,
-                    )
+                    input_required([ask], ask.ask_id, reads_meta=reads_ask_meta(ctx))
                 )
-            response = await ctx.session.elicit_form(
-                message=ask_text(ask),
-                requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
-            )
-            action, content = response_parts(response)
+            action, content = response_parts(await elicit_inline(ctx, ask))
             service.answer(ask.ask_id, action, content, by="elicitation")
             try:
                 structured, text = await files_call(service, site, args)

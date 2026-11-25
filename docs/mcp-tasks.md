@@ -57,6 +57,18 @@ a form or URL elicitation. Answer with `tasks/update`, giving
 `input_responses` with the same keys. The task returns to `working` once every
 question is answered.
 
+### what a question says
+
+A question's message is the whole question, then what it rests on: the
+commands, log paths and evidence behind it. Each question also carries those
+facts typed in its `_meta`, under `io.iowarp.clio-relay/ask` keyed by ask id as
+`{detail, evidence}`, and a choice's options under `io.iowarp.clio-relay/choice`.
+A client that shows the typed facts itself, behind a disclosure say, declares
+the client extension `io.iowarp.clio-relay/ask` (or `io.iowarp.clio-relay/choice`).
+On a `2026-07-28` connection the declaration is in each request's `_meta`, on an
+older one in the client's `extensions` or `experimental` capabilities. Such a
+client gets the question sentence alone as the message.
+
 ### cancelling
 
 `tasks/cancel` cancels the operation on its site. A job is cancelled through

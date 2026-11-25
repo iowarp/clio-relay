@@ -44,6 +44,7 @@ from clio_relay.surface.elicit import (
     elicitation_modes,
     input_required,
     modern,
+    reads_ask_meta,
     refusal_result,
     response_parts,
 )
@@ -330,7 +331,9 @@ async def with_person[T](
         if "form" not in elicitation_modes(ctx):
             return needs_person(service, ask, again)
         if modern(ctx):
-            return InputRequiredToolResult(input_required([ask], ask.ask_id))
+            return InputRequiredToolResult(
+                input_required([ask], ask.ask_id, reads_meta=reads_ask_meta(ctx))
+            )
         action, content = response_parts(await elicit_inline(ctx, ask))
         service.answer(ask.ask_id, action, content, by="elicitation")
         try:

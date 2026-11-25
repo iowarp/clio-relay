@@ -2,6 +2,9 @@
 
 A modern client gets a multi-round-trip input request, a legacy one gets an
 elicitation, and a client with neither gets a typed refusal naming the ask.
+Each is worded by :func:`hooks.short_ask`: the question alone for a client that
+declared it reads relay's typed ask ``_meta``, the question and its detail for
+any other.
 """
 
 from __future__ import annotations
@@ -10,14 +13,16 @@ from typing import Any, cast
 
 import mcp_types
 from fastmcp import Context
+from fastmcp.server.extensions import read_client_extension_settings
 from fastmcp.tools import ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from clio_relay.adapters.hooks import ASK_META, CHOICE_META, Ask
+from clio_relay.adapters.hooks import ASK_META, CHOICE_META, READS_ASK_META, Ask, short_ask
 from clio_relay.jobs.refusals import Refusal
 
 _BY_ASK = (CHOICE_META, ASK_META)
+_LOOKUP_ERRORS = (AttributeError, RuntimeError, LookupError, TypeError)
 
 
 def refusal_result(refusal: Refusal) -> ToolResult:
@@ -66,8 +71,54 @@ def ask_mode(ask: Ask) -> str:
     return "url" if ask.kind == "url" else "form"
 
 
-def elicit_request(ask: Ask) -> mcp_types.ElicitRequest:
-    """Return the elicitation for one ask."""
+def _declares(settings: Any, session: Any) -> bool:
+    for identifier in READS_ASK_META:
+        try:
+            if settings(identifier) is not None:
+                return True
+        except _LOOKUP_ERRORS:
+            pass
+    try:
+        capabilities = session.client_capabilities if session is not None else None
+    except _LOOKUP_ERRORS:
+        return False
+    for group in ("extensions", "experimental"):
+        found: Any = getattr(capabilities, group, None) if capabilities else None
+        if isinstance(found, dict) and any(name in found for name in READS_ASK_META):
+            return True
+    return False
+
+
+def reads_ask_meta(ctx: Context | None) -> bool:
+    """True when the client declared it reads relay's typed ask and choice ``_meta``.
+
+    The declaration is the ``io.iowarp.clio-relay/ask`` (or ``/choice``) client
+    extension: in each request's ``_meta`` at ``2026-07-28``, in the session's
+    ``extensions`` or ``experimental`` capabilities at ``2025-11-25``.
+    """
+    if ctx is None:
+        return False
+    try:
+        session: Any = ctx.session
+    except _LOOKUP_ERRORS:
+        session = None
+    return _declares(ctx.client_extension_settings, session)
+
+
+def request_reads_ask_meta(rc: Any) -> bool:
+    """:func:`reads_ask_meta` for a low-level request context (``tasks/get``)."""
+    if rc is None:
+        return False
+
+    def settings(identifier: str) -> dict[str, Any] | None:
+        return read_client_extension_settings(rc, identifier)
+
+    return _declares(settings, getattr(rc, "session", None))
+
+
+def elicit_request(ask: Ask, *, reads_meta: bool) -> mcp_types.ElicitRequest:
+    """Return the elicitation for one ask, worded for whether the client reads its ``_meta``."""
+    ask = short_ask(ask, reads_meta=reads_meta)
     if ask.kind == "url":
         return mcp_types.ElicitRequest(
             params=mcp_types.ElicitRequestURLParams(
@@ -83,12 +134,17 @@ def elicit_request(ask: Ask) -> mcp_types.ElicitRequest:
     )
 
 
-def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequiredResult:
+def input_required(
+    asks: list[Ask], request_state: str, *, reads_meta: bool
+) -> mcp_types.InputRequiredResult:
     """The modern input request for ``asks``, with their ``_meta`` on the result.
 
     The 2026-07-28 schema gives an embedded input request no ``_meta``, so each
     ask's typed data (a job card, say) rides on the result's own ``_meta``.
     """
+    requests: dict[str, Any] = {
+        ask.ask_id: elicit_request(ask, reads_meta=reads_meta) for ask in asks
+    }
     meta: dict[str, Any] = {}
     for ask in asks:
         for key, value in (ask.meta or {}).items():
@@ -98,7 +154,7 @@ def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequir
             else:
                 meta[key] = value
     return mcp_types.InputRequiredResult(
-        input_requests={ask.ask_id: elicit_request(ask) for ask in asks},
+        input_requests=requests,
         request_state=request_state,
         _meta=cast("mcp_types.RequestParamsMeta | None", meta or None),
     )
@@ -106,16 +162,19 @@ def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequir
 
 async def elicit_inline(ctx: Context, ask: Ask) -> mcp_types.ElicitResult:
     """Put one ask to a legacy client as an elicitation, with the ask's ``_meta``."""
-    if ask.kind == "url":
+    request = elicit_request(ask, reads_meta=reads_ask_meta(ctx))
+    if isinstance(request.params, mcp_types.ElicitRequestURLParams):
         return await ctx.session.elicit_url(
-            message=ask.message, url=ask.url or "", elicitation_id=ask.ask_id
+            message=request.params.message, url=ask.url or "", elicitation_id=ask.ask_id
         )
-    return await ctx.session.send_request(elicit_request(ask), mcp_types.ElicitResult)
+    return await ctx.session.send_request(request, mcp_types.ElicitResult)
 
 
-def elicit_document(ask: Ask) -> dict[str, Any]:
+def elicit_document(ask: Ask, *, reads_meta: bool) -> dict[str, Any]:
     """The elicitation for one ask, as JSON."""
-    return elicit_request(ask).model_dump(by_alias=True, mode="json", exclude_none=True)
+    return elicit_request(ask, reads_meta=reads_meta).model_dump(
+        by_alias=True, mode="json", exclude_none=True
+    )
 
 
 def response_parts(response: Any) -> tuple[str, dict[str, Any] | None]:

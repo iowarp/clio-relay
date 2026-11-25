@@ -134,9 +134,9 @@ def test_a_flagged_run_asks_once_with_its_card(
 
     asyncio.run(scenario())
     params = _the_card(person)
-    assert params.message.endswith("?")
+    assert "left this call's confirm to relay" in params.message
     (asked,) = RelayService(relay_paths).asks.all()
-    assert "left this call's confirm to relay" in ask_text(asked)
+    assert params.message == ask_text(asked) != asked.message
     card = _job_on(params, mode, rounds)
     assert card["phase"] == "planned"
     assert card["site"] == {"id": "fx", "label": "fx"}
@@ -255,7 +255,7 @@ def test_a_flagged_exec_asks_once_for_that_command(relay_paths: RelayPaths, answ
     asyncio.run(scenario())
     params = _the_card(person)
     (ask,) = RelayService(relay_paths).asks.all()
-    assert params.message == ask.message and "echo hi" in ask_text(ask)
+    assert params.message == ask_text(ask) and "echo hi" in params.message
     assert ask.binding["kind"] == confirm.EXEC_CONFIRM_KIND
     assert ask.completed_at is not None
 

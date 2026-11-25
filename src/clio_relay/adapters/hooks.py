@@ -83,6 +83,13 @@ job asks for, the command, a log path) and its evidence lines, for a host to
 show behind a disclosure. The ask's ``message`` is the question sentence only.
 """
 
+READS_ASK_META = (ASK_META, CHOICE_META)
+"""The client extensions that say a client reads :data:`ASK_META` and :data:`CHOICE_META`.
+
+A client that declares either one gets each ask's question alone; any other
+client gets the question followed by its detail (see :func:`short_ask`).
+"""
+
 _QUESTION_END = re.compile(r"\?(?=\s|$)")
 _SENTENCE_GAP = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -142,19 +149,26 @@ def with_ask_context(ask: Ask, *, detail: str | None = None, evidence: Sequence[
     _fill_choices(ask)
 
 
-def short_ask(ask: Ask) -> Ask:
+def short_ask(ask: Ask, *, reads_meta: bool = True) -> Ask:
     """Make ``ask``'s message its question sentence; the rest of the text becomes its detail.
 
     Every ask relay's providers build goes through here, so a host can show the
     question alone and the rest behind a disclosure. Text already kept as the
-    ask's detail stays after the new rest.
+    ask's detail stays after the new rest. The split is idempotent.
+
+    Every delivery to a client goes through here too, with ``reads_meta`` saying
+    whether the client declared it reads :data:`READS_ASK_META`. One that did
+    gets ``ask`` itself; any other gets a copy whose message is the question
+    followed by the detail, so a generic client never loses the facts behind it.
     """
     question, rest = split_question(ask.message)
     known = _ask_entry(ask)
     ask.message = question
     detail = "\n\n".join(part for part in (rest, known.get("detail") or "") if part)
     with_ask_context(ask, detail=detail, evidence=cast(list[str], known.get("evidence") or []))
-    return ask
+    if reads_meta:
+        return ask
+    return ask.model_copy(deep=True, update={"message": ask_text(ask)})
 
 
 def ask_detail(ask: Ask) -> str | None:

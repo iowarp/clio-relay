@@ -20,6 +20,7 @@ import pytest
 
 from clio_relay import jarvis_exits, jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import (
+    ASK_META,
     CHOICE_META,
     Ask,
     ChoiceOption,
@@ -282,8 +283,9 @@ def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     other = choice_ask(
         ask_id="ask_2", site="fx", operation_id="op", message="m", field_name="x", options=["y"]
     )
-    merged = input_required([ask, other], "state").meta or {}
+    merged = input_required([ask, other], "state", reads_meta=True).meta or {}
     assert set(merged[CHOICE_META]) == {"ask_1", "ask_2"}
+    assert set(merged[ASK_META]) == {"ask_1", "ask_2"}
     # A form that names only values still reads, each its own label.
     assert schema_options({"properties": {"x": {"type": "string", "enum": ["y"]}}}) == [
         ChoiceOption(value="y", label="y")
