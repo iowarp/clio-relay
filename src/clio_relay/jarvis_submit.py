@@ -188,6 +188,12 @@ EXIT_REFUSED = 5
 RECHECK = "clio_relay_recheck"
 """The key in :func:`install_command`'s answers that makes it a ``recheck``: a job in
 which JARVIS checks the software with the person's answers, and builds nothing."""
+INSTALL_SCHEDULER = "clio_relay_install_scheduler"
+"""The key in :func:`install_command`'s answers for the ``scheduler.install`` settings
+the person picked (``{"partition": ...}`` or ``{"time": ...}``) when JARVIS's build
+estimate was longer than the partition allows (:mod:`clio_relay.install_time`)."""
+RELAY_ANSWERS = (RECHECK, INSTALL_SCHEDULER)
+"""Relay's own keys in the answers; JARVIS's answers file gets none of them."""
 
 REFUSAL_SCHEMA = "jarvis.refusal.v1"
 CHECK_SCHEMA = "jarvis.pipeline-check.v1"
@@ -840,7 +846,9 @@ def install_pipeline(
     ``scheduler.install.time`` only when the site sets one (``walltime_s``) and
     the pipeline sets none; a check job (``answers`` make it a ``recheck``)
     builds nothing, so then it gets the shorter of ``walltime_s`` and
-    :data:`INSTALL_CHECK_WALLTIME_S`.
+    :data:`INSTALL_CHECK_WALLTIME_S`. The person's pick when JARVIS's estimate
+    was longer than the partition allows (:data:`INSTALL_SCHEDULER` in
+    ``answers``) sets ``scheduler.install`` over the pipeline's own.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
@@ -852,6 +860,11 @@ def install_pipeline(
     }
     install = scheduler.get("install")
     own = dict(cast(Mapping[str, object], install)) if isinstance(install, Mapping) else {}
+    chosen = answers.get(INSTALL_SCHEDULER)
+    if isinstance(chosen, Mapping):
+        own.update(
+            {str(key): value for key, value in cast(Mapping[object, object], chosen).items()}
+        )
     if walltime_s:
         seconds = min(walltime_s, INSTALL_CHECK_WALLTIME_S) if is_recheck(answers) else walltime_s
         own.setdefault("time", slurm_time(timedelta(seconds=seconds)))
@@ -891,7 +904,7 @@ def install_command(
         mode="recheck" if recheck else "install",
         jarvis=jarvis,
         execution=install_execution_id(operation_id),
-        answers={key: value for key, value in answers.items() if key != RECHECK},
+        answers={key: value for key, value in answers.items() if key not in RELAY_ANSWERS},
         pipeline=pipeline,
     )
     return _site_command(spec, arguments, script=script, home=home, graph=graph)

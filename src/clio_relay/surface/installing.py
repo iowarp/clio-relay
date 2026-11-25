@@ -62,7 +62,13 @@ import logging
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from clio_relay import install_failures, install_wording, jarvis_report, jarvis_submit
+from clio_relay import (
+    install_failures,
+    install_time,
+    install_wording,
+    jarvis_report,
+    jarvis_submit,
+)
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import approval_covers as approval_covers
@@ -174,7 +180,12 @@ async def ask_install(
     provider = service.ask_provider
     binding: dict[str, Any] = {"site": site.id, "spec_digest": record.spec_digest}
     state: dict[str, Any] = {"kind": kind, "stage": "asking", "rounds": rounds + 1}
+    chosen = state_of(record).get("install_scheduler")
+    if isinstance(chosen, dict):
+        state["install_scheduler"] = chosen
     asks: list[Ask] = []
+    if kind == "software" and refusal.data.get("kind") == install_time.KIND:
+        return await _ask_install_time(service, operation_id, site, refusal, state)
     if kind == "software":
         report = cast(dict[str, Any], refusal.data["install_report"])
         blocking = jarvis_report.blocking_issues(report)
@@ -279,6 +290,58 @@ async def ask_install(
     return _hold(service, operation_id, state, asks, refusal.message)
 
 
+_CARRIED = ("missing_keys", "installed", "summary", "report_digest", "recheck")
+"""What an install round keeps when JARVIS stops it to ask how the build job runs."""
+
+
+async def _ask_install_time(
+    service: RelayService,
+    operation_id: str,
+    site: SiteEntry,
+    refusal: Refusal,
+    state: dict[str, Any],
+) -> OperationRecord:
+    """Ask how JARVIS's install job runs when its estimate is past the partition's limit.
+
+    The person already approved the install, so this is the only ask; the
+    round's other state stays (:data:`_CARRIED`). The pick applies in
+    :func:`start_install` (:func:`_install_time_answer`).
+    """
+    previous = state_of(service.operation(operation_id))
+    state.update({key: previous[key] for key in _CARRIED if key in previous})
+    issue = cast(dict[str, Any], refusal.data["install_report"])["issues"][0]
+    issue_id = str(issue.get("issue_id"))
+    ask = await choice_ask(service, site, operation_id, issue)
+    state["choices"] = {ask.ask_id: issue_id}
+    state["offers"] = {ask.ask_id: offer_map(issue)}
+    state["install_time"] = issue_id
+    return _hold(service, operation_id, state, [ask], refusal.message)
+
+
+def _install_time_answer(
+    service: RelayService, operation_id: str, state: dict[str, Any], answers: dict[str, Any]
+) -> dict[str, Any]:
+    """Turn the person's install-time pick into relay's answers; JARVIS gets none for it."""
+    issue_id = state.get("install_time")
+    found = answers.pop(issue_id, None) if isinstance(issue_id, str) else None
+    if isinstance(found, dict):
+        value = str(cast(dict[str, Any], found).get("constraint") or "")
+        settings = install_time.picked(value)
+        if settings is None:
+            state = {**state, "recheck": True}
+        else:
+            state = {**state, "install_scheduler": settings, "recheck": False}
+        _update(
+            service,
+            operation_id,
+            recheck=state["recheck"],
+            install_scheduler=state.get("install_scheduler"),
+        )
+    if isinstance(state.get("install_scheduler"), dict):
+        answers[jarvis_submit.INSTALL_SCHEDULER] = state["install_scheduler"]
+    return state
+
+
 def _hold(
     service: RelayService,
     operation_id: str,
@@ -322,6 +385,7 @@ async def start_install(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
         answers = choice_answers(service, state)
+        state = _install_time_answer(service, operation_id, state, answers)
         if state.get("recheck"):
             answers[jarvis_submit.RECHECK] = True
         handle = await adapter.install(job, operation_id=operation_id, answers=answers)

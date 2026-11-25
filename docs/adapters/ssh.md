@@ -202,7 +202,11 @@ itself, its walltime included, from its own estimate of the build within the
 partition's limit. Relay drops the run's walltime from that job, since a
 build is not the run, and gives `install_walltime_s` as
 `scheduler.install.time` only when the site sets it; then the approval says
-how long the build may take. When
+how long the build may take. When JARVIS's estimate is longer than the
+partition allows, it stops with an `install_time_exceeds_partition` issue,
+and relay asks the person to pick one of its candidates: a partition whose
+limit fits or a time to build in parts (set in the install pipeline's
+`scheduler.install`), or a check job that refreshes the estimate. When
 the site chose the login host, relay starts JARVIS's own
 `jarvis ppl install --answers` there, detached, under the operation's
 `relay.login-build/` folder. JARVIS sets and applies its limits; relay sets
