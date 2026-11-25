@@ -23,7 +23,7 @@ from fastmcp.tools import InputRequiredToolResult, ToolResult
 from pydantic import Field
 
 from clio_relay import site_clean as cleaning
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ask_detail, ask_text
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import canonical_digest
 from clio_relay.surface import exec_plan, job_card
@@ -113,6 +113,7 @@ def _needs_person(service: RelayService, ask: Ask) -> ToolResult:
                 "ask_id": ask.ask_id,
                 "kind": ask.kind,
                 "message": ask.message,
+                "detail": ask_detail(ask),
                 "page": service.ask_provider.page_address(ask),
             }
         ],
@@ -141,7 +142,7 @@ async def site_clean_tool(
                     )
                 )
             response = await ctx.session.elicit_form(
-                message=ask.message,
+                message=ask_text(ask),
                 requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
             )
             action, content = response_parts(response)

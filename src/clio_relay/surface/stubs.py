@@ -21,6 +21,7 @@ from clio_relay.adapters.hooks import (
     HookContext,
     approve_schema,
     choice_ask,
+    short_ask,
 )
 from clio_relay.jobs.handles import Endpoint, JobStatus
 from clio_relay.jobs.records import OperationRecord, new_id
@@ -58,15 +59,17 @@ class StubAskProvider:
         recommended_reason: str | None = None,
     ) -> Ask:
         return self._store(
-            choice_ask(
-                ask_id=new_id("ask"),
-                site=site.id,
-                operation_id=operation_id,
-                message=message,
-                field_name=field_name,
-                options=options,
-                title=title,
-                recommended_reason=recommended_reason,
+            short_ask(
+                choice_ask(
+                    ask_id=new_id("ask"),
+                    site=site.id,
+                    operation_id=operation_id,
+                    message=message,
+                    field_name=field_name,
+                    options=options,
+                    title=title,
+                    recommended_reason=recommended_reason,
+                )
             )
         )
 
@@ -88,7 +91,7 @@ class StubAskProvider:
             requested_schema=approve_schema(plain=plain),
         )
         ask.bind(binding)
-        return self._store(ask)
+        return self._store(short_ask(ask))
 
     async def url(self, *, site: SiteEntry, operation_id: str | None, need: SignInNeed) -> Ask:
         ask = Ask(

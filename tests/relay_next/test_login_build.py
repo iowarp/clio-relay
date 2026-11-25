@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 
 from clio_relay import install_wording, jarvis_exits, jarvis_report, jarvis_submit
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
@@ -162,7 +163,7 @@ async def _approved(service: RelayService) -> str:
     operation_id = (await install_op.start(service, "fx", PACKAGE)).operation_id
     (approve,) = service.outstanding(service.operation(operation_id))
     assert approve.kind == "approve"
-    assert "login host under its own limits" in approve.message
+    assert "login host under its own limits" in ask_text(approve)
     service.answer(approve.ask_id, "accept", {"approve": True}, by="test")
     record = await service.advance(operation_id)
     assert record.state == OperationState.QUEUED, record

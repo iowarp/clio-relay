@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any, NoReturn, cast
 
 import typer
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ask_detail
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.surface.settings import RelayPaths
@@ -73,6 +73,7 @@ def asks_list(
                 "site": ask.site,
                 "operation_id": ask.operation_id,
                 "message": ask.message,
+                "detail": ask_detail(ask),
                 "state": ask.state,
                 "created_at": ask.created_at,
             }

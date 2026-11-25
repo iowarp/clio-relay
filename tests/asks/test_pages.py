@@ -9,7 +9,15 @@ import httpx
 import pytest
 
 from clio_relay.adapters.base import SignInNeed
-from clio_relay.adapters.hooks import Ask, choice_ask, with_choice_context
+from clio_relay.adapters.hooks import (
+    Ask,
+    ask_detail,
+    ask_text,
+    choice_ask,
+    short_ask,
+    split_question,
+    with_choice_context,
+)
 from clio_relay.asks.core import origin_ok
 from clio_relay.asks.pages import SECURITY_HEADERS, binding_table, choice_context
 from clio_relay.asks.provider import base_file, read_base
@@ -317,5 +325,29 @@ def test_a_choice_folds_its_evidence_away() -> None:
     with_choice_context(ask, "x", note="For <site>.", detail="More.", evidence=["load 4<5"])
     html = choice_context(ask)
     assert html.startswith("<p class='note'>For &lt;site&gt;.</p><details>")
-    assert "<summary>Evidence</summary><p>More.</p><ul><li>load 4&lt;5</li></ul>" in html
+    folded = "<p class='detail'>More.</p><ul><li>load 4&lt;5</li></ul>"
+    assert "<summary>Details</summary>" + folded in html
     assert "<details open" not in html
+
+
+def test_every_ask_is_its_question_with_the_rest_folded_away() -> None:
+    text = (
+        "Compiler gcc@12.3.0 cannot run on the build host n1 (cc: cannot create "
+        "executables). Which compiler should builds use?\n\nspack -e x install\nlog: /op_1/log"
+    )
+    assert split_question("Where at this site: pkg (~60 s)? Recommended: a.") == (
+        "Where at this site: pkg (~60 s)?",
+        "Recommended: a.",
+    )
+    assert split_question("Review pvserver.") == ("Review pvserver.", "")
+    ask = Ask(ask_id="ask_a", kind="approve", site="fx", message=text)
+    short_ask(ask)
+    assert ask.message == "Which compiler should builds use?"
+    detail = ask_detail(ask) or ""
+    assert detail.startswith("Compiler gcc@12.3.0") and "log: /op_1/log" in detail
+    assert ask_text(ask).startswith("Which compiler should builds use?\n\nCompiler gcc@12.3.0")
+    html = choice_context(ask, opened=True)
+    assert html.startswith("<details open><summary>Details</summary>")
+    assert "spack -e x install" in html
+    with_choice_context(ask, "x", detail="ignored")  # no such field: the ask's own detail stays
+    assert ask_detail(ask) == detail

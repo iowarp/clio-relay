@@ -512,6 +512,7 @@ def site_clean(
     unless told.
     """
     from clio_relay import site_clean as cleaning
+    from clio_relay.adapters.hooks import ask_text
     from clio_relay.surface.service import RelayService
 
     _json_flag(extra)
@@ -529,7 +530,7 @@ def site_clean(
         if service.asks.get(ask.ask_id) is None:
             service.asks.put(ask.ask_id, ask)
         if sys.stdin.isatty():
-            if typer.confirm(ask.message, default=False, err=True):
+            if typer.confirm(ask_text(ask), default=False, err=True):
                 service.answer(ask.ask_id, "accept", {"approve": True}, by="cli")
             else:
                 service.answer(ask.ask_id, "decline", by="cli")

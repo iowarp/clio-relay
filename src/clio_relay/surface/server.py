@@ -45,7 +45,7 @@ from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
 from clio_relay import shutdown as shutdown_ops
-from clio_relay.adapters.hooks import Ask, MountsPages, Transport
+from clio_relay.adapters.hooks import Ask, MountsPages, Transport, ask_detail
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -332,6 +332,7 @@ class RelayServer:
                 "ask_id": ask.ask_id,
                 "kind": ask.kind,
                 "message": ask.message,
+                "detail": ask_detail(ask),
                 "page": self.service.ask_provider.page_address(ask),
             }
             for ask in pending

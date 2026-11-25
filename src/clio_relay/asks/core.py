@@ -175,6 +175,7 @@ class PageCore:
         if ask.kind == "approve":
             body = (
                 intro
+                + choice_context(ask, opened=True)
                 + binding_table(ask)
                 + f"<form method='post'>{fields}"
                 + _button("accept", "Approve")

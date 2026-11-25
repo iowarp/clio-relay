@@ -170,13 +170,14 @@ async def consider(
         for item in fitting
     )
     site = service.site(record.site)
+    there = str(fitting[0]["partition"]) if len(fitting) == 1 else "a partition with room"
     message = (
         f"{_what(record, phase)} {handle.native_id} waits in the {partition} queue on "
         f"{site.title}{f' ({reason})' if reason else ''}. The scheduler expects it to start "
         f"at {start}, in about {_hours(starts_in)}. {names} "
-        f"{'has' if len(fitting) == 1 else 'have'} room for it now. Keep waiting, or move "
-        "it there? Moving keeps the job and its place in relay; it starts when that "
-        "partition runs it."
+        f"{'has' if len(fitting) == 1 else 'have'} room for it now. Keep job "
+        f"{handle.native_id} waiting in {partition}, or move it to {there}? Moving keeps "
+        "the job and its place in relay; it starts when that partition runs it."
     )
     ask = await service.ask_provider.choose(
         site=site,

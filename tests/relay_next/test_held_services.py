@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.sites.models import SiteEntry
@@ -80,7 +81,7 @@ async def test_the_person_chooses_whether_the_running_service_ends(
     record = await service.start_run("fx", ECHO)
     assert record.state == OperationState.AWAITING_INPUT
     (ask,) = service.outstanding(record)
-    assert "op_pilot" in ask.message and "pvserver" in ask.message
+    assert "op_pilot" in ask_text(ask) and "pvserver" in ask_text(ask)
     schema = ask.requested_schema
     assert schema is not None and schema["properties"][held_services.FIELD]
     service.answer(ask.ask_id, action, content, by="test")

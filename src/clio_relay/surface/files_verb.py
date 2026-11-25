@@ -15,7 +15,7 @@ import mcp_types
 from fastmcp import Context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ask_detail, ask_text
 from clio_relay.jobs.file_rules import CHUNK_BYTES
 from clio_relay.jobs.handles import FileAccess
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -221,7 +221,7 @@ async def files_tool(
                     )
                 )
             response = await ctx.session.elicit_form(
-                message=ask.message,
+                message=ask_text(ask),
                 requested_schema=ask.requested_schema or {"type": "object", "properties": {}},  # pyright: ignore[reportArgumentType]
             )
             action, content = response_parts(response)
@@ -264,6 +264,7 @@ def _needs_person(service: RelayService, ask: Ask) -> ToolResult:
                 "ask_id": ask.ask_id,
                 "kind": ask.kind,
                 "message": ask.message,
+                "detail": ask_detail(ask),
                 "page": service.ask_provider.page_address(ask),
             }
         ],

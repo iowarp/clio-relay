@@ -108,7 +108,7 @@ def test_the_tool_forgets_the_answers_only_when_asked(
                 arguments = {"site": "fx", "forget_decisions": forget}
                 asked = await client.call_tool("site_clean", arguments, raise_on_error=False)
                 refusal = cast(dict[str, Any], asked.structured_content)["refusal"]
-                message = refusal["data"]["asks"][0]["message"]
+                message = refusal["data"]["asks"][0]["detail"]
                 assert ("next install asks them again" in message) is forget
                 service.answer(refusal["data"]["ask_id"], "accept", {"approve": True}, by="test")
                 await client.call_tool("site_clean", arguments)

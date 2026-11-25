@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
-from clio_relay.adapters.hooks import Ask, schema_options
+from clio_relay.adapters.hooks import Ask, ask_text, schema_options
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import RecordStore
 
@@ -197,7 +197,7 @@ def _form(ask: Ask, page: str, form: str) -> str:
         f"<input type='hidden' name='t' value='{html.escape(page)}'>"
         f"<input type='hidden' name='csrf' value='{html.escape(form)}'>"
     )
-    body = f"<p>{html.escape(ask.message)}</p>"
+    body = f"<p>{html.escape(ask_text(ask))}</p>"
     if ask.state != "pending" and not (ask.kind == "url" and ask.completed_at is None):
         return _page("Already answered", body + f"<p>Answer: {html.escape(ask.state)}</p>")
     choice = ""

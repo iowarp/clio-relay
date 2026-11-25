@@ -6,6 +6,7 @@ from datetime import timedelta
 
 import pytest
 
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.sites.models import SiteEntry, SpendPolicy
@@ -67,8 +68,8 @@ async def test_unknown_cost_asks_and_says_so(relay_paths: RelayPaths) -> None:
     charge = (record.result or {})["charge"]
     assert charge["walltime_s"] is None and charge["node_hours"] is None
     (ask,) = service.outstanding(record)
-    assert "unknown" in ask.message
-    assert "scheduler's default limit applies" in ask.message
+    assert "unknown" in ask_text(ask)
+    assert "scheduler's default limit applies" in ask_text(ask)
     await service.close()
 
 

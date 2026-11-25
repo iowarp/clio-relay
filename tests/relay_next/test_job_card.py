@@ -14,6 +14,7 @@ from fastmcp_tasks.client import (
     call_tool_task,  # pyright: ignore[reportUnknownVariableType]
 )
 
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.surface import confirm, held_services, job_card
@@ -133,7 +134,9 @@ def test_a_flagged_run_asks_once_with_its_card(
 
     asyncio.run(scenario())
     params = _the_card(person)
-    assert "left this call's confirm to relay" in params.message
+    assert params.message.endswith("?")
+    (asked,) = RelayService(relay_paths).asks.all()
+    assert "left this call's confirm to relay" in ask_text(asked)
     card = _job_on(params, mode, rounds)
     assert card["phase"] == "planned"
     assert card["site"] == {"id": "fx", "label": "fx"}
@@ -251,8 +254,8 @@ def test_a_flagged_exec_asks_once_for_that_command(relay_paths: RelayPaths, answ
 
     asyncio.run(scenario())
     params = _the_card(person)
-    assert "echo hi" in params.message
     (ask,) = RelayService(relay_paths).asks.all()
+    assert params.message == ask.message and "echo hi" in ask_text(ask)
     assert ask.binding["kind"] == confirm.EXEC_CONFIRM_KIND
     assert ask.completed_at is not None
 
@@ -306,7 +309,7 @@ def test_the_card_folds_the_running_services_choice(relay_paths: RelayPaths) -> 
         service.cancel = _cancel  # type: ignore[method-assign]
         record = await service.start_run("fx", JobSpec.model_validate(ECHO), confirm=True)
         (ask,) = service.outstanding(record)
-        assert "op_pilot" in ask.message
+        assert "op_pilot" in ask_text(ask)
         schema = ask.requested_schema or {}
         assert schema["properties"][held_services.FIELD]["default"] == held_services.KEEP
         # The card shows in place of the message, so the field itself names the service.

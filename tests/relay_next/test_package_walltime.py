@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jarvis_site import archive_package
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationState
@@ -90,8 +91,8 @@ async def test_the_spend_ask_prices_the_package_walltime(
     assert (charge["nodes"], charge["walltime_s"]) == (2, 1800)
     assert charge["node_hours"] == pytest.approx(1.0)
     (ask,) = service.outstanding(record)
-    assert "Walltime: 30 min, up to 1 node-hour in all" in ask.message
-    assert "sets no walltime" not in ask.message
+    assert "Walltime: 30 min, up to 1 node-hour in all" in ask_text(ask)
+    assert "sets no walltime" not in ask_text(ask)
     stored = JobSpec.model_validate(service.operation(record.operation_id).spec)
     assert stored.attributes.duration == timedelta(seconds=1800)
     assert stored.attributes.queue_name is None

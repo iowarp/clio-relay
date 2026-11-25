@@ -26,7 +26,7 @@ from typing import Any, Literal, cast
 
 from filelock import FileLock
 
-from clio_relay.adapters.hooks import CHOICE_META, Ask, schema_options
+from clio_relay.adapters.hooks import ASK_META, CHOICE_META, Ask, schema_options
 
 DEFAULT_PAGE_TTL_S = 24 * 3600.0
 MAX_LIVE_TOKENS = 8
@@ -161,7 +161,7 @@ _STYLE = (
     " .25rem 0;vertical-align:top}th{font-weight:600}button{font:inherit;padding:.4rem 1rem;"
     "margin:.25rem .5rem .25rem 0}input[type=password],input[type=text]{font:inherit;"
     "padding:.3rem;width:100%;box-sizing:border-box}.note{color:#555}.code{font:600 1.6rem "
-    "ui-monospace,monospace;letter-spacing:.15rem}"
+    "ui-monospace,monospace;letter-spacing:.15rem}.detail{white-space:pre-wrap}"
 )
 
 
@@ -278,19 +278,27 @@ def field_name(ask: Ask) -> str:
     return "value"
 
 
-def choice_context(ask: Ask) -> str:
-    """Return a choose ask's note, then the producer's detail and evidence, folded away."""
+def choice_context(ask: Ask, *, opened: bool = False) -> str:
+    """Return an ask's note, then the producer's detail and evidence, folded away.
+
+    The detail is the ask's own (:data:`ASK_META`), else its typed choice's.
+    ``opened`` unfolds it, for an approval whose detail says what a yes does.
+    """
     by_ask = cast(dict[str, Any], (ask.meta or {}).get(CHOICE_META) or {})
     entry = cast(
         dict[str, Any],
         cast(dict[str, Any], by_ask.get(ask.ask_id) or {}).get(field_name(ask)) or {},
     )
-    note, detail = entry.get("note"), entry.get("detail")
-    evidence = [str(item) for item in cast(list[object], entry.get("evidence") or [])]
+    own = cast(dict[str, Any], (ask.meta or {}).get(ASK_META) or {}).get(ask.ask_id)
+    known = cast(dict[str, Any], own) if isinstance(own, dict) else {}
+    found = known if known.get("detail") or known.get("evidence") else entry
+    note, detail = entry.get("note"), found.get("detail")
+    evidence = [str(item) for item in cast(list[object], found.get("evidence") or [])]
     parts = [f"<p class='note'>{e(note)}</p>"] if isinstance(note, str) and note else []
-    folded = [f"<p>{e(detail)}</p>"] if isinstance(detail, str) and detail else []
+    folded = [f"<p class='detail'>{e(detail)}</p>"] if isinstance(detail, str) and detail else []
     if evidence:
         folded.append("<ul>" + "".join(f"<li>{e(item)}</li>" for item in evidence) + "</ul>")
     if folded:
-        parts.append(f"<details><summary>Evidence</summary>{''.join(folded)}</details>")
+        tag = "<details open>" if opened else "<details>"
+        parts.append(f"{tag}<summary>Details</summary>{''.join(folded)}</details>")
     return "".join(parts)

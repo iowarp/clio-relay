@@ -148,7 +148,7 @@ def asks_again(issues: list[dict[str, Any]], *, site: str) -> Refusal:
     refusal = jarvis_report.install_needed(report, site=site)
     refusal.data["ask_message"] = (
         f"{failed.message}. JARVIS asks {len(issues)} question(s) about it; with your "
-        "answers it runs the install job again. Go ahead?"
+        f"answers it runs the install job again. Answer them and install again on {site}?"
     )
     refusal.data["failure"] = failed.data
     return refusal

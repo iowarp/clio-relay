@@ -14,8 +14,10 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from clio_relay.adapters.hooks import CHOICE_META, Ask
+from clio_relay.adapters.hooks import ASK_META, CHOICE_META, Ask
 from clio_relay.jobs.refusals import Refusal
+
+_BY_ASK = (CHOICE_META, ASK_META)
 
 
 def refusal_result(refusal: Refusal) -> ToolResult:
@@ -90,7 +92,7 @@ def input_required(asks: list[Ask], request_state: str) -> mcp_types.InputRequir
     meta: dict[str, Any] = {}
     for ask in asks:
         for key, value in (ask.meta or {}).items():
-            if key == CHOICE_META and isinstance(meta.get(key), dict) and isinstance(value, dict):
+            if key in _BY_ASK and isinstance(meta.get(key), dict) and isinstance(value, dict):
                 # Keyed by ask id, so each ask's options survive beside the others'.
                 meta[key] = {**meta[key], **cast(dict[str, Any], value)}
             else:

@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from clio_relay import jarvis_plan
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ask_text
 from clio_relay.adapters.ssh.scripts import jarvis_status_script
 from clio_relay.guard.reviews import Review
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
@@ -239,7 +239,7 @@ def test_a_package_card_carries_jarvis_plan_and_the_yes_binds_it(
         ask = _card(service, record)
         assert jarvis.plans == [record.operation_id]
         assert ask.binding["plan_sha256"] == "5eed"
-        assert jarvis_plan.summary(_document()) in ask.message
+        assert jarvis_plan.summary(_document()) in ask_text(ask)
         card: dict[str, Any] = dict((ask.meta or {})[job_card.JOB_META])
         assert card["source"] == "jarvis"
         assert card["phase"] == "planned"

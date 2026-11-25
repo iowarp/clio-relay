@@ -264,7 +264,8 @@ async def ask_install(
                 message=(
                     f"{refusal.message}. Relay installs jarvis-cd "
                     f"{jarvis_submit.JARVIS_PIN[:8]} in a virtual environment under the CLIO "
-                    "home on the site, which needs the site to reach github.com. Install it?"
+                    "home on the site, which needs the site to reach github.com. Install "
+                    f"jarvis-cd on {site.title}?"
                 ),
                 binding={
                     "site": site.id,

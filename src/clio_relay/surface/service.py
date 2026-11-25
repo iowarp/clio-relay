@@ -24,6 +24,7 @@ from clio_relay.adapters.hooks import (
     HookContext,
     ServeHook,
     Transport,
+    ask_detail,
     hook_factory,
     said_yes,
 )
@@ -1073,6 +1074,7 @@ class RelayService:
                 "kind": ask.kind,
                 "state": ask.state,
                 "message": ask.message,
+                "detail": ask_detail(ask),
             }
             if ask.kind == "url":
                 shown["url"] = ask.url

@@ -111,8 +111,8 @@ async def question(
         f"{'A service' if one else 'Services'} of relay's still "
         f"{'runs' if one else 'run'} on {site.title}: {named}. "
         f"{'It keeps its' if one else 'They keep their'} nodes while up, beside this job's. "
-        f"End {'it' if one else 'them'} when this job is submitted, or keep "
-        f"{'it' if one else 'them'} running, for example to review the results?"
+        f"End the running {'service' if one else 'services'} when this job is submitted, "
+        f"or keep {'it' if one else 'them'} running, for example to review the results?"
     )
     return message, [r.operation_id for r in running]
 

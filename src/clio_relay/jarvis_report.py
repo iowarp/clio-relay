@@ -13,7 +13,7 @@ import json
 from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
-from clio_relay.adapters.hooks import ChoiceOption
+from clio_relay.adapters.hooks import ChoiceOption, split_question
 from clio_relay.jarvis_submit import INSTALL_REPORT_SCHEMA, NEEDS_INSTALL, parse_document
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
@@ -498,11 +498,7 @@ def _split_question(issue: Mapping[str, Any]) -> tuple[str, str]:
     )
     if not isinstance(question, str) or not question.strip():
         return f"Which option should JARVIS use for {subject}?", ""
-    head, mark, rest = question.strip().partition("?")
-    if mark:
-        return head.strip() + "?", rest.strip()
-    head, mark, rest = question.strip().partition(". ")
-    return (head.strip() + "." if mark else head.strip()), rest.strip()
+    return split_question(question)
 
 
 def choice_message(issue: Mapping[str, Any]) -> str:

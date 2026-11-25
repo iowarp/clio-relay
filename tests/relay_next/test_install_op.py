@@ -17,6 +17,7 @@ import pytest
 from fastmcp import Client
 
 from clio_relay import install_wording, jarvis_exits, jarvis_report, jarvis_submit
+from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -143,7 +144,7 @@ def test_missing_software_is_asked_then_installed_as_a_job(
         record = await install_op.start(service, "fx", SPEC)
         asked = service.operation(record.operation_id)
         (ask,) = service.outstanding(asked)
-        assert "nothing runs after it" in ask.message
+        assert "nothing runs after it" in ask_text(ask)
         await _approve(service, record.operation_id)
         assert service.operation(record.operation_id).state == OperationState.QUEUED
         done = await service.refresh(record.operation_id)
@@ -213,7 +214,7 @@ def test_a_site_without_jarvis_gets_it_first(relay_paths: RelayPaths, site: _Sit
         record = await install_op.start(service, "fx", SPEC)
         (ask,) = service.outstanding(service.operation(record.operation_id))
         assert ask.binding["jarvis"] == jarvis_submit.JARVIS_PIN
-        assert "Install it?" in ask.message
+        assert ask.message == "Install jarvis-cd on fx?"
         await _approve(service, record.operation_id)
         done = service.operation(record.operation_id)
         assert done.state == OperationState.COMPLETED, done

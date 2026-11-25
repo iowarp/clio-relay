@@ -31,7 +31,7 @@ from fastmcp.tools import InputRequiredToolResult, ToolResult
 
 from clio_relay import jarvis_plan, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, explain_approval
+from clio_relay.adapters.hooks import Ask, Charge, GuardDecision, ask_detail, explain_approval
 from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationKind, OperationRecord, OperationState
@@ -215,7 +215,7 @@ async def one_shot(
             site=site, operation_id=None, message=message, binding=binding, plain=plain
         )
         if meta:
-            ask.meta = meta
+            ask.meta = {**(ask.meta or {}), **meta}
             service.asks.put(ask.ask_id, ask)
     if ask.state == "pending":
         raise NeedsPerson(ask)
@@ -303,6 +303,7 @@ def needs_person(service: RelayService, ask: Ask, again: str) -> ToolResult:
                 "ask_id": ask.ask_id,
                 "kind": ask.kind,
                 "message": ask.message,
+                "detail": ask_detail(ask),
                 "page": service.ask_provider.page_address(ask),
             }
         ],

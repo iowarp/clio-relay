@@ -112,8 +112,8 @@ def _package_lines(package: PackageRef, info: ArchiveInfo, archive: Path) -> lis
 def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, archive: Path) -> str:
     """Return the review question's text: what the package is, where it came from, its hash."""
     lines = [
-        f"Review the JARVIS package {package.name} {package.version} before it runs on "
-        f"{site.title}, a guarded site.",
+        f"Approve the JARVIS package {package.name} {package.version} to run on "
+        f"{site.title}, a guarded site?",
         *_package_lines(package, info, archive),
         "A yes records this hash as reviewed on this site. A changed package has a "
         "different hash and needs a new review.",
@@ -125,8 +125,8 @@ def reviews_message(site: SiteEntry, packages: list[tuple[PackageRef, ArchiveInf
     """Return one question that reviews several packages of one job at once."""
     names = ", ".join(f"{package.name} {package.version}" for package, _, _ in packages)
     lines = [
-        f"Review {len(packages)} JARVIS packages before they run on {site.title}, a guarded "
-        f"site: {names}."
+        f"Approve {len(packages)} JARVIS packages to run on {site.title}, a guarded "
+        f"site? They are {names}."
     ]
     for package, info, archive in packages:
         lines.extend(

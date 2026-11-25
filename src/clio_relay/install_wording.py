@@ -58,12 +58,12 @@ def install_message(
         return (
             f"JARVIS needs {asked} choice(s) from you {before} on {site}; nothing has to be "
             f"installed. It applies your answers in a short job on the site, {then}.{reuse} "
-            "Go ahead?"
+            f"Answer JARVIS's questions for {package} on {site}?"
         )
     if not built and not installed:
         return (
             f"JARVIS applies its recorded choices for {site} in a short job {before}; "
-            f"nothing has to be installed.{reuse} Go ahead?"
+            f"nothing has to be installed.{reuse} Apply them for {package} on {site}?"
         )
     parts = [f"{package} needs software that {site} does not have yet."]
     if summary["reuse"]:
@@ -78,6 +78,7 @@ def install_message(
         parts.append(reuse.strip())
     job = f"an install job of up to {walltime}" if walltime else "an install job"
     parts.append(_where_built(report, site=site, job=job, last=last))
+    parts.append(f"Install the software {package} needs on {site}?")
     return " ".join(parts)
 
 
@@ -94,11 +95,11 @@ def _where_built(report: Mapping[str, Any], *, site: str, job: str, last: str) -
     if choice == "login_limited":
         return (
             f"JARVIS builds it on {site}'s login host under its own limits {last}, as a "
-            "background task with no time limit that you can stop. Install it?"
+            "background task with no time limit that you can stop."
         )
     if choice is None and plan.get("questions"):
         return (
             f"Where JARVIS builds it, on the login host under its limits or as {job}, is "
-            f"one of its questions; it installs it {last}. Install it?"
+            f"one of its questions; it installs it {last}."
         )
-    return f"JARVIS installs it as {job} on the site {last}. Install it?"
+    return f"JARVIS installs it as {job} on the site {last}."

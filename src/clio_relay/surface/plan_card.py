@@ -20,7 +20,13 @@ from typing import TYPE_CHECKING, Any
 
 from clio_relay import jarvis_plan
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.adapters.hooks import SERVICE_CHOICES, Ask, GuardDecision, PlansServices
+from clio_relay.adapters.hooks import (
+    SERVICE_CHOICES,
+    Ask,
+    GuardDecision,
+    PlansServices,
+    ask_text,
+)
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, ServiceSpec
@@ -167,7 +173,7 @@ async def refused(
     rounds = int((record.result or {}).get(ROUNDS) or 0)
     if rounds >= MAX_ROUNDS:
         return service.finish(operation_id, OperationState.FAILED, refusal)
-    message = card.message.replace(jarvis_plan.summary(old), jarvis_plan.summary(plan))
+    message = ask_text(card).replace(jarvis_plan.summary(old), jarvis_plan.summary(plan))
     listed = "\n".join(
         f"  - {line.strip()}" if line.startswith("  ") else f"- {line}" for line in what
     )
@@ -192,7 +198,7 @@ async def refused(
         }
         record.asks = [*record.asks, ask.ask_id]
         record.move(OperationState.AWAITING_INPUT, CHANGED)
-        ask.meta = {job_card.JOB_META: job_card.snapshot(service, record)}
+        ask.meta = {**(ask.meta or {}), job_card.JOB_META: job_card.snapshot(service, record)}
         service.asks.put(ask.ask_id, ask)
         service.operations.put(operation_id, record)
     return record

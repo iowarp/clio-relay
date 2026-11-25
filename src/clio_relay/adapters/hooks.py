@@ -8,6 +8,7 @@ the name ``asks``, ``guard`` or ``serve``. A factory takes a
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -73,6 +74,103 @@ def said_yes(content: dict[str, Any] | None) -> bool:
 
 CHOICE_META = "io.iowarp.clio-relay/choice"
 """The ``_meta`` key of a choose ask's typed options, keyed by ask id, then by field."""
+
+ASK_META = "io.iowarp.clio-relay/ask"
+"""The ``_meta`` key of what surrounds every ask's short question, keyed by ask id.
+
+Each entry is ``{detail, evidence}``: the rest of the producer's text (what the
+job asks for, the command, a log path) and its evidence lines, for a host to
+show behind a disclosure. The ask's ``message`` is the question sentence only.
+"""
+
+_QUESTION_END = re.compile(r"\?(?=\s|$)")
+_SENTENCE_GAP = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def split_question(text: str) -> tuple[str, str]:
+    """Return a text's question sentence and the rest of it, in order.
+
+    The question is the sentence that holds the first ``?`` ending a sentence.
+    A text that asks nothing gives its first sentence, which is all a short one has.
+    """
+    text = text.strip()
+    found = _QUESTION_END.search(text)
+    head = text[: found.end()] if found else text
+    gaps = [gap for gap in _SENTENCE_GAP.finditer(head)]
+    if found:
+        start = gaps[-1].end() if gaps else 0
+        question, before, after = head[start:], text[:start], text[found.end() :]
+    else:
+        end = gaps[0].start() if gaps else len(text)
+        question, before, after = text[:end], "", text[end:]
+    rest = "\n\n".join(part.strip() for part in (before, after) if part.strip())
+    return question.strip(), rest
+
+
+def _ask_entry(ask: Ask) -> dict[str, Any]:
+    meta = dict(ask.meta or {})
+    by_ask = dict(cast(dict[str, Any], meta.get(ASK_META) or {}))
+    entry = dict(cast(dict[str, Any], by_ask.get(ask.ask_id) or {}))
+    entry.setdefault("detail", None)
+    entry.setdefault("evidence", [])
+    by_ask[ask.ask_id] = entry
+    meta[ASK_META] = by_ask
+    ask.meta = meta
+    return entry
+
+
+def _fill_choices(ask: Ask) -> None:
+    """Give each of the ask's typed choices its detail and evidence, unless it has its own."""
+    entry = cast(dict[str, Any], (ask.meta or {}).get(ASK_META, {})).get(ask.ask_id)
+    by_ask = cast(dict[str, Any], (ask.meta or {}).get(CHOICE_META) or {})
+    fields = cast(dict[str, Any], by_ask.get(ask.ask_id) or {})
+    if not isinstance(entry, dict):
+        return
+    found = cast(dict[str, Any], entry)
+    for raw in fields.values():
+        choice = cast(dict[str, Any], raw)
+        if not choice.get("detail") and not choice.get("evidence"):
+            choice["detail"] = found.get("detail")
+            choice["evidence"] = list(cast(list[str], found.get("evidence") or []))
+
+
+def with_ask_context(ask: Ask, *, detail: str | None = None, evidence: Sequence[str] = ()) -> None:
+    """Set what surrounds ``ask``'s short question, under :data:`ASK_META`."""
+    entry = _ask_entry(ask)
+    entry["detail"] = detail or None
+    entry["evidence"] = [item for item in evidence if item]
+    _fill_choices(ask)
+
+
+def short_ask(ask: Ask) -> Ask:
+    """Make ``ask``'s message its question sentence; the rest of the text becomes its detail.
+
+    Every ask relay's providers build goes through here, so a host can show the
+    question alone and the rest behind a disclosure. Text already kept as the
+    ask's detail stays after the new rest.
+    """
+    question, rest = split_question(ask.message)
+    known = _ask_entry(ask)
+    ask.message = question
+    detail = "\n\n".join(part for part in (rest, known.get("detail") or "") if part)
+    with_ask_context(ask, detail=detail, evidence=cast(list[str], known.get("evidence") or []))
+    return ask
+
+
+def ask_detail(ask: Ask) -> str | None:
+    """Return what surrounds an ask's question: its detail, then its evidence."""
+    entry = cast(dict[str, Any], (ask.meta or {}).get(ASK_META) or {}).get(ask.ask_id)
+    found = cast(dict[str, Any], entry) if isinstance(entry, dict) else {}
+    parts = [str(found.get("detail") or "")]
+    evidence = [str(item) for item in cast(list[object], found.get("evidence") or [])]
+    if evidence:
+        parts.append("Evidence:\n" + "\n".join(f"- {item}" for item in evidence))
+    return "\n\n".join(part for part in parts if part) or None
+
+
+def ask_text(ask: Ask) -> str:
+    """Return an ask's whole text: its question, then its detail and evidence."""
+    return "\n\n".join(part for part in (ask.message, ask_detail(ask)) if part)
 
 
 class ChoiceOption(BaseModel):
@@ -175,6 +273,10 @@ def with_choice_context(
     entry["note"] = note or None
     entry["detail"] = detail or None
     entry["evidence"] = [item for item in evidence if item]
+    known = _ask_entry(ask)
+    if not known.get("detail") and not known.get("evidence"):
+        known["detail"] = entry["detail"]
+        known["evidence"] = list(entry["evidence"])
 
 
 def with_recommended_basis(ask: Ask, field_name: str, basis: Mapping[str, Any] | None) -> None:
@@ -258,6 +360,7 @@ def explain_approval(ask: Ask, *, title: str, yes: str, no: str) -> None:
     fields = {**cast(dict[str, Any], properties), "approve": choice_field(options, title=title)}
     ask.requested_schema = {**schema, "properties": fields}
     ask.meta = with_choice_meta(ask.meta, choice_meta(ask.ask_id, "approve", options, title=title))
+    _fill_choices(ask)
 
 
 def schema_options(schema: dict[str, Any] | None) -> list[ChoiceOption]:

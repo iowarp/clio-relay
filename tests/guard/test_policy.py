@@ -208,7 +208,7 @@ async def test_a_pipelines_unreviewed_packages_are_one_review_question(
     binding = review["binding"]
     assert binding["kind"] == "package_review"
     assert [item["package_hash"] for item in binding["packages"]] == [hello, other]
-    assert "Review 2 JARVIS packages" in review["message"]
+    assert "Approve 2 JARVIS packages" in review["message"]
     assert hello in review["message"] and other in review["message"]
     answer(guard, "ask-1", hpc.id, review["message"], {**binding, "site": hpc.id})
 

@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from clio_relay.adapters.hooks import Ask
+from clio_relay.adapters.hooks import Ask, ask_text
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobAttributes, JobSpec
@@ -67,7 +67,7 @@ async def test_spend_approval_then_submit(relay_paths: RelayPaths) -> None:
     assert ask.kind == "approve"
     assert ask.binding["spec_digest"] == record.spec_digest
     assert ask.binding["site"] == "fx"
-    assert "unknown" in ask.message
+    assert "unknown" in ask_text(ask)
     service.answer(ask.ask_id, "accept", {"approve": True}, by="test")
     advanced = await service.advance(record.operation_id)
     assert advanced.state == OperationState.QUEUED
