@@ -11,6 +11,7 @@ connection, as elicitation on a legacy one, else as a typed refusal naming the a
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -88,6 +89,8 @@ from clio_relay.surface.skills import SkillResources
 from clio_relay.surface.staging import PackagesArgs
 from clio_relay.surface.staging import packages as packages_op
 from clio_relay.wording import with_article
+
+logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "2026-07-28"
 TASK_TTL_MS = 7 * 24 * 3600 * 1000
@@ -235,6 +238,11 @@ class RelayTasksExtension(ServerExtension):
             raise MCPError(
                 code=-32603, message=refusal.message, data=refusal.to_dict()
             ) from refusal
+        except Exception:
+            # A fault in one look must not end the client's custody of the task:
+            # its asks and their answers live on the record, which still stands.
+            logger.exception("refreshing task %s", params.task_id)
+            record = self._record(params.task_id)
         return await self.task_result(record)
 
     async def _update(

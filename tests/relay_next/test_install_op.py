@@ -301,3 +301,74 @@ def test_the_check_exit_is_the_install_report_or_a_typed_refusal() -> None:
     jarvis_exits.refuse(0, line, "", spec=SPEC, site="fx", install_walltime_s=3600)
     refused = jarvis_exits.install_only_refused("local", site="fx")
     assert refused.data["needs"] == "a Slurm site"
+
+
+@pytest.mark.parametrize("exit_code", [0, jarvis_submit.EXIT_DECISION])
+def test_concurrent_observers_of_an_ended_install_job_check_it_once(
+    relay_paths: RelayPaths, site: _Site, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    """Two ``tasks/get`` at once on one ended job: one resubmits, the other leaves it be."""
+    check = FixtureAdapter.install_check
+
+    async def slow_check(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> Any:
+        if site.calls.count("check"):
+            await asyncio.sleep(0.05)  # the other observer runs while this check is out
+        return await check(self, spec, operation_id=operation_id)
+
+    async def ended(self: FixtureAdapter, handle: JobHandle) -> JobStatus:
+        await asyncio.sleep(0)  # a real look goes over the network: both observers see the end
+        state = JobState.COMPLETED if exit_code == 0 else JobState.FAILED
+        return JobStatus(state=state, exit_code=exit_code)
+
+    monkeypatch.setattr(FixtureAdapter, "install_check", slow_check)
+    monkeypatch.setattr(FixtureAdapter, "status", ended)
+
+    async def scenario() -> None:
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        record = await install_op.start(service, "fx", SPEC)
+        await _approve(service, record.operation_id)
+        asked = len(service.operation(record.operation_id).asks)
+        await asyncio.gather(*(service.refresh(record.operation_id) for _ in range(2)))
+        after = service.operation(record.operation_id)
+        assert site.calls == ["check", "install", "check"]
+        # The check found the software still missing: it asks once, not once per observer.
+        assert after.state == OperationState.AWAITING_INPUT, after
+        assert len(after.asks) == asked + 1
+        assert len(service.outstanding(after)) == 1
+        assert [change.state for change in after.history].count(OperationState.SUBMITTING) == 2
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_submit_lease_is_the_call_chain_s_alone(relay_paths: RelayPaths) -> None:
+    """A nested call takes the lease again; another coroutine finds it held and waits for none."""
+
+    async def scenario() -> None:
+        add_site(relay_paths)
+        service = RelayService(relay_paths)
+        store = service.operations
+        holding, release = asyncio.Event(), asyncio.Event()
+
+        async def holder() -> None:
+            with store.submitting("op_1"), store.submitting("op_1"):  # nested: it resubmits
+                holding.set()
+                await release.wait()
+
+        async def other() -> bool:
+            await holding.wait()
+            taken = store.claim_submit("op_1") is not None
+            release.set()
+            return taken
+
+        _, taken = await asyncio.gather(holder(), other())
+        assert taken is False
+        assert store.submit_in_hand("op_1") is False
+        lease = store.claim_submit("op_1")
+        assert lease is not None
+        with lease:
+            assert store.submit_in_hand("op_1") is True
+        await service.close()
+
+    asyncio.run(scenario())

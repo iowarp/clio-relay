@@ -12,7 +12,8 @@ import os
 import secrets
 import tempfile
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -99,8 +100,10 @@ def _safe_id(record_id: str) -> str:
     return record_id
 
 
-_LEASES: dict[str, int] = {}
-"""The submit leases this process holds, by lock path, with how deep each is taken."""
+_LEASES: set[str] = set()
+"""The submit leases this process holds, by lock path."""
+_HELD: ContextVar[frozenset[str]] = ContextVar("relay_submit_leases", default=frozenset())
+"""The submit leases the current call chain holds: only it takes one again."""
 
 
 class RecordStore[RecordT: BaseModel]:
@@ -126,28 +129,41 @@ class RecordStore[RecordT: BaseModel]:
             yield
 
     @contextmanager
-    def submitting(self, record_id: str, timeout: float = 30.0) -> Generator[None]:
-        """Hold the record's submit lease while this process submits its job.
+    def submitting(self, record_id: str, timeout: float = 0.0) -> Generator[None]:
+        """Hold the record's submit lease while this call submits its job.
 
         The operating system drops the lease when the holder dies, so an
         observer can tell a submission still in hand from one a crash cut short.
-        A submission that resubmits (an install that then runs) takes it again.
+        The call chain holding it takes it again (an install that then runs
+        resubmits). Anyone else, another coroutine of this process or another
+        process, gets :class:`filelock.Timeout`: one submission is in hand, and
+        waiting would only block this process's event loop behind it.
         """
         self._ensure()
         path = str(self._locks / f"{_safe_id(record_id)}.submit.lock")
-        if path in _LEASES:
-            _LEASES[path] += 1
-            try:
-                yield
-            finally:
-                _LEASES[path] -= 1
+        held = _HELD.get()
+        if path in held:
+            yield
             return
+        if path in _LEASES:
+            raise Timeout(path)
         with FileLock(path, timeout=timeout):
-            _LEASES[path] = 1
+            _LEASES.add(path)
+            token = _HELD.set(held | {path})
             try:
                 yield
             finally:
-                del _LEASES[path]
+                _HELD.reset(token)
+                _LEASES.discard(path)
+
+    def claim_submit(self, record_id: str) -> ExitStack | None:
+        """Take the submit lease for a ``with``, or return None while someone else holds it."""
+        stack = ExitStack()
+        try:
+            stack.enter_context(self.submitting(record_id))
+        except Timeout:
+            return None
+        return stack
 
     def submit_in_hand(self, record_id: str) -> bool:
         """Say whether a live process, this one or another, holds the submit lease."""

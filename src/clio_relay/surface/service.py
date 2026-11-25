@@ -545,7 +545,10 @@ class RelayService:
             adapter = self.adapter_named(site, record.adapter)
         except Refusal as refusal:
             return self.finish(operation_id, OperationState.FAILED, refusal)
-        with self.operations.submitting(operation_id):
+        lease = self.operations.claim_submit(operation_id)
+        if lease is None:  # another call is starting it; it moves the record on
+            return self.operation(operation_id)
+        with lease:
             with self.operations.locked(operation_id):
                 record = self.operation(operation_id)
                 if record.state != OperationState.AWAITING_INPUT or not installing.pending(record):
@@ -589,8 +592,12 @@ class RelayService:
             return self.finish(operation_id, OperationState.FAILED, refusal)
         job_name = _job_name(adapter, operation_id) if record.kind == "run" else None
         # The lease is taken before the move, so a live process holds it for as
-        # long as the record reads ``submitting``; a crash drops it.
-        with self.operations.submitting(operation_id):
+        # long as the record reads ``submitting``; a crash drops it. Whoever finds
+        # it held leaves the submission to its holder.
+        lease = self.operations.claim_submit(operation_id)
+        if lease is None:
+            return self.operation(operation_id)
+        with lease:
             with self.operations.locked(operation_id):
                 record = self.operation(operation_id)
                 if record.state != OperationState.AWAITING_INPUT:

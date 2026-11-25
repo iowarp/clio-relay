@@ -371,22 +371,18 @@ async def refresh_install(
         return service.observation_failed(operation_id, reason, "install")
     state = state_of(service.operation(operation_id))
     tail, offset = await install_logs.log_tail(adapter, handle, int(state.get("log_offset") or 0))
-    if status.state == JobState.COMPLETED:
-        checked = bool(state.get("recheck"))
-        _update(
-            service, operation_id, stage="done", job_ended=True, log_offset=offset, log_tail=tail
-        )
-        then = (
-            "JARVIS checks it"
-            if service.operation(operation_id).kind == "install"
-            else "submitting the run"
-        )
-        done = "the check job finished" if checked else "the install finished"
-        return await _resubmit(service, operation_id, f"{done}; {then}")
     if status.state.final:
-        return await _ended(
-            service, operation_id, status, (adapter, handle), tail or state.get("log_tail")
-        )
+        # One caller moves a job's end on: concurrent observers, here or in
+        # another process, would each resubmit and ask the person twice.
+        lease = service.operations.claim_submit(operation_id)
+        if lease is None:
+            return service.operation(operation_id)
+        with lease:
+            if install_handle(service.operation(operation_id)) != handle:
+                return service.operation(operation_id)
+            return await _job_done(
+                service, operation_id, status, (adapter, handle), (tail, offset, state)
+            )
     with service.operations.locked(operation_id):
         record = service.operation(operation_id)
         if record.state.final:
@@ -418,6 +414,28 @@ async def refresh_install(
     if status.queue:
         return await queue_switch.consider(service, operation_id, adapter, handle, "install")
     return record
+
+
+async def _job_done(
+    service: RelayService,
+    operation_id: str,
+    status: JobStatus,
+    job: tuple[BaseAdapter[Any], JobHandle],
+    seen: tuple[str | None, int, dict[str, Any]],
+) -> OperationRecord:
+    """Move an ended install job on. The caller holds the submit lease."""
+    tail, offset, state = seen
+    if status.state != JobState.COMPLETED:
+        return await _ended(service, operation_id, status, job, tail or state.get("log_tail"))
+    checked = bool(state.get("recheck"))
+    _update(service, operation_id, stage="done", job_ended=True, log_offset=offset, log_tail=tail)
+    then = (
+        "JARVIS checks it"
+        if service.operation(operation_id).kind == "install"
+        else "submitting the run"
+    )
+    done = "the check job finished" if checked else "the install finished"
+    return await _resubmit(service, operation_id, f"{done}; {then}")
 
 
 async def _ended(
