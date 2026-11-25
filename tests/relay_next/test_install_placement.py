@@ -197,6 +197,31 @@ def test_each_placement_option_says_where_it_runs_what_it_costs_and_its_limits()
     assert jarvis_report.choice_title(OCCASION) == "Where JARVIS runs this Spack check"
 
 
+def test_a_spack_candidate_says_where_it_comes_from_in_words() -> None:
+    issue = {
+        "kind": "spack_missing",
+        "question": "Which Spack should jarvis use on this site?",
+        "scope": "site",
+        "candidates": [
+            {"constraint": "/opt/site/spack", "source": "site_modules", "version": "0.23.1"},
+            {"constraint": "/home/me/spack", "source": "well_known", "version": "0.23.1"},
+            {"constraint": "/x/spack", "source": "something_new"},
+        ],
+    }
+    site, mine, new = jarvis_report.choice_details(issue)
+    assert site.label == "/opt/site/spack"
+    assert site.description == (
+        "The site's published Spack, whose modules the login host lists; version 0.23.1."
+    )
+    assert mine.description == (
+        "Found at a usual Spack location; the site does not publish it; version 0.23.1."
+    )
+    assert new.description == "Something_new."
+    message = jarvis_report.choice_message(issue)
+    assert "site_modules" not in message and "Well_known" not in message
+    assert jarvis_report.choice_title(issue) == "Spack to use"
+
+
 def test_a_choice_ask_is_a_titled_select_with_typed_options() -> None:
     options = [
         ChoiceOption(value="a", label="Option A", description="Does A.", recommended=True),

@@ -169,17 +169,34 @@ def choice_options(issue: Mapping[str, Any]) -> list[str]:
     return options
 
 
+_SOURCES = {
+    "site_modules": "the site's published Spack, whose modules the login host lists",
+    "well_known": "found at a usual Spack location; the site does not publish it",
+    "JARVIS_SITE_SPACKS": "listed in JARVIS_SITE_SPACKS",
+    "resource_graph_site": "beside JARVIS's resource graph for this site",
+    "JARVIS_SPACK_ROOT_sibling": "next to the Spack JARVIS_SPACK_ROOT names, which does not work",
+    "SPACK_ROOT_sibling": "next to the Spack SPACK_ROOT names, which does not work",
+    "PATH": "the one on PATH",
+    "CONDA_EXE": "the one CONDA_EXE names",
+    "MAMBA_EXE": "the one MAMBA_EXE names",
+    "jarvis_miniforge": "the Miniforge JARVIS installed in the site home",
+    "home": "found in your home directory",
+}
+"""What JARVIS's candidate ``source`` tags mean to a person (``discover_site_spacks``,
+the conda and Python probes). A tag not listed here is shown as JARVIS wrote it."""
+
+
 def _candidate_facts(candidate: Mapping[str, Any]) -> list[str]:
     facts: list[str] = []
     source = candidate.get("source")
     if isinstance(source, str) and source:
-        facts.append(source)
+        facts.append(_SOURCES.get(source, source))
     modules = candidate.get("modules")
     if isinstance(modules, list) and modules:
         facts.append("modules " + ", ".join(str(item) for item in cast(list[object], modules)))
     version = candidate.get("version")
     if isinstance(version, str) and version:
-        facts.append(version)
+        facts.append(f"version {version}" if version[:1].isdigit() else version)
     prefix = candidate.get("prefix")
     if isinstance(prefix, str) and prefix:
         facts.append(prefix)
