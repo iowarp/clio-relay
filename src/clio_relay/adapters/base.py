@@ -124,6 +124,9 @@ class PartitionInfo(BaseModel):
     Per-node figures are what every node of the partition has: the smallest
     when its nodes differ. ``max_time_s`` is None when the partition has no
     limit or relay could not read it; ``max_time`` is the scheduler's own text.
+    ``min_nodes`` and ``max_nodes`` bound the nodes one job may ask for;
+    ``max_nodes`` is None when the queue sets no such limit, and both are None
+    when relay could not read them.
     """
 
     name: str
@@ -140,6 +143,8 @@ class PartitionInfo(BaseModel):
     memory_mb: int | None = None
     max_time: str | None = None
     max_time_s: int | None = None
+    min_nodes: int | None = Field(default=None, description="the fewest nodes one job may ask for")
+    max_nodes: int | None = Field(default=None, description="the most nodes one job may ask for")
     allocated: int = 0
     idle: int = 0
     other: int = Field(default=0, description="down, drained or otherwise not usable")

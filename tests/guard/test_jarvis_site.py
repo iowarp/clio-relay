@@ -447,6 +447,7 @@ def test_describe_reads_jarvis_sched_info() -> None:
                 "max_time": "1:00:00",
                 "max_time_s": 3600,
                 "gres": "gpu:2",
+                "limits": {"min_nodes": 0, "max_nodes": "UNLIMITED"},
             },
             {"name": "unnamed-is-skipped"},
             {"partition": ""},
@@ -464,6 +465,9 @@ def test_describe_reads_jarvis_sched_info() -> None:
     assert (small.default, small.nodes, small.idle, small.allocated) == (True, 4, 3, 1)
     assert (small.cpus_per_node, small.memory_mb, small.max_time_s) == (40, 1000, 3600)
     assert small.gres == ["gpu:2"]
+    # Slurm's MinNodes=0 is no minimum, and UNLIMITED no per-job maximum.
+    assert (small.min_nodes, small.max_nodes) == (1, None)
+    assert (listed[1].min_nodes, listed[1].max_nodes) == (None, None)
     facts = sched_facts(found)
     assert facts["provider"] == "slurm"
     assert facts["site_skills"] == [{"name": "lab", "description": "the lab's notes"}]
@@ -516,10 +520,10 @@ def test_a_clean_site_reads_its_partitions_from_sinfo() -> None:
     from clio_relay.adapters import sched_info
 
     lines = (
-        "compute*|up|17/5/0/22|2-00:00:00|40|47759|(null)|2|10|2\n"
-        "debug|up|4/2/0/6|4-00:00:00|40|47661+|(null)|2|10|2\n"
-        "gpu|up|1/0/1/2|12:00:00|64|256000|gpu:a100:4|2|16|2\n"
-        "gpu|up|0/1/0/1|12:00:00|32|128000|gpu:a100:4|2|8|2\n"
+        "compute*|up|17/5/0/22|2-00:00:00|40|47759|(null)|2|10|2|1-infinite\n"
+        "debug|up|4/2/0/6|4-00:00:00|40|47661+|(null)|2|10|2|2-4\n"
+        "gpu|up|1/0/1/2|12:00:00|64|256000|gpu:a100:4|2|16|2|1\n"
+        "gpu|up|0/1/0/1|12:00:00|32|128000|gpu:a100:4|2|8|2|1\n"
         "noise line\n"
     )
     listed = {entry["partition"]: entry for entry in sched_info.sinfo_partitions(lines)}
@@ -539,6 +543,29 @@ def test_a_clean_site_reads_its_partitions_from_sinfo() -> None:
     compute_row = parsed["compute"]
     assert (compute_row.nodes, compute_row.idle, compute_row.physical_cores) == (22, 5, 20)
     assert (compute_row.memory_mb, compute_row.max_time_s) == (47759, 172800)
+    # sinfo's %s is the nodes one job may ask for.
+    assert (compute_row.min_nodes, compute_row.max_nodes) == (1, None)
+    assert (parsed["debug"].min_nodes, parsed["debug"].max_nodes) == (2, 4)
+    assert (parsed["gpu"].min_nodes, parsed["gpu"].max_nodes) == (1, 1)
+    from clio_relay.adapters.base import SiteInfo
+    from clio_relay.guard import limits
+
+    site = SiteInfo(adapter="ssh", partitions=list(parsed.values()))
+
+    def debug_job(nodes: int) -> JobSpec:
+        return JobSpec.model_validate(
+            {
+                "executable": "a.out",
+                "resources": {"node_count": nodes},
+                "attributes": {"queue_name": "debug"},
+            }
+        )
+
+    assert limits.check(debug_job(3), site) is None
+    for nodes, text in ((5, "at most 4"), (1, "at least 2")):
+        refused = limits.check(debug_job(nodes), site)
+        assert refused is not None and text in refused[1]
+        assert refused[2]["limits"]["max_nodes"] == 4
     from clio_relay.adapters.ssh.scripts import describe_script
 
     assert "sinfo --noheader --format=" in describe_script("slurm", "/home/me/.clio-relay")

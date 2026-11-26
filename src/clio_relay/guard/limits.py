@@ -2,7 +2,8 @@
 
 The guard reads the partitions from the adapter's ``describe`` (live from the
 scheduler) and refuses a job that asks for more than its partition has: more
-nodes than it holds, more ranks times threads per node than its nodes' physical
+nodes than it holds or than one job may have (or fewer than one job must have),
+more ranks times threads per node than its nodes' physical
 cores, more memory per node than its nodes have, or more walltime than its time
 limit. A queue the site does not have is refused too. A site that reports no
 partitions is not checked.
@@ -37,6 +38,8 @@ def facts(partition: PartitionInfo) -> dict[str, Any]:
         "cpus_per_node": partition.cpus_per_node,
         "memory_mb": partition.memory_mb,
         "max_time": partition.max_time,
+        "min_nodes": partition.min_nodes,
+        "max_nodes": partition.max_nodes,
     }
 
 
@@ -63,6 +66,10 @@ def check(spec: JobSpec, info: SiteInfo) -> tuple[RefusalReason, str, dict[str, 
     problems: list[str] = []
     if partition.nodes and nodes > partition.nodes:
         problems.append(f"{nodes} nodes, but it has {partition.nodes}")
+    elif partition.max_nodes is not None and nodes > partition.max_nodes:
+        problems.append(f"{nodes} nodes, but one job may have at most {partition.max_nodes}")
+    if partition.min_nodes is not None and nodes < partition.min_nodes:
+        problems.append(f"{nodes} nodes, but one job must have at least {partition.min_nodes}")
     cores = partition.physical_cores or partition.cpus_per_node
     if cores and ranks is not None and ranks * threads > cores:
         problems.append(

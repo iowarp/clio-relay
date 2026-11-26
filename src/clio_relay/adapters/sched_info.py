@@ -64,6 +64,9 @@ def partitions(document: dict[str, Any] | None) -> list[PartitionInfo]:
         if not isinstance(name, str) or not name:
             continue
         max_time = entry.get("max_time")
+        raw_limits: object = entry.get("limits")
+        limits = cast(dict[str, Any], raw_limits) if isinstance(raw_limits, dict) else {}
+        min_nodes = _int(limits.get("min_nodes"))
         found.append(
             PartitionInfo(
                 name=name,
@@ -78,6 +81,10 @@ def partitions(document: dict[str, Any] | None) -> list[PartitionInfo]:
                 memory_mb=_int(entry.get("memory_mb_per_node")),
                 max_time=str(max_time) if max_time is not None else None,
                 max_time_s=_int(entry.get("max_time_s")),
+                # Slurm's MinNodes=0 means no minimum: a job still has one node.
+                min_nodes=max(min_nodes, 1) if min_nodes is not None else None,
+                # "UNLIMITED" is no per-job limit.
+                max_nodes=_int(limits.get("max_nodes")),
                 allocated=_int(entry.get("allocated_nodes")) or 0,
                 idle=_int(entry.get("idle_nodes")) or 0,
                 other=_int(entry.get("other_nodes")) or 0,
@@ -87,13 +94,28 @@ def partitions(document: dict[str, Any] | None) -> list[PartitionInfo]:
     return found
 
 
-SINFO_FORMAT = "%P|%a|%F|%l|%c|%m|%G|%X|%Y|%Z"
-"""The ``sinfo --noheader --format`` JARVIS's ``sched info`` reads the partitions with."""
+SINFO_FORMAT = "%P|%a|%F|%l|%c|%m|%G|%X|%Y|%Z|%s"
+"""The ``sinfo --noheader --format`` JARVIS's ``sched info`` reads the partitions with.
+
+The last field, ``%s``, is the nodes one job may ask for (``min-max``), which
+JARVIS reads from ``scontrol show partition`` into each partition's ``limits``.
+"""
 
 
 def _count(text: str) -> int | None:
     text = text.rstrip("+")
     return int(text) if text.isdigit() else None
+
+
+def _job_size(text: str) -> dict[str, Any]:
+    """``limits`` of sinfo's job size (``1-infinite``, ``2-64``, ``4``), in JARVIS's shape."""
+    low, _, high = text.strip().partition("-")
+    if not low.isdigit():
+        return {}
+    high = high or low
+    if high.lower() in ("infinite", "unlimited"):
+        return {"min_nodes": int(low), "max_nodes": "UNLIMITED"}
+    return {"min_nodes": int(low), "max_nodes": int(high)} if high.isdigit() else {}
 
 
 def _seconds(text: str) -> int | None:
@@ -161,6 +183,8 @@ def sinfo_partitions(text: str) -> list[dict[str, Any]]:
         keys = ("allocated_nodes", "idle_nodes", "other_nodes", "total_nodes")
         for key, value in zip(keys, counts, strict=True):
             entry[key] += int(value)
+        if len(fields) >= 11 and "limits" not in entry:
+            entry["limits"] = _job_size(fields[10])
         if len(fields) < 7:
             continue
         line: dict[str, int | None] = {
