@@ -93,6 +93,13 @@ which path is in use, and why the direct one failed. Relay's desktop visitor
 punches the hole and carries the direct path over QUIC itself, as frpc
 does, so no frp program runs on the desktop.
 
+When the desktop's network leaves only through a proxy, as it does for a
+server CLIO runs inside its fence, the visitor reaches the rendezvous host
+through it, as frpc does: `transport.proxyURL` if set, else `HTTPS_PROXY`
+for `wss` (`HTTP_PROXY` otherwise), then `ALL_PROXY`, skipping hosts named in
+`NO_PROXY`. It speaks HTTP `CONNECT` and SOCKS5. The direct path is UDP and
+can't go through a proxy, so behind one it fails and says why.
+
 Two settings shape the direct path:
 
 - `stun_server` is the STUN server both ends ask for their public address.

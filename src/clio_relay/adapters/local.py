@@ -59,6 +59,9 @@ from clio_relay.login_load import batch_hints, direct_refused
 SchedulerName = Literal["slurm", "pbs", "lsf", "cobalt"]
 SchedulerChoice = Literal["auto", "none", "slurm", "pbs", "lsf", "cobalt"]
 
+# Within the worker's own 120 s describe call; the script bounds JARVIS's reads itself.
+DESCRIBE_TIMEOUT_S = 110.0
+
 _SUBMIT_COMMANDS: dict[SchedulerName, str] = {
     "slurm": "sbatch",
     "pbs": "qsub",
@@ -232,6 +235,10 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     async def describe(self) -> SiteInfo:
         scheduler = self.scheduler()
+        if POSIX:
+            found = await self._describe_posix()
+            if found is not None:
+                return found
         queues: list[str] = []
         if scheduler == "slurm":
             result = await run_bounded(
@@ -254,6 +261,41 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             },
             verbs=sorted(self.implements),
         )
+
+    async def _describe_posix(self) -> SiteInfo | None:
+        """Describe this host with the ``ssh`` adapter's script, as a worker site does.
+
+        It reads JARVIS's ``sched info`` (else ``sinfo``), the resource graph
+        and the MPI, so a site relay's worker reaches has the same facts as one
+        reached over ``ssh``. ``None`` when the script cannot run here.
+        """
+        from clio_relay.adapters.ssh import describing, scripts  # noqa: PLC0415
+
+        script = scripts.describe_script(
+            self.config.scheduler, self._home(), self.config.jarvis, self.config.jarvis_graph
+        )
+        result = await run_bounded(
+            ["sh", "-c", script], timeout_s=DESCRIBE_TIMEOUT_S, max_output_bytes=1 << 20
+        )
+        if result.timed_out or result.exit_code != 0 or "@@scheduler" not in result.stdout:
+            return None
+        described = describing.site_info(
+            result.stdout,
+            adapter=self.name,
+            address=socket.gethostname(),
+            verbs=self.implements,
+            remote_dir=self._home(),
+            jarvis=self.config.jarvis,
+            graph_setting=self.config.jarvis_graph,
+            outputs_dir=self.config.outputs_dir,
+        )
+        facts = {
+            **described.info.facts,
+            "cpus": os.cpu_count(),
+            "python": platform.python_version(),
+            "work_dir": str(self.work_dir),
+        }
+        return described.info.model_copy(update={"facts": facts})
 
     def _job_dir(self, operation_id: str) -> Path:
         return self.jobs_root / operation_id

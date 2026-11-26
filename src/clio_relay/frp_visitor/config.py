@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from clio_relay.frp_visitor import proxy
+
 PROTOCOLS = ("tcp", "websocket", "wss")
 DEFAULT_STUN_SERVER = "stun.easyvoip.com:3478"
 """frp's default ``natHoleStunServer``."""
@@ -36,6 +38,7 @@ _COMMON_KEYS = {
     "transport.heartbeatInterval",
     "transport.heartbeatTimeout",
     "transport.dialServerTimeout",
+    "transport.proxyURL",
     "transport.tls.enable",
     "transport.tls.trustedCaFile",
     "transport.tls.serverName",
@@ -62,7 +65,6 @@ _XTCP_KEYS = {
     "natTraversal.disableAssistedAddrs",
 }
 _NOT_YET = {
-    "transport.proxyURL": "reaching the rendezvous host through an HTTP or SOCKS proxy",
     "transport.tls.certFile": "a client TLS certificate",
     "transport.tls.keyFile": "a client TLS certificate",
     "transport.poolCount": "a pool of work connections",
@@ -94,6 +96,8 @@ class Server:
     tls_first_byte: bool = False
     login_fail_exit: bool = False
     stun_server: str = DEFAULT_STUN_SERVER
+    proxy_url: str | None = None
+    """``transport.proxyURL``; when unset, the host's proxy variables apply."""
 
     @property
     def uses_tls(self) -> bool:
@@ -202,6 +206,14 @@ def _server(common: dict[str, Any]) -> Server:
     token = common.get("auth.token", "")
     if not isinstance(token, str):
         raise ConfigError("auth.token must be a string")
+    proxy_url = common.get("transport.proxyURL") or None
+    if proxy_url is not None:
+        if not isinstance(proxy_url, str):
+            raise ConfigError("transport.proxyURL must be a string")
+        try:
+            proxy.parse(proxy_url)
+        except ValueError as exc:
+            raise ConfigError(f"transport.proxyURL: {exc}") from exc
     return Server(
         address=address,
         port=_int(common, "serverPort", 7000),
@@ -219,6 +231,7 @@ def _server(common: dict[str, Any]) -> Server:
         tls_first_byte=not _bool(common, "transport.tls.disableCustomTLSFirstByte", True),
         login_fail_exit=_bool(common, "loginFailExit", True),
         stun_server=str(common.get("natHoleStunServer") or DEFAULT_STUN_SERVER),
+        proxy_url=proxy_url,
     )
 
 

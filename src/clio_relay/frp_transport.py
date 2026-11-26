@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import urllib.parse
 from typing import ClassVar, Final, cast
 
@@ -316,13 +317,19 @@ class _FrpChannelTransport:
     def _translate_tunnel_failure(self, exc: BaseException) -> BaseException:
         """Return the exception to raise for a failed tunnel establish.
 
-        The default passes it through unchanged (``BrokeredTcpTransport``);
+        The default passes it through unchanged (``BrokeredTcpTransport``),
+        except that the visitor's own last word on why it failed (frpc's
+        format, ``[E]`` or ``[W]``) is added to the message. Without it a
+        refused login or an unreachable proxy reads as a bare timeout.
         ``UdpRendezvousTransport`` overrides this to translate into
         :class:`TransportPunchFailed`. Returning the SAME object (identity,
         not equality) tells :meth:`establish` to plain-``raise`` rather than
         chain a new exception.
         """
-        return exc
+        reason = _visitor_reason(self._failure_detail)
+        if reason is None or not isinstance(exc, RelayError) or type(exc) is not RelayError:
+            return exc
+        return RelayError(f"{exc}; the visitor said: {reason}")
 
     def open_stream_channel(self, *, name: str, remote_port: int) -> ChannelEndpoint:
         """Refuse: multiplexing additional channels onto the held link is not built."""
@@ -394,6 +401,21 @@ class UdpRendezvousTransport(_FrpChannelTransport):
             "failing, configure this link as brokered_tcp instead, "
             "or verify UDP reachability/firewall rules between both relays and the relay point."
         )
+
+
+def _visitor_reason(detail: str | None) -> str | None:
+    """Return the last error or warning line the visitor logged, without its stamp."""
+    if not detail:
+        return None
+    for line in reversed(detail.splitlines()):
+        for level in ("[E]", "[W]"):
+            if level in line:
+                return _SOURCE.sub("", line.split(level, 1)[1].strip())[:400] or None
+    return None
+
+
+_SOURCE = re.compile(r"^(\[[^\]\s]*[/.][^\]\s]*\]\s*)+")
+"""frpc's ``[client/service.go:389]`` and relay's ``[relay/visitor]`` source tags."""
 
 
 def _combined_failure_detail(visitor: HeldFrpVisitor) -> str | None:

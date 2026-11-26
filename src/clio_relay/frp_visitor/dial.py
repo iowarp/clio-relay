@@ -6,13 +6,15 @@
 - ``wss``: TLS first, always, then the websocket. A front proxy terminates it.
 
 Like frpc, TLS checks the server's certificate only when a CA file is given;
-relay always gives one for ``wss``.
+relay always gives one for ``wss``. Every transport goes through the host's
+proxy when it gives one (see :mod:`clio_relay.frp_visitor.proxy`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import ssl
 
 from websockets.client import ClientProtocol
@@ -22,6 +24,7 @@ from websockets.protocol import State
 from websockets.typing import Origin
 from websockets.uri import parse_uri
 
+from clio_relay.frp_visitor import proxy
 from clio_relay.frp_visitor.config import Server
 from clio_relay.frp_visitor.pipe import CHUNK, NETWORK_ERRORS, Pipe, ProtocolError, TcpPipe
 
@@ -197,12 +200,21 @@ def _host_port(address: str, port: int) -> str:
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
 
+async def _open(server: Server) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    url = server.proxy_url or proxy.from_environment(server.protocol, server.address, os.environ)
+    if url is None:
+        return await asyncio.open_connection(server.address, server.port)
+    try:
+        found = proxy.parse(url)
+    except ValueError as exc:
+        raise proxy.ProxyError(f"the host's proxy setting cannot be used: {exc}") from exc
+    return await proxy.open_tunnel(found, server.address, server.port)
+
+
 async def dial(server: Server) -> Pipe:
     """Open one connection to ``frps`` over the configured transport."""
     timeout = server.dial_timeout_s if server.dial_timeout_s > 0 else None
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(server.address, server.port), timeout
-    )
+    reader, writer = await asyncio.wait_for(_open(server), timeout)
     pipe: Pipe = TcpPipe(reader, writer)
     try:
         async with asyncio.timeout(timeout):

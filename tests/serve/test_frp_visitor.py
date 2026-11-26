@@ -108,7 +108,7 @@ def test_a_missing_secret_is_refused_by_name(tmp_path: Path) -> None:
     ("extra", "match"),
     [
         ('transport.protocol = "kcp"', "kcp"),
-        ('transport.proxyURL = "http://proxy:3128"', "proxyURL"),
+        ('transport.proxyURL = "ftp://proxy:21"', "proxyURL"),
         ("transport.poolCount = 2", "poolCount"),
         ('auth.method = "oidc"', "oidc"),
         ("surprise = 1", "surprise"),
