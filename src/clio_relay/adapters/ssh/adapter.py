@@ -280,7 +280,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "The site publishes this resource graph ($JARVIS_RESOURCE_GRAPH) and every "
                 "relay JARVIS call uses it. Relay never writes it; nothing to collect"
             )
+            if "graph" not in sections:
+                graph["note"] += (
+                    ". Its net section is read with relay's JARVIS, so net shows once "
+                    "relay has placed JARVIS on the site; null until then is not empty"
+                )
         else:
+            unset = (
+                "The site's jarvis_graph setting names this graph. "
+                if source == "setting"
+                else "The site publishes no resource graph ($JARVIS_RESOURCE_GRAPH is unset). "
+            )
             graph["collect"] = {
                 "exec": scripts.graph_collect_command(
                     self.config.remote_dir,
@@ -291,8 +301,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "pipeline": pipeline,
                 "plan": {"kind": "resource_graph", "summary": summary, "submits": job is not None},
                 "note": (
-                    "The site publishes no resource graph ($JARVIS_RESOURCE_GRAPH is unset). "
-                    "Relay's network collection job collects the networks on compute "
+                    unset + "Relay's network collection job collects the networks on compute "
                     "nodes; run this with exec (and this plan on a guarded site) once the "
                     "person approves, then describe again"
                 ),

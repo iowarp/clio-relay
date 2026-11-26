@@ -127,6 +127,8 @@ def test_describe_reports_the_sites_variable_and_offers_no_collection(tmp_path: 
     assert graph["source"] == "site" and graph["published"] is True
     assert graph["path"] == "/home/me/.jarvis/resource_graph.yaml"
     assert "collect" not in graph
+    # Before placement relay's JARVIS cannot read net, and the note says null is not empty.
+    assert graph["net"] is None and "not empty" in graph["note"]
 
 
 def test_describe_offers_collection_only_without_a_site_graph(tmp_path: Path) -> None:
