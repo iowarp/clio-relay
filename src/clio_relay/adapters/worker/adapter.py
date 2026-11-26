@@ -570,12 +570,22 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         ]
         return "\n".join(parts) + "\n"
 
-    def ssh_argv(self) -> list[str]:
+    def sign_in_argv(self) -> list[str]:
         """Return the sign-in ssh command. It asks through askpass, never a terminal."""
         argv = ["ssh", "-T", "-o", "BatchMode=no"]
         if self.config.ssh_config_file:
             argv += ["-F", str(Path(self.config.ssh_config_file).expanduser())]
         return [*argv, self.config.ssh_profile, "bash", "-s"]
+
+    def ssh_argv(self) -> list[str]:
+        """Return the base ``ssh`` argv (program, options, host) for ``serve``.
+
+        It never prompts; ``serve`` adds its own flags (``-N -L``) before the host.
+        """
+        argv = ["ssh", "-o", "BatchMode=yes"]
+        if self.config.ssh_config_file:
+            argv += ["-F", str(Path(self.config.ssh_config_file).expanduser())]
+        return [*argv, self.config.ssh_profile]
 
     async def connect(self, env: Mapping[str, str] | None = None) -> WorkerLink:
         """Place the worker in one ssh pass, then hold the link to it over frp.
@@ -603,7 +613,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
         self._drop_connection()
         env = {**os.environ, **(env or {})}
-        argv = programs.resolved(self.ssh_argv(), env)
+        argv = programs.resolved(self.sign_in_argv(), env)
         if argv is None:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
@@ -835,7 +845,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
 
     async def _plain_ssh(self, script: str, what: str) -> str:
         """Run ``script`` over a plain ``ssh`` that signs in without a prompt."""
-        argv = self.ssh_argv()
+        argv = self.sign_in_argv()
         argv[argv.index("BatchMode=no")] = "BatchMode=yes"
         return await batch_ssh(
             argv, script, f"{what} {self.config.ssh_profile}", self.context.site_id

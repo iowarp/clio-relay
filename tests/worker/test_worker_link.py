@@ -238,6 +238,16 @@ def test_the_worker_reads_the_port_a_package_service_bound_from_the_site(
     assert seen[0].data == {"mode": "jarvis"}
 
 
+def test_a_serve_forward_from_a_worker_site_gets_a_plain_ssh_ending_at_the_host(
+    tmp_path: Path,
+) -> None:
+    # serve puts -N -L before the last word; the sign-in's "bash -s" made bash read them.
+    adapter = _adapter(tmp_path)
+
+    assert adapter.ssh_argv() == ["ssh", "-o", "BatchMode=yes", "site-login"]
+    assert adapter.sign_in_argv()[-3:] == ["site-login", "bash", "-s"]
+
+
 def test_no_stored_link_asks_for_sign_in(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path)
 
