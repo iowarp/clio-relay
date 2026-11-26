@@ -203,3 +203,23 @@ def test_a_failed_link_says_what_the_visitor_said() -> None:
     assert "cannot reach the proxy" in str(told)
     other = ValueError("x")
     assert link._translate_tunnel_failure(other) is other  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_failed_punch_names_each_visitor_line_once() -> None:
+    lines = [
+        "2026-11-26 16:41:52.308 [E] [relay/visitor] [v] open tunnel error: open tunnel timeout"
+    ] * 3
+    lines.insert(
+        1, "2026-11-26 16:41:53.604 [W] [relay/visitor]         [v] nathole prepare error: x"
+    )
+    link = object.__new__(frp_transport.UdpRendezvousTransport)
+    link._cluster = "c"  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    link._failure_detail = "stdout: " + "\r\n".join(lines)  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    link._failed_cleanup = "could not remove the visitor config"  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    told = str(link._translate_tunnel_failure(RelayError("timed out")))  # pyright: ignore[reportPrivateUsage]
+    assert (
+        "the visitor said: [v] open tunnel error: open tunnel timeout (3 times); "
+        "[v] nathole prepare error: x; could not remove the visitor config"
+    ) in told
+    assert "\r" not in told
+    assert "16:41" not in told

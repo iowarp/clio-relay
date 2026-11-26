@@ -176,6 +176,7 @@ class _FrpChannelTransport:
         self._visitor: HeldFrpVisitor | None = None
         self._established = False
         self._failure_detail: str | None = None
+        self._failed_cleanup: str | None = None
         # iowarp/clio-relay#285: populated by the reconciliation pass at the
         # START of establish(), before this instance's own new visitor is
         # even rendered. RemoteConnection._establish reads
@@ -287,6 +288,7 @@ class _FrpChannelTransport:
         except BaseException as exc:
             visitor.close()
             self._failure_detail = _combined_failure_detail(visitor)
+            self._failed_cleanup = visitor.config_cleanup_error
             self._visitor = None
             translated = self._translate_tunnel_failure(exc)
             if translated is exc:
@@ -394,6 +396,9 @@ class UdpRendezvousTransport(_FrpChannelTransport):
         if isinstance(exc, TransportPunchFailed):
             return exc
         detail = self._failure_detail or str(exc)
+        said = _visitor_said(self._failure_detail)
+        if said is not None:
+            detail = "; ".join(part for part in (said, self._failed_cleanup) if part)
         return TransportPunchFailed(
             f"udp_rendezvous hole punch failed for cluster {self._cluster!r}: {detail}. "
             "Reconnecting retries the same xtcp handshake in the same configured mode; it "
@@ -412,6 +417,30 @@ def _visitor_reason(detail: str | None) -> str | None:
             if level in line:
                 return _SOURCE.sub("", line.split(level, 1)[1].strip())[:400] or None
     return None
+
+
+def _visitor_said(detail: str | None) -> str | None:
+    """Return each distinct error or warning line the visitor logged, once, with its count.
+
+    A failed punch retries for its whole deadline, so the raw output repeats one line many
+    times and can hide the line that names the cause.
+    """
+    if not detail:
+        return None
+    counts: dict[str, int] = {}
+    for line in detail.splitlines():
+        for level in ("[E]", "[W]"):
+            if level in line:
+                reason = _SOURCE.sub("", line.split(level, 1)[1].strip())[:400]
+                if reason:
+                    counts[reason] = counts.get(reason, 0) + 1
+                break
+    if not counts:
+        return None
+    said = "; ".join(
+        reason if count == 1 else f"{reason} ({count} times)" for reason, count in counts.items()
+    )
+    return f"the visitor said: {said}"
 
 
 _SOURCE = re.compile(r"^(\[[^\]\s]*[/.][^\]\s]*\]\s*)+")
