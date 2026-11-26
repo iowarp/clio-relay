@@ -87,9 +87,12 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     ``packages`` are the JARVIS packages relay can run there. ``run`` takes one
     as ``package: {name, parameters}`` and pins its version and SHA-256.
     The site's cluster facts are JARVIS's, not relay's: an adapter that reads
-    them reports ``info.facts.resource_graph``, with the graph's path, the
+    them reports ``info.facts.resource_graph``, with the graph's path and
+    ``source`` (``setting``, ``site`` for the graph the site publishes as
+    ``$JARVIS_RESOURCE_GRAPH``, or ``relay`` for the home's own), the
     install decisions JARVIS records, and the net report of ``jarvis rg net
-    show`` (``None`` until the graph has a ``net`` section). ``jobs`` are the
+    show`` (``None`` until the graph has a ``net`` section). Only a site that
+    publishes no graph is offered ``collect``. ``jobs`` are the
     site's open jobs and its latest ended ones, each as its job card, observed
     in the last 30 s (:func:`job_watch.current`).
     """

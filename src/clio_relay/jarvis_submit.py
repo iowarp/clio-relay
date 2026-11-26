@@ -49,7 +49,7 @@ import math
 import posixpath
 import re
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any, Literal, cast
 
@@ -61,6 +61,7 @@ from clio_relay.jarvis_bootstrap import explicit_python as explicit_python
 from clio_relay.jarvis_graph import NO_BUILTIN_ENV
 from clio_relay.jarvis_graph import PKG_TYPE as GRAPH_PKG_TYPE
 from clio_relay.jarvis_record import install_progress, scheduler_start
+from clio_relay.jarvis_site_script import GRAPH_LOOKUP as GRAPH_LOOKUP
 from clio_relay.jarvis_site_script import SITE_SCRIPT as SITE_SCRIPT
 from clio_relay.jobs.handles import VIEW_METADATA, JobState, JobStatus, OutputRef
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -137,10 +138,11 @@ JARVIS_SETTING_HELP = (
 )
 """The description of an adapter's ``jarvis`` setting (:func:`explicit_jarvis`)."""
 GRAPH_SETTING_HELP = (
-    "Leave empty: JARVIS keeps the site's resource graph under the CLIO site home. A site "
-    "that publishes its graph names that file here, absolute or from ~/. JARVIS reads and "
-    "writes it, including the install answers it shares with other homes, and site clean "
-    "keeps it"
+    "Leave empty: JARVIS uses the resource graph the site publishes as $JARVIS_RESOURCE_GRAPH "
+    "in the person's login environment, and only without one keeps a graph under the CLIO "
+    "site home. A site that publishes its graph elsewhere names that file here, absolute or "
+    "from ~/. JARVIS reads and writes it, including the install answers it shares with "
+    "other homes, and site clean keeps it"
 )
 """The description of an adapter's ``jarvis_graph`` setting (:func:`published_graph`)."""
 PIPELINES_DIR = "pipelines"
@@ -152,7 +154,9 @@ GRAPH_FILE = "resource_graph.yaml"
 DECISIONS_FILE = "decisions.yaml"
 """The site's JARVIS install decisions, in :data:`SITE_DIR`, beside the graph."""
 GRAPH_ENV = "CLIO_RELAY_JARVIS_GRAPH"
-"""The file the site script exports as ``JARVIS_RESOURCE_GRAPH``."""
+"""The site's ``jarvis_graph`` setting, exported as ``JARVIS_RESOURCE_GRAPH`` when set."""
+GRAPH_OWN_ENV = "CLIO_RELAY_JARVIS_GRAPH_OWN"
+"""The graph under the CLIO site home, exported only when the site publishes none."""
 DECISIONS_ENV = "CLIO_RELAY_JARVIS_DECISIONS"
 """The file the site script exports as ``JARVIS_SPACK_DECISIONS``."""
 SPACK_ENV_ENV = "CLIO_RELAY_JARVIS_SPACK_ENV"
@@ -307,12 +311,22 @@ def published_graph(value: str) -> str:
 
 
 def site_graph(home: str, published: str = "") -> str:
-    """Return the site's JARVIS resource graph: the published one, else the home's own.
+    """Return the site's ``jarvis_graph`` setting, else the graph kept under the CLIO site home.
 
     ``published`` is the site's ``jarvis_graph`` setting (:func:`published_graph`).
-    Without it the graph is kept under the CLIO site home ``home``.
+    Without it, a graph the site publishes as ``$JARVIS_RESOURCE_GRAPH`` is found
+    on the site (:data:`GRAPH_LOOKUP`), and this path is the fallback.
     """
     return published or posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
+
+
+def graph_lines(home: str, published: str, expression: Callable[[str], str]) -> str:
+    """Shell lines that set ``G`` to the site's resource graph and ``GS`` to its source.
+
+    ``expression`` turns a site path into a shell expression. See :data:`GRAPH_LOOKUP`.
+    """
+    setting = expression(published) if published else "''"
+    return f"G={setting}; GO={expression(site_graph(home))}\n" + GRAPH_LOOKUP
 
 
 def site_decisions(home: str) -> str:
@@ -382,8 +396,10 @@ def site_environment(spec: JobSpec, home: str | None, graph: str = "") -> dict[s
     without one keeps JARVIS's own lookup, and JARVIS asks ``spack_missing``
     when it finds none.
 
-    ``graph`` is the site's published resource graph (``jarvis_graph``), which
-    replaces the home's own when the site names one.
+    ``graph`` is the site's ``jarvis_graph`` setting (:data:`GRAPH_ENV`). Without
+    it the site script uses the graph the site publishes as
+    ``$JARVIS_RESOURCE_GRAPH``, and only without one the home's own
+    (:data:`GRAPH_OWN_ENV`, :data:`GRAPH_LOOKUP`).
     """
     if not home:
         return {}
@@ -391,7 +407,8 @@ def site_environment(spec: JobSpec, home: str | None, graph: str = "") -> dict[s
     return {
         FALLBACK_ENV: bootstrap_path(home),
         PIN_ENV: JARVIS_PIN,
-        GRAPH_ENV: site_graph(home, graph),
+        GRAPH_ENV: graph,
+        GRAPH_OWN_ENV: site_graph(home),
         DECISIONS_ENV: site_decisions(home),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
         INSTALL_ENV_ENV: posixpath.join(kept, "install-envs"),

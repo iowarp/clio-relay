@@ -1,11 +1,15 @@
 """The site's scheduler facts, as JARVIS reports them (``jarvis sched info +json``).
 
-Relay runs no scheduler reads of its own for ``describe``: JARVIS's
-``jarvis.sched-info.v1`` document has the partitions and their limits, the MPI
-candidates an install would offer, the resource graph's network, the site
-skills and what is missing (``issues``). It is light, so it runs on the login
-host. This module turns it into :class:`~clio_relay.adapters.base.PartitionInfo`
-for the guard and ``describe``.
+JARVIS's ``jarvis.sched-info.v1`` document has the partitions and their
+limits, the MPI candidates an install would offer, the resource graph's
+network, the site skills and what is missing (``issues``). It is light, so it
+runs on the login host. This module turns it into
+:class:`~clio_relay.adapters.base.PartitionInfo` for the guard and ``describe``.
+
+Until relay places JARVIS on a Slurm site, ``describe`` runs the one ``sinfo``
+query JARVIS's report rests on (:data:`SINFO_FORMAT`) and reads it as JARVIS
+does (:func:`sinfo_partitions`), so the first describe has the real partitions.
+JARVIS's report replaces it once JARVIS is there.
 """
 
 from __future__ import annotations
@@ -81,6 +85,106 @@ def partitions(document: dict[str, Any] | None) -> list[PartitionInfo]:
             )
         )
     return found
+
+
+SINFO_FORMAT = "%P|%a|%F|%l|%c|%m|%G|%X|%Y|%Z"
+"""The ``sinfo --noheader --format`` JARVIS's ``sched info`` reads the partitions with."""
+
+
+def _count(text: str) -> int | None:
+    text = text.rstrip("+")
+    return int(text) if text.isdigit() else None
+
+
+def _seconds(text: str) -> int | None:
+    """Seconds of a Slurm time limit (``[days-]hours:minutes:seconds``), None for none."""
+    text = text.strip()
+    if not text or text.lower() in ("infinite", "unlimited", "n/a"):
+        return None
+    days, _, clock = text.rpartition("-")
+    parts = clock.split(":")
+    if not (days == "" or days.isdigit()) or not all(part.isdigit() for part in parts):
+        return None
+    numbers = [int(part) for part in parts]
+    if len(numbers) > 3:
+        return None
+    if days:
+        # days-hours[:minutes[:seconds]]
+        numbers += [0] * (3 - len(numbers))
+    elif len(numbers) < 3:
+        # minutes[:seconds]
+        numbers = [0, *numbers, *([0] * (2 - len(numbers)))]
+    hours, minutes, seconds = numbers
+    return ((int(days or 0) * 24 + hours) * 60 + minutes) * 60 + seconds
+
+
+def sinfo_partitions(text: str) -> list[dict[str, Any]]:
+    """Return the partitions of ``sinfo``'s :data:`SINFO_FORMAT` lines, as JARVIS lists them.
+
+    One entry per partition, in ``jarvis.sched-info.v1``'s shape. A partition
+    with several node configurations has several lines; its per-node figures
+    are the smallest node's, and it is ``heterogeneous``. So is one whose
+    figure ends in sinfo's ``+``, which marks the smallest of differing nodes.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for raw in text.splitlines():
+        fields = [field.strip() for field in raw.split("|")]
+        if len(fields) < 4 or not fields[0]:
+            continue
+        counts = fields[2].split("/")
+        if len(counts) != 4 or not all(item.isdigit() for item in counts):
+            continue
+        name = fields[0].rstrip("*")
+        seen = name in merged
+        entry = merged.setdefault(
+            name,
+            {
+                "partition": name,
+                "default": fields[0].endswith("*"),
+                "available": fields[1],
+                "allocated_nodes": 0,
+                "idle_nodes": 0,
+                "other_nodes": 0,
+                "total_nodes": 0,
+                "max_time": fields[3],
+                "max_time_s": _seconds(fields[3]),
+                "cpus_per_node": None,
+                "sockets_per_node": None,
+                "cores_per_socket": None,
+                "threads_per_core": None,
+                "physical_cores_per_node": None,
+                "memory_mb_per_node": None,
+                "gres": None,
+                "heterogeneous": False,
+            },
+        )
+        keys = ("allocated_nodes", "idle_nodes", "other_nodes", "total_nodes")
+        for key, value in zip(keys, counts, strict=True):
+            entry[key] += int(value)
+        if len(fields) < 7:
+            continue
+        line: dict[str, int | None] = {
+            "cpus_per_node": _count(fields[4]),
+            "memory_mb_per_node": _count(fields[5]),
+        }
+        if len(fields) >= 10:
+            line["sockets_per_node"] = _count(fields[7])
+            line["cores_per_socket"] = _count(fields[8])
+            line["threads_per_core"] = _count(fields[9])
+            sockets, cores = line["sockets_per_node"], line["cores_per_socket"]
+            line["physical_cores_per_node"] = sockets * cores if sockets and cores else None
+        if any(fields[index].endswith("+") for index in range(4, min(len(fields), 10))):
+            entry["heterogeneous"] = True
+        for key, value in line.items():
+            current = entry[key]
+            if not seen or current is None:
+                entry[key] = value
+            elif value is not None and value != current:
+                entry["heterogeneous"] = True
+                entry[key] = min(current, value)
+        if entry["gres"] is None and fields[6] not in ("", "(null)"):
+            entry["gres"] = fields[6]
+    return list(merged.values())
 
 
 def site_facts(document: dict[str, Any] | None) -> dict[str, Any]:

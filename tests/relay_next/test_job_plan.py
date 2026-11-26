@@ -301,6 +301,32 @@ def test_a_package_card_carries_jarvis_plan_and_the_yes_binds_it(
     asyncio.run(scenario())
 
 
+def test_the_planned_record_keeps_the_partitions_current_facts(
+    monkeypatch: pytest.MonkeyPatch, relay_paths: RelayPaths, jarvis: _Jarvis
+) -> None:
+    from clio_relay.guard.policy import Guard
+
+    facts = {"partition": "compute", "nodes": 22, "idle": 5, "observed_at": "2026-11-26T10:00:00"}
+    asked: list[str | None] = []
+
+    async def partition_facts(self: Guard, site: Any, queue: str | None) -> dict[str, Any]:
+        asked.append(queue)
+        return facts
+
+    monkeypatch.setattr(Guard, "partition_facts", partition_facts)
+
+    async def scenario() -> None:
+        service = RelayService(relay_paths)
+        record = await service.start_run("fx", SPEC, confirm=True)
+        _card(service, record)
+        kept = service.operation(record.operation_id).result or {}
+        assert kept[plan_card.PARTITION] == facts
+        assert asked
+        await service.close()
+
+    asyncio.run(scenario())
+
+
 def test_a_changed_plan_asks_once_more_with_the_new_plan(
     relay_paths: RelayPaths, jarvis: _Jarvis
 ) -> None:

@@ -41,7 +41,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
-| `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty keeps the graph under `remote_dir`. Set it once the person confirms the site publishes one: every CLIO home then shares the install answers JARVIS writes there, `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. JARVIS owns its content |
+| `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty takes the graph the site's `$JARVIS_RESOURCE_GRAPH` names, else keeps one under `remote_dir`. Set it when the person names another: every CLIO home then shares the install answers JARVIS writes there, `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. JARVIS owns its content |
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software. Unset, JARVIS sizes it from its estimate of the build, within the partition's limit. Set it only to override JARVIS |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
@@ -338,22 +338,37 @@ these exact shapes: `jarvis sched info +json`, `jarvis rg facts show +json`,
 `info.facts.jarvis.exec` is an `exec` argument prefix (a shell) that runs the
 same JARVIS for everything else; append JARVIS's own arguments, such as `rg
 facts answer ...` or `spack prepare ...`. On a guarded site each call through
-it runs with a `plan` and the person's yes. Before relay has placed JARVIS on the site, `describe` lists only the
-queue names. On a guarded site, relay checks a job's layout against its
-partition before it asks anything (see [guarded sites](../guarded-sites.md)).
+it runs with a `plan` and the person's yes. Before relay has placed JARVIS on the
+site, `describe` reads the same partitions from `sinfo` (the query JARVIS's
+`sched info` makes), so a clean Slurm site still reports its nodes, idle
+nodes, cores and memory per node and time limits; `info.facts.sched.source` is
+then `sinfo`, with its `observed_at`. On a guarded site, relay checks a job's
+layout against its partition before it asks anything (see [guarded
+sites](../guarded-sites.md)). A run's card keeps that partition's current facts
+in `result.partition_facts`, read when the card is made, so the job is sized
+from them rather than from an earlier `describe`.
 The site's cluster facts, such as which network MPI uses, are JARVIS's
-resource graph, kept for the site at `jarvis-cd/site/resource_graph.yaml` in the
-CLIO site home and exported as `JARVIS_RESOURCE_GRAPH` on every JARVIS call.
-JARVIS collects its `net` section on compute nodes (with relay's own
+resource graph. By default the cluster publishes it: the site's
+`$JARVIS_RESOURCE_GRAPH`, read from the call's environment and else from the
+person's login shell, names it. Relay reads that graph and never writes it, and
+`describe` reports it with `source: site`. The `jarvis_graph` setting, when set,
+comes first (`source: setting`). Only when neither names a readable graph does
+relay keep one for the site at `jarvis-cd/site/resource_graph.yaml` in the CLIO
+site home (`source: relay`). Whichever it is, relay exports it as
+`JARVIS_RESOURCE_GRAPH` on every JARVIS call, so it never overrides the site's
+own. Only relay's own graph is collected: JARVIS collects its `net` section on
+compute nodes (with relay's own
 `clio_relay_site.net_graph` package; relay runs JARVIS with `JARVIS_NO_BUILTIN=1`,
 so jarvis-cd's builtin packages are never registered), picks the fastest network that reaches every node, and applies it
 when it launches MPI, for each MPI flavour. Relay sets no MPI variables itself.
-`describe(site=...)` shows `info.facts.resource_graph`: the graph's path, the
-decisions file, JARVIS's net report (`jarvis rg net show`), and `collect`, the
-`exec` that submits the collection job. A run that fails on the network carries
+`describe(site=...)` shows `info.facts.resource_graph`: the graph's path and
+`source`, the decisions file, JARVIS's net report (`jarvis rg net show`), and,
+for relay's own graph only, `collect`, the `exec` that submits the collection
+job. A run that fails on the network carries
 JARVIS's `mpi_network` issue in `result.issues`, naming the graph field to
-change; the person's override is `jarvis rg net set`. `site clean` removes the
-graph with the rest of relay's directory and keeps the decisions file, unless
+change; the person's override is `jarvis rg net set`. `site clean` removes
+relay's own graph with the rest of relay's directory, never a published one,
+and keeps the decisions file, unless
 `--forget-decisions` (`forget_decisions` over MCP) says otherwise.
 Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
 site home, by absolute path for submit, install, check, execution and stop. It

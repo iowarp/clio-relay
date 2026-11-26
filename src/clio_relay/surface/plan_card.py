@@ -16,7 +16,8 @@ person is asked once more, with what changed.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_plan
 from clio_relay.adapters.base import BaseAdapter
@@ -60,6 +61,13 @@ SERVICE_NOTE = (
     "Relay adds the service's connector to this job when it starts it, so the "
     "batch script is made then."
 )
+PARTITION = "partition_facts"
+"""The ``record.result`` key of the current facts of the partition the job runs in.
+
+Nodes, idle nodes, cores and memory per node and the time limit, as the guard
+read them from ``describe`` when the card was made (``observed_at``), so the
+job is sized from current facts rather than an earlier describe.
+"""
 
 
 async def plan_first(
@@ -81,9 +89,33 @@ async def plan_first(
     if not installing.job_of(record).steps():
         return None
     plan, kept = await _plan(service, site, record, adapter)
-    if plan is not None:
-        record.result = {**(record.result or {}), jarvis_plan.KEY: plan, **kept}
+    current = await _partition(service, site, record)
+    if current is not None:
+        kept = {**kept, PARTITION: current}
+    if plan is not None or current is not None:
+        record.result = {
+            **(record.result or {}),
+            **({jarvis_plan.KEY: plan} if plan is not None else {}),
+            **kept,
+        }
     return plan
+
+
+async def _partition(
+    service: RelayService, site: SiteEntry, record: OperationRecord
+) -> dict[str, Any] | None:
+    """The current facts of the partition the record's job runs in (:data:`PARTITION`)."""
+    facts: object = getattr(service.guard, "partition_facts", None)
+    if not callable(facts):
+        return None
+    try:
+        job = installing.job_of(record)
+        read = cast(Callable[..., Awaitable[object]], facts)
+        found = await read(site, job.attributes.queue_name)
+    except Exception:
+        logger.info("no partition facts for %s", record.operation_id, exc_info=True)
+        return None
+    return cast(dict[str, Any], found) if isinstance(found, dict) else None
 
 
 async def _plan(

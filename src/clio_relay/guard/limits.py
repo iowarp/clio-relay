@@ -27,7 +27,8 @@ def partition_for(info: SiteInfo, queue: str | None) -> PartitionInfo | None:
     return next((found for found in info.partitions if found.default), None)
 
 
-def _limits(partition: PartitionInfo) -> dict[str, Any]:
+def facts(partition: PartitionInfo) -> dict[str, Any]:
+    """The partition's facts a job's layout is sized and checked against."""
     return {
         "partition": partition.name,
         "nodes": partition.nodes,
@@ -89,5 +90,5 @@ def check(spec: JobSpec, info: SiteInfo) -> tuple[RefusalReason, str, dict[str, 
         RefusalReason.INVALID_SPEC,
         f"the job does not fit partition {partition.name}: it asks for {'; '.join(problems)}. "
         "Size it to the partition, or pick another (describe(site=) lists them)",
-        {"field": "resources", "limits": _limits(partition), "next_step": "resize"},
+        {"field": "resources", "limits": facts(partition), "next_step": "resize"},
     )

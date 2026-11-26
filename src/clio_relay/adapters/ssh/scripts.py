@@ -33,6 +33,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import PurePosixPath
 
 from clio_relay import jarvis_graph, jarvis_submit
+from clio_relay.adapters import sched_info
 from clio_relay.adapters.ssh import store
 from clio_relay.login_load import BATCH_HINT_SH
 
@@ -495,16 +496,18 @@ def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
 
     ``jarvis rg net show +json`` only reads the site graph, so it is safe on a
     login host. ``jarvis`` is the site's ``jarvis`` setting; empty is relay's pin.
-    ``graph`` is the site's published graph (``jarvis_graph``); empty is the home's own.
+    ``graph`` is the site's ``jarvis_graph`` setting; empty is the graph the site
+    publishes as ``$JARVIS_RESOURCE_GRAPH``, else the home's own
+    (:data:`jarvis_submit.GRAPH_LOOKUP`). ``@@graph_source`` says which.
     """
     home = remote_dir.rstrip("/") or "/"
     program = root_expression(jarvis or jarvis_submit.bootstrap_path(home))
     return (
-        f"G={root_expression(jarvis_submit.site_graph(home, graph))}\n"
-        f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
+        jarvis_submit.graph_lines(home, graph, root_expression)
+        + f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={program}\n"
-        'echo "@@graph_path $G"; echo "@@decisions_path $D"\n'
+        'echo "@@graph_path $G"; echo "@@graph_source $GS"; echo "@@decisions_path $D"\n'
         'if [ -x "$JB" ]; then\n'
         '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
         '  echo "@@graph"\n'
@@ -526,7 +529,9 @@ def graph_collect_command(
     run`` with no scheduler), with the site graph and a site-level JARVIS root,
     printing JARVIS's handle as JSON. An argument after the argv's own (``$1``)
     is the queue the job goes to; with none, the scheduler's default. ``graph``
-    is the site's published graph, which the collection then writes to.
+    is the site's ``jarvis_graph`` setting, which the collection then writes to.
+    A graph the site publishes as ``$JARVIS_RESOURCE_GRAPH`` is the person's:
+    the collection refuses to write it (exit 64).
     """
     home = remote_dir.rstrip("/") or "/"
     pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
@@ -543,18 +548,19 @@ def graph_collect_command(
         if verb == "submit"
         else ""
     )
-    graph_file = jarvis_submit.site_graph(home, graph)
     # Relay's own collection files stay under the site home, even beside a published graph.
     site = posixpath.dirname(jarvis_submit.site_graph(home))
     script = (
         f"S={root_expression(site)}; R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
         '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
+        + jarvis_submit.graph_lines(home, graph, root_expression)
+        + '[ "$GS" != site ] || { echo "the site publishes its resource graph at $G '
+        '($JARVIS_RESOURCE_GRAPH); relay does not write it" >&2; exit 64; }\n'
         + _init_site_root(jarvis)
         + jarvis_graph.write_lines('"$S"')
         + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
-        + f"G={root_expression(graph_file)}\n"
         + 'mkdir -p "$(dirname "$G")"\n'
         + 'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" '
         f'exec "$JB" ppl {verb} {source}"$S/site_net.yaml" +json\n'
@@ -565,8 +571,8 @@ def graph_collect_command(
 def _jarvis_env(home: str, jarvis: str, graph: str = "") -> str:
     """Shell lines that name relay's JARVIS (``JB``) and the site's JARVIS record."""
     return (
-        f"G={root_expression(jarvis_submit.site_graph(home, graph))}\n"
-        f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
+        jarvis_submit.graph_lines(home, graph, root_expression)
+        + f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"SR={root_expression(posixpath.join(home, jarvis_submit.SPACK_DIR))}\n"
         f"JB={root_expression(jarvis or jarvis_submit.bootstrap_path(home))}\n"
@@ -591,7 +597,7 @@ def _init_site_root(jarvis: str) -> str:
 
 
 _JARVIS_EXPORTS = (
-    'mkdir -p "$(dirname "$G")" 2>/dev/null\n'
+    '[ "$GS" = site ] || mkdir -p "$(dirname "$G")" 2>/dev/null\n'
     'export JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" JARVIS_SPACK_DECISIONS="$D"\n'
     'if [ -x "$SR/bin/spack" ]; then export JARVIS_SPACK_ROOT="$SR"; fi\n'
 )
@@ -648,13 +654,15 @@ def describe_script(
     """Report the host, JARVIS's site graph and JARVIS's scheduler facts.
 
     Short reads only. The graph part is :func:`graph_script` and the scheduler
-    part :func:`sched_script`, when ``remote_dir`` is given. Relay reads no
-    partitions or MPI facts itself; before JARVIS is on the site it lists only
-    the queue names.
+    part :func:`sched_script`, when ``remote_dir`` is given. On Slurm it also
+    prints the queue names and the ``sinfo`` lines JARVIS's ``sched info``
+    reads (:data:`sched_info.SINFO_FORMAT`), so a site where relay has not
+    placed JARVIS yet still has its partitions.
     """
     queues = (
         'case "$S" in\n'
-        'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null ;;\n'
+        'slurm) echo "@@queues"; sinfo -h -o %R 2>/dev/null\n'
+        f'  echo "@@sinfo"; sinfo --noheader --format={q(sched_info.SINFO_FORMAT)} 2>/dev/null ;;\n'
         "pbs) echo \"@@queues\"; qstat -Q 2>/dev/null | awk 'NR>2 {print $1}' ;;\n"
         "esac\n"
     )

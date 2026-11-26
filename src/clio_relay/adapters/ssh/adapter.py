@@ -65,6 +65,7 @@ from clio_relay.jobs.handles import (
     JobStatus,
     OutputRef,
     StallReport,
+    utc_now,
 )
 from clio_relay.jobs.psij_executors import batch_executor as _executor
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -247,7 +248,11 @@ class SshAdapter(BaseAdapter[SshConfig]):
         queues = sorted({line.strip() for line in sections.get("queues", []) if line.strip()})
         sched_text = "\n".join(sections.get("sched", []))
         sched = sched_info.report(sched_text)
-        partitions = sched_info.partitions(sched)
+        sinfo = None
+        if sched is None and "sinfo" in sections:
+            listed = sched_info.sinfo_partitions("\n".join(sections["sinfo"]))
+            sinfo = {"partitions": listed} if listed else None
+        partitions = sched_info.partitions(sched or sinfo)
         cpu = sched_info.graph_cpu(sched)
         compute_cores = sched_info.compute_cores(partitions, cpu)
         self._cores = (compute_cores, partitions)
@@ -260,13 +265,23 @@ class SshAdapter(BaseAdapter[SshConfig]):
             f"Relay's network collection job runs {where} with JARVIS and collects the "
             "networks it sees into the site's resource graph."
         )
+        source = first("graph_source") or ("setting" if self.config.jarvis_graph else "relay")
         graph: dict[str, Any] = {
             "path": first("graph_path"),
-            # The site's published graph (its jarvis_graph setting), else the home's own.
-            "published": bool(self.config.jarvis_graph),
+            # setting: the site's jarvis_graph; site: the graph the site publishes as
+            # $JARVIS_RESOURCE_GRAPH; relay: the home's own, which only collection fills.
+            "source": source,
+            "published": source != "relay",
             "decisions": first("decisions_path"),
             "net": jarvis_submit.graph_report(graph_text),
-            "collect": {
+        }
+        if source == "site":
+            graph["note"] = (
+                "The site publishes this resource graph ($JARVIS_RESOURCE_GRAPH) and every "
+                "relay JARVIS call uses it. Relay never writes it; nothing to collect"
+            )
+        else:
+            graph["collect"] = {
                 "exec": scripts.graph_collect_command(
                     self.config.remote_dir,
                     scheduler,
@@ -276,12 +291,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "pipeline": pipeline,
                 "plan": {"kind": "resource_graph", "summary": summary, "submits": job is not None},
                 "note": (
+                    "The site publishes no resource graph ($JARVIS_RESOURCE_GRAPH is unset). "
                     "Relay's network collection job collects the networks on compute "
                     "nodes; run this with exec (and this plan on a guarded site) once the "
                     "person approves, then describe again"
                 ),
-            },
-        }
+            }
         if graph["net"] is None and graph_text.strip():
             graph["detail"] = graph_text.strip()[-500:]
         return SiteInfo(
@@ -302,18 +317,32 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "home": first("home"),
                 **site_outputs.dir_facts(self.config.remote_dir, self.config.outputs_dir),
                 "resource_graph": graph,
-                "sched": self._sched_facts(sched, sections, sched_text),
+                "sched": self._sched_facts(sched, sections, sched_text, sinfo),
                 "jarvis": self._jarvis_facts(),
             },
             verbs=sorted(self.implements),
         )
 
     def _sched_facts(
-        self, sched: dict[str, Any] | None, sections: dict[str, list[str]], text: str
+        self,
+        sched: dict[str, Any] | None,
+        sections: dict[str, list[str]],
+        text: str,
+        sinfo: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if sched is not None:
             return sched_info.site_facts(sched)
         if "nosched" in sections:
+            if sinfo is not None:
+                return {
+                    "source": "sinfo",
+                    "observed_at": utc_now().isoformat(),
+                    "note": (
+                        "relay has not placed JARVIS on this site yet, so the partitions are "
+                        "the sinfo query JARVIS's sched info reads, as of observed_at; "
+                        "JARVIS's report replaces them once JARVIS is placed"
+                    ),
+                }
             return {"note": "relay has not placed JARVIS on this site yet; its first run does"}
         return {"note": "jarvis sched info gave no report", "detail": text.strip()[-500:] or None}
 

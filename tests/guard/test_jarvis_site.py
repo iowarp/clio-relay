@@ -512,6 +512,56 @@ def test_describe_reports_compute_cores_from_jarvis_never_the_login_host() -> No
     assert sched_info.threads_per_core(cores, listed, "nope") is None
 
 
+def test_a_clean_site_reads_its_partitions_from_sinfo() -> None:
+    from clio_relay.adapters import sched_info
+
+    lines = (
+        "compute*|up|17/5/0/22|2-00:00:00|40|47759|(null)|2|10|2\n"
+        "debug|up|4/2/0/6|4-00:00:00|40|47661+|(null)|2|10|2\n"
+        "gpu|up|1/0/1/2|12:00:00|64|256000|gpu:a100:4|2|16|2\n"
+        "gpu|up|0/1/0/1|12:00:00|32|128000|gpu:a100:4|2|8|2\n"
+        "noise line\n"
+    )
+    listed = {entry["partition"]: entry for entry in sched_info.sinfo_partitions(lines)}
+    assert set(listed) == {"compute", "debug", "gpu"}
+    compute = listed["compute"]
+    assert compute["default"] is True and compute["heterogeneous"] is False
+    assert (compute["idle_nodes"], compute["total_nodes"]) == (5, 22)
+    assert compute["max_time_s"] == 2 * 86400
+    assert (compute["physical_cores_per_node"], compute["memory_mb_per_node"]) == (20, 47759)
+    # sinfo's "+" marks the smallest of differing nodes.
+    assert listed["debug"]["heterogeneous"] is True
+    gpu = listed["gpu"]
+    assert (gpu["total_nodes"], gpu["idle_nodes"], gpu["other_nodes"]) == (3, 1, 1)
+    assert gpu["heterogeneous"] is True and gpu["physical_cores_per_node"] == 16
+    assert gpu["gres"] == "gpu:a100:4"
+    parsed = {item.name: item for item in sched_partitions({"partitions": list(listed.values())})}
+    compute_row = parsed["compute"]
+    assert (compute_row.nodes, compute_row.idle, compute_row.physical_cores) == (22, 5, 20)
+    assert (compute_row.memory_mb, compute_row.max_time_s) == (47759, 172800)
+    from clio_relay.adapters.ssh.scripts import describe_script
+
+    assert "sinfo --noheader --format=" in describe_script("slurm", "/home/me/.clio-relay")
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("2-00:00:00", 172800),
+        ("1-12", 129600),
+        ("30", 1800),
+        ("30:15", 1815),
+        ("1:00:00", 3600),
+        ("infinite", None),
+        ("UNLIMITED", None),
+    ],
+)
+def test_sinfo_time_limits_are_seconds(text: str, seconds: int | None) -> None:
+    from clio_relay.adapters import sched_info
+
+    assert sched_info._seconds(text) == seconds  # pyright: ignore[reportPrivateUsage]
+
+
 def test_the_jarvis_exec_runs_relays_jarvis_with_the_site_record() -> None:
     argv = jarvis_command("/home/me/.clio-relay")
     assert argv[:2] == ["sh", "-c"]

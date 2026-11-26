@@ -5,7 +5,32 @@ Relay copies it to the site and runs it with :func:`clio_relay.jarvis_submit.sit
 
 from __future__ import annotations
 
-SITE_SCRIPT = r"""set -eu
+GRAPH_LOOKUP = (
+    'if [ -n "$G" ]; then GS=setting; else\n'
+    "  G=${JARVIS_RESOURCE_GRAPH:-}\n"
+    '  if [ -z "$G" ] && command -v bash >/dev/null 2>&1; then\n'
+    '    GT=; command -v timeout >/dev/null 2>&1 && GT="timeout 20"\n'
+    '    G=$($GT bash -lc \'printf "@@graph=%s\\n" "${JARVIS_RESOURCE_GRAPH:-}"\' '
+    "</dev/null 2>/dev/null | sed -n 's/^@@graph=//p' | tail -n 1) || G=\n"
+    "  fi\n"
+    '  case $G in "~") G=$HOME ;; "~/"*) G=$HOME/${G#??} ;; esac\n'
+    '  if [ -n "$G" ] && [ -f "$G" ] && [ -r "$G" ]; then GS=site; else G=$GO; GS=relay; fi\n'
+    "fi\n"
+)
+"""Shell lines that set ``G`` to the site's JARVIS resource graph and ``GS`` to its source.
+
+``G`` comes in as the site's ``jarvis_graph`` setting (empty when unset) and
+``GO`` as the graph relay keeps under the CLIO site home. The setting wins
+(``GS=setting``). Without it, the graph the site publishes as
+``$JARVIS_RESOURCE_GRAPH`` in the person's login environment is the site's
+(``GS=site``) when it names a readable file: the call's own environment first,
+then a login shell's, for a site that sets it only there. Relay never overrides
+it. Only with neither is it relay's own (``GS=relay``), which relay's network
+collection fills.
+"""
+
+SITE_SCRIPT = (
+    r"""set -eu
 mode=$1 jarvis=$2 execution=$3 steps=$4
 shift 4
 job=$PWD
@@ -57,14 +82,18 @@ home() {
 fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
 pin=${CLIO_RELAY_JARVIS_PIN:-}
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
-graph=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
+G=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
+GO=$(home "${CLIO_RELAY_JARVIS_GRAPH_OWN:-}")
+"""
+    + GRAPH_LOOKUP
+    + r"""graph=$G
 spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 install_env=$(home "${CLIO_RELAY_JARVIS_INSTALL_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
 bind=${CLIO_RELAY_PLAN:-}
 unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
-unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_OUTPUTS CLIO_RELAY_PLAN
+unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_JARVIS_GRAPH_OWN CLIO_RELAY_OUTPUTS CLIO_RELAY_PLAN
 unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_JARVIS_INSTALL_ENV CLIO_RELAY_SPACK_ROOT
 unset JARVIS_ALLOW_LOCAL_BUILD
 # Where checks and builds run is the site's choice: JARVIS asks it (install_placement),
@@ -76,9 +105,11 @@ if [ -n "$spack_root" ] && [ -x "$spack_root/bin/spack" ]; then
   export JARVIS_SPACK_ROOT="$spack_root"
 fi
 # The site's own JARVIS record, shared by every per-job root: the resource graph and the
-# install decisions. JARVIS reads and writes both; relay keeps no copy.
+# install decisions. JARVIS reads and writes both; relay keeps no copy. A graph the site
+# publishes ($JARVIS_RESOURCE_GRAPH) is the site's and already there; relay makes no
+# directory for it.
 if [ -n "$graph" ]; then
-  mkdir -p "$(dirname "$graph")"
+  [ "$GS" = site ] || mkdir -p "$(dirname "$graph")"
   export JARVIS_RESOURCE_GRAPH="$graph"
 fi
 if [ -n "$decisions" ]; then
@@ -419,6 +450,7 @@ if [ "$rc" -eq 3 ]; then keep_report "$out"; exit 3; fi
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
 """
+)
 """The site script. ``bash -c SITE_SCRIPT <$0> <mode> <jarvis> <execution> <steps>
 [<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
 ``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
@@ -429,7 +461,10 @@ names one, else ``$CLIO_RELAY_JARVIS_FALLBACK``, relay's pinned jarvis-cd,
 whose ``pin`` file must say ``$CLIO_RELAY_JARVIS_PIN``. When that JARVIS is
 missing or at another pin it writes ``relay.refusal.json`` (with ``explicit``
 or ``pin`` when they apply) and exits 69. A relative path is from the home
-directory. ``$CLIO_RELAY_JARVIS_GRAPH``, ``$CLIO_RELAY_JARVIS_DECISIONS``,
+directory. ``$CLIO_RELAY_JARVIS_GRAPH`` (the site's ``jarvis_graph`` setting) or,
+without it, the graph the site publishes as ``$JARVIS_RESOURCE_GRAPH``, else
+``$CLIO_RELAY_JARVIS_GRAPH_OWN`` (:data:`GRAPH_LOOKUP`), and
+``$CLIO_RELAY_JARVIS_DECISIONS``,
 ``$CLIO_RELAY_JARVIS_SPACK_ENV`` and ``$CLIO_RELAY_JARVIS_INSTALL_ENV`` become
 ``JARVIS_RESOURCE_GRAPH``, ``JARVIS_SPACK_DECISIONS``, ``JARVIS_SPACK_ENV_DIR``
 and ``JARVIS_INSTALL_ENV_DIR`` (:func:`site_environment`).

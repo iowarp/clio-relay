@@ -41,6 +41,7 @@ from clio_relay.guard.warm import WARM_EXECUTABLE, holder_job, is_warm
 from clio_relay.jarvis_site import ArchiveInfo, read_archive
 from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
+from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
@@ -165,6 +166,7 @@ class Guard:
             context.state_dir / "operations", OperationRecord
         )
         self._described: dict[str, tuple[float, SiteInfo | None]] = {}
+        self._described_at: dict[str, str] = {}
 
     def settings(self, site: SiteEntry) -> SiteGuard:
         """Return the site's guard settings from ``guard.yaml``."""
@@ -211,7 +213,21 @@ class Guard:
         except Exception as error:  # noqa: BLE001 - any failure only skips the check
             _log.info("not checking the layout on %s: %s", site.id, error)
         self._described[site.id] = (now, found)
+        self._described_at[site.id] = utc_now().isoformat()
         return found
+
+    async def partition_facts(self, site: SiteEntry, queue: str | None) -> dict[str, Any] | None:
+        """The current facts of the partition a job on ``queue`` runs in, and when they were read.
+
+        They are the facts :meth:`check_run` sizes the job against
+        (:func:`limits.facts`), from a ``describe`` at most :data:`DESCRIBE_TTL_S`
+        old. None when the site reports no such partition.
+        """
+        info = await self.site_info(site)
+        partition = None if info is None else limits.partition_for(info, queue)
+        if partition is None:
+            return None
+        return {**limits.facts(partition), "observed_at": self._described_at.get(site.id)}
 
     async def _check_run(self, site: SiteEntry, spec: JobSpec) -> GuardDecision:
         if is_warm(spec):
