@@ -115,6 +115,31 @@ def test_a_plan_keeps_what_the_card_shows() -> None:
     assert jarvis_plan.parse('{"schema_version":"jarvis.execution.handle.v1"}') is None
 
 
+def test_a_plan_keeps_jarvis_cores_unaltered_and_says_what_they_mean() -> None:
+    meaning = "each rank claims 1 whole core(s): 16 ranks per node claim 16 of the 20 cores"
+    cores = {
+        "schema_version": jarvis_plan.CORES_SCHEMA,
+        "partition": "compute",
+        "source": "sinfo",
+        "threads_per_core": 2,
+        "physical_cores_per_node": 20,
+        "cores_per_rank": 1,
+        "cores_claimed_per_node": 16,
+        "fits": True,
+        "exclusive": False,
+        "meaning": meaning,
+    }
+    plan = jarvis_plan.parse(_line(_document(cores=cores)))
+    assert plan is not None and plan["cores"] == cores
+    assert f"Cores: {meaning}" in jarvis_plan.summary(plan)
+    other = jarvis_plan.parse(_line(_document(cores={"schema_version": "x", "meaning": "y"})))
+    assert other is not None and "cores" not in other
+    wider = {**cores, "meaning": "each rank claims 2 whole core(s)"}
+    assert f"Cores: {meaning}, now each rank claims 2 whole core(s)" in jarvis_plan.changes(
+        plan, {**plan, "cores": wider}
+    )
+
+
 def test_only_the_plan_mode_exit_is_a_plan() -> None:
     text = _line(_document())
     assert jarvis_plan.planned(jarvis_plan.EXIT_PLANNED, text) is not None

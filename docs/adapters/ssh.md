@@ -155,7 +155,14 @@ directories made before the submit, and the bound interpreter and
    key carries the run's resources: `nodes`, `ntasks_per_node`, `time` (the
    walltime above), `partition` and `account`, and `output` and `error` only
    when the job sets `stdout_path` or `stderr_path`. Otherwise JARVIS writes
-   the logs into the execution directory.
+   the logs into the execution directory. `cpu_cores_per_process` counts whole
+   cores; above 1 it becomes `cpus_per_task`, which keeps Slurm's meaning of
+   hardware threads, so relay multiplies it by the partition's threads per
+   core. One core per rank is JARVIS's own default (jarvis-cd 1.9.15), so
+   relay sends nothing for it. `exclusive_node_use` becomes `exclusive: true`.
+   JARVIS's `+plan` shows what the ranks claim in its `cores` section
+   (`jarvis.submit-cores.v1`); relay passes it to the agent unaltered as
+   `plan.cores`, and the confirm ask quotes its `meaning`.
 2. `relay-jarvis.sh` checks the archive against the reviewed hash, unpacks it,
    makes a JARVIS root for this job only (`<job dir>/.relay-jarvis`), adds the
    package's repository and runs
@@ -314,9 +321,15 @@ the review lists them.
 `describe(site=...)` shows JARVIS's view of the scheduler: relay runs `jarvis
 sched info +json`, a light read that is safe on a login host, and fills
 `info.partitions` (nodes, CPUs and memory per node, the time limit, idle and
-allocated counts) and `info.mpi` (the MPIs an install would offer and whether
+allocated counts, and each node's sockets, cores per socket, threads per core
+and physical cores) and `info.mpi` (the MPIs an install would offer and whether
 the person must choose) from it. `info.facts.sched` holds the provider, the
-account, the site skills and JARVIS's `issues`. `info.facts.jarvis.read` is
+account, the site skills and JARVIS's `issues`. `info.facts.compute_cores`
+gives each partition's compute cores with their `source`: `sinfo`, else the
+smallest node in the resource graph's `cpu` section (`resource_graph.cpu`),
+else none. `info.facts.cpu` is that graph section as JARVIS wrote it, and
+`info.facts.login_cpus` is the login host's count, which is not a compute
+fact. `info.facts.jarvis.read` is
 `["jarvis"]`: in `exec`, a bare `jarvis` is relay's JARVIS with the site's
 record, and its arguments reach JARVIS as they are, never parsed by a shell.
 Reads go that way, with no plan even on a guarded site, when they have one of

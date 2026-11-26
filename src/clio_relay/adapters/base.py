@@ -134,6 +134,9 @@ class PartitionInfo(BaseModel):
     cores_per_socket: int | None = None
     threads_per_core: int | None = None
     physical_cores: int | None = Field(default=None, description="sockets x cores per socket")
+    heterogeneous: bool = Field(
+        default=False, description="its nodes differ; the per-node figures are the smallest"
+    )
     memory_mb: int | None = None
     max_time: str | None = None
     max_time_s: int | None = None

@@ -73,9 +73,20 @@ class JobResources(_Spec):
     node_count: int | None = Field(default=None, ge=1)
     process_count: int | None = Field(default=None, ge=1)
     processes_per_node: int | None = Field(default=None, ge=1)
-    cpu_cores_per_process: int | None = Field(default=None, ge=1)
+    cpu_cores_per_process: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Whole physical cores per rank, for a threaded rank. Leave it out for one: JARVIS "
+            "gives each rank a whole core by itself. Relay asks the scheduler for these cores "
+            "in its own unit (Slurm's hardware threads)"
+        ),
+    )
     gpu_cores_per_process: int | None = Field(default=None, ge=1)
-    exclusive_node_use: bool = False
+    exclusive_node_use: bool = Field(
+        default=False,
+        description="Keep the nodes to this job; otherwise cores it leaves free can go to others",
+    )
     memory: int | None = Field(default=None, ge=1, description="Bytes of memory per node")
 
     def nodes(self) -> int:

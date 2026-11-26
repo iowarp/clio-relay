@@ -41,6 +41,7 @@ from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
+    PartitionInfo,
     Reach,
     SignInNeed,
     SiteInfo,
@@ -154,6 +155,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         self.transport = SshTransport(config, site_id=context.site_id, state_dir=context.state_dir)
         self.render_dir = context.state_dir / "ssh-psij"
         self.outbox = context.state_dir / "ssh-outbox"
+        # The compute cores the last describe read from JARVIS, for the submits after it.
+        self._cores: tuple[dict[str, dict[str, Any]], list[PartitionInfo]] | None = None
 
     # helpers
 
@@ -245,6 +248,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
         sched_text = "\n".join(sections.get("sched", []))
         sched = sched_info.report(sched_text)
         partitions = sched_info.partitions(sched)
+        cpu = sched_info.graph_cpu(sched)
+        compute_cores = sched_info.compute_cores(partitions, cpu)
+        self._cores = (compute_cores, partitions)
         scheduler = first("scheduler") or "none"
         graph_text = "\n".join(sections.get("graph", []))
         pipeline = jarvis_submit.graph_pipeline(scheduler)
@@ -289,7 +295,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 "host": first("host"),
                 "os": first("os"),
                 "machine": first("machine"),
-                "cpus": int(cpus) if cpus and cpus.isdigit() else None,
+                # The host relay reaches, a login node on most sites: not a compute fact.
+                "login_cpus": int(cpus) if cpus and cpus.isdigit() else None,
+                "compute_cores": compute_cores,
+                "cpu": cpu,
                 "home": first("home"),
                 **site_outputs.dir_facts(self.config.remote_dir, self.config.outputs_dir),
                 "resource_graph": graph,
@@ -425,7 +434,14 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
         if jarvis_mode:
             mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
-            rendered = self._render_jarvis(spec, operation_id, job_dir, name, mode)
+            rendered = self._render_jarvis(
+                spec,
+                operation_id,
+                job_dir,
+                name,
+                mode,
+                threads_per_core=await self._threads_per_core(spec),
+            )
         else:
             if scheduler is not None:
                 _executor(scheduler, self.render_dir)  # import PSI/J on this thread
@@ -554,8 +570,29 @@ class SshAdapter(BaseAdapter[SshConfig]):
             jarvis_data[jarvis_plan.KEY] = plan
         return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
 
+    async def _threads_per_core(self, spec: JobSpec) -> int | None:
+        """Return the hardware threads per core of the job's partition, when it asks for
+        more than one core per rank; JARVIS's facts from the last describe, else a new one."""
+        cores = spec.resources.cpu_cores_per_process
+        if cores is None or cores <= 1:
+            return None
+        if self._cores is None:
+            try:
+                await self.describe()
+            except Exception as error:  # noqa: BLE001 - unknown leaves 1, which the plan shows
+                logger.info("no core topology on %s: %s", self.config.ssh_profile, error)
+                return None
+        assert self._cores is not None
+        return sched_info.threads_per_core(*self._cores, spec.attributes.queue_name)
+
     def _jarvis_document(
-        self, spec: JobSpec, operation_id: str, job_dir: PurePosixPath, name: str
+        self,
+        spec: JobSpec,
+        operation_id: str,
+        job_dir: PurePosixPath,
+        name: str,
+        *,
+        threads_per_core: int | None = None,
     ) -> dict[str, object]:
         stdout = _remote_path(job_dir, spec.stdout_path)
         stderr = _remote_path(job_dir, spec.stderr_path)
@@ -565,6 +602,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             stdout=str(stdout) if stdout is not None else None,
             stderr=str(stderr) if stderr is not None else None,
             job_dir=str(job_dir),
+            threads_per_core=threads_per_core,
         )
         return jarvis_submit.pipeline_document(
             spec,
@@ -580,9 +618,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
         job_dir: PurePosixPath,
         name: str,
         mode: jarvis_submit.SiteMode,
+        *,
+        threads_per_core: int | None = None,
     ) -> _Rendered:
-
-        document = self._jarvis_document(spec, operation_id, job_dir, name)
+        document = self._jarvis_document(
+            spec, operation_id, job_dir, name, threads_per_core=threads_per_core
+        )
         rendered = _Rendered()
         rendered.files[jarvis_submit.PIPELINE_FILE] = jarvis_submit.render_pipeline(document)
         rendered.files[jarvis_submit.SCRIPT_FILE] = jarvis_submit.SITE_SCRIPT
@@ -1042,7 +1083,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
             )
         job_dir = root / "jobs" / operation_id
         spec = jarvis_submit.with_archive(spec)
-        document = self._jarvis_document(spec, operation_id, job_dir, job_name(operation_id))
+        document = self._jarvis_document(
+            spec,
+            operation_id,
+            job_dir,
+            job_name(operation_id),
+            threads_per_core=await self._threads_per_core(spec),
+        )
         command = jarvis_submit.install_command(
             site_outputs.with_outputs(spec, self.config.outputs_dir),
             operation_id=operation_id,

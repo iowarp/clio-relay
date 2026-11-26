@@ -113,11 +113,11 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_VERSION = "1.9.14"
+JARVIS_VERSION = "1.9.15"
 """The jarvis-cd release relay installs under the CLIO site home and runs."""
-JARVIS_PIN = "96ea53d71c84269617430aad999241c61e77ccac"
+JARVIS_PIN = "c6fc7d531a46c3b534b5a23793e614358f14ad99"
 """The commit the jarvis-cd :data:`JARVIS_VERSION` tag names. It is written to the pin file."""
-JARVIS_WHEEL_SHA256 = "98636601a424481d8710776faca26496fbf2919f3afee5072c4c0ea7808a95e9"
+JARVIS_WHEEL_SHA256 = "4c3ca4554f13ed2b8e4a571cbcb77ed10523b5b5e7cfd3ac40faf838a5164746"
 JARVIS_SOURCE = (
     f"https://github.com/grc-iit/jarvis-cd/releases/download/v{JARVIS_VERSION}/"
     f"jarvis_cd-{JARVIS_VERSION}-py3-none-any.whl#sha256={JARVIS_WHEEL_SHA256}"
@@ -524,11 +524,17 @@ def scheduler_block(
     stdout: str | None = None,
     stderr: str | None = None,
     job_dir: str | None = None,
+    threads_per_core: int | None = None,
 ) -> dict[str, object]:
     """Return the pipeline's ``scheduler:`` block for ``spec``, naming no scheduler.
 
     JARVIS detects it (typed ``scheduler_missing``). The resources and walltime
     are those the spend ask priced: ``nodes()``, ``ranks_per_node()`` and ``duration``.
+    ``cpu_cores_per_process`` counts whole cores and Slurm's ``cpus_per_task``
+    hardware threads, so a rank's cores become ``cores x threads_per_core``,
+    the target partition's, as JARVIS reports it (1 when unknown). JARVIS gives
+    each rank one whole core by itself, so one core sends nothing.
+    ``exclusive_node_use`` becomes ``exclusive: true``.
     A ``slurm.<key>`` custom attribute adds ``--<key>``. With no duration, JARVIS
     writes no ``--time`` and the scheduler's default applies. With no ``stdout``
     or ``stderr``, JARVIS writes the logs in its execution directory and
@@ -546,7 +552,7 @@ def scheduler_block(
         block["ntasks_per_node"] = ranks
     cores = resources.cpu_cores_per_process
     if cores is not None and cores > 1:
-        block["cpus_per_task"] = cores
+        block["cpus_per_task"] = cores * max(1, threads_per_core or 1)
     if resources.memory is not None:
         block["mem"] = f"{math.ceil(resources.memory / 2**20)}M"
     if resources.gpu_cores_per_process is not None:

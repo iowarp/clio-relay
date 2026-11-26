@@ -65,7 +65,7 @@ def check(spec: JobSpec, info: SiteInfo) -> tuple[RefusalReason, str, dict[str, 
     cores = partition.physical_cores or partition.cpus_per_node
     if cores and ranks is not None and ranks * threads > cores:
         problems.append(
-            f"{ranks} ranks x {threads} threads per node, but its nodes have {cores} cores"
+            f"{ranks} ranks x {threads} cores per node, but its nodes have {cores} cores"
         )
     if partition.memory_mb and resources.memory is not None:
         wanted = -(-resources.memory // 2**20)

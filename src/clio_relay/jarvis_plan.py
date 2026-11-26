@@ -58,6 +58,12 @@ KEY = "plan"
 TERMINAL = frozenset({"done", "failed", "cancelled"})
 SCRIPT_LIMIT = 256 * 1024
 """The most of the batch script a plan keeps; a longer one keeps its sha and path."""
+CORES_SCHEMA = "jarvis.submit-cores.v1"
+"""A Slurm run plan's ``cores``: what the request claims per node, in physical cores.
+
+Relay keeps it as JARVIS wrote it, the partition's topology (``sinfo``, else
+the resource graph's ``cpu`` section), the cores per rank, the cores claimed
+per node, ``fits`` and ``meaning``, and quotes ``meaning`` in the plan's line."""
 
 _KEPT = (
     "plan_sha256",
@@ -121,6 +127,12 @@ def parse(text: str) -> dict[str, Any] | None:
     if found is None or not isinstance(found.get("plan_sha256"), str):
         return None
     kept = {key: found[key] for key in _KEPT if key in found}
+    cores = found.get("cores")
+    if (
+        isinstance(cores, dict)
+        and cast(dict[str, Any], cores).get("schema_version") == CORES_SCHEMA
+    ):
+        kept["cores"] = cores
     script = found.get("script")
     if isinstance(script, dict):
         script = cast(dict[str, Any], script)
@@ -196,6 +208,9 @@ def changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
         if old.get(key) != new.get(key)
     ]
     lines += _component_changes(old, new)
+    before_cores, after_cores = _cores_meaning(old), _cores_meaning(new)
+    if before_cores != after_cores:
+        lines.append(f"Cores: {before_cores or 'unknown'}, now {after_cores or 'unknown'}")
     if (old.get("couplings") or []) != (new.get("couplings") or []):
         lines.append("The couplings between the components changed")
     before = {a["message"] for a in advisories(old) if a.get("message")}
@@ -205,6 +220,12 @@ def changes(old: Mapping[str, Any], new: Mapping[str, Any]) -> list[str]:
         if a.get("message") and a["message"] not in before
     ]
     return lines + _script_changes(old.get("script"), new.get("script"))
+
+
+def _cores_meaning(plan: Mapping[str, Any]) -> str | None:
+    cores = plan.get("cores")
+    meaning = cast(dict[str, Any], cores).get("meaning") if isinstance(cores, dict) else None
+    return meaning if isinstance(meaning, str) and meaning else None
 
 
 def _shown(value: object) -> str:
@@ -469,5 +490,8 @@ def summary(plan: Mapping[str, Any]) -> str:
     line = "JARVIS's plan: " + ", ".join(parts)
     line = f"{line}; starts {shown}" if shown else line
     line = f"{line}; {flows}" if flows else line
+    cores = _cores_meaning(plan)
     notes = [f"JARVIS notes: {a['message']}" for a in advisories(plan) if a.get("message")]
-    return "\n".join([line, *notes])
+    # JARVIS repeats the cores sentence as a warning when the cores do not fit.
+    notes = [note for note in notes if cores is None or note != f"JARVIS notes: {cores}"]
+    return "\n".join([line, *([f"Cores: {cores}"] if cores else []), *notes])

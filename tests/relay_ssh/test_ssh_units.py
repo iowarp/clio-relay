@@ -173,6 +173,23 @@ def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     )
 
 
+def test_cores_per_rank_reach_jarvis_as_hardware_threads_and_exclusive_as_is() -> None:
+    def block(threads_per_core: int | None, **resources: object) -> dict[str, object]:
+        spec = _package_spec(resources={"process_count": 32, "processes_per_node": 8, **resources})
+        return jarvis_submit.scheduler_block(
+            spec, job_name="relay-op_x", threads_per_core=threads_per_core
+        )
+
+    # 2 whole cores per rank on 2-thread cores: Slurm's cpus_per_task counts threads.
+    assert block(2, cpu_cores_per_process=2)["cpus_per_task"] == 4
+    assert block(None, cpu_cores_per_process=3)["cpus_per_task"] == 3
+    # One core per rank is JARVIS's own default, so relay sends nothing.
+    assert "cpus_per_task" not in block(2, cpu_cores_per_process=1)
+    assert "cpus_per_task" not in block(2)
+    assert block(2, exclusive_node_use=True)["exclusive"] is True
+    assert "exclusive" not in block(2)
+
+
 def test_a_jarvis_handle_comes_from_the_submit_line(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path)
     line = (

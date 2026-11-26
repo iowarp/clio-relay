@@ -470,6 +470,48 @@ def test_describe_reads_jarvis_sched_info() -> None:
     assert sched_partitions(None) == []
 
 
+def test_describe_reports_compute_cores_from_jarvis_never_the_login_host() -> None:
+    from clio_relay.adapters import sched_info
+
+    topology = {
+        "sockets_per_node": 2,
+        "cores_per_socket": 10,
+        "threads_per_core": 2,
+        "physical_cores_per_node": 20,
+        "heterogeneous": False,
+    }
+    cpu = {
+        "schema_version": sched_info.CPU_SCHEMA,
+        "hosts": {"n1": {"cpus": 64, "physical_cores": 32, "threads_per_core": 2}},
+        "smallest": {"cpus": 64, "sockets": 2, "physical_cores": 32, "threads_per_core": 2},
+        "heterogeneous": False,
+    }
+    document = {
+        "schema_version": SCHED_SCHEMA,
+        "partitions": [
+            {"partition": "compute", "default": True, "cpus_per_node": 40, **topology},
+            {"partition": "gpu", "cpus_per_node": 64},
+        ],
+        "cpu": cpu,
+    }
+    listed = sched_partitions(document)
+    compute = listed[0]
+    assert (compute.sockets, compute.cores_per_socket) == (2, 10)
+    assert (compute.threads_per_core, compute.physical_cores) == (2, 20)
+    assert sched_info.graph_cpu(document) is cpu
+    assert sched_info.graph_cpu({"cpu": {"schema_version": "other"}}) is None
+    cores = sched_info.compute_cores(listed, cpu)
+    assert cores["compute"]["source"] == "sinfo"
+    assert cores["compute"]["physical_cores"] == 20
+    # No sinfo topology: the graph's smallest collected node stands in, as JARVIS's plan does.
+    assert cores["gpu"]["source"] == "resource_graph.cpu"
+    assert cores["gpu"]["physical_cores"] == 32
+    assert sched_info.compute_cores(listed[1:], None)["gpu"]["source"] is None
+    assert sched_info.threads_per_core(cores, listed, None) == 2
+    assert sched_info.threads_per_core(cores, listed, "gpu") == 2
+    assert sched_info.threads_per_core(cores, listed, "nope") is None
+
+
 def test_the_jarvis_exec_runs_relays_jarvis_with_the_site_record() -> None:
     argv = jarvis_command("/home/me/.clio-relay")
     assert argv[:2] == ["sh", "-c"]
