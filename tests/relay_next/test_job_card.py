@@ -351,13 +351,13 @@ def test_task_status_and_site_report_carry_the_card(relay_paths: RelayPaths) -> 
 
 
 def test_the_snapshot_follows_the_job(relay_paths: RelayPaths) -> None:
-    add_site(relay_paths, config={"queue_s": 0.3, "run_s": 0.3})
+    add_site(relay_paths, config={"queue_s": 0.3, "run_s": 1.5})
 
     async def scenario() -> None:
         service = RelayService(relay_paths)
         record = await service.start_run("fx", JobSpec.model_validate(ECHO))
         phases = [job_card.snapshot(service, record)]
-        for _ in range(40):
+        for _ in range(100):
             record = await service.refresh(record.operation_id)
             phases.append(job_card.snapshot(service, record))
             if record.state.final:

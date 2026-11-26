@@ -38,7 +38,7 @@ from clio_relay.serve.plan import ServePlan, free_loopback_port
 MAX_BACKOFF_S = 30.0
 POLL_S = 1.0
 CLOSED_MARKER = "closed"
-"""In a forward's directory: ``clio-relay shutdown`` closed it, so no process restarts it."""
+"""In a forward's directory: relay shut, stopped or cancelled it, so no process restarts it."""
 
 
 def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[str, str]]:
@@ -204,6 +204,14 @@ def forward_marker(plan: ServePlan, directory: Path) -> str:
     if plan.mode == "frp":
         return str(directory)
     return f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
+
+
+def mark_closed(directory: Path) -> Path:
+    """Mark a forward closed, so no relay process's watcher starts it again."""
+    with contextlib.suppress(OSError):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / CLOSED_MARKER).touch()
+    return directory
 
 
 def kill_recorded(pid: int | None, marker: str) -> bool:
@@ -419,7 +427,7 @@ class Forward:
             self._in_use_polls = 0
             self.adopted = False
             if (self.directory / CLOSED_MARKER).exists():
-                self._log("shutdown closed this forward; not starting it again")
+                self._log("relay closed this forward; not starting it again")
                 return
             lines = self._new_lines()
             failure = classify_exit(lines, self.plan.host)

@@ -34,7 +34,7 @@ from clio_relay.jobs.spec import JobSpec, ServiceSpec
 from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve import planning
-from clio_relay.serve.forward import CLOSED_MARKER, Forward, forward_marker, kill_recorded
+from clio_relay.serve.forward import Forward, forward_marker, kill_recorded, mark_closed
 from clio_relay.serve.keys import ForwardCare
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
@@ -288,10 +288,7 @@ class ServeRuntime(ForwardCare):
                 if plan.final is None and plan.desktop_closed_at is None:
                     plan.desktop_closed_at = utc_now()
                     self._save(plan)
-                directory = self.state_dir / "serve" / "forwards" / op
-                with contextlib.suppress(OSError):
-                    directory.mkdir(parents=True, exist_ok=True)
-                    (directory / CLOSED_MARKER).touch()
+                directory = mark_closed(self.state_dir / "serve" / "forwards" / op)
                 forward = self.forwards.pop(op, None)
                 await self.mounter.unmount(op)
                 if forward is not None:
@@ -841,12 +838,12 @@ class ServeRuntime(ForwardCare):
     # Stopping
 
     async def _close_desktop(self, plan: ServePlan) -> None:
+        directory = mark_closed(self.state_dir / "serve" / "forwards" / plan.operation_id)
         forward = self.forwards.pop(plan.operation_id, None)
         if forward is not None:
             await forward.close()
         elif plan.forward_pid and plan.ports:
             # A forward an earlier relay process left up, for a service that has ended.
-            directory = self.state_dir / "serve" / "forwards" / plan.operation_id
             kill_recorded(plan.forward_pid, forward_marker(plan, directory))
         await self.mounter.unmount(plan.operation_id)
 

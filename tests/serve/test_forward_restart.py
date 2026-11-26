@@ -313,3 +313,26 @@ def test_an_ended_service_closes_the_forward_an_earlier_relay_left(
         await _until(lambda: not port_bound(port), "the left forward is closed")
 
     asyncio.run(observe())
+
+
+def test_a_service_stopped_by_another_relay_process_is_not_bound_again(
+    tmp_path: Path, held_: Held, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancel from a second relay process closes the forward the first one watches."""
+    held = held_.plan
+    port = held.ports[0].local_port
+    ready = held.model_copy(update={"ready_at": utc_now()})
+
+    async def scenario() -> None:
+        watching = ServeRuntime(tmp_path / "state", transport="stdio")
+        forward = await watching._ensure_forward(ready, None)  # pyright: ignore[reportPrivateUsage]
+        await _until(forward.bound, "the first relay binds")
+        pid = held_.spawned[0]
+        monkeypatch.setattr(forward_module, "_is_ours", lambda found, _m: found == pid)  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
+        stopping = ServeRuntime(tmp_path / "state", transport="stdio")
+        await stopping._close_desktop(ready.model_copy(update={"forward_pid": pid}))  # pyright: ignore[reportPrivateUsage]
+        await _until(lambda: forward.task is not None and forward.task.done(), "it stops")
+        assert len(held_.spawned) == 1 and not port_bound(port)
+        await watching.close()
+
+    asyncio.run(scenario())
