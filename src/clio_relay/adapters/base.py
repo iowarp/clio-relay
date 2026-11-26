@@ -73,6 +73,9 @@ Optional hooks, found by name when an adapter defines them:
 - ``system_id()``: the facility's own id for the site, shown in the tab.
 - ``ssh_argv``, ``hop_exec``, ``transport``: SSH-based adapters only, for the
   serve hook's port forwarding.
+- ``serve_link() -> ServeLink | None``: an adapter that already holds an frp link
+  to its site (the worker) gives that link's rendezvous and site frpc, so a
+  service there goes over frp with no serve settings. Settings a person sets win.
 
 Identity: :meth:`BaseAdapter.reaches` says which place a config reaches and as
 whom. The site store refuses a second endpoint that reaches the same place the

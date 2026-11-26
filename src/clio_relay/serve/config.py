@@ -167,6 +167,47 @@ class ServeSettings(BaseModel):
     sites: dict[str, SiteServe] = Field(default_factory=dict[str, SiteServe])
 
 
+class ServeLink(BaseModel):
+    """What an adapter's own frp link already gives a service on its site.
+
+    A site reached through relay's placed worker has a rendezvous and an frpc
+    on the site from its sign-in. The adapter's ``serve_link()`` returns them,
+    and :func:`with_link` fills the settings a person did not set from them.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rendezvous: Rendezvous
+    frpc: str | None = Field(default=None, description="frpc on the site, from the link")
+    address: str | None = Field(
+        default=None, description="The rendezvous address as the site sees it"
+    )
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+def with_link(
+    link: ServeLink | None, rendezvous: Rendezvous | None, site: SiteServe
+) -> tuple[Rendezvous | None, SiteServe]:
+    """Fill what the serve settings leave unset from the adapter's own link.
+
+    The settings' rendezvous wins over the link's, and the site's own address,
+    port and frpc win over the link's. The site's address and port come from
+    the link only when its rendezvous is used.
+    """
+    if link is None:
+        return rendezvous, site
+    changes: dict[str, Any] = {}
+    if rendezvous is None:
+        rendezvous = link.rendezvous
+        if site.address is None and link.address:
+            changes["address"] = link.address
+        if site.port is None and link.port:
+            changes["port"] = link.port
+    if not site.frpc and not site.frpc_binary and link.frpc:
+        changes["frpc"] = link.frpc
+    return rendezvous, site.model_copy(update=changes) if changes else site
+
+
 def frp_unusable(site: SiteServe, rendezvous: Rendezvous) -> str | None:
     """Say why frp cannot carry a port for ``site`` now, or None when it can.
 

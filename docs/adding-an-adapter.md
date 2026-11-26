@@ -248,6 +248,10 @@ returns the first bytes of each stream, and stops it.
   where the file names a `fallbackTo`. Nothing else in relay speaks
   frp's wire, and an adapter neither starts a desktop frp program nor imports
   the visitor.
+- An adapter that already holds an frp link to its site, as the worker does,
+  gives `serve_link()`: the link's rendezvous and the site's frpc. A service
+  there then uses frp with no serve settings, and tries the direct path when
+  the link does. Anything set in the serve settings wins over it.
 
 See [rendezvous host](rendezvous-host.md) for the transports it speaks.
 

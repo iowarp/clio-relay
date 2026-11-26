@@ -79,9 +79,11 @@ A punch that fails is refused with `punch_failed`, with frp's reason. Relay
 does not switch to `brokered_tcp` on its own. Retrying tries the same punch.
 To go through the rendezvous, set `link_mode: brokered_tcp`.
 
-Services that `serve` starts get their own tunnels; the rendezvous `direct`
-setting in [running a rendezvous host](../rendezvous-host.md#point-relay-at-it)
-picks those.
+Services that `serve` starts get their own tunnels, through the same frps as
+the link and with the frpc the sign-in placed, so a worker site needs no serve
+settings. They try the direct path when the link is `udp_rendezvous`. A
+rendezvous or a site `frpc` set as in
+[running a rendezvous host](../rendezvous-host.md#point-relay-at-it) wins.
 
 ## Settings
 
@@ -132,7 +134,7 @@ the link, and the worker answers with the same results or refusals.
 - `exec` runs a command on the login node, with the same output limit and stall
   reports as `local`.
 - `files` reads and writes under the worker's directory, in chunks.
-- `serve` starts a service job and carries its traffic over the same link.
+- `serve` starts a service job and carries its traffic through the link's frps.
 
 ## Upgrades
 

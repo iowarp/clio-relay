@@ -15,7 +15,7 @@ from clio_relay import jarvis_submit
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import ServiceSpec
 from clio_relay.serve import config as serve_settings
-from clio_relay.serve.config import Rendezvous, SiteServe, frp_unusable
+from clio_relay.serve.config import Rendezvous, ServeLink, SiteServe, frp_unusable
 from clio_relay.serve.plan import ServePlan, check_wrappable, plan_ports, service_name
 
 logger = logging.getLogger(__name__)
@@ -34,11 +34,12 @@ def serve_plan(
     site_id = str(adapter.context.site_id)
     loaded = serve_settings.load(settings_file)
     site = serve_settings.site_serve(loaded, site_id, getattr(entry, "serve", None))
+    rendezvous, site = serve_settings.with_link(_own_link(adapter), loaded.rendezvous, site)
     check_wrappable(spec)
     package = bool(spec.job.steps())
     if package and not getattr(adapter, "runs_packages", False):
         raise jarvis_submit.not_run_here(str(adapter.name))
-    mode = path_of(adapter, site, loaded.rendezvous)
+    mode = path_of(adapter, site, rendezvous)
     adopt = package and bool(getattr(adapter, "reads_service_runtimes", False))
     idle = spec.lifetime.idle_release
     return ServePlan(
@@ -48,12 +49,21 @@ def serve_plan(
         service=service_name(spec),
         mode=mode,
         ports=plan_ports(spec, adopt=adopt, choices=choices),
-        rendezvous=loaded.rendezvous if mode == "frp" else None,
+        rendezvous=rendezvous if mode == "frp" else None,
         site_serve=site,
         bound_to=spec.lifetime.bound_to,
         idle_release_s=idle.total_seconds() if idle else None,
         package=package,
     )
+
+
+def _own_link(adapter: Any) -> ServeLink | None:
+    """Return the frp link the adapter already holds to its site, if it has one."""
+    own = getattr(adapter, "serve_link", None)
+    if not callable(own):
+        return None
+    link = own()
+    return link if isinstance(link, ServeLink) else None
 
 
 def path_of(adapter: Any, site: SiteServe, rendezvous: Rendezvous | None) -> Any:
