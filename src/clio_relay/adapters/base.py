@@ -124,9 +124,15 @@ class PartitionInfo(BaseModel):
     Per-node figures are what every node of the partition has: the smallest
     when its nodes differ. ``max_time_s`` is None when the partition has no
     limit or relay could not read it; ``max_time`` is the scheduler's own text.
-    ``min_nodes`` and ``max_nodes`` bound the nodes one job may ask for;
-    ``max_nodes`` is None when the queue sets no such limit, and both are None
-    when relay could not read them.
+    ``min_nodes`` and ``max_nodes`` bound the nodes one job may ask for, None
+    when the queue sets no such limit or its value is unknown.
+
+    ``limits`` is the scheduler's queue limits exactly as JARVIS reports them,
+    with every key of its schema on every scheduler: ``"UNLIMITED"`` is no
+    limit, and a key in ``limits_unknown`` is unknown, never unlimited.
+    ``limits_source`` names the scheduler command and native field each known
+    limit came from, and the error when the read failed. All three are None
+    or empty when the site's scheduler was not read through JARVIS or sinfo.
     """
 
     name: str
@@ -150,6 +156,14 @@ class PartitionInfo(BaseModel):
     other: int = Field(default=0, description="down, drained or otherwise not usable")
     gres: list[str] = Field(default_factory=list[str])
     features: list[str] = Field(default_factory=list[str])
+    state: str | None = Field(
+        default=None, description="the queue's state in Slurm's words: UP, DOWN, DRAIN, INACTIVE"
+    )
+    limits: dict[str, Any] = Field(default_factory=dict[str, Any])
+    limits_unknown: list[str] | None = Field(
+        default=None, description="limits keys whose value is unknown, never unlimited"
+    )
+    limits_source: dict[str, Any] | None = None
 
 
 class SiteInfo(BaseModel):

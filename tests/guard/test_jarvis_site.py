@@ -474,6 +474,34 @@ def test_describe_reads_jarvis_sched_info() -> None:
     assert sched_partitions(None) == []
 
 
+def test_describe_passes_jarvis_queue_limits_through_unchanged() -> None:
+    from clio_relay.guard import limits
+
+    queue_limits = {"min_nodes": 1, "max_nodes": None, "max_time": "24:00:00", "state": "UP"}
+    source = {"provider": "pbs", "command": "qstat -Qf", "fields": {"max_time": "walltime"}}
+    document = {
+        "schema_version": SCHED_SCHEMA,
+        "provider": "pbs",
+        "providers_queues_readable": ["slurm", "pbs", "lsf", "flux"],
+        "partitions": [
+            {
+                "partition": "prod",
+                "total_nodes": 512,
+                "limits": queue_limits,
+                "limits_unknown": ["max_nodes"],
+                "limits_source": source,
+            }
+        ],
+    }
+    prod = sched_partitions(document)[0]
+    assert prod.limits == queue_limits and prod.limits_source == source
+    assert prod.state == "UP"
+    # Unknown is not unlimited: the guard reports it, and neither enforces nor waves it.
+    assert prod.max_nodes is None and prod.limits_unknown == ["max_nodes"]
+    assert limits.facts(prod)["limits_unknown"] == ["max_nodes"]
+    assert sched_facts(document)["providers_queues_readable"] == ["slurm", "pbs", "lsf", "flux"]
+
+
 def test_describe_reports_compute_cores_from_jarvis_never_the_login_host() -> None:
     from clio_relay.adapters import sched_info
 
@@ -547,6 +575,14 @@ def test_a_clean_site_reads_its_partitions_from_sinfo() -> None:
     assert (compute_row.min_nodes, compute_row.max_nodes) == (1, None)
     assert (parsed["debug"].min_nodes, parsed["debug"].max_nodes) == (2, 4)
     assert (parsed["gpu"].min_nodes, parsed["gpu"].max_nodes) == (1, 1)
+    # Pre-placement limits have JARVIS's shape: what sinfo shows is known, the rest unknown.
+    assert set(compute["limits"]) == set(sched_info.LIMIT_KEYS)
+    assert compute["limits"]["max_nodes"] == "UNLIMITED"
+    assert compute["limits"]["state"] == "UP" and compute["limits"]["total_nodes"] == 22
+    assert "max_nodes" not in compute["limits_unknown"]
+    assert "max_mem_per_node_mb" in compute["limits_unknown"]
+    assert compute["limits_source"]["fields"]["max_nodes"] == "%s"
+    assert compute_row.state == "UP" and compute_row.limits_unknown == compute["limits_unknown"]
     from clio_relay.adapters.base import SiteInfo
     from clio_relay.guard import limits
 

@@ -40,6 +40,7 @@ def facts(partition: PartitionInfo) -> dict[str, Any]:
         "max_time": partition.max_time,
         "min_nodes": partition.min_nodes,
         "max_nodes": partition.max_nodes,
+        "limits_unknown": partition.limits_unknown,
     }
 
 
