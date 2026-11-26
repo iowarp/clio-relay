@@ -132,7 +132,10 @@ link. A run or service
 whose job names a path inside relay's directories is refused before anything is
 asked, with the outputs directory to use instead. The question names the
 outputs, taken from the operations' records, and the result lists them as
-`outputs_kept`. Pass `--remove-outputs` (`remove_outputs` over MCP) to delete
+`outputs_kept`. Each job relay sent to the site, an install's check and build
+included, has its directory under the outputs directory even when its record
+names no file there, so the question lists those directories too. Pass
+`--remove-outputs` (`remove_outputs` over MCP) to delete
 them with the rest; the question then says it deletes them.
 
 A clean keeps JARVIS's recorded answers unless you pass `--forget-decisions`, and

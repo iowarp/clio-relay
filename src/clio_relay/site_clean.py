@@ -240,7 +240,7 @@ async def plan(
         keep += spared
     targets = list(dict.fromkeys(targets))
     targets += [hop for hop in _hop_dirs(service, site_id, cleaners) if not under(hop, targets)]
-    outputs = run_outputs(service, site_id, targets)
+    outputs = run_outputs(service, site_id, targets, outputs_dirs(cleaners))
     return {
         "site": site_id,
         "adapter": cleaners[0].name,
@@ -258,8 +258,36 @@ def _in_job_dir(path: str, operation_id: str, targets: list[str]) -> bool:
     return under(path, targets) and f"/{operation_id}/" in path + "/"
 
 
-def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list[dict[str, Any]]:
-    """What the site's runs wrote outside their own job directories, from their records.
+def outputs_dirs(cleaners: list[Any]) -> list[str]:
+    """The cleaning adapters' outputs directories (``outputs_dir``), as configured."""
+    found = (getattr(getattr(cleaner, "config", None), "outputs_dir", None) for cleaner in cleaners)
+    return list(dict.fromkeys(str(item) for item in found if item))
+
+
+def _op_dir(outputs_dir: str, operation_id: str) -> str:
+    """Where the site script keeps an operation's JARVIS shared directory."""
+    base = outputs_dir.strip().rstrip("/")
+    if not base.startswith(("/", "~")):
+        base = "~/" + base
+    return f"{base}/{operation_id}"
+
+
+def _touched_site(record: Any) -> bool:
+    """Say whether the operation's JARVIS job made its directory on the site.
+
+    A run or serve does once its job is submitted; an install's first step is
+    JARVIS's check on the site, so every install does.
+    """
+    return record.kind == "install" or getattr(record, "handle", None) is not None
+
+
+def run_outputs(
+    service: RelayService,
+    site_id: str,
+    targets: list[str],
+    outputs_dirs: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """What the site's operations wrote outside their own job directories.
 
     A clean leaves these unless the person asks: a case's results are the
     person's, not relay's deployment, even when a run put them inside relay's
@@ -267,10 +295,20 @@ def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list
     removing the outer one does the same to it. An output in a directory named
     for its operation (the site's outputs directory keeps one per job) is
     listed as that directory, which holds everything the run wrote there.
+
+    Every JARVIS job, an install's check and build too, has that directory in
+    each of ``outputs_dirs``, whether or not its record names a file in it, so
+    each run, serve and install that reached the site lists it. An install's
+    recorded outputs (the packages it built) are not listed.
     """
     found: dict[str, dict[str, Any]] = {}
-    for record in service.operations.all():
-        if record.site != site_id or record.kind not in ("run", "serve"):
+    records = [
+        record
+        for record in service.operations.all()
+        if record.site == site_id and record.kind in ("run", "serve", "install")
+    ]
+    for record in records:
+        if record.kind == "install":
             continue
         for output in record.outputs:
             path = output.path.rstrip("/")
@@ -289,6 +327,20 @@ def run_outputs(service: RelayService, site_id: str, targets: list[str]) -> list
                 "name": output.name if size is not None else record.operation_id,
                 "operation_id": record.operation_id,
                 "size": size,
+            }
+    for record in records:
+        if not _touched_site(record):
+            continue
+        for outputs_dir in outputs_dirs or []:
+            own = _op_dir(outputs_dir, record.operation_id)
+            tail = own.removeprefix("~")
+            if any(path == own or path.endswith(tail) for path in found):
+                continue
+            found[own] = {
+                "path": own,
+                "name": record.operation_id,
+                "operation_id": record.operation_id,
+                "size": None,
             }
     paths = sorted(found)
     return [found[path] for path in paths if not any(path.startswith(o + "/") for o in paths)]

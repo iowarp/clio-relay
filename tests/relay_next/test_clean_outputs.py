@@ -64,6 +64,33 @@ def test_a_runs_outputs_directory_is_listed_once_for_all_it_holds() -> None:
     ]
 
 
+def test_every_job_that_reached_the_site_lists_its_outputs_directory() -> None:
+    runs = "/home/u/clio-relay-runs/op_run/relay_op_run/executions/op_run"
+    recorded = _record("ares", "run", OutputRef(name="input", path=f"{runs}/input/p.yaml"))
+    recorded.handle = object()
+    failed = SimpleNamespace(
+        site="ares", kind="run", operation_id="op_failed", outputs=[], handle=object()
+    )
+    unsent = SimpleNamespace(site="ares", kind="run", operation_id="op_unsent", outputs=[])
+    install = _record("ares", "install", OutputRef(name="pkg", path="/home/u/spack/opt/x"))
+    service = _service(recorded, failed, unsent, install)
+    found = run_outputs(service, "ares", TARGETS, ["clio-relay-runs"])
+    # An install's check and build, and a run that ended with nothing recorded, still
+    # left their JARVIS shared directories; a recorded one is not listed twice.
+    assert [item["path"] for item in found] == [
+        "/home/u/clio-relay-runs/op_run",
+        "~/clio-relay-runs/op_failed",
+        "~/clio-relay-runs/op_install",
+    ]
+    assert all(item["size"] is None for item in found)
+    assert [item["path"] for item in run_outputs(service, "ares", TARGETS, ["/scratch/u/"])] == [
+        "/home/u/clio-relay-runs/op_run",
+        "/scratch/u/op_failed",
+        "/scratch/u/op_install",
+        "/scratch/u/op_run",
+    ]
+
+
 def _planned(remove: bool) -> dict[str, Any]:
     return {
         "site": "ares",
