@@ -21,7 +21,7 @@ GRAPH_LOOKUP = (
     'if [ -n "$GO" ]; then\n'
     "  SH=${GO%/*}\n"
     '  if [ "$GS" != relay ] && [ "$(gdir "$G")" = "$(gdir "$GO")" ]; then G=$GO; GS=relay; fi\n'
-    '  if [ "$GS" = relay ]; then JG=${SH%/*}/no-site-graph/resource_graph.yaml; fi\n'
+    '  if [ "$GS" = relay ]; then JG=; fi\n'
     "fi\n"
 )
 """Shell lines that set ``G`` to the site's JARVIS resource graph and ``GS`` to its source.
@@ -36,12 +36,12 @@ it. Only with neither is it relay's own (``GS=relay``), which relay's network
 collection fills.
 
 JARVIS reads a named graph and never writes it; what it records goes to its
-site home (jarvis-cd 1.9.16), which relay sets to ``SH``, the directory of
-relay's own graph, so every write stays under the CLIO site home. ``JG`` is what
-relay exports as ``JARVIS_RESOURCE_GRAPH``: the site's graph, or, with none, a
-file relay never makes, so JARVIS's own graph in ``SH`` is relay's (``GO``).
-A site graph in ``SH`` itself is relay's own: JARVIS refuses a site home that
-holds the site graph.
+site home, which relay sets to ``SH``, the directory of relay's own graph, so
+every write stays under the CLIO site home. ``JG`` is what relay exports as
+``JARVIS_RESOURCE_GRAPH``: the site's graph, or empty with none, so JARVIS's own
+graph in ``SH`` is relay's (``GO``; jarvis-cd 1.9.18 keeps its state in
+``JARVIS_SITE_HOME`` without a site graph too). A site graph in ``SH`` itself is
+relay's own: JARVIS refuses a site home that holds the site graph.
 """
 
 SITE_SCRIPT = (
@@ -121,10 +121,8 @@ fi
 # The site's own JARVIS record, shared by every per-job root: the resource graph and the
 # install decisions. A graph the site publishes ($JARVIS_RESOURCE_GRAPH) is the site's:
 # JARVIS only reads it, and keeps what it records in relay's site home ($SH).
-if [ -n "$JG" ]; then
-  if [ -n "$SH" ]; then mkdir -p "$SH"; export JARVIS_SITE_HOME="$SH"; fi
-  export JARVIS_RESOURCE_GRAPH="$JG"
-fi
+if [ -n "$SH" ]; then mkdir -p "$SH"; export JARVIS_SITE_HOME="$SH"; fi
+if [ -n "$JG" ]; then export JARVIS_RESOURCE_GRAPH="$JG"; else unset JARVIS_RESOURCE_GRAPH; fi
 if [ -n "$decisions" ]; then
   mkdir -p "$(dirname "$decisions")"
   export JARVIS_SPACK_DECISIONS="$decisions"

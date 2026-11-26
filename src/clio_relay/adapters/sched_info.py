@@ -45,7 +45,7 @@ LIMIT_KEYS: tuple[str, ...] = (
     "oversubscribe",
     "exclusive_user",
 )
-"""The ``limits`` keys JARVIS gives every partition on every scheduler (jarvis-cd 1.9.17's
+"""The ``limits`` keys JARVIS gives every partition on every scheduler (jarvis-cd 1.9.17+'s
 ``queue_limits.LIMIT_KEYS``). ``"UNLIMITED"`` is unlimited; a key listed in
 ``limits_unknown`` is unknown, never unlimited."""
 

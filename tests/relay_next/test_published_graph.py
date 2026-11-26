@@ -126,10 +126,8 @@ def test_jarvis_keeps_its_own_graph_in_relays_home_and_never_the_sites(tmp_path:
     site_home = str(own.parent)
     # The site's graph is exported as it is, and JARVIS's own writes go to relay's home.
     assert lookup(str(published)) == ["site", str(published), str(published), site_home]
-    # With none, the base JARVIS reads is a file relay never makes, so its own is relay's.
-    source, graph, base, home_dir = lookup(str(tmp_path / "missing.yaml"))
-    assert (source, graph, home_dir) == ("relay", str(own), site_home)
-    assert base != str(own) and not Path(base).exists()
+    # With none, relay exports no site graph: JARVIS keeps its own in JARVIS_SITE_HOME.
+    assert lookup(str(tmp_path / "missing.yaml")) == ["relay", str(own), "", site_home]
     # A named graph inside relay's site home would be JARVIS's own, so it is relay's.
     own.parent.mkdir(parents=True)
     own.write_text("net: []\n")
