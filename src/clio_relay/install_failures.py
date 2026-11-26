@@ -49,19 +49,34 @@ def read_jsonl(text: str) -> list[dict[str, Any]]:
     return issues
 
 
+FAILURE_KIND = "failure"
+"""JARVIS's kind for a failure record (``failure_schema: jarvis.failure.v1``)."""
+
+
+def is_record(issue: Mapping[str, Any]) -> bool:
+    """Say whether an issue is one of JARVIS's failure records.
+
+    JARVIS's contract: ``kind: failure``, or a ``compiler_unavailable`` no answer
+    settles (the compiler's executables are missing and no usable one is left).
+    A check's other unanswerable issues (``not_installed``, ``install_unchecked``)
+    are not failures.
+    """
+    kind = issue.get("kind")
+    return kind == FAILURE_KIND or (kind == "compiler_unavailable" and not issue.get("answerable"))
+
+
 def records(
     issues: Iterable[Mapping[str, Any]], named: Iterable[object] = ()
 ) -> list[dict[str, Any]]:
     """Return the failure records among ``issues``, one per ``issue_id`` (the last wins).
 
     ``named`` is the report's ``failures``. Without it (an install job's
-    ``issues.jsonl``), the records are the issues JARVIS says no answer settles
-    (``answerable`` false).
+    ``issues.jsonl``), the records are :func:`is_record`'s.
     """
     ids = {str(item) for item in named}
     found: dict[str, dict[str, Any]] = {}
     for issue in issues:
-        if (str(issue.get("issue_id")) in ids) if ids else not issue.get("answerable"):
+        if (str(issue.get("issue_id")) in ids) if ids else is_record(issue):
             found[str(issue.get("issue_id") or len(found))] = dict(issue)
     return list(found.values())
 

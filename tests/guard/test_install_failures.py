@@ -122,6 +122,15 @@ def test_issues_jsonl_keeps_the_last_line_per_issue() -> None:
     assert found == [BUILD]
 
 
+def test_a_job_s_other_unanswerable_issues_are_not_failures() -> None:
+    missing = {"issue_id": "n1", "kind": "not_installed", "answerable": False}
+    unchecked = {"issue_id": "u1", "kind": "install_unchecked", "answerable": False}
+    no_compiler = {"issue_id": "c1", "kind": "compiler_unavailable", "answerable": False}
+    pickable = {**no_compiler, "issue_id": "c2", "answerable": True}
+    found = install_failures.records([missing, unchecked, BUILD, no_compiler, pickable])
+    assert found == [BUILD, no_compiler]
+
+
 class _Files:
     def __init__(self, text: str) -> None:
         self.text = text
