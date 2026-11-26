@@ -206,6 +206,38 @@ def _adapter(tmp_path: Path) -> WorkerAdapter:
     return WorkerAdapter(WorkerConfig(ssh_profile="site-login"), context)
 
 
+def test_the_worker_reads_the_port_a_package_service_bound_from_the_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without this a package service on a worker site never learns the port it bound.
+    from clio_relay.adapters.local import LocalAdapter
+    from clio_relay.jobs.handles import JobHandle
+
+    document = {"service_endpoints": [{"name": "pvserver", "port": 53173}]}
+    seen: list[JobHandle] = []
+
+    async def site_reads(self: LocalAdapter, handle: JobHandle) -> dict[str, Any]:
+        seen.append(handle)
+        return document
+
+    monkeypatch.setattr(LocalAdapter, "service_runtimes", site_reads)
+    client = TestClient(site_app(_settings(tmp_path / "site")))
+    adapter = _adapter(tmp_path)
+
+    async def call(path: str, body: dict[str, Any], *, timeout_s: float) -> Any:
+        payload = {"namespace": "ab" * 8, **body}
+        return client.post(f"/adapter{path}", headers=_headers(), json=payload).json()["ok"]
+
+    monkeypatch.setattr(adapter, "call", call)
+    remote = {"adapter": "local", "native_id": "29177", "data": {"mode": "jarvis"}}
+    handle = JobHandle(adapter="worker", native_id="29177", data={"remote": remote})
+
+    assert adapter.reads_service_runtimes
+    assert asyncio.run(adapter.service_runtimes(handle)) == document
+    assert seen[0].native_id == "29177"
+    assert seen[0].data == {"mode": "jarvis"}
+
+
 def test_no_stored_link_asks_for_sign_in(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path)
 

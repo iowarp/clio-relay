@@ -237,6 +237,13 @@ def register_adapter_routes(
 
         return await _answer(action)
 
+    @app.post(f"{prefix}/service-runtimes", dependencies=[auth_dependency])
+    async def adapter_service_runtimes(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            return await _site_adapter(ctx, body).service_runtimes(_handle(body))
+
+        return await _answer(action)
+
     @app.post(f"{prefix}/install", dependencies=[auth_dependency])
     async def adapter_install(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:

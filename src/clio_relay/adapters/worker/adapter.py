@@ -337,6 +337,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
     # The site's local adapter hands a package job to jarvis ppl submit.
     runs_packages: ClassVar[bool] = True
+    # and reads the port the package bound from JARVIS, so relay forwards that one.
+    reads_service_runtimes: ClassVar[bool] = True
 
     @classmethod
     def reaches(cls, config: BaseModel) -> Reach | None:
@@ -992,6 +994,13 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             timeout_s=self.config.submit_timeout_s + 120,
         )
         return JobStatus.model_validate(reported)
+
+    async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
+        """The site's ``jarvis execution service-runtimes +json`` for a JARVIS job."""
+        reported = await self.call(
+            "/service-runtimes", {"handle": self._unwrap(handle)}, timeout_s=120
+        )
+        return cast(dict[str, Any], reported) if isinstance(reported, dict) else None
 
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
