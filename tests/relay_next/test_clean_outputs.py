@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from clio_relay.jobs.handles import OutputRef
-from clio_relay.site_clean import describe_plan, run_outputs
+from clio_relay.site_clean import describe_plan, run_outputs, with_writes
 from clio_relay.surface.exec_plan import ExecPlan, _message  # pyright: ignore[reportPrivateUsage]
 
 TARGETS = ["/home/u/clio/site", "~/.clio-relay", "~/.config/clio-relay"]
@@ -104,11 +104,31 @@ def _planned(remove: bool) -> dict[str, Any]:
 
 def test_the_clean_ask_names_the_outputs_it_keeps_or_deletes() -> None:
     kept = describe_plan(_planned(False))
-    assert "It keeps what relay's runs wrote" in kept
+    assert "It keeps what relay's runs and file uploads wrote" in kept
     assert "/home/u/clio-cases/tgv (11.0 GB)" in kept
     assert "remove_outputs" in kept
     removed = describe_plan(_planned(True))
-    assert "It also deletes what relay's runs wrote" in removed
+    assert "It also deletes what relay's runs and file uploads wrote" in removed
+
+
+def test_files_relay_wrote_are_listed_unless_a_target_or_an_output_holds_them() -> None:
+    outputs = [{"path": "/home/u/clio-relay-runs/op_run", "operation_id": "op_run"}]
+    written = {
+        "/home/u/clio-relay-runs/bundle.zip": {"size": 9},
+        "/home/u/clio-relay-runs/op_run/input.yaml": {"size": 1},
+        "/home/u/clio/site/jobs/x.txt": {"size": 1},
+    }
+    found = with_writes(outputs, written, TARGETS)
+    assert [item["path"] for item in found] == [
+        "/home/u/clio-relay-runs/bundle.zip",
+        "/home/u/clio-relay-runs/op_run",
+    ]
+    assert found[0] == {
+        "path": "/home/u/clio-relay-runs/bundle.zip",
+        "name": "bundle.zip",
+        "operation_id": None,
+        "size": 9,
+    }
 
 
 def test_a_plan_that_submits_a_job_does_not_say_it_runs_on_the_login_node() -> None:

@@ -501,7 +501,9 @@ def site_clean(
     ] = False,
     remove_outputs: Annotated[
         bool,
-        typer.Option(help="Delete what relay's runs wrote outside its directories too"),
+        typer.Option(
+            help="Delete what relay's runs and file uploads wrote outside its directories too"
+        ),
     ] = False,
     wait_s: Annotated[float, typer.Option(help="How long to wait for the answer")] = 600.0,
 ) -> None:

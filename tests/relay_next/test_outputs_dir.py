@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from clio_relay import jarvis_submit, relay_state, site_clean, site_outputs
+from clio_relay import jarvis_submit, relay_state, site_clean, site_outputs, site_writes
 from clio_relay.adapters.ssh.config import SshConfig
 from clio_relay.adapters.worker.adapter import WorkerConfig
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -126,7 +127,7 @@ def test_a_run_naming_relays_state_is_refused_with_the_outputs_directory() -> No
 
 @pytest.mark.asyncio
 async def test_clean_keeps_listed_outputs_unless_the_person_says_remove(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     cleaner = _Cleaner()
 
@@ -143,7 +144,9 @@ async def test_clean_keeps_listed_outputs_unless_the_person_says_remove(
     def _no_dir(*_args: Any) -> Any:
         return SimpleNamespace(exists=lambda: False)
 
-    service: Any = SimpleNamespace(paths=SimpleNamespace(adapter_dir=_no_dir))
+    service: Any = SimpleNamespace(paths=SimpleNamespace(adapter_dir=_no_dir, state_dir=tmp_path))
+    # A file relay's files verb uploaded is an output like a run's, kept until removed.
+    site_writes.record(tmp_path, "ares", "/home/u/.clio-relay/naca", 9)
     planned = {
         "site": "ares",
         "adapter": "ssh",
@@ -158,7 +161,9 @@ async def test_clean_keeps_listed_outputs_unless_the_person_says_remove(
     assert kept["kept"] == ["spack", "/home/u/.clio-relay/naca"]
     assert kept["removed"] == [".clio-relay"]
     assert kept["outputs_kept"] == ["/home/u/.clio-relay/naca"]
+    assert list(site_writes.written(tmp_path, "ares")) == ["/home/u/.clio-relay/naca"]
     removed = await site_clean.clean(service, {**planned, "remove_outputs": True})
     assert removed["kept"] == ["spack"]
     assert removed["removed"] == [".clio-relay", "/home/u/.clio-relay/naca"]
     assert removed["outputs_kept"] == []
+    assert site_writes.written(tmp_path, "ares") == {}

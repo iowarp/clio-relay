@@ -191,9 +191,9 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         remove_outputs: Annotated[
             bool,
             Field(
-                description="Also delete what relay's runs wrote outside its directories "
-                "(the outputs the ask names, a case's results say). Only when the person "
-                "asks to remove them"
+                description="Also delete what relay's runs and file uploads wrote outside "
+                "its directories (the outputs the ask names, a case's results say). Only "
+                "when the person asks to remove them"
             ),
         ] = False,
     ) -> ToolResult | InputRequiredToolResult:
@@ -201,8 +201,8 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         relay stops its processes there, then deletes its worker, scripts, job
         directories and JARVIS bootstrap, and drops its local state for the site.
         The Spack store stays, and so do JARVIS's recorded install answers unless
-        forget_decisions is set, and so does what the runs wrote outside relay's
-        directories unless remove_outputs is set. It refuses while a job of
+        forget_decisions is set, and so does what the runs and file uploads wrote
+        outside relay's directories unless remove_outputs is set. It refuses while a job of
         the site runs, cancels operations that wait on a person with no job yet,
         and asks the person first, naming what goes and what stays. The site stays
         registered."""

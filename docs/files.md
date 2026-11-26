@@ -90,6 +90,21 @@ asked for.
 | Upload | `stat` on `<path>.relay-part` gives its size, which is the next offset. A chunk at any other offset refuses, and its `resume_at` names the right one. Starting again at offset 0 throws the part away. |
 | Download | The client knows how many bytes it holds; it reads again from there. |
 
+## What site clean removes
+
+Relay records each file a `write` or an `upload` made on a site, by the
+absolute path the site reports, in its own local state for the site. A
+chunked write's `<path>.relay-part` is recorded until the last chunk moves it
+in place, and so is the part an upload cut short left. A file that was there
+before, which `overwrite` replaced, stays the person's and is not recorded. A
+`delete` drops what it removed from the record.
+
+`site clean` names the recorded files that are outside relay's own
+directories with the runs' outputs, keeps them, and deletes them only with
+`remove_outputs`. Files inside relay's directories go with them. A directory
+a write made for its file is not recorded, so it stays, empty, once the file
+goes. `stage` puts content in relay's own directory, so the clean removes it.
+
 ## Adapters
 
 | Adapter | list, stat, read, whole write | delete | chunked write | Notes |

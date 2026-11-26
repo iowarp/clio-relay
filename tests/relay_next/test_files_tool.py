@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
 
+from clio_relay import site_writes
 from clio_relay.surface.server import create_server
 from clio_relay.surface.settings import RelayPaths
 
@@ -97,5 +99,39 @@ def test_files_chunks_and_delete(relay_paths: RelayPaths) -> None:
                 "files", call("read", path="../outside"), raise_on_error=False
             )
             assert _structured(escape)["refusal"]["reason"] == "invalid_arguments"
+
+    asyncio.run(scenario())
+
+
+def test_relay_records_the_files_it_made_for_site_clean(relay_paths: RelayPaths) -> None:
+    """A file relay wrote is recorded; one it replaced stays the person's; a delete forgets."""
+    add_site(relay_paths)
+
+    def call(op: str, **args: object) -> dict[str, object]:
+        return {"site": "fx", "op": op, **args}
+
+    def recorded() -> list[str]:
+        return sorted(site_writes.written(relay_paths.state_dir, "fx"))
+
+    async def scenario() -> None:
+        async with Client(create_server(relay_paths), mode="legacy") as client:
+            part = _structured(
+                await client.call_tool(
+                    "files", call("write", path="up/new.txt", content="a", final=False)
+                )
+            )
+            assert recorded() == [part["path"]]
+            made = _structured(
+                await client.call_tool(
+                    "files", call("write", path="up/new.txt", content="b", offset=1)
+                )
+            )
+            assert recorded() == [made["path"]]
+            Path(str(made["path"])).with_name("theirs.txt").write_text("mine")
+            replace = call("write", path="up/theirs.txt", content="x", overwrite=True)
+            await client.call_tool("files", replace)
+            assert recorded() == [made["path"]]
+            await client.call_tool("files", call("delete", path="up", recursive=True))
+            assert recorded() == []
 
     asyncio.run(scenario())

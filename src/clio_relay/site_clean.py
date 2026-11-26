@@ -31,14 +31,19 @@ outputs to the site's outputs directory, outside them. The ask names those
 outputs, from the operations' records, and the clean keeps them unless
 ``remove_outputs`` says otherwise; the result lists the ones it kept. Only what a
 run left in its own job directory (its streams, relay's records) goes with it.
+The files relay's ``files`` verb wrote or uploaded outside its directories are
+listed and kept the same way, from relay's record of them
+(:mod:`clio_relay.site_writes`).
 """
 
 from __future__ import annotations
 
 import logging
+import posixpath
 import shutil
 from typing import TYPE_CHECKING, Any, cast
 
+from clio_relay import site_writes
 from clio_relay.adapters.base import CleansSite, ListsLiveJobs, ShutsDown
 from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -241,6 +246,7 @@ async def plan(
     targets = list(dict.fromkeys(targets))
     targets += [hop for hop in _hop_dirs(service, site_id, cleaners) if not under(hop, targets)]
     outputs = run_outputs(service, site_id, targets, outputs_dirs(cleaners))
+    outputs = with_writes(outputs, site_writes.written(service.paths.state_dir, site_id), targets)
     return {
         "site": site_id,
         "adapter": cleaners[0].name,
@@ -346,6 +352,28 @@ def run_outputs(
     return [found[path] for path in paths if not any(path.startswith(o + "/") for o in paths)]
 
 
+def with_writes(
+    outputs: list[dict[str, Any]], written: dict[str, dict[str, Any]], targets: list[str]
+) -> list[dict[str, Any]]:
+    """Add the files relay's ``files`` verb made on the site (:mod:`clio_relay.site_writes`).
+
+    One inside relay's ``targets`` goes with them, and one inside a listed
+    output goes or stays with it, so neither is listed again.
+    """
+    listed = [str(item["path"]) for item in outputs]
+    added = [
+        {
+            "path": path,
+            "name": posixpath.basename(path),
+            "operation_id": None,
+            "size": row.get("size"),
+        }
+        for path, row in sorted(written.items())
+        if not under(path, targets) and not under(path, listed)
+    ]
+    return sorted([*outputs, *added], key=lambda item: str(item["path"]))
+
+
 def _size(count: int) -> str:
     for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
         if count >= scale:
@@ -365,10 +393,10 @@ def _outputs_line(planned: dict[str, Any]) -> str:
         shown.append(f"{len(outputs) - _LISTED_OUTPUTS} more")
     named = ", ".join(shown)
     if planned.get("remove_outputs"):
-        return f" It also deletes what relay's runs wrote: {named}."
+        return f" It also deletes what relay's runs and file uploads wrote: {named}."
     return (
-        f" It keeps what relay's runs wrote: {named}. To delete those too, clean again "
-        "with remove_outputs."
+        f" It keeps what relay's runs and file uploads wrote: {named}. To delete those too, "
+        "clean again with remove_outputs."
     )
 
 
@@ -462,6 +490,8 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
         if directory.exists():
             shutil.rmtree(directory, ignore_errors=True)
             local.append(str(directory))
+    gone = [*planned["targets"], *report.get("removed", []), *report.get("absent", [])]
+    site_writes.forget(service.paths.state_dir, site_id, [str(path) for path in gone])
     return {
         "schema": SCHEMA,
         "site": site_id,

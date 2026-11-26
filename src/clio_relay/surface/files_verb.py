@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,8 +16,9 @@ import mcp_types
 from fastmcp import Context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 
+from clio_relay import site_writes
 from clio_relay.adapters.hooks import Ask, ask_detail
-from clio_relay.jobs.file_rules import CHUNK_BYTES
+from clio_relay.jobs.file_rules import CHUNK_BYTES, part_path
 from clio_relay.jobs.handles import FileAccess
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
@@ -40,6 +42,8 @@ from clio_relay.surface.files_transfer import download, upload
 from clio_relay.surface.service import RelayService
 
 MAX_INLINE_BYTES = CHUNK_BYTES
+
+logger = logging.getLogger(__name__)
 
 
 def _need(value: str | None, name: str) -> str:
@@ -101,10 +105,79 @@ async def files_call(
     adapter = service.adapter_for(entry, "files")
     access = await adapter.files()
     approved = await _approved(service, entry, access, args)
-    structured, text = await _dispatch(access, args)
+    replaced = await _replaces(access, args)
+    deleting = await _deleting(service, site, access, args)
+    try:
+        structured, text = await _dispatch(access, args)
+    except Exception:
+        if args.op == "upload" and args.path:
+            await _left_part(service, site, access, args.path)
+        raise
+    _note(service, site, args, structured, replaced, deleting)
     if approved is not None and (args.op == "delete" or args.final):
         used(service, approved)
     return structured, text
+
+
+async def _existing(access: FileAccess, path: str) -> str | None:
+    """The site's absolute path for ``path`` when something is there, else None."""
+    try:
+        return (await access.stat(path)).path
+    except Refusal as refusal:
+        if refusal.reason is RefusalReason.PATH_NOT_FOUND:
+            return None
+        raise
+
+
+async def _replaces(access: FileAccess, args: FilesArgs) -> str | None:
+    """The file an overwrite would replace: relay records only what it made."""
+    whole = args.op == "upload" or (args.op == "write" and args.final)
+    if not (whole and args.overwrite and args.path):
+        return None
+    return await _existing(access, args.path)
+
+
+async def _deleting(
+    service: RelayService, site: str, access: FileAccess, args: FilesArgs
+) -> str | None:
+    """The site's path a delete removes, when relay's record of the site has files."""
+    if args.op != "delete" or not args.path:
+        return None
+    if not site_writes.ledger_path(service.paths.state_dir, site).exists():
+        return None
+    return await _existing(access, args.path)
+
+
+async def _left_part(service: RelayService, site: str, access: FileAccess, path: str) -> None:
+    """Record the part file an upload cut short left, so a site clean finds it."""
+    try:
+        found = await access.stat(part_path(path))
+        site_writes.record(service.paths.state_dir, site, found.path, found.size)
+    except (Refusal, OSError):
+        logger.info("no part file of %s to record", path, exc_info=True)
+
+
+def _note(
+    service: RelayService,
+    site: str,
+    args: FilesArgs,
+    structured: dict[str, Any],
+    replaced: str | None,
+    deleting: str | None,
+) -> None:
+    """Keep relay's record of what it wrote on the site (:mod:`clio_relay.site_writes`)."""
+    state_dir = service.paths.state_dir
+    try:
+        if args.op == "delete" and deleting:
+            site_writes.forget(state_dir, site, [deleting])
+        elif args.op == "write" and not args.final:
+            site_writes.record(state_dir, site, str(structured["path"]), structured.get("size"))
+        elif args.op in {"write", "upload"}:
+            path = str(structured["path"])
+            ours = replaced is None or replaced in site_writes.written(state_dir, site)
+            site_writes.finished(state_dir, site, path, structured.get("size"), record_it=ours)
+    except OSError:
+        logger.warning("recording relay's write on %s", site, exc_info=True)
 
 
 async def _approved(
