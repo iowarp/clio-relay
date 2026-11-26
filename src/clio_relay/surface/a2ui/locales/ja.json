@@ -5,7 +5,6 @@
   "A host name or an IP address": "ホスト名または IP アドレス",
   "A leased node with a floating IP": "フローティング IP 付きの貸し出しノード",
   "A local clio-relay wheel to install on the site": "サイトにインストールするローカルの clio-relay wheel",
-  "A local frpc built for the site, copied in when site_frpc is unset": "サイト向けにビルドしたローカルの frpc。site_frpc が未設定のときにコピーします",
   "A relay worker on Ares, over an frp tunnel": "frp トンネル経由の Ares 上の relay ワーカー",
   "A relay worker on the endpoint runs the work": "エンドポイント上の relay ワーカーが処理を実行します",
   "A skill name, or the path of your own Markdown skill": "スキル名、または独自の Markdown スキルのパス",
@@ -266,7 +265,6 @@
   "auto picks the scheduler whose submit command is on PATH, and refuses to run jobs here when it finds none but the host shows a batch system. none runs them here": "auto は投入コマンドが PATH 上にあるスケジューラーを選びます。見つからないのにホストにバッチシステムがある場合は、ここでのジョブ実行を拒否します。none はここで実行します",
   "auto picks the scheduler whose submit command is on the site's PATH": "auto は投入コマンドがサイトの PATH 上にあるスケジューラーを選びます",
   "auto picks the scheduler whose submit command the site has, and refuses to run jobs on the login host when it finds none but the host shows a batch system. none runs them on that host": "auto はサイトにある投入コマンドのスケジューラーを選びます。見つからないのにホストにバッチシステムがある場合は、ログインホストでのジョブ実行を拒否します。none はそのホストで実行します",
-  "frpc on the site. When unset relay copies in frpc_binary": "サイト上の frpc。未設定なら relay が frpc_binary をコピーします",
   "open runs the job spec's executable; guarded runs reviewed packages only": "open はジョブ仕様の実行ファイルを実行し、guarded はレビュー済みのパッケージだけを実行します",
   "pki: relay makes a key pair for a host the person can reach over SSH. tms: Tapis's trust manager makes and holds the key, for hosts with a second factor": "pki: 本人が SSH で接続できるホスト用に relay が鍵ペアを作ります。tms: 二要素認証のあるホスト用に Tapis のトラストマネージャーが鍵を作成して保持します",
   "removed earlier": "以前に削除",
@@ -281,5 +279,9 @@
   "{protocol} needs your {provider} sign-in first": "{protocol} を使うには先に {provider} へのサインインが必要です",
   "{protocol}, host {host}": "{protocol}、ホスト {host}",
   "{protocol}, {tenant} tenant": "{protocol}、{tenant} テナント",
-  "{seconds} s": "{seconds} 秒"
+  "{seconds} s": "{seconds} 秒",
+  "A local frpc built for the site, copied in instead of fetching one": "???????????????? frpc???????????????????",
+  "frpc on the site. When unset the sign-in fetches a checked frpc on the site": "????? frpc?????????????????????? frpc ??????????",
+  "Where the site fetches frpc instead of relay's pinned frp release (a .tar.gz, .tgz or the binary); needs frpc_sha256": "relay ????? frp ????????????? frpc ????????.tar.gz?.tgz??????????frpc_sha256 ?????",
+  "The sha256 the file at frpc_url must have": "frpc_url ?????????? sha256"
 }

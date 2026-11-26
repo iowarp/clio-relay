@@ -5,7 +5,6 @@
   "A host name or an IP address": "Un nombre de host o una dirección IP",
   "A leased node with a floating IP": "Un nodo alquilado con una IP flotante",
   "A local clio-relay wheel to install on the site": "Un wheel local de clio-relay para instalar en el sitio",
-  "A local frpc built for the site, copied in when site_frpc is unset": "Un frpc local compilado para el sitio, que se copia cuando site_frpc no está definido",
   "A relay worker on Ares, over an frp tunnel": "Un worker de relay en Ares, por un túnel frp",
   "A relay worker on the endpoint runs the work": "Un worker de relay en el endpoint hace el trabajo",
   "A skill name, or the path of your own Markdown skill": "El nombre de una skill, o la ruta de tu propia skill en Markdown",
@@ -266,7 +265,6 @@
   "auto picks the scheduler whose submit command is on PATH, and refuses to run jobs here when it finds none but the host shows a batch system. none runs them here": "auto elige el planificador cuyo comando de envío está en el PATH, y se niega a ejecutar trabajos aquí si no encuentra ninguno pero el host muestra un sistema de colas. none los ejecuta aquí",
   "auto picks the scheduler whose submit command is on the site's PATH": "auto elige el planificador cuyo comando de envío está en el PATH del sitio",
   "auto picks the scheduler whose submit command the site has, and refuses to run jobs on the login host when it finds none but the host shows a batch system. none runs them on that host": "auto elige el planificador cuyo comando de envío tiene el sitio, y se niega a ejecutar trabajos en el host de acceso si no encuentra ninguno pero el host muestra un sistema de colas. none los ejecuta en ese host",
-  "frpc on the site. When unset relay copies in frpc_binary": "frpc en el sitio. Si no está definido, relay copia frpc_binary",
   "open runs the job spec's executable; guarded runs reviewed packages only": "open ejecuta el ejecutable de la especificación del trabajo; guarded solo ejecuta paquetes revisados",
   "pki: relay makes a key pair for a host the person can reach over SSH. tms: Tapis's trust manager makes and holds the key, for hosts with a second factor": "pki: relay crea un par de claves para un host al que la persona llega por SSH. tms: el gestor de confianza de Tapis crea y guarda la clave, para hosts con segundo factor",
   "removed earlier": "quitado antes",
@@ -281,5 +279,9 @@
   "{protocol} needs your {provider} sign-in first": "{protocol} necesita antes tu inicio de sesión en {provider}",
   "{protocol}, host {host}": "{protocol}, host {host}",
   "{protocol}, {tenant} tenant": "{protocol}, tenant {tenant}",
-  "{seconds} s": "{seconds} s"
+  "{seconds} s": "{seconds} s",
+  "A local frpc built for the site, copied in instead of fetching one": "Un frpc local compilado para el sitio, que se copia en lugar de descargar uno",
+  "frpc on the site. When unset the sign-in fetches a checked frpc on the site": "frpc en el sitio. Si no est? definido, el inicio de sesi?n descarga en el sitio un frpc verificado",
+  "Where the site fetches frpc instead of relay's pinned frp release (a .tar.gz, .tgz or the binary); needs frpc_sha256": "De d?nde descarga el sitio frpc en lugar de la versi?n de frp fijada por relay (un .tar.gz, .tgz o el binario); requiere frpc_sha256",
+  "The sha256 the file at frpc_url must have": "El sha256 que debe tener el archivo en frpc_url"
 }

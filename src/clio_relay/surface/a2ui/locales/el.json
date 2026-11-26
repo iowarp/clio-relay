@@ -5,7 +5,6 @@
   "A host name or an IP address": "Ένα όνομα κεντρικού υπολογιστή ή μια διεύθυνση IP",
   "A leased node with a floating IP": "Ένας μισθωμένος κόμβος με κινητή IP",
   "A local clio-relay wheel to install on the site": "Ένα τοπικό wheel του clio-relay για εγκατάσταση στον ιστότοπο",
-  "A local frpc built for the site, copied in when site_frpc is unset": "Ένα τοπικό frpc για τον ιστότοπο, που αντιγράφεται όταν δεν έχει οριστεί το site_frpc",
   "A relay worker on Ares, over an frp tunnel": "Ένας worker του relay στο Ares, μέσω σήραγγας frp",
   "A relay worker on the endpoint runs the work": "Ένας worker του relay στο τελικό σημείο εκτελεί τη δουλειά",
   "A skill name, or the path of your own Markdown skill": "Ένα όνομα skill ή η διαδρομή του δικού σας skill σε Markdown",
@@ -266,7 +265,6 @@
   "auto picks the scheduler whose submit command is on PATH, and refuses to run jobs here when it finds none but the host shows a batch system. none runs them here": "Το auto επιλέγει τον χρονοπρογραμματιστή του οποίου η εντολή υποβολής βρίσκεται στο PATH, και αρνείται να εκτελέσει εργασίες εδώ όταν δεν βρίσκει κανέναν αλλά ο κεντρικός υπολογιστής δείχνει σύστημα παρτίδων. Το none τις εκτελεί εδώ",
   "auto picks the scheduler whose submit command is on the site's PATH": "Το auto επιλέγει τον χρονοπρογραμματιστή του οποίου η εντολή υποβολής βρίσκεται στο PATH του ιστότοπου",
   "auto picks the scheduler whose submit command the site has, and refuses to run jobs on the login host when it finds none but the host shows a batch system. none runs them on that host": "Το auto επιλέγει τον χρονοπρογραμματιστή του οποίου την εντολή υποβολής έχει ο ιστότοπος, και αρνείται να εκτελέσει εργασίες στον κόμβο σύνδεσης όταν δεν βρίσκει κανέναν αλλά ο κεντρικός υπολογιστής δείχνει σύστημα παρτίδων. Το none τις εκτελεί σε αυτόν τον κεντρικό υπολογιστή",
-  "frpc on the site. When unset relay copies in frpc_binary": "Το frpc στον ιστότοπο. Αν δεν έχει οριστεί, το relay αντιγράφει το frpc_binary",
   "open runs the job spec's executable; guarded runs reviewed packages only": "Το open εκτελεί το εκτελέσιμο της προδιαγραφής εργασίας, το guarded εκτελεί μόνο ελεγμένα πακέτα",
   "pki: relay makes a key pair for a host the person can reach over SSH. tms: Tapis's trust manager makes and holds the key, for hosts with a second factor": "pki: το relay φτιάχνει ένα ζεύγος κλειδιών για κεντρικό υπολογιστή που μπορείτε να φτάσετε μέσω SSH. tms: ο διαχειριστής εμπιστοσύνης του Tapis φτιάχνει και κρατά το κλειδί, για κεντρικούς υπολογιστές με δεύτερο παράγοντα",
   "removed earlier": "αφαιρέθηκε νωρίτερα",
@@ -281,5 +279,9 @@
   "{protocol} needs your {provider} sign-in first": "Το {protocol} χρειάζεται πρώτα τη σύνδεσή σας στο {provider}",
   "{protocol}, host {host}": "{protocol}, κεντρικός υπολογιστής {host}",
   "{protocol}, {tenant} tenant": "{protocol}, tenant {tenant}",
-  "{seconds} s": "{seconds} δευτ."
+  "{seconds} s": "{seconds} δευτ.",
+  "A local frpc built for the site, copied in instead of fetching one": "??? ?????? frpc ??? ??? ????????, ??? ???????????? ???? ?? ??????? ???",
+  "frpc on the site. When unset the sign-in fetches a checked frpc on the site": "?? frpc ???? ????????. ?? ??? ???? ???????, ? ??????? ????????? ???? ???????? ??? ???????? frpc",
+  "Where the site fetches frpc instead of relay's pinned frp release (a .tar.gz, .tgz or the binary); needs frpc_sha256": "??? ??? ????????? ? ????????? ?? frpc ???? ??? ??? ???????????? ?????? frp ??? relay (.tar.gz, .tgz ? ?? ??????????)? ?????????? frpc_sha256",
+  "The sha256 the file at frpc_url must have": "?? sha256 ??? ?????? ?? ???? ?? ?????? ??? frpc_url"
 }

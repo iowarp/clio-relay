@@ -40,13 +40,22 @@ In that one ssh pass relay:
 
 1. installs `uv` on the cluster if it is missing;
 2. installs `clio-relay` into the worker directory with `uv tool install`;
-3. copies `frpc_binary` over, unless the site has its own frpc (`site_frpc`);
+3. fetches frpc on the cluster and checks its sha256, unless the site has its
+   own frpc (`site_frpc`) or you give relay one to copy in (`frpc_binary`);
 4. writes the worker's settings and starts it in the background;
 5. waits for the worker to report ready, then closes ssh.
 
 The worker then dials out to the rendezvous and keeps that link up. Relay dials
 the same rendezvous and reaches the worker through it. Each sign-in places a
 fresh worker generation with new secrets and stops the previous one.
+
+The frpc the cluster fetches is relay's pin: one frp release, picked for the
+cluster's `uname` (Linux x86_64 and arm64, macOS x86_64 and arm64), with the
+sha256 frp publishes for it. The fetch runs on the cluster in the same ssh pass,
+the way `uv` does, so nothing is staged from the desktop. A later sign-in
+reuses the download while its sha256 still matches. A cluster with no internet
+access, or another platform, sets `site_frpc`, `frpc_url` with `frpc_sha256`
+(such as a mirror), or `frpc_binary`.
 
 Relay's end of the link is its own frp visitor, the same one a served port
 uses (see [running a rendezvous host](../rendezvous-host.md)), so the desktop
@@ -88,7 +97,9 @@ picks those.
 | `relay_wheel` | none | A local clio-relay wheel to install instead of the PyPI release |
 | `relay_requirement` | `clio-relay==<this version>` | What `uv` installs on the cluster |
 | `site_frpc` | none | An frpc already on the cluster |
-| `frpc_binary` | none | A local frpc built for the cluster, which relay copies in when `site_frpc` is unset. One of the two is needed |
+| `frpc_url` | relay's pinned frp release | Where the cluster fetches frpc instead: a `.tar.gz`, a `.tgz` or the binary. Needs `frpc_sha256` |
+| `frpc_sha256` | the pin's | The sha256 the download must have. A mismatch stops the sign-in |
+| `frpc_binary` | none | A local frpc built for the cluster, which relay copies in instead of fetching one |
 | `python` | `3.12` | The Python `uv` installs the worker with |
 | `submit_timeout_s` | 60 | How long one scheduler submit command may take |
 | `jarvis_python` | empty | The Python relay installs its jarvis-cd with on the cluster, as in the [ssh adapter](ssh.md#settings) |

@@ -272,16 +272,43 @@ def _placing(tmp_path: Path, **config: Any) -> tuple[WorkerAdapter, WorkerLink]:
     return adapter, link
 
 
-def test_placement_never_uploads_the_desktops_own_frpc(tmp_path: Path) -> None:
-    """The site's frpc is a site path or a binary built for the site, never the desktop's."""
+def test_placement_fetches_a_pinned_frpc_on_the_site(tmp_path: Path) -> None:
+    """With no frpc set, the site fetches relay's pinned frpc and checks its sha256."""
+    from clio_relay.adapters.worker.frpc_fetch import FRP_VERSION, PINNED
+
     adapter, link = _placing(tmp_path)
+
+    script = adapter.placement_script(link, session_owner_token="owner-token")
+
+    archive, digest = PINNED[("Linux", "x86_64|amd64")]
+    assert f"v{FRP_VERSION}/{archive}" in script
+    assert digest in script
+    assert '"$got" != "$FRPC_SHA"' in script
+    assert 'FRPC_PATH="$D/bin/frpc"' in script
+    assert "CLIO_RELAY_FRPC" not in script
+
+
+def test_placement_fetches_the_sites_own_frpc_url(tmp_path: Path) -> None:
+    digest = "ab" * 32
+    adapter, link = _placing(
+        tmp_path, frpc_url="https://mirror.example.test/frpc.tgz", frpc_sha256=digest
+    )
+
+    script = adapter.placement_script(link, session_owner_token="owner-token")
+
+    assert "FRPC_URL=https://mirror.example.test/frpc.tgz" in script
+    assert f"FRPC_SHA={digest}" in script
+    assert "uname -m" not in script
+
+
+def test_placement_refuses_an_frpc_url_without_its_sha256(tmp_path: Path) -> None:
+    adapter, link = _placing(tmp_path, frpc_url="https://mirror.example.test/frpc")
 
     with pytest.raises(Refusal) as refusal:
         adapter.placement_script(link, session_owner_token="owner-token")
 
     assert refusal.value.reason is RefusalReason.INVALID_CONFIG
-    assert "site_frpc" in refusal.value.message
-    assert "frpc_binary" in refusal.value.message
+    assert "frpc_sha256" in refusal.value.message
 
 
 def test_placement_copies_in_the_frpc_built_for_the_site(tmp_path: Path) -> None:

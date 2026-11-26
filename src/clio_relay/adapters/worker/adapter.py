@@ -144,11 +144,22 @@ class WorkerConfig(BaseModel):
         default=None, description="What uv installs on the site instead, such as clio-relay==1.7.0"
     )
     site_frpc: str | None = Field(
-        default=None, description="frpc on the site. When unset relay copies in frpc_binary"
+        default=None,
+        description="frpc on the site. When unset the sign-in fetches a checked frpc on the site",
+    )
+    frpc_url: str | None = Field(
+        default=None,
+        description="Where the site fetches frpc instead of relay's pinned frp release "
+        "(a .tar.gz, .tgz or the binary); needs frpc_sha256",
+    )
+    frpc_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="The sha256 the file at frpc_url must have",
     )
     frpc_binary: str | None = Field(
         default=None,
-        description="A local frpc built for the site, copied in when site_frpc is unset",
+        description="A local frpc built for the site, copied in instead of fetching one",
     )
     python: str = Field(default="3.12", pattern=r"^3\.\d+$")
     submit_timeout_s: float = Field(default=60, gt=0)
@@ -490,13 +501,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
         if self.config.site_frpc:
             frpc = self.config.site_frpc
-        else:
-            if not self.config.frpc_binary:
-                raise Refusal(
-                    RefusalReason.INVALID_CONFIG,
-                    "the site has no frp client: set site_frpc (a site path), or frpc_binary "
-                    "(a local frpc built for the site, which relay copies in)",
-                )
+        elif self.config.frpc_binary:
             try:
                 binary = Path(os.path.expanduser(self.config.frpc_binary)).read_bytes()
             except OSError as exc:
@@ -504,6 +509,19 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                     RefusalReason.INVALID_CONFIG, f"cannot read frpc_binary: {exc.strerror}"
                 ) from exc
             parts.append(self._payload("FRPC", "$D/bin/frpc", binary, "700"))
+            frpc = "$D/bin/frpc"
+        else:
+            from clio_relay.adapters.worker.frpc_fetch import fetch_script
+
+            if (self.config.frpc_url is None) != (self.config.frpc_sha256 is None):
+                raise Refusal(
+                    RefusalReason.INVALID_CONFIG,
+                    "frpc_url and frpc_sha256 go together: the site checks the download "
+                    "against the sha256",
+                )
+            parts += fetch_script(
+                "$D/bin/frpc", url=self.config.frpc_url, sha256=self.config.frpc_sha256
+            )
             frpc = "$D/bin/frpc"
         registry = ClusterRegistry(clusters={link.cluster: self._definition(link, site_view=True)})
         settings = {
