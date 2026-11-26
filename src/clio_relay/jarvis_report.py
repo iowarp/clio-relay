@@ -367,12 +367,6 @@ SITE_COPY_KIND = "site_copy"
 already has of the package (a module, a site Spack install), or build it with Spack."""
 SITE_COPY_NONE = "site_copy_none"
 """JARVIS's fact that its search found no site copy, so Spack builds the package."""
-SITE_COPY_UNUSABLE = "site_copy_unusable"
-"""JARVIS's question (jarvis-cd 1.9.8) when the site copy chosen for a package does not
-load: another copy, a Spack build, or forget the choice and be asked again."""
-SPACK_BROKEN = "spack_broken"
-"""JARVIS's question (jarvis-cd 1.9.8) when a Spack fails before any package: run its
-commands without the person's user config, skip that Spack, or check again."""
 
 
 def site_copy_facts(report: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -398,12 +392,8 @@ _TITLES = {
     "variant_conflict": "Constraint to add",
     "concretize_failed": "How to resolve the Spack spec",
     SITE_COPY_KIND: "Site copy or Spack build",
-    SITE_COPY_UNUSABLE: "Site copy that does not load",
-    SPACK_BROKEN: "A Spack that fails",
 }
-_NAMED_TITLES = frozenset(
-    {"ambiguous_provider", "install_method", SITE_COPY_KIND, SITE_COPY_UNUSABLE}
-)
+_NAMED_TITLES = frozenset({"ambiguous_provider", "install_method", SITE_COPY_KIND})
 
 _LABELS = {
     "pip": "pip, in a Python venv",
@@ -499,7 +489,7 @@ def _sentence(text: str) -> str:
 
 
 def _written(candidate: Mapping[str, Any]) -> bool:
-    """Say whether JARVIS wrote what a candidate does (``site_copy``, ``spack_broken``...)."""
+    """Say whether JARVIS wrote what a candidate does (``site_copy``, ``install_placement``...)."""
     does = candidate.get("does")
     return isinstance(does, str) and bool(does.strip())
 
@@ -618,22 +608,12 @@ def choice_note(issue: Mapping[str, Any]) -> str | None:
         )
     if once(issue):
         notes.append("The answer is for this run only; JARVIS asks again next time.")
-    elif issue.get("kind") == SPACK_BROKEN:
-        notes.append(
-            "JARVIS records the way out chosen for the site's later installs; checking "
-            "again records nothing."
-        )
     elif issue.get("scope") == "site":
         notes.append("JARVIS records the answer for the site's later installs.")
     elif issue.get("kind") == SITE_COPY_KIND and issue.get("package"):
         notes.append(
             f"JARVIS records the answer for {issue['package']} on this site, and later "
             "installs use it without searching again."
-        )
-    elif issue.get("kind") == SITE_COPY_UNUSABLE and issue.get("package"):
-        notes.append(
-            f"Another copy or the Spack build replaces the site copy JARVIS recorded for "
-            f"{issue['package']} on this site."
         )
     return " ".join(notes) or None
 
@@ -711,15 +691,32 @@ def check_unrecorded(issues: list[dict[str, Any]], *, site: str) -> Refusal:
     )
 
 
+def words(issue: Mapping[str, Any]) -> str:
+    """Return what JARVIS wrote about an issue: its message (or question, or detail) and hint."""
+    said = next(
+        (
+            str(issue[key]).strip()
+            for key in ("message", "question", "detail", "error")
+            if isinstance(issue.get(key), str) and str(issue[key]).strip()
+        ),
+        "",
+    )
+    hint = issue.get("hint")
+    if isinstance(hint, str) and hint.strip() and hint.strip() not in said:
+        said = then(said, hint.strip()) if said else hint.strip()
+    return said or str(issue.get("kind") or "")
+
+
 def install_blocked(issues: list[dict[str, Any]], *, site: str) -> Refusal:
-    """The refusal when JARVIS reports an install issue no answer can fix."""
-    first = issues[0]
-    detail = first.get("detail") or first.get("question") or first.get("kind")
-    hint = first.get("hint")
-    message = f"JARVIS cannot install the package's software on {site}: {detail}"
-    if isinstance(hint, str) and hint:
-        message = then(message, hint)
-    return Refusal(RefusalReason.SUBMIT_FAILED, message, issues=issues, needs=NEEDS_INSTALL)
+    """The refusal when JARVIS raises an issue no answer settles: its issues and words, whole."""
+    message = "\n".join(line for line in map(words, issues) if line)
+    return Refusal(
+        RefusalReason.SUBMIT_FAILED,
+        message or f"JARVIS raised {len(issues)} issue(s) on {site} that no answer settles",
+        site=site,
+        issues=issues,
+        needs=NEEDS_INSTALL,
+    )
 
 
 def then(sentence: str, more: str) -> str:

@@ -7,33 +7,48 @@ from typing import Any
 import pytest
 
 from clio_relay import install_failures
-from clio_relay.jarvis_submit import INSTALL_REPORT_SCHEMA, NEEDS_INSTALL
+from clio_relay.jarvis_submit import INSTALL_REPORT_SCHEMA
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.surface import installing
 
-BUILD_FAILED: dict[str, Any] = {
-    "issue_id": "f1",
-    "kind": "build_failed",
-    "host": "ares-comp-05",
+OUTPUT = "/home/u/.clio-relay/install/failures/install-ares-comp-05-0123456789ab.log"
+BUILD: dict[str, Any] = {
+    "schema": "jarvis.install-issue.v1",
+    "failure_schema": "jarvis.failure.v1",
+    "issue_id": "sha256:f1",
+    "kind": "failure",
+    "package": "paraview",
+    "subject": "install",
+    "scope": "run",
+    "answerable": False,
+    "candidates": [],
+    "evidence": [],
     "stage": "install",
+    "doing": "building paraview@5.13.1 with Spack",
+    "message": (f"spack install paraview failed on ares-comp-05 (exit 1); full output: {OUTPUT}"),
+    "question": (f"spack install paraview failed on ares-comp-05 (exit 1); full output: {OUTPUT}"),
+    "host": "ares-comp-05",
+    "command": "spack install paraview@5.13.1",
+    "cwd": "/home/u/jobs/op/executions/e1",
+    "exit_code": 1,
     "packages": ["paraview"],
     "failed_node": "paraview@5.13.1",
-    "log_tail": "\n".join(f"line {n}" for n in range(40)),
-    "message": "paraview failed to build",
-    "remedy": "Read the build log, then constrain the spec.",
+    "output_tail": "\n".join(f"line {n}" for n in range(40)),
+    "output_path": OUTPUT,
+    "output_bytes": 81234,
+    "paths": {"install_log": "/x/install.log", "issues": "/x/issues.jsonl", "build_log": "/b"},
 }
-COMPILER: dict[str, Any] = {
-    "issue_id": "c1",
-    "kind": "compiler_unavailable",
-    "host": "ares-comp-05",
-    "stage": "install",
-    "answerable": True,
-    "question": "Which compiler should JARVIS build with?",
-    "candidates": [{"id": "gcc@11.4.0", "constraint": "gcc@11.4.0"}],
-    "message": "gcc@12.3.0 is not usable on the build host",
-    "remedy": "Pick a usable compiler.",
+PROBE: dict[str, Any] = {
+    **BUILD,
+    "issue_id": "sha256:p1",
+    "stage": "compiler_probe",
+    "package": "*",
+    "message": "gcc@12.3.0 cannot create executables on ares-comp-05; full output: /p.log",
+    "question": "gcc@12.3.0 cannot create executables on ares-comp-05; full output: /p.log",
+    "compiler": "gcc@12.3.0",
+    "probe_step": "compile",
 }
 
 
@@ -41,113 +56,70 @@ def _report(*issues: dict[str, Any], failures: list[str] | None = None) -> str:
     document: dict[str, Any] = {
         "schema_version": INSTALL_REPORT_SCHEMA,
         "failed": True,
+        "exit_code": 6,
+        "satisfied": False,
         "failures": failures if failures is not None else [i["issue_id"] for i in issues],
         "installers": {},
         "issues": list(issues),
+        "open_issues": [i["issue_id"] for i in issues],
+        "issues_path": "/x/issues.jsonl",
+        "record_path": "/x/install-check.json",
     }
     return f"spack said things\n{json.dumps(document)}\n"
 
 
-def test_a_build_failure_is_a_typed_error_without_the_raw_log() -> None:
-    refusal = install_failures.refusal(_report(BUILD_FAILED), site="ares")
+def test_a_failure_is_passed_whole_in_jarvis_s_words() -> None:
+    refusal = install_failures.refusal(_report(BUILD), site="Ares")
     assert refusal.reason == RefusalReason.SUBMIT_FAILED
-    assert refusal.data["kind"] == "build_failed"
+    assert refusal.message == BUILD["message"]
+    assert refusal.data["failures"] == [BUILD]
     assert refusal.data["exit_code"] == 6
-    assert "ares-comp-05" in refusal.message
-    assert "paraview@5.13.1" in refusal.message
-    assert "constrain the spec" in refusal.message
-    assert "line 39" not in refusal.message
-    tail = refusal.data["issues"][0]["log_tail"].splitlines()
-    assert tail[0] == "line 20" and tail[-1] == "line 39"
+    assert refusal.data["retry"] is False
+    assert refusal.data["issues_path"] == "/x/issues.jsonl"
+    assert refusal.data["record_path"] == "/x/install-check.json"
+    assert refusal.data["report"]["failed"] is True
+    assert installing.install_kind(refusal) is None
 
 
-def test_a_message_that_ends_its_sentence_gets_one_period() -> None:
-    pulled = dict(BUILD_FAILED, kind="container_pull_failed", message="podman could not pull x:3.")
-    refusal = install_failures.refusal(_report(pulled), site="ares")
-    assert "could not pull x:3. Read the build log" in refusal.message
-    assert ".." not in refusal.message
-
-
-@pytest.mark.parametrize(
-    ("kind", "reason"),
-    [
-        ("fetch_failed", RefusalReason.UNREACHABLE),
-        ("concretize_failed", RefusalReason.INVALID_SPEC),
-        ("variant_conflict", RefusalReason.INVALID_SPEC),
-        ("install_failed", RefusalReason.SUBMIT_FAILED),
-    ],
-)
-def test_each_kind_keeps_its_name_and_a_reason(kind: str, reason: RefusalReason) -> None:
-    refusal = install_failures.refusal(_report({**BUILD_FAILED, "kind": kind}), site="ares")
-    assert refusal.reason == reason
-    assert refusal.data["kind"] == kind
-
-
-@pytest.mark.parametrize(
-    ("kind", "method"),
-    [
-        ("pip_install_failed", "pip"),
-        ("conda_install_failed", "conda"),
-        ("conda_bootstrap_failed", "conda"),
-        ("container_pull_failed", "container"),
-        ("venv_failed", "pip"),
-    ],
-)
-def test_every_install_method_fails_the_same_typed_way(kind: str, method: str) -> None:
-    failed = {
-        "issue_id": "m1",
-        "kind": kind,
-        "method": method,
-        "host": "ares-comp-05",
-        "stage": "install",
-        "packages": ["tool"],
-        "message": f"{method} could not install tool",
-        "remedy": "Read log_tail.",
-        "log_tail": "ERROR: no such thing",
+def test_a_failure_is_never_an_ask_even_with_candidates_beside_it() -> None:
+    question = {
+        "issue_id": "q1",
+        "kind": "ambiguous_provider",
+        "answerable": True,
+        "question": "Which MPI?",
+        "candidates": [{"id": "openmpi", "constraint": "^openmpi"}],
     }
-    refusal = install_failures.refusal(_report(failed), site="ares")
+    refusal = install_failures.refusal(_report(PROBE, question, failures=["sha256:p1"]), site="A")
+    assert installing.install_kind(refusal) is None
+    assert refusal.message == PROBE["message"]
+    assert refusal.data["failures"] == [PROBE]
+    assert refusal.data["issues"] == [PROBE, question]
+
+
+def test_every_failure_is_listed_one_line_each() -> None:
+    refusal = install_failures.refusal(_report(BUILD, PROBE), site="Ares")
+    assert refusal.message.splitlines() == [BUILD["message"], PROBE["message"]]
+    assert [item["issue_id"] for item in refusal.data["failures"]] == ["sha256:f1", "sha256:p1"]
+
+
+def test_exit_6_with_no_record_passes_what_jarvis_printed() -> None:
+    refusal = install_failures.refusal("Error: something\n", site="Ares")
     assert refusal.reason == RefusalReason.SUBMIT_FAILED
-    assert refusal.data["kind"] == kind
-    assert refusal.data["issues"][0]["method"] == method
-    assert f"{method} could not install tool" in refusal.message
-    assert "Spack" not in refusal.message
-
-
-def test_a_compiler_the_person_picks_becomes_the_install_asks() -> None:
-    refusal = install_failures.refusal(_report(COMPILER), site="ares")
-    assert refusal.data["needs"] == NEEDS_INSTALL
-    assert installing.install_kind(refusal) == "software"
-    assert refusal.data["install_report"]["issues"][0]["issue_id"] == "c1"
-    assert "compiler_unavailable" in refusal.data["ask_message"]
-    assert refusal.data["failure"]["kind"] == "compiler_unavailable"
-
-
-def test_only_the_named_failures_count() -> None:
-    other = {**BUILD_FAILED, "issue_id": "f2", "kind": "fetch_failed"}
-    refusal = install_failures.refusal(_report(BUILD_FAILED, other, failures=["f2"]), site="ares")
-    assert refusal.data["kind"] == "fetch_failed"
-
-
-def test_exit_6_with_no_typed_issue_says_so() -> None:
-    refusal = install_failures.refusal("Error: something\n", site="ares")
-    assert refusal.reason == RefusalReason.SUBMIT_FAILED
-    assert "no typed issue" in refusal.message
+    assert refusal.message == "Error: something"
+    assert refusal.data["failures"] == []
 
 
 def test_raise_for_raises_only_on_6() -> None:
-    install_failures.raise_for(5, _report(BUILD_FAILED), site="ares")
-    install_failures.raise_for(None, _report(BUILD_FAILED), site="ares")
+    install_failures.raise_for(5, _report(BUILD), site="Ares")
+    install_failures.raise_for(None, _report(BUILD), site="Ares")
     with pytest.raises(Refusal):
-        install_failures.raise_for("6", _report(BUILD_FAILED), site="ares")
+        install_failures.raise_for("6", _report(BUILD), site="Ares")
 
 
 def test_issues_jsonl_keeps_the_last_line_per_issue() -> None:
-    text = "\n".join(
-        [json.dumps({**BUILD_FAILED, "message": "first"}), "not json", json.dumps(BUILD_FAILED)]
-    )
-    found = install_failures.failures(install_failures.read_jsonl(text))
-    assert len(found) == 1
-    assert found[0]["message"] == "paraview failed to build"
+    text = "\n".join([json.dumps({**BUILD, "message": "first"}), "not json", json.dumps(BUILD)])
+    found = install_failures.records(install_failures.read_jsonl(text))
+    assert found == [BUILD]
 
 
 class _Files:
@@ -193,120 +165,92 @@ class _Service:
         return "record"
 
 
-@pytest.mark.asyncio
-async def test_an_install_job_that_exits_6_fails_with_its_typed_issue() -> None:
-    adapter = _Adapter(json.dumps(BUILD_FAILED) + "\n")
-    service = _Service()
-    handle = JobHandle(
-        adapter="ssh",
-        native_id="27990",
-        data={"execution_dir": "/home/u/jobs/op/executions/e1"},
-    )
-    status = JobStatus(
-        state=JobState.FAILED, exit_code=6, observed_at=datetime.now(UTC), native_state="FAILED"
-    )
-    result = await installing._ended(  # pyright: ignore[reportPrivateUsage]
-        service,  # pyright: ignore[reportArgumentType]
-        "op",
-        status,
-        (adapter, handle),  # pyright: ignore[reportArgumentType]
-        "raw tail",
-    )
-    assert result == "record"
-    assert adapter._files.paths == ["/home/u/jobs/op/executions/e1/install/issues.jsonl"]  # pyright: ignore[reportPrivateUsage]
-    state, refusal = service.finished[0]
-    assert state == OperationState.FAILED
-    assert refusal is not None
-    assert refusal.data["kind"] == "build_failed"
-    assert refusal.data["install_job"] == "27990"
-    assert "raw tail" not in refusal.message
-
-
-ENGINE_UNUSABLE: dict[str, Any] = {
-    "issue_id": "sha256:fc84",
-    "kind": "container_engine_unusable",
-    "answerable": False,
-    "candidates": [],
-    "method": "container",
-    "engine": "podman",
-    "host": "ares-comp-18",
-    "scope": "site",
-    "message": "podman is installed on ares-comp-18 but cannot run: `podman info` fails.",
-    "detail": "Error: error creating tmpdir: mkdir /run/user/1008: permission denied",
-    "remedy": "fix podman on this host (its own error is in the detail), or name another "
-    "container_engine in the pipeline",
-}
-
-
-def _decision_status() -> JobStatus:
+def _status(code: int) -> JobStatus:
     return JobStatus(
-        state=JobState.FAILED, exit_code=3, observed_at=datetime.now(UTC), native_state="FAILED"
+        state=JobState.FAILED, exit_code=code, observed_at=datetime.now(UTC), native_state="FAILED"
     )
 
 
 def _handle() -> JobHandle:
     return JobHandle(
-        adapter="ssh", native_id="28941", data={"execution_dir": "/home/u/jobs/op/executions/e1"}
+        adapter="ssh", native_id="27990", data={"execution_dir": "/home/u/jobs/op/executions/e1"}
     )
 
 
-@pytest.mark.asyncio
-async def test_an_install_job_that_needs_a_decision_no_answer_fixes_fails_with_its_issue(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def _end(
+    monkeypatch: pytest.MonkeyPatch, text: str, code: int, tail: str | None
+) -> tuple[_Adapter, _Service, object]:
     async def resubmit(*args: object) -> str:
         raise AssertionError("relay must not check again on the login host")
 
     monkeypatch.setattr(installing, "_resubmit", resubmit)
-    adapter = _Adapter(json.dumps(ENGINE_UNUSABLE) + "\n")
-    service = _Service()
+    adapter, service = _Adapter(text), _Service()
     result = await installing._ended(  # pyright: ignore[reportPrivateUsage]
         service,  # pyright: ignore[reportArgumentType]
         "op",
-        _decision_status(),
+        _status(code),
         (adapter, _handle()),  # pyright: ignore[reportArgumentType]
-        None,
+        tail,
     )
+    return adapter, service, result
+
+
+@pytest.mark.asyncio
+async def test_an_install_job_that_exits_6_fails_with_its_records_whole(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, service, result = await _end(monkeypatch, json.dumps(BUILD) + "\n", 6, "raw tail")
     assert result == "record"
+    assert adapter._files.paths == ["/home/u/jobs/op/executions/e1/install/issues.jsonl"]  # pyright: ignore[reportPrivateUsage]
     state, refusal = service.finished[0]
     assert state == OperationState.FAILED
     assert refusal is not None
-    assert refusal.data["kind"] == "container_engine_unusable"
-    assert refusal.data["install_job"] == "28941"
-    assert "ares-comp-18" in refusal.message
-    assert "fix podman on this host" in refusal.message
+    assert refusal.message == BUILD["message"]
+    assert refusal.data["failures"] == [BUILD]
+    assert refusal.data["install_job"] == "27990"
     assert installing.install_kind(refusal) is None
 
 
 @pytest.mark.asyncio
-async def test_an_install_job_with_a_blocking_question_fails_with_it(
+async def test_an_install_job_that_exits_6_with_no_record_passes_its_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def resubmit(*args: object) -> str:
-        raise AssertionError("relay must not check again on the login host")
+    _adapter, service, _result = await _end(monkeypatch, "", 6, "==> Error: out of space\n")
+    _state, refusal = service.finished[0]
+    assert refusal is not None
+    assert refusal.message == "==> Error: out of space"
 
-    monkeypatch.setattr(installing, "_resubmit", resubmit)
+
+@pytest.mark.asyncio
+async def test_an_install_job_that_ends_otherwise_passes_its_output_as_printed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _adapter, service, _result = await _end(monkeypatch, "", 1, "slurmstepd: CANCELLED\n")
+    _state, refusal = service.finished[0]
+    assert refusal is not None
+    assert refusal.message == "slurmstepd: CANCELLED"
+    assert refusal.data["exit_code"] == 1
+    assert "JARVIS could not" not in refusal.message
+
+
+@pytest.mark.asyncio
+async def test_an_install_job_with_an_issue_no_answer_settles_fails_in_jarvis_s_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     stuck: dict[str, Any] = {
         "issue_id": "q1",
         "kind": "mpi_unavailable",
         "answerable": True,
         "candidates": [],
-        "question": "Which MPI should JARVIS use?",
         "detail": "no MPI on the compute nodes",
+        "hint": "Load an MPI module first.",
     }
-    adapter = _Adapter(json.dumps(stuck) + "\n")
-    service = _Service()
-    await installing._ended(  # pyright: ignore[reportPrivateUsage]
-        service,  # pyright: ignore[reportArgumentType]
-        "op",
-        _decision_status(),
-        (adapter, _handle()),  # pyright: ignore[reportArgumentType]
-        None,
-    )
+    _adapter, service, _result = await _end(monkeypatch, json.dumps(stuck) + "\n", 3, None)
     state, refusal = service.finished[0]
     assert state == OperationState.FAILED
     assert refusal is not None
-    assert "no MPI on the compute nodes" in refusal.message
+    assert refusal.message == "no MPI on the compute nodes. Load an MPI module first."
+    assert refusal.data["issues"] == [stuck]
 
 
 @pytest.mark.asyncio
@@ -327,17 +271,16 @@ async def test_an_install_job_with_a_question_checks_again_on_the_login_host(
     monkeypatch.setattr(installing, "_update", update)
     question = {
         "issue_id": "q2",
-        "kind": "mpi_choice",
+        "kind": "ambiguous_provider",
         "answerable": True,
         "question": "Which MPI should JARVIS use?",
         "candidates": [{"id": "openmpi", "constraint": "^openmpi"}],
     }
-    adapter = _Adapter(json.dumps(question) + "\n")
-    service = _Service()
+    adapter, service = _Adapter(json.dumps(question) + "\n"), _Service()
     result = await installing._ended(  # pyright: ignore[reportPrivateUsage]
         service,  # pyright: ignore[reportArgumentType]
         "op",
-        _decision_status(),
+        _status(3),
         (adapter, _handle()),  # pyright: ignore[reportArgumentType]
         None,
     )

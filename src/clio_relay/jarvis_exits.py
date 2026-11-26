@@ -3,7 +3,8 @@
 The site script (:data:`~clio_relay.jarvis_site_script.SITE_SCRIPT`) exits 69 when
 relay's JARVIS is missing, 3 when JARVIS needs software installed or a choice,
 4 when JARVIS refused to build outside an allocation, 5 when JARVIS refused the
-pipeline and 6 for a typed install failure. Its ``check`` mode (the light
+pipeline and 6 when something JARVIS ran failed (its failure records). Its
+``check`` mode (the light
 ``ppl install +check``) exits 0 with JARVIS's install report when JARVIS's
 record says the package's software is all there. Its ``install`` mode exits 0
 with no job when JARVIS answered on the submitting host (:func:`checked_here`)

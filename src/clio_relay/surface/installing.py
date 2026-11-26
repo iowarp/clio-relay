@@ -261,8 +261,7 @@ async def ask_install(
             approval = await provider.approve(
                 site=site,
                 operation_id=operation_id,
-                message=cast(str | None, refusal.data.get("ask_message"))
-                or install_wording.install_message(
+                message=install_wording.install_message(
                     report,
                     site=site.title,
                     package=package,
@@ -612,18 +611,19 @@ async def _ended(
     record = service.operation(operation_id)
     site = service.site(record.site).title
     issues = await install_logs.job_issues(adapter, handle)
-    found = install_failures.from_issues(
-        issues,
-        site=site,
-        install_log=install_logs.log_path(handle),
-        install_job=handle.native_id,
-    )
+    where: dict[str, Any] = {
+        "install_log": install_logs.log_path(handle),
+        "install_job": handle.native_id,
+    }
+    output = tail if isinstance(tail, str) else ""
+    if status.exit_code == install_failures.EXIT_INSTALL_FAILED:
+        # Something JARVIS ran failed: its records and words go to the agent whole.
+        return service.finish(
+            operation_id,
+            OperationState.FAILED,
+            install_failures.failed(issues, site=site, output=output, **where),
+        )
     if status.exit_code == jarvis_submit.EXIT_DECISION:
-        # An issue no answer fixes (a container engine that cannot run on the job's
-        # node) ends the operation with the job's own report: the login host may not
-        # see it, and checking there again would only ask the same approval again.
-        if found is not None and install_kind(found) is None:
-            return service.finish(operation_id, OperationState.FAILED, found)
         blocking = jarvis_report.blocking_issues({"issues": issues})
         if blocking:
             return service.finish(
@@ -637,23 +637,22 @@ async def _ended(
         return await _resubmit(
             service, operation_id, "the install job needs a decision; JARVIS checks again"
         )
-    if found is not None and install_kind(found) is not None:
-        return await ask_install(service, operation_id, service.site(record.site), found)
-    if found is not None:
-        return service.finish(operation_id, OperationState.FAILED, found)
-    detail = status.message or f"the install job ended {status.native_state or 'badly'}"
-    message = f"JARVIS could not install the package's software: {detail}"
-    if isinstance(tail, str) and tail.strip():
-        message = f"{message}\n{tail.strip()[-1500:]}"
+    # Any other end: what the job printed, as it printed it.
+    message = (
+        output.strip()[-4000:]
+        or status.message
+        or f"the install job ended {status.native_state or status.state.value}"
+    )
     return service.finish(
         operation_id,
         OperationState.FAILED,
         Refusal(
             RefusalReason.SUBMIT_FAILED,
             message,
+            site=site,
             needs=jarvis_submit.NEEDS_INSTALL,
             exit_code=status.exit_code,
-            install_log=install_logs.log_path(handle),
-            install_job=handle.native_id,
+            issues=issues,
+            **where,
         ),
     )

@@ -198,15 +198,10 @@ package (`site_copy`). When it finds one, the question is whether to use the
 site's copy or build with Spack: each option's meaning is JARVIS's `does` and
 `why`, the recommended one is JARVIS's, and JARVIS records the answer for that
 package on the site. When it finds none, the install approval says so first.
-When a chosen site copy does not load (`site_copy_unusable`), the question
-offers the site's other copies, a Spack build, or forgetting the choice so the
-site-copy question is asked again. When a Spack itself fails before any package
-(`spack_broken`), the question offers leaving out only the failing repos (when
-the failure is confined to them, and then recommended), running JARVIS's Spack
-commands without the person's user config, each with what it leaves out,
-skipping that Spack, or checking again after the person fixes it. Relay shows each option as JARVIS
-wrote it and sends only the answers given in that round, so a check that still
-fails is asked again.
+A chosen site copy that does not load, or a Spack that fails before any
+package, is a failure (exit 6, below), not a question. Relay shows each option
+as JARVIS wrote it and sends every answer the person gave in the operation, so
+JARVIS uses the ones for the questions it still raises.
 When the site chose the login host for
 checks, the check runs there and relay submits no check job. Where JARVIS
 builds is the same choice, and relay declares no default for it, so a site
@@ -230,17 +225,19 @@ progress until it ends or you cancel it. When JARVIS refuses a build outside
 an allocation (exit 4, `build_outside_allocation`), for example because the
 login host had no room for its limits, relay reports it as `policy_refused`
 and does not retry it. `describe(job=...)` follows the install log and its progress
-for as long as the install takes, then relay submits the run. When Spack
-itself fails, JARVIS types the failure and exits 6 (`compiler_unavailable`,
-`fetch_failed`, `build_failed`, `variant_conflict`, `no_recipe`,
-`concretize_failed` or `install_failed`, each with the host, stage, failed
-node, log tail and remedy, in `install/issues.jsonl`). Relay passes it on: a
-failure the person answers, such as the compiler to build with, becomes the
-install questions again; any other fails the run with JARVIS's `kind`, its
-message and remedy, the issues (each with the last 20 lines of the log),
-`install_log` (the whole log on the site, for `files`) and `install_job` (the
-scheduler's job id). An install job that ends without a typed issue fails
-`submit_failed` with the end of the log in its message.
+for as long as the install takes, then relay submits the run. When something
+JARVIS runs fails (a Spack build, a compiler probe, a Spack that breaks on its
+own, a site copy that does not load), JARVIS exits 6 with one failure record
+per failure (in its install report, and in `install/issues.jsonl` for an
+install job): the stage, host, command and exit code, a preview of the output,
+`output_path` (the whole output on the site, for `files`) and the logs
+involved. Relay asks nothing about it and adds no words: the run fails
+`submit_failed` with JARVIS's own line for each failure as the message and the
+records whole in `failures`, with `install_log` and `install_job` (the
+scheduler's job id) for a job. The agent reads the output, decides what to
+change (for example the install's `scheduler.install.exclude`), and the person
+confirms the consequential steps. An install job that ends any other way fails
+with the end of what it printed, as printed.
 When a pick rests on a site fact JARVIS cannot settle by itself, such as the
 MPI launch network, JARVIS raises `site_fact_uncertain`. A blocking one stops
 the check before anything is submitted, and relay refuses the run
