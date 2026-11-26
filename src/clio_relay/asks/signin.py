@@ -202,7 +202,9 @@ class SignIns:
             self._fail(item, refusal.message)
         except Exception as exc:
             logger.exception("the sign-in to %s failed", item.site)
-            self._fail(item, f"the sign-in failed: {type(exc).__name__}")
+            detail = str(exc).strip()[:300]
+            reason = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+            self._fail(item, f"the sign-in failed: {reason}")
         else:
             await self.complete(item)
             return
