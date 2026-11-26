@@ -11,6 +11,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from clio_relay.adapters import base as adapter_base
 from clio_relay.adapters.hooks import set_hook
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.store import SiteStore
@@ -89,6 +90,19 @@ def stub_guard() -> Iterator[None]:
         yield
     finally:
         set_hook("guard", None)
+
+
+@pytest.fixture(autouse=True)
+def forget_patched_adapter_verbs() -> Iterator[None]:
+    """Clear the isinstance caches of the optional adapter protocols after each test.
+
+    A test that patches a verb such as ``live_jobs`` onto ``FixtureAdapter`` makes
+    ABCMeta cache the class as having it, and the cache outlives the patch.
+    """
+    yield
+    for value in vars(adapter_base).values():
+        if isinstance(value, type) and getattr(value, "_is_runtime_protocol", False):
+            cast(Any, value)._abc_caches_clear()
 
 
 @pytest.fixture(autouse=True)

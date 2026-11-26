@@ -225,6 +225,8 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 @functools.cache
 def _kernel32() -> Any:
+    if sys.platform != "win32":
+        raise OSError("kernel32 exists only on Windows")
     import ctypes
     from ctypes import wintypes
 
@@ -259,7 +261,7 @@ def _running(pid: int, handle: int | None) -> bool:
 
 
 def _exit_code(handle: int | None) -> int:
-    if os.name != "nt" or not handle:
+    if sys.platform != "win32" or not handle:
         return -1
     import ctypes
     from ctypes import wintypes

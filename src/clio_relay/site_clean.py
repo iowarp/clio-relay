@@ -491,7 +491,9 @@ async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any
             shutil.rmtree(directory, ignore_errors=True)
             local.append(str(directory))
     gone = [*planned["targets"], *report.get("removed", []), *report.get("absent", [])]
-    site_writes.forget(service.paths.state_dir, site_id, [str(path) for path in gone])
+    written = site_writes.written(service.paths.state_dir, site_id)
+    dropped = [path for path in written if under(path, gone) and not under(path, keep)]
+    site_writes.forget(service.paths.state_dir, site_id, dropped)
     return {
         "schema": SCHEMA,
         "site": site_id,

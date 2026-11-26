@@ -23,7 +23,7 @@ from clio_relay.adapters.hooks import ask_text
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
-from clio_relay.surface import install_op
+from clio_relay.surface import install_logs, install_op
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.testing.fixture_adapter import FixtureAdapter
@@ -78,6 +78,15 @@ def test_the_site_script_start_document_is_a_login_build_handle() -> None:
     assert (
         here is not None and jarvis_exits.ran_here(here) and jarvis_exits.built_here(here) is None
     )
+
+
+def test_an_install_job_log_is_found_through_a_site_worker() -> None:
+    """The worker wraps the site's handle; the install job's log is still read."""
+    execution = "/home/u/runs/op_x/relay_op_x/executions/op_x-install-2"
+    site = JobHandle(adapter="local", native_id="29154", data={"execution_dir": execution})
+    wrapped = JobHandle(adapter="worker", data={"remote": site.model_dump(mode="json")})
+    assert install_logs.log_path(wrapped) == f"{execution}/install/install.log"
+    assert install_logs.log_path(site) == install_logs.log_path(wrapped)
 
 
 def test_the_approval_says_where_jarvis_builds() -> None:

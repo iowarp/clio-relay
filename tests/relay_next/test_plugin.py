@@ -55,15 +55,23 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text("utf-8"))["project"]
     assert server["args"][-2:] == ["clio-relay", "serve"]
     assert "clio-relay" in project["scripts"]
-    source = server["args"][server["args"].index("--from") + 1]
+    assert server["args"][:4] == ["run", "--project", "${PLUGIN_ROOT}/server", "--frozen"]
+    locked = tomllib.loads((PLUGIN / "server" / "pyproject.toml").read_text("utf-8"))
+    (source,) = locked["project"]["dependencies"]
     # The tapis extra brings tapipy; without it every Tapis call under CLIO refuses.
-    pinned = r"clio-relay\[tapis\] @ git\+https://github\.com/iowarp/clio-relay@[0-9a-f]{40}"
-    assert re.fullmatch(pinned, source)
+    # A release wheel, never git: the server project builds nothing (no-build).
+    pinned = (
+        r"clio-relay\[tapis\] @ https://github\.com/iowarp/clio-relay/releases/download/"
+        r"v(?P<v>[0-9][^/]*)/clio_relay-(?P=v)-py3-none-any\.whl"
+    )
+    assert re.fullmatch(pinned, source), source
+    assert locked["tool"]["uv"]["no-build"] is True
     assert "tapis" in project["optional-dependencies"]
     assert server["env"] == {
         "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
         "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
         "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}",
+        "CLIO_RELAY_PACKAGE_SOURCES": "${PLUGIN_ROOT}/packages",
     }
     launched = {
         "CLIO_RELAY_CONFIG_DIR": "/plugin-data/config",

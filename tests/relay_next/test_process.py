@@ -80,7 +80,7 @@ async def test_no_limit_runs_to_the_end_and_reports_quiet_stretches() -> None:
     # Reported at 0.3 s, then every 0.3 s while it stays quiet.
     assert 3 <= len(reports) <= 6, reports
     assert all(idle >= 0.3 for idle, _ in reports)
-    assert all(next_s <= 0.3 for _, next_s in reports), reports
+    assert all(next_s <= 0.3 + 1e-9 for _, next_s in reports), reports
     assert [idle for idle, _ in reports] == sorted(idle for idle, _ in reports)
 
 

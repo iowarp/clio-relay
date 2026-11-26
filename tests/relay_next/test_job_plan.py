@@ -108,7 +108,8 @@ def test_a_plan_keeps_what_the_card_shows() -> None:
     assert plan["plan_sha256"] == "5eed"
     assert [c["id"] for c in plan["components"]] == ["solver", "viewer"]
     assert plan["script"]["text"].startswith("#!/bin/bash")
-    assert "submit_with" not in plan and "input_sha256" not in plan
+    assert "submit_with" not in plan
+    assert plan["input_sha256"] == "11"
     long = _document(script={"path": "/x", "text": "x" * (jarvis_plan.SCRIPT_LIMIT + 1)})
     kept = jarvis_plan.parse(_line(long))
     assert kept is not None and kept["script"]["text"] is None
@@ -211,7 +212,12 @@ class _Jarvis:
         self.submitted: list[JobSpec] = []
         self.sha = "5eed"
         self.refuse_once = False
+        self.changed: dict[str, Any] = {"time": "02:00:00", "time_limit_s": 7200}
+        """What the plan JARVIS makes after its refusal changes; the walltime by default."""
         self.status = JobStatus(state=JobState.QUEUED)
+
+    def document(self) -> dict[str, Any]:
+        return _document(self.sha, **(self.changed if self.sha == "beef" else {}))
 
 
 @pytest.fixture
@@ -221,7 +227,7 @@ def jarvis(monkeypatch: pytest.MonkeyPatch, relay_paths: RelayPaths) -> Iterator
 
     async def plan_job(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> Any:
         state.plans.append(operation_id)
-        return jarvis_plan.parse(_line(_document(state.sha)))
+        return jarvis_plan.parse(_line(state.document()))
 
     async def run(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> JobHandle:
         if state.refuse_once:
@@ -233,7 +239,7 @@ def jarvis(monkeypatch: pytest.MonkeyPatch, relay_paths: RelayPaths) -> Iterator
                 kinds=[jarvis_plan.PLAN_CHANGED],
             )
         state.submitted.append(spec)
-        plan = jarvis_plan.parse(_line(_document(state.sha)))
+        plan = jarvis_plan.parse(_line(state.document()))
         return JobHandle(adapter="fixture", native_id="77", data={jarvis_plan.KEY: plan})
 
     async def status(self: FixtureAdapter, handle: JobHandle) -> JobStatus:
@@ -342,6 +348,7 @@ def test_a_changed_plan_asks_once_more_with_the_new_plan(
         second = _card(service, record)
         assert second.ask_id != first.ask_id
         assert second.message.startswith(plan_card.CHANGED)
+        assert "Walltime: 01:00:00, now 02:00:00" in second.message
         assert second.binding["plan_sha256"] == "beef"
         assert (record.result or {})[plan_card.ROUNDS] == 1
         assert ((second.meta or {})[job_card.JOB_META])["source"] == "jarvis"
@@ -351,6 +358,30 @@ def test_a_changed_plan_asks_once_more_with_the_new_plan(
         (submitted,) = jarvis.submitted
         assert submitted.environment[jarvis_plan.BIND_ENV] == "sha256:beef"
         assert record.state == OperationState.QUEUED, record
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_plan_changed_only_in_its_sealed_input_is_bound_without_asking(
+    relay_paths: RelayPaths, jarvis: _Jarvis
+) -> None:
+    jarvis.refuse_once = True
+    jarvis.changed = {"input_sha256": "22"}
+
+    async def scenario() -> None:
+        service = RelayService(relay_paths)
+        record = await service.start_run("fx", SPEC, confirm=True)
+        first = _card(service, record)
+        service.answer(first.ask_id, "accept", {"approve": "approve"}, by="test")
+        record = await service.advance(record.operation_id)
+        assert record.state == OperationState.QUEUED, record
+        (submitted,) = jarvis.submitted
+        assert submitted.environment[jarvis_plan.BIND_ENV] == "sha256:beef"
+        (rebind,) = (record.result or {})[plan_card.REBINDS]
+        assert (rebind["from"], rebind["to"]) == ("5eed", "beef")
+        assert rebind["input_sha256"] == {"was": "11", "now": "22"}
+        assert len(record.asks) == 1
         await service.close()
 
     asyncio.run(scenario())

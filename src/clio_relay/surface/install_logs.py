@@ -14,7 +14,7 @@ from typing import Any
 
 from clio_relay import install_failures, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.jarvis_exits import built_here
+from clio_relay.jarvis_exits import built_here, site_data
 from clio_relay.jobs.handles import JobHandle
 
 logger = logging.getLogger(__name__)
@@ -27,12 +27,13 @@ def log_path(handle: JobHandle) -> str | None:
     if login is not None:
         log = login.get("log")
         return log if isinstance(log, str) and log else None
-    execution = handle.data.get("execution_dir")
-    job_dir = handle.data.get("job_dir") or handle.data.get("root")
+    data = site_data(handle)
+    execution = data.get("execution_dir")
+    job_dir = data.get("job_dir") or data.get("root")
     if not isinstance(execution, str) or not execution:
         if not isinstance(job_dir, str) or not job_dir:
             return None
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
+        execution_id, pipeline = jarvis_submit.handle_pipeline(data)
         execution = jarvis_submit.execution_dir(job_dir, execution_id, pipeline=pipeline)
     return posixpath.join(execution, "install", "install.log")
 

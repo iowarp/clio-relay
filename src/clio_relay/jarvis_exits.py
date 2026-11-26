@@ -164,7 +164,8 @@ def without_job(
     return built or checked_here(adapter, exit_code, output, handle)
 
 
-def _data(handle: JobHandle) -> dict[str, Any]:
+def site_data(handle: JobHandle) -> dict[str, Any]:
+    """The data of the handle the site's own adapter made, inside a worker's handle."""
     remote = handle.data.get("remote")
     data = cast(dict[str, Any], remote).get("data") if isinstance(remote, dict) else handle.data
     return cast(dict[str, Any], data) if isinstance(data, dict) else {}
@@ -172,12 +173,12 @@ def _data(handle: JobHandle) -> dict[str, Any]:
 
 def ran_here(handle: JobHandle) -> bool:
     """Say whether an install handle is :func:`checked_here`'s, also through a worker."""
-    return _data(handle).get(CHECKED_HERE) is True
+    return site_data(handle).get(CHECKED_HERE) is True
 
 
 def built_here(handle: JobHandle) -> dict[str, Any] | None:
     """Return :func:`login_build`'s record of an install handle, also through a worker."""
-    found = _data(handle).get(LOGIN_BUILD)
+    found = site_data(handle).get(LOGIN_BUILD)
     return cast(dict[str, Any], found) if isinstance(found, dict) else None
 
 
