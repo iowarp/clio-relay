@@ -343,7 +343,7 @@ wheels = [
 
 [[package]]
 name = "clio-relay"
-version = "2.0.0a34"
+version = "2.0.0a35"
 source = { editable = "." }
 dependencies = [
     { name = "aioquic" },
