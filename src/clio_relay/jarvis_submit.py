@@ -116,7 +116,7 @@ RECORD_FILE = ".jarvis-execution.json"
 JARVIS_VERSION = "1.9.14"
 """The jarvis-cd release relay installs under the CLIO site home and runs. Until 1.9.14 is
 out, relay runs its candidate commit (:data:`JARVIS_SOURCE`)."""
-JARVIS_PIN = "472b753b0c17891f2d8785c1c84861388e9cb6c9"
+JARVIS_PIN = "96ea53d71c84269617430aad999241c61e77ccac"
 """The commit relay runs: the 1.9.14 candidate. It is written to the pin file."""
 JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
 """The 1.9.14 candidate by its commit, which pip clones from github.com. The release
