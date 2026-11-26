@@ -93,7 +93,7 @@ prerelease = "allow"
 [dependency-groups]
 dev = [
     "hatchling==1.31.0",
-    "jarvis-cd @ https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.15/jarvis_cd-1.9.15-py3-none-any.whl",
+    "jarvis-cd @ https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.16/jarvis_cd-1.9.16-py3-none-any.whl",
     "pip-audit>=2.10.0",
     "pyright>=1.1.390",
     "pytest>=8.3",

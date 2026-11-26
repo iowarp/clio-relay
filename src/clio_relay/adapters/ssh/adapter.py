@@ -272,13 +272,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
             # $JARVIS_RESOURCE_GRAPH; relay: the home's own, which only collection fills.
             "source": source,
             "published": source != "relay",
+            # JARVIS only reads a named graph; what it records goes to its own graph
+            # here, under the CLIO site home, over the named one.
+            "site_home": first("site_home"),
             "decisions": first("decisions_path"),
             "net": jarvis_submit.graph_report(graph_text),
         }
         if source == "site":
             graph["note"] = (
                 "The site publishes this resource graph ($JARVIS_RESOURCE_GRAPH) and every "
-                "relay JARVIS call uses it. Relay never writes it; nothing to collect"
+                "relay JARVIS call uses it. JARVIS only reads it, keeping what it records "
+                "under site_home; nothing to collect"
             )
             if "graph" not in sections:
                 graph["note"] += (

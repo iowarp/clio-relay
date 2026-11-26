@@ -16,6 +16,13 @@ GRAPH_LOOKUP = (
     '  case $G in "~") G=$HOME ;; "~/"*) G=$HOME/${G#??} ;; esac\n'
     '  if [ -n "$G" ] && [ -f "$G" ] && [ -r "$G" ]; then GS=site; else G=$GO; GS=relay; fi\n'
     "fi\n"
+    'gdir() { d=${1%/*}; (cd "$d" 2>/dev/null && pwd -P) || printf \'%s\\n\' "$d"; }\n'
+    "SH=; JG=$G\n"
+    'if [ -n "$GO" ]; then\n'
+    "  SH=${GO%/*}\n"
+    '  if [ "$GS" != relay ] && [ "$(gdir "$G")" = "$(gdir "$GO")" ]; then G=$GO; GS=relay; fi\n'
+    '  if [ "$GS" = relay ]; then JG=${SH%/*}/no-site-graph/resource_graph.yaml; fi\n'
+    "fi\n"
 )
 """Shell lines that set ``G`` to the site's JARVIS resource graph and ``GS`` to its source.
 
@@ -27,6 +34,14 @@ GRAPH_LOOKUP = (
 then a login shell's, for a site that sets it only there. Relay never overrides
 it. Only with neither is it relay's own (``GS=relay``), which relay's network
 collection fills.
+
+JARVIS reads a named graph and never writes it; what it records goes to its
+site home (jarvis-cd 1.9.16), which relay sets to ``SH``, the directory of
+relay's own graph, so every write stays under the CLIO site home. ``JG`` is what
+relay exports as ``JARVIS_RESOURCE_GRAPH``: the site's graph, or, with none, a
+file relay never makes, so JARVIS's own graph in ``SH`` is relay's (``GO``).
+A site graph in ``SH`` itself is relay's own: JARVIS refuses a site home that
+holds the site graph.
 """
 
 SITE_SCRIPT = (
@@ -86,8 +101,7 @@ G=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
 GO=$(home "${CLIO_RELAY_JARVIS_GRAPH_OWN:-}")
 """
     + GRAPH_LOOKUP
-    + r"""graph=$G
-spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
+    + r"""spack_env=$(home "${CLIO_RELAY_JARVIS_SPACK_ENV:-}")
 install_env=$(home "${CLIO_RELAY_JARVIS_INSTALL_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
@@ -105,12 +119,11 @@ if [ -n "$spack_root" ] && [ -x "$spack_root/bin/spack" ]; then
   export JARVIS_SPACK_ROOT="$spack_root"
 fi
 # The site's own JARVIS record, shared by every per-job root: the resource graph and the
-# install decisions. JARVIS reads and writes both; relay keeps no copy. A graph the site
-# publishes ($JARVIS_RESOURCE_GRAPH) is the site's and already there; relay makes no
-# directory for it.
-if [ -n "$graph" ]; then
-  [ "$GS" = site ] || mkdir -p "$(dirname "$graph")"
-  export JARVIS_RESOURCE_GRAPH="$graph"
+# install decisions. A graph the site publishes ($JARVIS_RESOURCE_GRAPH) is the site's:
+# JARVIS only reads it, and keeps what it records in relay's site home ($SH).
+if [ -n "$JG" ]; then
+  if [ -n "$SH" ]; then mkdir -p "$SH"; export JARVIS_SITE_HOME="$SH"; fi
+  export JARVIS_RESOURCE_GRAPH="$JG"
 fi
 if [ -n "$decisions" ]; then
   mkdir -p "$(dirname "$decisions")"
@@ -467,7 +480,9 @@ without it, the graph the site publishes as ``$JARVIS_RESOURCE_GRAPH``, else
 ``$CLIO_RELAY_JARVIS_DECISIONS``,
 ``$CLIO_RELAY_JARVIS_SPACK_ENV`` and ``$CLIO_RELAY_JARVIS_INSTALL_ENV`` become
 ``JARVIS_RESOURCE_GRAPH``, ``JARVIS_SPACK_DECISIONS``, ``JARVIS_SPACK_ENV_DIR``
-and ``JARVIS_INSTALL_ENV_DIR`` (:func:`site_environment`).
+and ``JARVIS_INSTALL_ENV_DIR`` (:func:`site_environment`), and the directory of
+``$CLIO_RELAY_JARVIS_GRAPH_OWN`` becomes ``JARVIS_SITE_HOME``, where JARVIS keeps
+what it records over a named graph.
 When the CLIO Spack is on the site,
 ``$CLIO_RELAY_SPACK_ROOT`` becomes ``JARVIS_SPACK_ROOT`` (only when its
 ``bin/spack`` is there). The script unsets

@@ -507,11 +507,12 @@ def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
         + f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={program}\n"
-        'echo "@@graph_path $G"; echo "@@graph_source $GS"; echo "@@decisions_path $D"\n'
+        'echo "@@graph_path $G"; echo "@@graph_source $GS"; echo "@@site_home $SH"; '
+        'echo "@@decisions_path $D"\n'
         'if [ -x "$JB" ]; then\n'
         '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
         '  echo "@@graph"\n'
-        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" '
+        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$JG" JARVIS_SITE_HOME="$SH" '
         f"{jarvis_graph.NO_BUILTIN_ENV}=1 "
         '$T "$JB" rg net show +json </dev/null 2>&1\n'
         "fi\n"
@@ -529,9 +530,10 @@ def graph_collect_command(
     run`` with no scheduler), with the site graph and a site-level JARVIS root,
     printing JARVIS's handle as JSON. An argument after the argv's own (``$1``)
     is the queue the job goes to; with none, the scheduler's default. ``graph``
-    is the site's ``jarvis_graph`` setting, which the collection then writes to.
-    A graph the site publishes as ``$JARVIS_RESOURCE_GRAPH`` is the person's:
-    the collection refuses to write it (exit 64).
+    is the site's ``jarvis_graph`` setting. JARVIS only reads a named graph and
+    writes what it collects to its own graph in relay's site home, over it. A
+    graph the site publishes as ``$JARVIS_RESOURCE_GRAPH`` is the site's record,
+    so relay generates none beside it (exit 64).
     """
     home = remote_dir.rstrip("/") or "/"
     pipeline = jarvis_submit.render_pipeline(jarvis_submit.graph_pipeline(scheduler))
@@ -556,13 +558,14 @@ def graph_collect_command(
         '[ -x "$JB" ] || { echo "relay has not placed JARVIS on this site yet" >&2; exit 69; }\n'
         + jarvis_submit.graph_lines(home, graph, root_expression)
         + '[ "$GS" != site ] || { echo "the site publishes its resource graph at $G '
-        '($JARVIS_RESOURCE_GRAPH); relay does not write it" >&2; exit 64; }\n'
+        '($JARVIS_RESOURCE_GRAPH); relay generates one only for a site that publishes none" '
+        ">&2; exit 64; }\n"
         + _init_site_root(jarvis)
         + jarvis_graph.write_lines('"$S"')
         + f'printf %s {q(pipeline)} > "$S/site_net.yaml"\n'
         + queue
-        + 'mkdir -p "$(dirname "$G")"\n'
-        + 'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" '
+        + 'mkdir -p "$SH"\n'
+        + 'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$JG" JARVIS_SITE_HOME="$SH" '
         f'exec "$JB" ppl {verb} {source}"$S/site_net.yaml" +json\n'
     )
     return ["sh", "-c", script, "site_net"]
@@ -597,8 +600,9 @@ def _init_site_root(jarvis: str) -> str:
 
 
 _JARVIS_EXPORTS = (
-    '[ "$GS" = site ] || mkdir -p "$(dirname "$G")" 2>/dev/null\n'
-    'export JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$G" JARVIS_SPACK_DECISIONS="$D"\n'
+    'mkdir -p "$SH" 2>/dev/null\n'
+    'export JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$JG" JARVIS_SITE_HOME="$SH" '
+    'JARVIS_SPACK_DECISIONS="$D"\n'
     'if [ -x "$SR/bin/spack" ]; then export JARVIS_SPACK_ROOT="$SR"; fi\n'
 )
 
