@@ -411,7 +411,8 @@ def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
     env = _env(tmp_path, tmp_path / "bin")
     done = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == f"ran in {job}"
+    # The script names the shared JARVIS home first, then JARVIS prints.
+    assert done.stdout.strip().splitlines()[-1] == f"ran in {job}"
     assert (job / PIPELINE_FILE).read_text() == PIPELINE
     last = (tmp_path / "jarvis.log").read_text().splitlines()[-1]
     assert last.endswith(f"ppl run yaml {job}/{PIPELINE_FILE} +json")
@@ -441,7 +442,7 @@ def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> 
         assert "are not <repo>.<package>" in done.stderr
     mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
     assert mode.returncode == EXIT_USAGE
-    assert "mode up is not submit, run, install, check or recheck" in mode.stderr
+    assert "mode up is not submit, plan, run, install, check or recheck" in mode.stderr
     unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
     assert unnamed.returncode == EXIT_USAGE
     assert "needs an execution id" in unnamed.stderr
@@ -477,7 +478,8 @@ def test_the_site_script_expands_a_home_jarvis_path(tmp_path: Path) -> None:
     env = _env(tmp_path, tmp_path / "bin", HOME=str(home))
     done = _site(job, env, digest, "demo.hello", "~/jv/bin/jarvis", "", PIPELINE)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip() == f"ran in {job}"
+    # The script names the shared JARVIS home first, then JARVIS prints.
+    assert done.stdout.strip().splitlines()[-1] == f"ran in {job}"
 
 
 def _holder(

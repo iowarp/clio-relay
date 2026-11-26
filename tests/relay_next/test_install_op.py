@@ -534,12 +534,22 @@ def test_concurrent_observers_of_an_ended_install_job_check_it_once(
         asked = len(service.operation(record.operation_id).asks)
         await asyncio.gather(*(service.refresh(record.operation_id) for _ in range(2)))
         after = service.operation(record.operation_id)
-        assert site.calls == ["check", "install", "check"]
-        # The check found the software still missing: it asks once, not once per observer.
-        assert after.state == OperationState.AWAITING_INPUT, after
-        assert len(after.asks) == asked + 1
-        assert len(service.outstanding(after)) == 1
-        assert [change.state for change in after.history].count(OperationState.SUBMITTING) == 2
+        # One observer checks the ended job; the other leaves it be.
+        assert site.calls[:3] == ["check", "install", "check"], site.calls
+        assert site.calls.count("check") == 2
+        assert len(after.asks) == asked
+        assert service.outstanding(after) == []
+        if exit_code == 0:
+            # The job succeeded, yet the check finds the same software missing.
+            assert after.state == OperationState.FAILED, after
+            error = after.error or {}
+            assert (error.get("data") or {})["kind"] == jarvis_report.STILL_MISSING
+            assert site.calls == ["check", "install", "check"]
+        else:
+            # The job stopped for a decision and the build is already approved:
+            # JARVIS's next job goes on with it, once.
+            assert after.state == OperationState.QUEUED, after
+            assert site.calls == ["check", "install", "check", "install"]
         await service.close()
 
     asyncio.run(scenario())

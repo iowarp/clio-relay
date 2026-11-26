@@ -60,7 +60,7 @@ jobs:
           enable-cache: true
           version: "0.11.28"
       - name: install dependencies
-        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups
+        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups --all-extras
       - name: pytest
         run: uv run --no-sync pytest
 

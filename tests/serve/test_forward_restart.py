@@ -32,8 +32,11 @@ from clio_relay.serve.runtime import ServeRuntime
 from .helpers import frp_plan
 
 HOLD = (
-    "import socket, sys, time\n"
+    "import os, socket, sys, time\n"
     "s = socket.socket()\n"
+    # As frpc and ssh do on POSIX: a connection's TIME_WAIT never holds the port.
+    "if os.name != 'nt':\n"
+    "    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
     "s.bind(('127.0.0.1', int(sys.argv[1])))\n"
     "s.listen()\n"
     "while True:\n"

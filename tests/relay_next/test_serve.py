@@ -152,8 +152,11 @@ def test_serve_without_tasks_waits_for_the_endpoint(
             assert "viz: relay-host:8080" in text and "token" not in text
 
             described = await client.call_tool("describe", {"job": view["operation_id"]})
+            # The panel's URL rides only in _meta, for the host's panel; the model never reads it.
             assert SECRET not in json.dumps(_structured(described))
-            assert described.meta is None or SERVICE_META not in described.meta
+            described_text = " ".join(getattr(item, "text", "") for item in described.content)
+            assert SECRET not in described_text
+            assert (described.meta or {})[SERVICE_META] == {"url": SECRET}
 
             observed = await client.call_tool("serve", {"service": view["operation_id"]})
             assert _structured(observed)["state"] == "running"

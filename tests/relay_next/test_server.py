@@ -64,7 +64,10 @@ async def _approve(
     if isinstance(params, mcp_types.ElicitRequestURLParams):
         assert await asyncio.to_thread(answer_page, params.url) == 200
         return ElicitResult(action="accept", content=None)
-    return {"approve": True}
+    schema: dict[str, Any] = getattr(params, "requested_schema", None) or {}
+    properties: dict[str, Any] = schema.get("properties") or {}
+    field: dict[str, Any] = properties.get("approve") or {}
+    return {"approve": "approve" if field.get("type") == "string" else True}
 
 
 async def _decline(message: str, response_type: Any, params: Any, context: Any) -> Any:

@@ -347,8 +347,8 @@ def test_a_changed_plan_asks_once_more_with_the_new_plan(
         assert record.state == OperationState.AWAITING_INPUT, record
         second = _card(service, record)
         assert second.ask_id != first.ask_id
-        assert second.message.startswith(plan_card.CHANGED)
-        assert "Walltime: 01:00:00, now 02:00:00" in second.message
+        assert ask_text(second).startswith(f"{second.message}\n\n{plan_card.CHANGED}")
+        assert "Walltime: 01:00:00, now 02:00:00" in ask_text(second)
         assert second.binding["plan_sha256"] == "beef"
         assert (record.result or {})[plan_card.ROUNDS] == 1
         assert ((second.meta or {})[job_card.JOB_META])["source"] == "jarvis"
@@ -406,7 +406,7 @@ def test_over_mcp_a_changed_plan_is_a_second_card_and_one_submit(
 
     asyncio.run(scenario())
     assert len(person.shown) == 2
-    assert person.shown[1].message.startswith(plan_card.CHANGED)
+    assert f"\n\n{plan_card.CHANGED}\n\n" in person.shown[1].message
     (submitted,) = jarvis.submitted
     assert submitted.environment[jarvis_plan.BIND_ENV] == "sha256:beef"
 

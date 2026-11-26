@@ -75,7 +75,10 @@ def _answerer(auth: tuple[str, str] | None = None) -> ElicitationFnT:
         if isinstance(params, mcp_types.ElicitRequestURLParams):
             assert await asyncio.to_thread(answer_page, params.url, auth=auth) == 200
             return mcp_types.ElicitResult(action="accept")
-        return mcp_types.ElicitResult(action="accept", content={"approve": True})
+        properties: dict[str, Any] = params.requested_schema.get("properties") or {}
+        field: dict[str, Any] = properties.get("approve") or {}
+        approve = "approve" if field.get("type") == "string" else True
+        return mcp_types.ElicitResult(action="accept", content={"approve": approve})
 
     return answer
 
@@ -248,11 +251,16 @@ def test_plain_mcp_client_over_stdio(relay_paths: RelayPaths, mode: str) -> None
             assert {tool.name for tool in listed.tools} == {
                 "describe",
                 "run",
+                "install",
+                "cancel",
                 "exec",
+                "exec_read",
                 "files",
+                "files_read",
                 "serve",
                 "packages",
                 "packages_read",
+                "site_clean",
                 "shutdown",
             }
             for site in ("open", "spend", "sso"):
