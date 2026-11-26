@@ -169,14 +169,64 @@ def asks_page(ask_id: str) -> None:
     service = _service()
     ask = _ask(service, ask_id)
     base = read_base(paths.state_dir)
-    if base is None:
-        _fail("no relay is serving its page here. Start relay, then try again")
+    if base is None or not _page_answers(base):
+        if base is not None and not _loopback(base):
+            _fail(f"relay's page at {base} is not answering. Check the relay serving it")
+        _serve_page(service, ask)
+        return
     ttl = float(os.environ.get(PAGE_TTL_ENV) or DEFAULT_PAGE_TTL_S)
     token = PageTokens(paths.state_dir / "pages", ttl).mint(ask.ask_id)
     typer.echo(page_url(base, ask.ask_id, token))
-    if not base.startswith(("http://127.0.0.1", "http://localhost")):
+    if not _loopback(base):
         where = operator_token_file(paths.state_dir)
         typer.echo(f"Sign in with any user name and the operator token in {where}", err=True)
+
+
+def _loopback(base: str) -> bool:
+    return base.startswith(("http://127.0.0.1", "http://localhost"))
+
+
+def _page_answers(base: str) -> bool:
+    """Return whether the page a relay recorded still answers.
+
+    The record outlives its writer: a relay that exited, or one its host stopped,
+    leaves an address nothing answers.
+    """
+    import httpx
+
+    try:
+        httpx.get(f"{base.rstrip('/')}/relay/asks/", timeout=3.0)
+    except httpx.HTTPError:
+        return False
+    return True
+
+
+def _serve_page(service: RelayService, ask: Ask) -> None:
+    """Serve relay's page from this command until the ask is answered."""
+    from clio_relay.asks.provider import base_file, read_base
+
+    address = service.ask_provider.page_address(ask)
+    if address is None:
+        _fail("no relay is serving its page here, and this relay has no page to serve")
+    typer.echo(address)
+    typer.echo(
+        "No running relay is serving its page, so this command serves it until the ask "
+        "is answered. Press Ctrl+C to stop.",
+        err=True,
+    )
+    mine = read_base(service.paths.state_dir)
+    try:
+        while True:
+            current = service.asks.get(ask.ask_id)
+            if current is None or not _waiting(current):
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        asyncio.run(service.close())
+        if mine is not None and read_base(service.paths.state_dir) == mine:
+            base_file(service.paths.state_dir).unlink(missing_ok=True)
 
 
 def _identities() -> Identities:

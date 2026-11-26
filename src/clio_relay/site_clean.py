@@ -282,9 +282,17 @@ def _touched_site(record: Any) -> bool:
     """Say whether the operation's JARVIS job made its directory on the site.
 
     A run or serve does once its job is submitted; an install's first step is
-    JARVIS's check on the site, so every install does.
+    JARVIS's check on the site, so every install does. So does a run that had an
+    install stage, which ran that check in the run's directory, even when it
+    ended before its own job was submitted.
     """
-    return record.kind == "install" or getattr(record, "handle", None) is not None
+    result = cast(dict[str, Any], getattr(record, "result", None) or {})
+    staged: object = result.get(installing.INSTALL_KEY)
+    return (
+        record.kind == "install"
+        or getattr(record, "handle", None) is not None
+        or isinstance(staged, dict)
+    )
 
 
 def run_outputs(

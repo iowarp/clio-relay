@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -133,15 +134,19 @@ def test_choose_from_the_terminal(relay_paths: RelayPaths) -> None:
     assert stored.answer == {"action": "accept", "content": {"queue": "batch"}}
 
 
-def test_page_prints_a_fresh_address(relay_paths: RelayPaths) -> None:
+def test_page_prints_a_fresh_address(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ask = _choice(relay_paths)
-    base_file(relay_paths.state_dir).unlink(missing_ok=True)
-    nobody = runner.invoke(cli_asks.app, ["page", ask.ask_id])
-    assert nobody.exit_code == 2 and "Start relay" in nobody.output
     base_file(relay_paths.state_dir).parent.mkdir(parents=True, exist_ok=True)
     base_file(relay_paths.state_dir).write_text(
         json.dumps({"base": "http://127.0.0.1:9", "pid": 1}), encoding="utf-8"
     )
+
+    def answers(base: str) -> bool:
+        return True
+
+    monkeypatch.setattr(cli_asks, "_page_answers", answers)
     printed = runner.invoke(cli_asks.app, ["page", ask.ask_id])
     assert printed.exit_code == 0, printed.output
     url = printed.stdout.strip().splitlines()[0]
@@ -150,6 +155,31 @@ def test_page_prints_a_fresh_address(relay_paths: RelayPaths) -> None:
     assert PageTokens(relay_paths.state_dir / "pages").check(ask.ask_id, token) == "ok"
     other = runner.invoke(cli_asks.app, ["page", ask.ask_id]).stdout.strip()
     assert other != url
+
+
+def test_page_serves_itself_when_the_recorded_page_is_gone(
+    relay_paths: RelayPaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ask = _choice(relay_paths)
+    base_file(relay_paths.state_dir).parent.mkdir(parents=True, exist_ok=True)
+    base_file(relay_paths.state_dir).write_text(
+        json.dumps({"base": "http://127.0.0.1:9", "pid": 1}), encoding="utf-8"
+    )
+    served: list[int] = []
+
+    def answer_from_the_page(_seconds: float) -> None:
+        base = json.loads(base_file(relay_paths.state_dir).read_text(encoding="utf-8"))["base"]
+        served.append(httpx.get(f"{base}/relay/asks/", timeout=5.0).status_code)
+        RelayService(relay_paths).answer(ask.ask_id, "accept", {"queue": "batch"}, by="page")
+
+    monkeypatch.setattr(cli_asks.time, "sleep", answer_from_the_page)
+    printed = runner.invoke(cli_asks.app, ["page", ask.ask_id])
+    assert printed.exit_code == 0, printed.output
+    url = printed.stdout.strip().splitlines()[0]
+    assert url.startswith("http://127.0.0.1:") and "127.0.0.1:9/" not in url
+    assert served == [404]
+    assert _stored(relay_paths, ask.ask_id).state == "accepted"
+    assert not base_file(relay_paths.state_dir).exists()
 
 
 def test_identities_show_where_a_token_comes_from(

@@ -789,6 +789,9 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             ) from exc
         finally:
             connection.close()
+        # The worker is gone, so is its link: the next use signs in at once, and a
+        # second shutdown (site clean runs one) has nothing to wait on.
+        self.link_path.unlink(missing_ok=True)
         answered = cast(dict[str, Any], answer) if isinstance(answer, dict) else {}
         pid = answered.get("pid")
         stopped: dict[str, Any] = {

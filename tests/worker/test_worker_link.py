@@ -355,3 +355,37 @@ def test_placement_with_no_relay_setting_sends_this_computers_relay(
     assert base64.b64encode(b"relay wheel").decode("ascii") in script
     assert '"$D/dist/clio_relay-9.9.9-py3-none-any.whl"' in script
     assert "clio-relay==" not in script
+
+
+class _HeldWorker:
+    connected = True
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        self.closed = False
+
+    def request_json(self, *, method: str, path: str, **_: Any) -> dict[str, Any]:
+        self.asked.append(f"{method} {path}")
+        return {"pid": 4242}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_a_shutdown_the_worker_took_forgets_its_link(tmp_path: Path) -> None:
+    """A second shutdown, as site clean runs after one, has no gone worker to wait on."""
+    from clio_relay.adapters.worker import adapter as worker_adapter
+
+    adapter, link = _placing(tmp_path)
+    adapter._store_link(link)  # pyright: ignore[reportPrivateUsage]
+    held = _HeldWorker()
+    key = adapter._connection_key(link)  # pyright: ignore[reportPrivateUsage]
+    with worker_adapter._connections_lock:  # pyright: ignore[reportPrivateUsage]
+        worker_adapter._connections[key] = held  # pyright: ignore[reportPrivateUsage, reportArgumentType]
+
+    stopped = asyncio.run(adapter.shutdown())
+
+    assert held.asked == ["POST /shutdown"] and held.closed
+    assert stopped[0]["kind"] == "site_serve" and stopped[0]["pid"] == 4242
+    assert adapter.load_link() is None
+    assert asyncio.run(adapter.shutdown()) == []
