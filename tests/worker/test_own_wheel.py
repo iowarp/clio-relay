@@ -35,7 +35,10 @@ def _installed(tmp_path: Path, direct_url: dict[str, object] | None) -> metadata
         archive.writestr("clio_relay-9.9.9.dist-info/RECORD", "")
     info = tmp_path / "site" / "clio_relay-9.9.9.dist-info"
     info.mkdir(parents=True)
-    (info / "METADATA").write_bytes(FILES["clio_relay-9.9.9.dist-info/METADATA"])
+    for name, data in FILES.items():
+        installed = tmp_path / "site" / name
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes(data)
     record = [f"{name},sha256={_hash(data)},{len(data)}" for name, data in FILES.items()]
     record.append("clio_relay-9.9.9.dist-info/RECORD,,")
     (info / "RECORD").write_text("\n".join(record) + "\n", encoding="utf-8")
