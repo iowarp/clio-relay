@@ -48,6 +48,10 @@ cd examples/adapter-template
 uv run pytest
 ```
 
+A second CI job runs the conformance kit for the `ssh` and `worker` adapters
+against Docker fixture sites (`scripts/ares/fixtures.sh up`). It is a regression
+check and does not gate merges.
+
 ## Layout
 
 Read it top-down: an MCP call enters at `surface`, the guard checks it, and an

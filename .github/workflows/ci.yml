@@ -86,6 +86,55 @@ jobs:
       - name: pytest
         run: uv run --python "3.12" pytest
 
+  # A regression check that does not gate merges: the conformance kit for the
+  # ssh adapter (W2's fx-ssh, fx-slurm and fx-pbs) and the worker adapter
+  # (placed on fx-slurm, linked through fx-frps), on Docker fixtures.
+  adapter-conformance:
+    name: ssh and worker conformance on the fixture sites
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      FX_SITES: ssh slurm pbs frps
+    steps:
+      - name: name the fixture and worker paths
+        run: |
+          {
+            echo "FX_STATE_DIR=$RUNNER_TEMP/fx"
+            echo "CLIO_RELAY_FIXTURES_ENV=$RUNNER_TEMP/fx/fixtures.env"
+            echo "RELAY_TEST_WORKER_CONFIG=$RUNNER_TEMP/worker-config.json"
+            echo "RELAY_TEST_WORKER_DIR=$RUNNER_TEMP/worker-state"
+          } >>"$GITHUB_ENV"
+      - name: check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          version: "0.11.28"
+      - name: install dependencies
+        run: uv sync --python "3.12" --locked --all-groups
+      - name: build the wheel the worker site installs
+        run: uv build --wheel -o "$RUNNER_TEMP/dist"
+      - name: start the fixture sites
+        run: scripts/ares/fixtures.sh up
+      - name: write the worker config
+        run: |
+          mkdir -p "$RELAY_TEST_WORKER_DIR"
+          uv run --no-sync python scripts/ares/fixtures_worker_config.py \
+            "$CLIO_RELAY_FIXTURES_ENV" "$(ls "$RUNNER_TEMP"/dist/clio_relay-*.whl)" \
+            "$RELAY_TEST_WORKER_CONFIG"
+      - name: pytest
+        run: >
+          uv run --no-sync pytest
+          tests/relay_ssh/test_ssh_conformance.py
+          tests/worker/test_conformance_worker.py
+      - name: remove the fixture sites
+        if: always()
+        run: scripts/ares/fixtures.sh down --images
+
   build:
     name: build the wheel and sdist
     runs-on: ubuntu-latest
