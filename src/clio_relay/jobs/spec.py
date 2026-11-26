@@ -340,6 +340,27 @@ class Sizing(_Spec):
     )
 
 
+class InstallSetting(_Spec):
+    """An answer to one of the install settings a JARVIS failure record offered.
+
+    JARVIS offers a site's install settings (its temp dir, for one) under a
+    failure record's ``settings``, each with its ``issue_id``, its question and
+    what an answer does. Relay sends the value with the job's install answers;
+    JARVIS records it for the site. Relay takes only an issue id a failure on
+    the same site offered.
+    """
+
+    issue_id: str = Field(
+        pattern=r"^sha256:[0-9a-f]{64}$", description="The setting's issue_id from the record"
+    )
+    value: str = Field(min_length=1, max_length=4096, description="The answer, as JARVIS asks it")
+    basis: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Why this value, e.g. what the person said; JARVIS records it",
+    )
+
+
 class JobSpec(_Spec):
     """A job, in PSI/J terms, plus relay's inputs and package reference."""
 
@@ -382,9 +403,20 @@ class JobSpec(_Spec):
             "the order JARVIS starts them in, not the data's direction"
         ),
     )
+    install_settings: list[InstallSetting] = Field(
+        default_factory=list[InstallSetting],
+        max_length=16,
+        description=(
+            "Answers to install settings an earlier install failure on this site offered "
+            "(its failure records' settings, by issue_id). JARVIS gets them with the "
+            "install answers and records them for the site"
+        ),
+    )
 
     @model_validator(mode="after")
     def _one_entry_point(self) -> Self:
+        if self.install_settings and not self.steps():
+            raise ValueError("install_settings go with a package job")
         if self.package is not None and self.packages:
             raise ValueError("give package or packages, not both")
         if (self.executable is None) == (not self.steps()):
@@ -411,13 +443,12 @@ class JobSpec(_Spec):
         return self.model_copy(update={"package": None, "packages": steps})
 
     def dump(self) -> dict[str, Any]:
-        """Return the JSON form. Empty ``packages``, ``couplings`` and ``sizing`` are left
-        out, so older digests hold."""
+        """Return the JSON form. Empty ``packages``, ``couplings``, ``sizing`` and
+        ``install_settings`` are left out, so older digests hold."""
         data = self.model_dump(mode="json")
-        if not data.get("packages"):
-            data.pop("packages", None)
-        if not data.get("couplings"):
-            data.pop("couplings", None)
+        for key in ("packages", "couplings", "install_settings"):
+            if not data.get(key):
+                data.pop(key, None)
         if data.get("sizing") is None:
             data.pop("sizing", None)
         return data

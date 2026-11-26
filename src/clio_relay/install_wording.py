@@ -7,7 +7,7 @@ record, and how many questions follow.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from clio_relay.jarvis_report import (
@@ -27,6 +27,7 @@ def install_message(
     names: Mapping[str, str] | None = None,
     walltime: str | None = None,
     run: bool = True,
+    settings: Sequence[tuple[str, str]] = (),
 ) -> str:
     """Return the approval question for installing the package's software on the site.
 
@@ -34,7 +35,37 @@ def install_message(
     False for an install ahead of any run, which launches nothing after it. The choices
     JARVIS replays from its decisions record (:func:`applied_decisions`) are
     named, so the person sees what is reused without being asked again.
+    ``settings`` are the job's install settings, ``(JARVIS's question, value)``,
+    which JARVIS records for the site with this install.
     """
+    return _install_message(
+        report,
+        site=site,
+        package=package,
+        names=names,
+        walltime=walltime,
+        run=run,
+        given=_settings_line(settings, site=site),
+    )
+
+
+def _settings_line(settings: Sequence[tuple[str, str]], *, site: str) -> str:
+    if not settings:
+        return ""
+    named = "; ".join(f"{question} {value}" for question, value in settings)
+    return f"With the install setting(s) the agent gives, which JARVIS records for {site}: {named}."
+
+
+def _install_message(
+    report: Mapping[str, Any],
+    *,
+    site: str,
+    package: str,
+    names: Mapping[str, str] | None,
+    walltime: str | None,
+    run: bool,
+    given: str,
+) -> str:
     summary = install_summary(report, names)
     applied = applied_decisions(report)
     asked = len(choice_issues(report))
@@ -48,6 +79,8 @@ def install_message(
         where = report.get("decisions_path")
         kept = f" in {where}" if isinstance(where, str) and where else ""
         reuse = f" JARVIS applies the {named} chosen for {site} before (kept{kept})."
+    if given:
+        reuse = f"{reuse} {given}"
     before = f"before {package} runs" if run else f"for {package}"
     then = "then the run goes ahead" if run else "and nothing runs after it"
     last = "before the run" if run else "ahead of any run; nothing runs after it"

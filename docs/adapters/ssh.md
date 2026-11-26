@@ -236,7 +236,18 @@ involved. Relay asks nothing about it and adds no words: the run fails
 records whole in `failures`, with `install_log` and `install_job` (the
 scheduler's job id) for a job. The agent reads the output, decides what to
 change (for example the install's `scheduler.install.exclude`), and the person
-confirms the consequential steps. An install job that ends any other way fails
+confirms the consequential steps. A record can also offer the site's install
+settings (jarvis-cd 1.9.14: `install_tmpdir`, the install job's temp dir and
+Spack build stage) under `settings`, each with its `issue_id`, JARVIS's question
+and what an answer does. Relay passes them whole as the refusal's `settings`
+and adds JARVIS's question and answer text to the message. To give one, the
+agent runs or installs the same job again with `spec.install_settings`
+`[{issue_id, value, basis}]`; relay takes only an issue_id a failure on the same
+site offered, names the value in the install approval, and sends it with every
+round's answers (`answered_by: agent`). JARVIS records it for the site
+(`decisions.yaml` `site.install_tmpdir`; `ppl install --forget install_tmpdir`
+clears it). A guarded site still refuses the same thing as job environment.
+An install job that ends any other way fails
 with the end of what it printed, as printed.
 When a pick rests on a site fact JARVIS cannot settle by itself, such as the
 MPI launch network, JARVIS raises `site_fact_uncertain`. A blocking one stops

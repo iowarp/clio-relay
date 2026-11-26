@@ -296,3 +296,106 @@ async def test_an_install_job_with_a_question_checks_again_on_the_login_host(
     assert result == "resubmitted"
     assert service.finished == []
     assert notes == ["the install job needs a decision; JARVIS checks again"]
+
+
+TMPDIR_ID = "sha256:" + "7" * 64
+TMPDIR_SETTING: dict[str, Any] = {
+    "setting": "install_tmpdir",
+    "issue_id": TMPDIR_ID,
+    "scope": "site",
+    "question": "Which directory should this site's install jobs use for temporary files?",
+    "answer": "a directory with room for the build's temporary files; recorded for this site",
+    "value": None,
+    "tmpdir": None,
+    "build_stage": None,
+    "source": None,
+    "unset": "the job's own TMPDIR and Spack's own config:build_stage apply",
+    "recorded_in": "/home/u/.clio-relay/jarvis/decisions.yaml",
+    "forget": "jarvis ppl install --forget install_tmpdir",
+}
+
+
+def test_a_failure_s_install_settings_are_offered_whole_in_jarvis_s_words() -> None:
+    build = {**BUILD, "settings": [TMPDIR_SETTING]}
+    probe = {**PROBE, "settings": [TMPDIR_SETTING]}
+    refusal = install_failures.refusal(_report(build, probe), site="Ares")
+    assert refusal.data["settings"] == [TMPDIR_SETTING]
+    assert refusal.data["failures"] == [build, probe]
+    lines = refusal.message.splitlines()
+    assert lines[:2] == [BUILD["message"], PROBE["message"]]
+    assert lines[2] == f"{TMPDIR_SETTING['question']} ({TMPDIR_SETTING['answer']})"
+    assert "install_settings" in refusal.data["settings_how"]
+
+
+def test_a_failure_without_settings_offers_none() -> None:
+    refusal = install_failures.refusal(_report(BUILD), site="Ares")
+    assert "settings" not in refusal.data
+    assert "settings_how" not in refusal.data
+
+
+def _failed_op(site: str, settings: list[dict[str, Any]]) -> Any:
+    from clio_relay.jobs.records import OperationRecord
+
+    refusal = install_failures.failed([{**BUILD, "settings": settings}], site=site)
+    return OperationRecord(
+        operation_id="op-f",
+        kind="install",
+        site=site,
+        adapter="ssh",
+        spec={},
+        spec_digest="d",
+        state=OperationState.FAILED,
+        error=refusal.to_dict(),
+    )
+
+
+def _job(*settings: dict[str, Any]) -> Any:
+    from clio_relay.jobs.spec import JobSpec
+
+    return JobSpec.model_validate(
+        {"package": {"name": "clio_jarvis.gray_scott"}, "install_settings": list(settings)}
+    )
+
+
+def test_install_settings_take_only_what_a_failure_on_the_site_offered() -> None:
+    offers = install_failures.site_offers([_failed_op("ares", [TMPDIR_SETTING])], "ares")
+    assert offers == {TMPDIR_ID: TMPDIR_SETTING}
+    job = _job({"issue_id": TMPDIR_ID, "value": "/mnt/scratch/u/tmp", "basis": "the person"})
+    install_failures.check_settings(job, offers, site="ares")
+    assert install_failures.setting_answers(job) == {
+        TMPDIR_ID: {
+            "constraint": "/mnt/scratch/u/tmp",
+            "answered_by": "agent",
+            "basis": "the person",
+        }
+    }
+    elsewhere = install_failures.site_offers([_failed_op("other", [TMPDIR_SETTING])], "ares")
+    with pytest.raises(Refusal) as refused:
+        install_failures.check_settings(job, elsewhere, site="ares")
+    assert refused.value.reason == RefusalReason.INVALID_SPEC
+    assert refused.value.data["unknown"] == [TMPDIR_ID]
+
+
+def test_install_settings_cannot_answer_a_decision() -> None:
+    offers = install_failures.site_offers([_failed_op("ares", [TMPDIR_SETTING])], "ares")
+    placement = "sha256:" + "8" * 64
+    with pytest.raises(Refusal):
+        install_failures.check_settings(
+            _job({"issue_id": placement, "value": "login_limited"}), offers, site="ares"
+        )
+
+
+def test_install_settings_stay_out_of_older_digests() -> None:
+    from clio_relay.jobs.spec import JobSpec
+
+    plain = JobSpec.model_validate({"package": {"name": "clio_jarvis.gray_scott"}})
+    assert "install_settings" not in plain.dump()
+    given = _job({"issue_id": TMPDIR_ID, "value": "/tmp/x"})
+    assert given.digest() != plain.digest()
+    with pytest.raises(ValueError):
+        JobSpec.model_validate(
+            {
+                "executable": "/bin/true",
+                "install_settings": [{"issue_id": TMPDIR_ID, "value": "/x"}],
+            }
+        )

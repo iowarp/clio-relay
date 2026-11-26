@@ -268,6 +268,7 @@ async def ask_install(
                     names=names,
                     walltime=cast(str | None, refusal.data.get("install_walltime")),
                     run=runs,
+                    settings=_settings_said(service, site, job_of(record)),
                 ),
                 binding={
                     **binding,
@@ -312,6 +313,19 @@ async def ask_install(
             )
             return _hold(service, operation_id, state, [ask], refusal.message)
     return _hold(service, operation_id, state, asks, refusal.message)
+
+
+def _settings_said(service: RelayService, site: SiteEntry, job: JobSpec) -> list[tuple[str, str]]:
+    """Return ``(JARVIS's question, the value)`` for each install setting the job gives."""
+    if not job.install_settings:
+        return []
+    offers = install_failures.site_offers(service.operations.all(), site.id)
+    said: list[tuple[str, str]] = []
+    for item in job.install_settings:
+        offer = offers.get(item.issue_id) or {}
+        question = str(offer.get("question") or offer.get("setting") or item.issue_id)
+        said.append((question, item.value))
+    return said
 
 
 def _approved(service: RelayService, record: OperationRecord, missing_keys: list[str]) -> bool:
@@ -445,7 +459,10 @@ async def start_install(
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
-        answers = choice_answers(service, record, _offers(state))
+        answers = {
+            **install_failures.setting_answers(job_of(record)),
+            **choice_answers(service, record, _offers(state)),
+        }
         state = _install_time_answer(service, operation_id, state, answers)
         if state.get("recheck"):
             answers[jarvis_submit.RECHECK] = True

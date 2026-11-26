@@ -113,16 +113,14 @@ SERVICE_RUNTIMES_SCHEMA = "jarvis.execution.service-runtimes.v1"
 INSTALL_REPORT_SCHEMA = "jarvis.install-report.v1"
 RECORD_FILE = ".jarvis-execution.json"
 
-JARVIS_VERSION = "1.9.13"
-"""The jarvis-cd release relay installs under the CLIO site home and runs."""
-JARVIS_PIN = "533217fb3693d3ef8f9c8ae05dd8180e8fec2981"
-"""The commit the jarvis-cd :data:`JARVIS_VERSION` tag names. It is written to the pin file."""
-JARVIS_WHEEL_SHA256 = "62325eed17e259c3d6c5455ba69eb409ea47aed306ac3dd6fe2aaa0c3bb8c964"
-JARVIS_SOURCE = (
-    f"https://github.com/grc-iit/jarvis-cd/releases/download/v{JARVIS_VERSION}/"
-    f"jarvis_cd-{JARVIS_VERSION}-py3-none-any.whl#sha256={JARVIS_WHEEL_SHA256}"
-)
-"""The release wheel. pip checks the digest in the fragment before it installs anything."""
+JARVIS_VERSION = "1.9.14"
+"""The jarvis-cd release relay installs under the CLIO site home and runs. Until 1.9.14 is
+out, relay runs its candidate commit (:data:`JARVIS_SOURCE`)."""
+JARVIS_PIN = "472b753b0c17891f2d8785c1c84861388e9cb6c9"
+"""The commit relay runs: the 1.9.14 candidate. It is written to the pin file."""
+JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
+"""The 1.9.14 candidate by its commit, which pip clones from github.com. The release
+returns this to the release wheel and its digest (``#sha256=``)."""
 BOOTSTRAP_DIR = "jarvis-cd"
 """Where relay installs jarvis-cd, relative to the CLIO site home."""
 FALLBACK_ENV = "CLIO_RELAY_JARVIS_FALLBACK"
@@ -947,7 +945,7 @@ def direct_job(
     )
     staged = with_archive(spec)
     data = staged.dump()
-    for key in ("package", "packages", "executable", "arguments"):
+    for key in ("package", "packages", "executable", "arguments", "install_settings"):
         data.pop(key, None)
     data["executable"] = "/bin/bash"
     data["arguments"] = [

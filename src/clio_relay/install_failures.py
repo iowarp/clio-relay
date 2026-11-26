@@ -20,10 +20,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_report, jarvis_submit, site_facts
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+
+if TYPE_CHECKING:
+    from clio_relay.jobs.records import OperationRecord
+    from clio_relay.jobs.spec import JobSpec
 
 EXIT_INSTALL_FAILED = 6
 """``ppl install`` or ``ppl submit`` exit: something JARVIS ran failed; see its records."""
@@ -85,6 +89,35 @@ def _tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-TAIL_LINES:])
 
 
+SETTINGS_KEY = "settings"
+"""A failure record's install settings (jarvis-cd 1.9.14): what the person may set."""
+
+SETTINGS_HOW = (
+    "To give a setting, run or install the same job again with spec.install_settings "
+    "[{issue_id, value, basis}]"
+)
+
+
+def offered(found: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return the install settings the records offer, whole, one per ``issue_id``.
+
+    JARVIS puts them on a failure record as the settings the person can change,
+    not as a reading of the error; relay passes them on as they are.
+    """
+    settings: dict[str, dict[str, Any]] = {}
+    for record in found:
+        for setting in _dicts(record.get(SETTINGS_KEY)):
+            if isinstance(setting.get("issue_id"), str):
+                settings.setdefault(str(setting["issue_id"]), setting)
+    return list(settings.values())
+
+
+def _offer_line(setting: Mapping[str, Any]) -> str:
+    question = str(setting.get("question") or setting.get("setting") or "").strip()
+    answer = str(setting.get("answer") or "").strip()
+    return f"{question} ({answer})" if question and answer else question
+
+
 def failed(
     issues: list[dict[str, Any]],
     *,
@@ -97,11 +130,18 @@ def failed(
     """The refusal for an install JARVIS reports failed: its records and words, whole.
 
     The message is each record's own line (:func:`clio_relay.jarvis_report.words`);
-    with no record it is the end of what JARVIS printed (``output``).
+    with no record it is the end of what JARVIS printed (``output``). The install
+    settings the records offer (:func:`offered`) follow in JARVIS's words, and
+    travel whole as ``settings``.
     """
     found = records(issues, named)
     said = [line for line in map(jarvis_report.words, found) if line]
     message = "\n".join(said) or _tail(output) or f"JARVIS exited {exit_code} with no output"
+    settings = offered(found)
+    if settings:
+        lines = [line for line in map(_offer_line, settings) if line]
+        message = "\n".join([message, *lines])
+        extra = {**extra, SETTINGS_KEY: settings, "settings_how": SETTINGS_HOW}
     return Refusal(
         RefusalReason.SUBMIT_FAILED,
         message,
@@ -140,3 +180,50 @@ def raise_for(exit_code: object, text: str, *, site: str) -> None:
         site_facts.raise_for(text, site=site)
     if str(exit_code) == str(EXIT_INSTALL_FAILED):
         raise refusal(text, site=site)
+
+
+def site_offers(operations: Iterable[OperationRecord], site_id: str) -> dict[str, dict[str, Any]]:
+    """Return the install settings failures on the site offered, by ``issue_id``.
+
+    They are what relay already holds: each failed operation's refusal keeps its
+    records' settings (:func:`failed`). The newest offer of an issue wins.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    for record in sorted(operations, key=lambda item: item.updated_at):
+        data = (record.error or {}).get("data") if record.site == site_id else None
+        if isinstance(data, dict):
+            for setting in _dicts(cast(dict[str, Any], data).get(SETTINGS_KEY)):
+                if isinstance(setting.get("issue_id"), str):
+                    found[str(setting["issue_id"])] = setting
+    return found
+
+
+def check_settings(spec: JobSpec, offers: Mapping[str, Mapping[str, Any]], *, site: str) -> None:
+    """Refuse a job's install settings that no failure on the site offered.
+
+    An install setting answers a question JARVIS put on a failure record; any
+    other issue is a decision, and those reach JARVIS only as the person's
+    answers to relay's asks.
+    """
+    unknown = [item.issue_id for item in spec.install_settings if item.issue_id not in offers]
+    if not unknown:
+        return
+    raise Refusal(
+        RefusalReason.INVALID_SPEC,
+        f"no install failure on {site} offered the setting(s) {', '.join(unknown)}; "
+        "install_settings take only the issue_ids of a failure record's settings",
+        site=site,
+        unknown=unknown,
+        settings=list(offers.values()),
+    )
+
+
+def setting_answers(spec: JobSpec) -> dict[str, Any]:
+    """Return the job's install settings as JARVIS's answers, by ``issue_id``."""
+    answers: dict[str, Any] = {}
+    for item in spec.install_settings:
+        entry: dict[str, Any] = {"constraint": item.value, "answered_by": "agent"}
+        if item.basis:
+            entry["basis"] = item.basis
+        answers[item.issue_id] = entry
+    return answers

@@ -575,3 +575,17 @@ def test_the_submit_lease_is_the_call_chain_s_alone(relay_paths: RelayPaths) -> 
         await service.close()
 
     asyncio.run(scenario())
+
+
+def test_the_install_ask_names_the_install_settings_given() -> None:
+    report = _report(False)
+    question = "Which directory should this site's install jobs use for temporary files?"
+    said = install_wording.install_message(
+        report,
+        site="Ares",
+        package="demo.hello",
+        names={"pkg": "demo.hello"},
+        settings=[(question, "/mnt/scratch/u/tmp")],
+    )
+    assert f"{question} /mnt/scratch/u/tmp" in said
+    assert said.endswith("?")

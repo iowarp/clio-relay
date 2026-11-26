@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any, cast
 
-from clio_relay import __version__, jarvis_submit, relay_state, site_clean
+from clio_relay import __version__, install_failures, jarvis_submit, relay_state, site_clean
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteAdded, Verb
 from clio_relay.adapters.hooks import (
@@ -319,6 +319,9 @@ class RelayService:
                 raise conflict
             spec = with_contract_resources(spec, entries)
             spec = with_contract_couplings(spec, entries)
+        if spec.install_settings:
+            offers = install_failures.site_offers(self.operations.all(), site.id)
+            install_failures.check_settings(spec, offers, site=site.id)
         attributes = spec.attributes
         changes: dict[str, Any] = {}
         if attributes.queue_name is None and site.defaults.queue is not None:
