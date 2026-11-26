@@ -1,6 +1,6 @@
 [project]
 name = "clio-relay"
-version = "2.0.0a29"
+version = "2.0.0a30"
 description = "An MCP server and command line that runs jobs, commands, files and services on your compute sites."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
@@ -93,7 +93,7 @@ prerelease = "allow"
 [dependency-groups]
 dev = [
     "hatchling==1.31.0",
-    "jarvis-cd @ https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.12/jarvis_cd-1.9.12-py3-none-any.whl",
+    "jarvis-cd @ https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.13/jarvis_cd-1.9.13-py3-none-any.whl",
     "pip-audit>=2.10.0",
     "pyright>=1.1.390",
     "pytest>=8.3",
