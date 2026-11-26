@@ -36,6 +36,7 @@ from clio_relay.surface.a2ui.surfaces import (
     SPEND,
     SPEND_LIMIT_FIELD,
     protocol_name,
+    scheduler_name,
 )
 from clio_relay.surface.a2ui.values import as_dict, located, site_values
 
@@ -355,8 +356,9 @@ def _refused(exc: ValidationError | Refusal) -> dict[str, str]:
 def ready_line(title: str, adapter: str, info: SiteInfo | None, seconds: float) -> str:
     """Return a passed test's line: ``Reached Ares over SSH: Slurm, 4 partitions, 1.1 s``."""
     parts: list[str] = []
-    if info is not None and info.scheduler:
-        parts.append(str(info.scheduler).capitalize())
+    scheduler = scheduler_name(info.scheduler) if info is not None else None
+    if scheduler:
+        parts.append(scheduler)
     if info is not None and info.partitions:
         count = len(info.partitions)
         parts.append(_("1 partition") if count == 1 else _("{n} partitions", n=count))

@@ -570,6 +570,13 @@ class _Asks:
 class _Service:
     def __init__(self, asks: list[Ask]) -> None:
         self.asks = _Asks(asks)
+        self.held = [ask.ask_id for ask in asks]
+
+    def operation_asks(self, record: Any) -> list[Ask]:
+        return [ask for ask_id in self.held if (ask := self.asks.get(ask_id)) is not None]
+
+
+_RECORD: Any = None
 
 
 def _answered(ask_id: str, value: str) -> Ask:
@@ -587,12 +594,12 @@ def _answered(ask_id: str, value: str) -> Ask:
 def test_a_per_package_option_answers_that_package_only() -> None:
     offers = offer_map(PLACEMENT)
     assert offers["compute_job for paraview only"] == ("sha256:pv", "compute_job")
-    state = {"choices": {"a1": PLACEMENT["issue_id"]}, "offers": {"a1": offers}}
+    held = {"a1": offers}
     service: Any = _Service([_answered("a1", "compute_job for paraview only")])
-    answers = choice_answers(service, state)
+    answers = choice_answers(service, _RECORD, held)
     assert answers == {
         "sha256:pv": {"constraint": "compute_job", "answered_by": "person", "ask_id": "a1"}
     }
     # A shared ask's option for a package this operation does not have answers nothing.
     service = _Service([_answered("a1", "compute_job for other only")])
-    assert choice_answers(service, state) == {}
+    assert choice_answers(service, _RECORD, held) == {}

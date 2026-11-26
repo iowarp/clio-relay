@@ -74,6 +74,10 @@ Optional hooks, found by name when an adapter defines them:
 - ``ssh_argv``, ``hop_exec``, ``transport``: SSH-based adapters only, for the
   serve hook's port forwarding.
 
+Identity: :meth:`BaseAdapter.reaches` says which place a config reaches and as
+whom. The site store refuses a second endpoint that reaches the same place the
+same way, so a person who saves a site twice is offered an update instead.
+
 Registration: an entry point in the group ``clio_relay.adapters`` names the
 class (see :mod:`clio_relay.adapters.registry`). Relay's own code does not
 change.
@@ -84,8 +88,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, get_args, runtime_checkable
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from clio_relay.adapters.site_files import Kind, SiteFiles
 from clio_relay.jobs.content import ContentStore
@@ -148,9 +153,13 @@ class SiteInfo(BaseModel):
     for the person and the agent sizing a run.
     """
 
+    model_config = ConfigDict(validate_assignment=True)
+
     adapter: str
     address: str | None = None
-    scheduler: str | None = Field(default=None, description="slurm, pbs, lsf, cobalt or none")
+    scheduler: str | None = Field(
+        default=None, description="slurm, pbs, lsf or cobalt, or null when the site has none"
+    )
     queues: list[str] = Field(default_factory=list[str])
     accounts: list[str] = Field(default_factory=list[str])
     limits: dict[str, Any] = Field(default_factory=dict[str, Any])
@@ -158,6 +167,13 @@ class SiteInfo(BaseModel):
     mpi: dict[str, Any] = Field(default_factory=dict[str, Any])
     facts: dict[str, Any] = Field(default_factory=dict[str, Any])
     verbs: list[Verb] = Field(default_factory=list[Verb])
+
+    @field_validator("scheduler")
+    @classmethod
+    def _no_scheduler_is_null(cls, value: str | None) -> str | None:
+        # "No scheduler" has one encoding on the wire, whatever word an adapter used.
+        found = (value or "").strip().lower()
+        return None if found in ("", "none") else found
 
 
 class SignInNeed(BaseModel):
@@ -345,6 +361,26 @@ class EmptyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+@dataclass(frozen=True)
+class Reach:
+    """The place a site config reaches and the account it reaches it as.
+
+    ``host`` is the normalized host name, or the endpoint or system the protocol
+    names when it has no host. ``user`` is the account, empty when the protocol
+    signs in later. Other settings (directories, the scheduler, timeouts) are not
+    part of it: changing them changes the endpoint, not which one it is.
+    """
+
+    host: str
+    user: str = ""
+
+
+def api_place(url: str, *names: str | None) -> str:
+    """Return a web API's place for :class:`Reach`: its lowercase host, then ``names``."""
+    host = (urlsplit(url.strip()).hostname or url.strip()).lower().rstrip(".")
+    return "/".join([host, *(name for name in names if name)])
+
+
 class BaseAdapter[ConfigT: BaseModel]:
     """Defaults for every optional verb: a typed refusal."""
 
@@ -361,6 +397,15 @@ class BaseAdapter[ConfigT: BaseModel]:
     def __init__(self, config: ConfigT, context: AdapterContext) -> None:
         self.config = config
         self.context = context
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        """Return the place ``config`` reaches and as whom, or None when it names none.
+
+        Two endpoints of one adapter with the same reach are the same endpoint.
+        """
+        del config
+        return None
 
     async def describe(self) -> SiteInfo:
         return SiteInfo(adapter=self.name, verbs=sorted(self.implements))

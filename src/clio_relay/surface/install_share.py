@@ -135,27 +135,30 @@ def offer_map(issue: dict[str, Any]) -> dict[str, tuple[str, str]]:
     return {**own, **jarvis_report.override_choices(issue)}
 
 
-def choice_answers(service: RelayService, state: dict[str, Any]) -> dict[str, Any]:
-    """Return the person's answers to this round's open issues; JARVIS replays the rest.
+def choice_answers(
+    service: RelayService, record: OperationRecord, offers: dict[str, Any]
+) -> dict[str, Any]:
+    """Return every answer the person gave JARVIS in this operation, by issue id.
 
-    ``state`` has ``choices`` (``{ask_id: issue_id}``) and ``offers``
-    (``{ask_id:`` :func:`offer_map` ``}``). A per-package option
+    What the person said is the operation's asks (``record.asks``, in the order
+    they were asked); ``offers`` (``{ask_id:`` :func:`offer_map` ``}``) says what
+    each option of each choice ask answers in JARVIS's terms. A later answer to
+    an issue replaces an earlier one. A per-package option
     (``<constraint> for <package> only``) answers that package's override issue
     instead, and leaves the site's question open. An option this operation was
-    not offered (a shared ask's other package) answers nothing here.
+    not offered (a shared ask's other package) answers nothing here. JARVIS
+    looks an answer up only for an issue it raises, so all of them go each time.
     """
     picked: dict[str, tuple[str, str]] = {}
-    offers = cast(dict[str, dict[str, list[str]]], state.get("offers") or {})
-    for ask_id, issue_id in cast(dict[str, str], state.get("choices") or {}).items():
-        ask = service.asks.get(ask_id)
-        content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
-        value = content.get(CHOICE_FIELD)
-        if not isinstance(value, str) or not value:
+    for ask in service.operation_asks(record):
+        offer = offers.get(ask.ask_id)
+        if ask.kind != "choose" or not isinstance(offer, dict):
             continue
-        if ask_id not in offers:
-            picked[issue_id] = (value, ask_id)
-        elif (offer := offers[ask_id].get(value)) is not None:
-            picked[offer[0]] = (offer[1], ask_id)
+        content = cast(dict[str, Any], (ask.answer or {}).get("content") or {})
+        found = cast(dict[str, Any], offer).get(str(content.get(CHOICE_FIELD) or ""))
+        if isinstance(found, (list, tuple)) and len(cast(list[Any], found)) == 2:
+            issue_id, constraint = cast(list[str], found)
+            picked[str(issue_id)] = (str(constraint), ask.ask_id)
     return jarvis_report.answers_document(picked)
 
 

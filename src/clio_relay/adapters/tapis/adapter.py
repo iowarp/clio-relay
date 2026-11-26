@@ -22,7 +22,15 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.base import (
+    AdapterContext,
+    BaseAdapter,
+    Reach,
+    SignInNeed,
+    SiteInfo,
+    Verb,
+    api_place,
+)
 from clio_relay.adapters.tapis import launcher, mapping
 from clio_relay.adapters.tapis.client import TapisCallError, acall, make_client
 from clio_relay.adapters.tapis.config import TapisConfig
@@ -52,6 +60,14 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
     # The launcher's package mode runs a reviewed package through jarvis (tapisjob_app.sh).
     runs_packages: ClassVar[bool] = True
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        assert isinstance(config, TapisConfig)
+        # Before relay registers a system there is no system to compare.
+        if not config.system_id:
+            return None
+        return Reach(api_place(config.base_url, config.tenant_id, config.system_id))
 
     def __init__(
         self,
@@ -280,8 +296,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         system_id = str(system["id"])
         facts["system_id"] = system_id
         info.address = str(system.get("host") or "") or None
-        scheduler = str(system.get("batchScheduler") or "").lower()
-        info.scheduler = scheduler if scheduler and scheduler != "none" else "none"
+        info.scheduler = str(system.get("batchScheduler") or "") or None
         queues = cast(list[dict[str, Any]], system.get("batchLogicalQueues") or [])
         info.queues = [str(item.get("name")) for item in queues if item.get("name")]
         info.limits = {

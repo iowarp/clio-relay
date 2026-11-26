@@ -354,7 +354,7 @@ def _scheduler(service: RelayService, record: OperationRecord) -> str | None:
     except Exception:  # noqa: BLE001 - a removed site still has its records
         return None
     found = config.get("scheduler")
-    return found if isinstance(found, str) and found not in ("auto", "") else None
+    return found if isinstance(found, str) and found not in ("auto", "none", "") else None
 
 
 def _site(service: RelayService, site_id: str) -> dict[str, Any]:

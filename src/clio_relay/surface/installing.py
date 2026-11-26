@@ -10,14 +10,18 @@ at all, the adapter raises :func:`~clio_relay.jarvis_submit.missing_jarvis`.
 
 Either refusal turns the operation back into asks instead of a failure:
 
-- software: one approval of the install (what is reused and what is built),
-  then one choice per issue JARVIS needs a person for. An issue no answer can
-  fix fails the operation. Once all are answered, relay submits
+- software: first one choice per issue JARVIS needs a person for, then, once
+  JARVIS's check has no question left, one approval of the install (what is
+  reused and what is built, and JARVIS's time for it). JARVIS asks its
+  questions a few at a time, so each answered round goes back to JARVIS's check
+  (``recheck``, below) until it asks nothing more; the approval is asked last,
+  once, and a later round asks it again only when JARVIS names more to build
+  than was approved. An issue no answer can fix fails the operation. Once the
+  install is approved, relay submits
   ``jarvis ppl install +submit`` with the answers, follows the install job
   (its ``metadata.install`` progress and the end of ``install/install.log``)
-  for as long as it takes, then submits the run again. When JARVIS names
-  nothing to build, only questions (a package it cannot resolve until one is
-  answered), relay asks only the questions and no approval: JARVIS checks again
+  for as long as it takes, then submits the run again. While JARVIS still has
+  questions, relay asks only the questions: JARVIS checks again
   with the answers in a job (``recheck``, ``ppl install +check +submit``), and
   the run goes ahead when that job finds the software all there, or relay asks
   to install what it finds missing. When JARVIS has no record to answer from
@@ -48,12 +52,20 @@ JARVIS's record says the software is all there.
 
 The state lives in ``record.result["install"]``.
 
-JARVIS records each answer in the site's decisions file
-(:func:`~clio_relay.jarvis_submit.site_decisions`) and replays it on a later
-install, of any package, while it is still one of its candidates; it asks again,
-with the earlier answer, when it no longer is. Relay keeps no store of its own:
-it asks only the issues JARVIS leaves open, and the install approval names the
-decisions JARVIS applies (:func:`~clio_relay.jarvis_report.applied_decisions`).
+JARVIS replays the answers it records (which Spack, where checks and builds
+run, a site copy and the like) on a later install while they are still among
+its candidates, and asks again, with the earlier answer, when they no longer
+are. Others (a "this time" placement, or one only a job can apply) hold only
+for the call they are sent with. Relay keeps no answer state of its own for
+either: what the person said is the operation's asks. Each round reads them
+all (:func:`~clio_relay.surface.install_share.choice_answers`), the newest
+answer to an issue winning, and sends JARVIS every one; JARVIS looks an answer
+up only for an issue it raises. The install approval is one of those asks too:
+its binding names the software it approves building (``build``), so a later
+round of the operation is covered while JARVIS finds nothing more missing.
+Relay asks only the issues JARVIS leaves open, and the install approval names
+the decisions JARVIS applies
+(:func:`~clio_relay.jarvis_report.applied_decisions`).
 """
 
 from __future__ import annotations
@@ -76,7 +88,7 @@ from clio_relay.jarvis_exits import build_refused, built_here, ran_here
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.jobs.spec import JobSpec, ServiceSpec
+from clio_relay.jobs.spec import JobSpec, ServiceSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import install_logs, queue_switch
 from clio_relay.surface.install_share import CHOICE_FIELD as CHOICE_FIELD
@@ -99,7 +111,11 @@ logger = logging.getLogger(__name__)
 
 INSTALL_KEY = "install"
 SOFTWARE_KIND = "jarvis_install"
-MAX_ROUNDS = 6
+BUILD_KEY = "build"
+"""In an install approval's binding: JARVIS's keys of the software it approves building."""
+OFFERS_KEY = "offers"
+INSTALL_TIME_KEY = "install_time"
+MAX_ROUNDS = 8
 """How many install rounds (check jobs, questions, installs) one operation may go through
 before relay stops asking."""
 
@@ -214,7 +230,7 @@ async def ask_install(
             state["installed"] = installed
         names = jarvis_submit.package_names(job_of(record).steps())
         state["summary"] = jarvis_report.install_summary(report, names)
-        state["report_digest"] = jarvis_report.report_digest(report)
+        state[OFFERS_KEY] = _offers(state_of(record))
         to_ask = jarvis_report.choice_issues(report)
         missing = jarvis_report.software_missing(report)
         unchecked = jarvis_report.unchecked(report)
@@ -229,8 +245,16 @@ async def ask_install(
             state["recheck"] = True
             _hold(service, operation_id, state, [], refusal.message)
             return await service.advance(operation_id)
-        if to_ask and not missing:
-            state["recheck"] = True
+        approved = _approved(service, record, missing_keys)
+        if to_ask:
+            # JARVIS asks its questions one at a time; the approval waits until it
+            # has none, so it is asked once and carries JARVIS's spec and time.
+            state["recheck"] = not (missing and approved)
+        elif approved:
+            # The person already approved building this; JARVIS's last answer
+            # changed nothing they were asked about.
+            _hold(service, operation_id, state, [], refusal.message)
+            return await service.advance(operation_id)
         else:
             package = _what(job_of(record))
             runs = record.kind != "install"
@@ -249,7 +273,7 @@ async def ask_install(
                 binding={
                     **binding,
                     "kind": SOFTWARE_KIND,
-                    "report_digest": state["report_digest"],
+                    BUILD_KEY: sorted(missing_keys),
                 },
                 plain=False,
             )
@@ -259,16 +283,11 @@ async def ask_install(
             explain_approval(approval, title=title, yes=yes, no=no)
             service.asks.put(approval.ask_id, approval)
             asks.append(approval)
-        choices: dict[str, str] = {}
-        offers: dict[str, dict[str, tuple[str, str]]] = {}
         with service.asks.locked(site_lock_id(site.id)):
             for issue in to_ask:
                 ask = await choice_ask(service, site, operation_id, issue)
-                choices[ask.ask_id] = str(issue.get("issue_id"))
-                offers[ask.ask_id] = offer_map(issue)
+                state[OFFERS_KEY][ask.ask_id] = offer_map(issue)
                 asks.append(ask)
-        state["choices"] = choices
-        state["offers"] = offers
     else:
         if jarvis_consented(service, site.id, record):
             # The package review the person accepted already said relay installs it.
@@ -296,7 +315,40 @@ async def ask_install(
     return _hold(service, operation_id, state, asks, refusal.message)
 
 
-_CARRIED = ("missing_keys", "installed", "summary", "report_digest", "recheck")
+def _approved(service: RelayService, record: OperationRecord, missing_keys: list[str]) -> bool:
+    """Say whether the person already approved building everything ``missing_keys`` names.
+
+    That is an accepted install approval among the operation's asks, for this
+    job, whose binding names at least what JARVIS now finds missing.
+    """
+    wanted = set(missing_keys)
+    for ask in service.operation_asks(record):
+        build = ask.binding.get(BUILD_KEY)
+        if (
+            ask.kind == "approve"
+            and ask.state == "accepted"
+            and ask.binding.get("kind") == SOFTWARE_KIND
+            and ask.binding_digest == canonical_digest(ask.binding)
+            and approval_covers(ask.binding, record)
+            and isinstance(build, list)
+            and wanted <= {str(key) for key in cast(list[object], build)}
+        ):
+            return True
+    return False
+
+
+def _offers(state: dict[str, Any]) -> dict[str, Any]:
+    """Return what each choice ask of the operation answers in JARVIS's terms, by ask id.
+
+    It grows with every round: an ask's options mean the same for the whole
+    operation, so :func:`~clio_relay.surface.install_share.choice_answers` reads
+    every answer the person gave from it.
+    """
+    found = state.get(OFFERS_KEY)
+    return dict(cast(dict[str, Any], found)) if isinstance(found, dict) else {}
+
+
+_CARRIED = ("missing_keys", "installed", "summary", "recheck", OFFERS_KEY)
 """What an install round keeps when JARVIS stops it to ask how the build job runs."""
 
 
@@ -316,23 +368,27 @@ async def _ask_install_time(
     previous = state_of(service.operation(operation_id))
     state.update({key: previous[key] for key in _CARRIED if key in previous})
     issue = cast(dict[str, Any], refusal.data["install_report"])["issues"][0]
-    issue_id = str(issue.get("issue_id"))
     ask = await choice_ask(service, site, operation_id, issue)
-    state["choices"] = {ask.ask_id: issue_id}
-    state["offers"] = {ask.ask_id: offer_map(issue)}
-    state["install_time"] = issue_id
+    state[INSTALL_TIME_KEY] = {"ask_id": ask.ask_id, OFFERS_KEY: offer_map(issue)}
     return _hold(service, operation_id, state, [ask], refusal.message)
 
 
 def _install_time_answer(
     service: RelayService, operation_id: str, state: dict[str, Any], answers: dict[str, Any]
 ) -> dict[str, Any]:
-    """Turn the person's install-time pick into relay's answers; JARVIS gets none for it."""
-    issue_id = state.get("install_time")
-    found = answers.pop(issue_id, None) if isinstance(issue_id, str) else None
-    if isinstance(found, dict):
-        value = str(cast(dict[str, Any], found).get("constraint") or "")
-        settings = install_time.picked(value)
+    """Turn the person's install-time pick into relay's answers; JARVIS gets none for it.
+
+    The question is relay's own (how its install job runs), so it is not among
+    the operation's offers and never reaches JARVIS's answers file.
+    """
+    found = state.get(INSTALL_TIME_KEY)
+    asked = cast(dict[str, Any], found) if isinstance(found, dict) else {}
+    ask = service.asks.get(str(asked.get("ask_id"))) if asked else None
+    content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
+    offers = cast(dict[str, Any], asked.get(OFFERS_KEY) or {})
+    offer = offers.get(str(content.get(CHOICE_FIELD) or ""))
+    if isinstance(offer, (list, tuple)) and len(cast(list[Any], offer)) == 2:
+        settings = install_time.picked(str(cast(list[Any], offer)[1]))
         if settings is None:
             state = {**state, "recheck": True}
         else:
@@ -390,7 +446,7 @@ async def start_install(
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
-        answers = choice_answers(service, state)
+        answers = choice_answers(service, record, _offers(state))
         state = _install_time_answer(service, operation_id, state, answers)
         if state.get("recheck"):
             answers[jarvis_submit.RECHECK] = True

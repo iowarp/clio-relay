@@ -157,6 +157,7 @@ class DialogActions:
         self.state.add.pop("test", None)
         self.state.add.pop("facts", None)
         self.state.add.pop("view", None)
+        self.state.add.pop("duplicate", None)
 
     async def pick(self, _subject: str, values: dict[str, Any]) -> Outcome:
         column = str(values.get("column") or "")
@@ -271,6 +272,12 @@ class DialogActions:
         try:
             added = self.service.sites.add(built.entry)
         except Refusal as refusal:
+            existing = str(refusal.data.get("existing") or "")
+            if existing:
+                try:
+                    return await self._update_instead(self.service.sites.get(existing), built.entry)
+                except Refusal:
+                    pass
             if refusal.reason is RefusalReason.SITE_EXISTS:
                 message = _("An endpoint named {id} exists", id=built.entry.id)
             else:
@@ -290,6 +297,30 @@ class DialogActions:
         self.state.notice = ""
         tone = "positive" if message == done else "warning"
         return _outcome(True, self.toast(message, tone, {"kind": "added", "id": added.id}))
+
+    async def _update_instead(self, dup: SiteEntry, entry: SiteEntry) -> Outcome:
+        """Offer to update ``dup``, which ``entry`` repeats; on the second Save, update it."""
+        marked = as_dict(self.state.add.get("duplicate"))
+        if marked.get("id") != dup.id:
+            self.state.add["duplicate"] = {"id": dup.id, "title": dup.title}
+            self.state.errors.pop(ADD_DIALOG, None)
+            return _outcome(False)
+        # The row keeps the person's name, security and spending; only how it is reached changes.
+        changes = {"adapter": entry.adapter, "config": entry.config}
+        try:
+            updated = self.service.sites.edit(dup.id, changes)
+        except Refusal as refusal:
+            self.state.errors[ADD_DIALOG] = {FORM_ERROR: sentence(refusal.message)}
+            return _outcome(False)
+        self.state.add = {}
+        self.state.errors.pop(ADD_DIALOG, None)
+        self.state.dialog = ""
+        done = _("Updated {name}", name=updated.title)
+        self.state.notice = ""
+        await self._saved(updated, done + ".")
+        message = self.state.notice.rstrip(".") or done
+        self.state.notice = ""
+        return _outcome(True, self.toast(message, "positive" if message == done else "warning"))
 
     # Removing and Undo
 

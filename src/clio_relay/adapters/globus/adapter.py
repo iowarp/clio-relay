@@ -25,7 +25,14 @@ from typing import Any, ClassVar, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.adapters import registry
-from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.base import (
+    AdapterContext,
+    BaseAdapter,
+    Reach,
+    SignInNeed,
+    SiteInfo,
+    Verb,
+)
 from clio_relay.adapters.globus import tokens
 from clio_relay.adapters.globus.compute import (
     ComputeService,
@@ -154,6 +161,11 @@ class GlobusAdapter(BaseAdapter[GlobusConfig]):
     name: ClassVar[str] = "globus"
     Config: ClassVar[type[BaseModel]] = GlobusConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        assert isinstance(config, GlobusConfig)
+        return Reach(config.endpoint.lower())
 
     def __init__(self, config: GlobusConfig, context: AdapterContext) -> None:
         super().__init__(config, context)

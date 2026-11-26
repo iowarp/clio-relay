@@ -16,9 +16,11 @@ from typing import Any
 
 import pytest
 
+from clio_relay.adapters.base import SiteInfo
+from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.store import SiteStore
-from clio_relay.surface.a2ui import i18n, saved
+from clio_relay.surface.a2ui import dialog_actions, i18n, saved
 from clio_relay.surface.a2ui.newsite import build, removed_record, saved_items
 from clio_relay.surface.a2ui.surfaces import ADD_TABS
 from clio_relay.surface.settings import RelayPaths
@@ -45,7 +47,7 @@ def _ssh_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     kept = tmp_path / "clio-hosts"
     kept.write_text("Host mine\n  HostName mine.example.org\n", encoding="utf-8")
-    monkeypatch.setattr(saved, "_ssh_dir", lambda: home)
+    monkeypatch.setattr(ssh_hosts, "ssh_dir", lambda: home)
     monkeypatch.setenv(saved.SAVED_ENV, str(kept))
     return kept
 
@@ -136,6 +138,56 @@ def test_a_catalog_site_is_tested_then_saved_and_undo_removes_it(
             assert result.structured_content["ok"] is True, said(result)
             assert store.list() == []
             assert toast(result) == {"message": "Removed This computer", "tone": "positive"}
+
+    asyncio.run(scenario())
+
+
+def test_saving_an_endpoint_that_reaches_a_saved_one_offers_to_update_it(
+    relay_paths: RelayPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ssh_files(tmp_path, monkeypatch)
+    store = SiteStore(relay_paths.sites_file)
+    # Saved earlier by hand: the same host and user the "lab" alias reaches.
+    store.add(
+        SiteEntry(
+            id="old", name="Lab", adapter="ssh", config={"ssh_profile": "me@LAB.example.org."}
+        )
+    )
+
+    async def reached(entry: SiteEntry, _paths: RelayPaths) -> tuple[str, None, SiteInfo]:
+        return "ready", None, SiteInfo(adapter=entry.adapter, scheduler="slurm")
+
+    monkeypatch.setattr(dialog_actions, "try_site", reached)
+
+    async def scenario() -> None:
+        async with a2ui_client(relay_paths) as client:
+            host = Host(client)
+            await host.open()
+            await host.add()
+            await host.pick("add-saved-list", "host:lab")
+            result = await host.dialog("add-dialog", "test")
+            assert result.structured_content["ok"] is True, host.text("relay-sites")
+            result = await host.dialog("add-dialog", "confirm")
+            assert result.structured_content["ok"] is False, "a repeat is not added"
+            dialog = host.component("add-dialog")
+            assert dialog["status"] == {
+                "tone": "warning",
+                "text": "Lab already reaches the same computer the same way. "
+                "Update it instead of adding a copy?",
+            }
+            assert dialog["confirm"]["label"] == "Update Lab"
+            assert dialog["confirm"]["enabled"] is True
+            assert [site.id for site in store.list()] == ["old"]
+
+            result = await host.dialog("add-dialog", "confirm")
+            assert result.structured_content["ok"] is True, host.text("relay-sites")
+            shown = toast(result)
+            assert shown is not None and shown["message"] == "Updated Lab"
+            assert "undo" not in shown
+            assert not host.is_open("add-dialog")
+            assert [(site.id, site.config) for site in store.list()] == [
+                ("old", {"ssh_profile": "lab"})
+            ]
 
     asyncio.run(scenario())
 

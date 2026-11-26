@@ -41,12 +41,14 @@ from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
+    Reach,
     SignInNeed,
     SiteInfo,
     Verb,
     not_implemented,
 )
 from clio_relay.adapters.hooks import Charge
+from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.ssh import pricing, scripts, signals, slurm_paths, store
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
@@ -140,6 +142,12 @@ class SshAdapter(BaseAdapter[SshConfig]):
     runs_packages: ClassVar[bool] = True
     reads_service_runtimes: ClassVar[bool] = True
     clean_over_connection: ClassVar[bool] = True
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        assert isinstance(config, SshConfig)
+        host, user = ssh_hosts.destination(config.ssh_profile, config.ssh_config)
+        return Reach(host, user)
 
     def __init__(self, config: SshConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
@@ -273,7 +281,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return SiteInfo(
             adapter=self.name,
             address=self.config.ssh_profile,
-            scheduler=scheduler,
+            scheduler=scheduler if scheduler != "none" else None,
             queues=queues or [partition.name for partition in partitions],
             partitions=partitions,
             mpi=cast(dict[str, Any], (sched or {}).get("mpi") or {}),

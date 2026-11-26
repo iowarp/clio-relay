@@ -43,8 +43,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from clio_relay import jarvis_submit, programs, site_outputs
-from clio_relay.adapters.base import BaseAdapter, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.base import BaseAdapter, Reach, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.local import SchedulerChoice
+from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.worker.batch_ssh import batch_ssh
 from clio_relay.adapters.worker.files import WorkerFileAccess
 from clio_relay.adapters.worker.site_server import IDLE_EXIT_S, LinkMode
@@ -324,6 +325,12 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files", "serve"})
     # The site's local adapter hands a package job to jarvis ppl submit.
     runs_packages: ClassVar[bool] = True
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        assert isinstance(config, WorkerConfig)
+        host, user = ssh_hosts.destination(config.ssh_profile, config.ssh_config_file)
+        return Reach(host, user)
 
     # --- link state -----------------------------------------------------
 

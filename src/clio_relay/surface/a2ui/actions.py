@@ -189,6 +189,8 @@ class TabActions(DialogActions):
         except ValidationError as exc:
             return self._fail(ADD_SURFACE, located(exc.errors(include_url=False), "site.", known))
         except Refusal as refusal:
+            if refusal.data.get("existing"):
+                return self._fail(ADD_SURFACE, {FORM_ERROR: f"{refusal.message}: edit it"})
             if refusal.reason is RefusalReason.SITE_EXISTS:
                 message = f"An endpoint named {common['id']} exists"
                 return self._fail(ADD_SURFACE, {"site.id": message})

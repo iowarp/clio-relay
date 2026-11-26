@@ -53,7 +53,7 @@ importable from it. Its docstring lists every method and hook.
 | `name` | The adapter's name in `sites.yaml` and in the entry point. |
 | `Config` | A pydantic model of one site's settings, with `extra="forbid"`. Relay validates `sites.yaml` with it, and the Compute tab draws its form from its JSON Schema. |
 | `implements` | The verbs it supports: `describe`, `run`, `exec`, `files`, `serve`. |
-| `describe()` | Reports the site as a `SiteInfo`. Required; it must not change anything. A facility without a batch scheduler reports `scheduler="none"`. |
+| `describe()` | Reports the site as a `SiteInfo`. Required; it must not change anything. A facility without a batch scheduler reports `scheduler=None` (null on the wire); `SiteInfo` turns `"none"` into null too. |
 | `run()`, `status()`, `cancel()`, `find()` | Jobs, for `run`. |
 | `exec()` | One bounded command, for `exec`. |
 | `files()` | File access, for `files`. |
@@ -94,6 +94,16 @@ Put everything that differs between two sites of your facility in `Config`:
 the API's URL, the project or allocation, the work directory. Give each field
 a `description`, which the Compute tab shows. Never put a secret in `Config`;
 `sites.yaml` is plain text.
+
+Then say where a config leads. The classmethod `reaches(config)` returns a
+`Reach`: the place the site is (a host, or a web API's host and system, which
+`api_place()` builds) and the account it acts as. Two sites on one adapter
+with the same `Reach` are one endpoint, so the site store refuses the second
+with `site_exists` and names the first in `existing`, and the Compute tab offers
+to update it. Settings that don't change the place, such as a work directory,
+stay out of `Reach`, so changing them updates the row. Return `None` when the
+config names no place relay can compare; such sites are never refused as a
+repeat.
 
 ### Sign-in and secrets
 

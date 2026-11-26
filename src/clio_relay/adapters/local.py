@@ -242,7 +242,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return SiteInfo(
             adapter=self.name,
             address=socket.gethostname(),
-            scheduler=scheduler or "none",
+            scheduler=scheduler,
             queues=queues,
             facts={
                 "os": platform.system(),

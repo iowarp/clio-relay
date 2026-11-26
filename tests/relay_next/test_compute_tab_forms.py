@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+from clio_relay.adapters.base import SiteInfo
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.a2ui.components import Tree
 from clio_relay.surface.a2ui.forms import Field, Kind, draft_value, field_components, form
+from clio_relay.surface.a2ui.newsite import ready_line
 from clio_relay.surface.settings import RelayPaths
 
 from .a2ui_host import Host, basic_client
@@ -83,3 +85,32 @@ def test_add_from_catalog(relay_paths: RelayPaths) -> None:
             assert host.visible("relay-add") == {"root"}, "a successful add closes the form"
 
     asyncio.run(scenario())
+
+
+def test_no_scheduler_is_null_on_the_wire_whatever_the_adapter_wrote() -> None:
+    for written in ("none", "None", " NONE ", "", None):
+        info = SiteInfo(adapter="any", scheduler=written)
+        assert info.scheduler is None
+        assert info.model_dump(mode="json")["scheduler"] is None
+    info = SiteInfo(adapter="any")
+    info.scheduler = "SLURM"
+    assert info.scheduler == "slurm"
+    info.scheduler = "none"
+    assert info.scheduler is None
+
+
+def test_a_ready_line_names_the_scheduler_properly_and_leaves_out_none() -> None:
+    local = SiteInfo(adapter="local", scheduler=None)
+    assert (
+        ready_line("This computer", "local", local, 0.1)
+        == "Reached This computer over Local: 0.1 s"
+    )
+    for reported, shown in (
+        ("slurm", "Slurm"),
+        ("pbs", "PBS"),
+        ("lsf", "LSF"),
+        ("cobalt", "Cobalt"),
+    ):
+        info = SiteInfo(adapter="ssh", scheduler=reported)
+        assert ready_line("Ares", "ssh", info, 1.14) == f"Reached Ares over SSH: {shown}, 1.1 s"
+    assert ready_line("Ares", "ssh", None, 2.0) == "Reached Ares over SSH: 2.0 s"

@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from clio_relay.adapters.base import AdapterContext, BaseAdapter
+from clio_relay.adapters.base import AdapterContext, BaseAdapter, Reach
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
 ENTRY_POINT_GROUP = "clio_relay.adapters"
@@ -94,6 +94,19 @@ def load(name: str) -> AdapterClass:
 def config_schema(name: str) -> dict[str, Any]:
     """Return the JSON Schema of an adapter's ``Config``. Drives the tab's form."""
     return load(name).Config.model_json_schema()
+
+
+def reaches(name: str, config: dict[str, Any]) -> Reach | None:
+    """Return the place a site config reaches and as whom, or None when relay cannot tell.
+
+    An adapter that is not installed, or a config it does not accept, reaches nothing
+    relay can compare.
+    """
+    try:
+        cls = load(name)
+        return cls.reaches(cls.Config.model_validate(config))
+    except (Refusal, ValidationError):
+        return None
 
 
 def validate_config(name: str, config: dict[str, Any]) -> BaseModel:

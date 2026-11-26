@@ -194,6 +194,19 @@ def protocol_name(adapter: str) -> str:
     return PROTOCOLS.get(adapter, (adapter, ""))[0]
 
 
+_SCHEDULERS = {"slurm": "Slurm", "pbs": "PBS", "lsf": "LSF", "cobalt": "Cobalt"}
+
+
+def scheduler_name(scheduler: str | None) -> str | None:
+    """Return a scheduler's proper name, or None when the site has none.
+
+    A name relay does not know is shown as the adapter reported it.
+    """
+    if scheduler is None:
+        return None
+    return _SCHEDULERS.get(scheduler, scheduler)
+
+
 # Protocols named with an ordinary word, which the page words in the person's language.
 _WORDED_PROTOCOLS = frozenset({"local"})
 # The catalog's name for the computer relay runs on (catalog/sites/local.yaml).

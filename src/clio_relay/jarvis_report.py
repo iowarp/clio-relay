@@ -8,8 +8,6 @@ the commands.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
@@ -25,16 +23,6 @@ def _dict(value: object) -> dict[str, Any]:
 def parse_install_report(text: str) -> dict[str, Any] | None:
     """Return the last ``jarvis.install-report.v1`` line in ``text``."""
     return parse_document(text, INSTALL_REPORT_SCHEMA)
-
-
-def report_digest(report: Mapping[str, Any]) -> str:
-    """Return the sha256 of an install report's installers and issues.
-
-    Paths and the mode are left out, so the digest binds what the person approves.
-    """
-    bound = {"installers": report.get("installers"), "issues": report.get("issues")}
-    text = json.dumps(bound, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def _issues(report: Mapping[str, Any]) -> list[dict[str, Any]]:

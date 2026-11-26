@@ -19,7 +19,15 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from clio_relay.adapters._process import run_bounded
-from clio_relay.adapters.base import AdapterContext, BaseAdapter, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.base import (
+    AdapterContext,
+    BaseAdapter,
+    Reach,
+    SignInNeed,
+    SiteInfo,
+    Verb,
+    api_place,
+)
 from clio_relay.adapters.globus import tokens
 from clio_relay.adapters.iri.client import FILE_SIZE_LIMIT, IriClient
 from clio_relay.adapters.iri.files import IriFiles
@@ -140,6 +148,11 @@ class IriAdapter(BaseAdapter[IriConfig]):
     name: ClassVar[str] = "iri"
     Config: ClassVar[type[BaseModel]] = IriConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
+
+    @classmethod
+    def reaches(cls, config: BaseModel) -> Reach | None:
+        assert isinstance(config, IriConfig)
+        return Reach(api_place(config.base_url, config.resource_id), config.identity)
 
     def __init__(self, config: IriConfig, context: AdapterContext) -> None:
         super().__init__(config, context)

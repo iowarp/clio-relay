@@ -297,6 +297,16 @@ def _status(state: TabState) -> dict[str, Any] | None:
         "missing_allocation": "warning",
     }.get(str(test.get("state")), "negative")
     status: dict[str, Any] = {"tone": tone, "text": str(test["line"])}
+    duplicate = as_dict(state.add.get("duplicate"))
+    if tone == "positive" and duplicate.get("title"):
+        return {
+            "tone": "warning",
+            "text": _(
+                "{name} already reaches the same computer the same way. "
+                "Update it instead of adding a copy?",
+                name=str(duplicate["title"]),
+            ),
+        }
     if test.get("detail"):
         status["detail"] = str(test["detail"])
     if test.get("url"):
@@ -331,6 +341,7 @@ def add_dialog(
     test = _test(state)
     testing = state.add.get("view") == "test"
     ok = passed(state)
+    duplicate = as_dict(state.add.get("duplicate"))
     steps = [_(step) for step in _STEPS]
     test_action = event(
         TEST_ENDPOINT, {"token": tokens.mint(TEST_ENDPOINT, ADD_SUBJECT), "values": bound(ADD)}
@@ -342,7 +353,9 @@ def add_dialog(
             "action": test_action,
         },
         "confirm": {
-            "label": _("Save endpoint"),
+            "label": _("Update {name}", name=str(duplicate["title"]))
+            if duplicate.get("title")
+            else _("Save endpoint"),
             "action": event(
                 SAVE_ENDPOINT,
                 {"token": tokens.mint(SAVE_ENDPOINT, ADD_SUBJECT), "values": bound(ADD)},

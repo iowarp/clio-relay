@@ -13,6 +13,7 @@ import yaml
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from clio_relay.adapters import registry
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import CatalogEntry, SiteEntry, SitePolicy, SpendAsk, SpendPolicy
 
@@ -38,6 +39,27 @@ def _dump_atomic(path: Path, data: Any) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def _refuse_same_endpoint(entry: SiteEntry, entries: list[SiteEntry]) -> None:
+    """Refuse ``entry`` when another site is the same endpoint: one adapter, one reach."""
+    reach = registry.reaches(entry.adapter, entry.config)
+    if reach is None:
+        return
+    for item in entries:
+        if item.id == entry.id or item.adapter != entry.adapter:
+            continue
+        if registry.reaches(item.adapter, item.config) != reach:
+            continue
+        where = f"{reach.user}@{reach.host}" if reach.user else reach.host
+        raise Refusal(
+            RefusalReason.SITE_EXISTS,
+            f"{item.title} already reaches {where} over {entry.adapter}",
+            site=entry.id,
+            existing=item.id,
+            host=reach.host,
+            user=reach.user,
+        )
 
 
 class SiteStore:
@@ -160,13 +182,19 @@ class SiteStore:
         )
 
     def add(self, entry: SiteEntry) -> SiteEntry:
-        """Add a site. Refuses with ``site_exists``."""
+        """Add a site. Refuses with ``site_exists`` when its id or its endpoint is taken.
+
+        The endpoint is the adapter and the place its config reaches, as whom
+        (:meth:`~clio_relay.adapters.base.BaseAdapter.reaches`). The refusal's
+        ``existing`` names the endpoint it repeats, so the caller can offer to update it.
+        """
         with self._locked():
             entries = self._read()
             if any(item.id == entry.id for item in entries):
                 raise Refusal(
                     RefusalReason.SITE_EXISTS, f"a site named {entry.id!r} exists", site=entry.id
                 )
+            _refuse_same_endpoint(entry, entries)
             entries.append(entry)
             self._write(entries)
         return entry
@@ -231,6 +259,7 @@ class SiteStore:
                         site=site_id,
                         errors=exc.errors(include_url=False, include_context=False),
                     ) from exc
+                _refuse_same_endpoint(updated, entries)
                 entries[index] = updated
                 self._write(entries)
                 return updated
