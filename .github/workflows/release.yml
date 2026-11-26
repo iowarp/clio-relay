@@ -3,9 +3,17 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Publishes an earlier tag's GitHub Release assets to PyPI, byte for byte.
+  # Run it from a v* tag ref, the only refs the pypi environment admits.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing release tag, such as v2.0.0a36
+        required: true
+        type: string
 
 concurrency:
-  group: clio-relay-release-${{ github.ref_name }}
+  group: clio-relay-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -14,6 +22,7 @@ permissions:
 jobs:
   build:
     name: build the tagged distributions
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -96,7 +105,7 @@ jobs:
   publish:
     name: publish to PyPI
     needs: build
-    if: github.repository == 'iowarp/clio-relay' && needs.build.outputs.prerelease == 'false'
+    if: github.repository == 'iowarp/clio-relay'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -111,6 +120,39 @@ jobs:
           path: dist/
       - name: keep only the distributions
         run: rm dist/SHA256SUMS
+      - name: publish
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist/
+
+  publish-existing:
+    name: publish an existing release to PyPI
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/clio-relay/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: download and check the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TAG_NAME" in v[0-9]*) ;; *) echo "not a release tag: $TAG_NAME" >&2; exit 1 ;; esac
+          version="${TAG_NAME#v}"
+          gh release download "$TAG_NAME" --dir dist
+          cd dist
+          sha256sum --check --strict SHA256SUMS
+          test -f "clio_relay-$version-py3-none-any.whl"
+          test -f "clio_relay-$version.tar.gz"
+          rm SHA256SUMS
+          ls -l
       - name: publish
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
