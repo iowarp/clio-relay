@@ -427,7 +427,7 @@ provides-extras = ["tapis", "globus", "iri", "testing"]
 [package.metadata.requires-dev]
 dev = [
     { name = "hatchling", specifier = "==1.31.0" },
-    { name = "jarvis-cd", url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.11/jarvis_cd-1.9.11-py3-none-any.whl" },
+    { name = "jarvis-cd", url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.12/jarvis_cd-1.9.12-py3-none-any.whl" },
     { name = "pip-audit", specifier = ">=2.10.0" },
     { name = "pyright", specifier = ">=1.1.390" },
     { name = "pytest", specifier = ">=8.3" },
@@ -955,8 +955,8 @@ wheels = [
 
 [[package]]
 name = "jarvis-cd"
-version = "1.9.11"
-source = { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.11/jarvis_cd-1.9.11-py3-none-any.whl" }
+version = "1.9.12"
+source = { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.12/jarvis_cd-1.9.12-py3-none-any.whl" }
 dependencies = [
     { name = "pandas" },
     { name = "podman-compose" },
@@ -964,7 +964,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.11/jarvis_cd-1.9.11-py3-none-any.whl", hash = "sha256:2867f0ef9d8991f5b926182d27a01a605c144528f0c423e5b7102d9a5c27ef5f" },
+    { url = "https://github.com/grc-iit/jarvis-cd/releases/download/v1.9.12/jarvis_cd-1.9.12-py3-none-any.whl", hash = "sha256:0c61b831268fbd0f695fc700b017e864ce1366fed1701b3cacbe0d310122f4f6" },
 ]
 
 [package.metadata]
