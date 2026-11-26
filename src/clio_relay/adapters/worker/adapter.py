@@ -48,6 +48,7 @@ from clio_relay.adapters.local import SchedulerChoice
 from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.worker.batch_ssh import batch_ssh
 from clio_relay.adapters.worker.files import WorkerFileAccess
+from clio_relay.adapters.worker.own_wheel import RelayInstall, relay_install
 from clio_relay.adapters.worker.site_server import IDLE_EXIT_S, LinkMode
 from clio_relay.jobs.handles import (
     Endpoint,
@@ -447,6 +448,14 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
     def _text_file(self, label: str, target: str, text: str) -> str:
         return self._payload(label, target, text.encode("utf-8"), "600")
 
+    def _relay_install(self) -> RelayInstall:
+        """Return the relay the site installs: the settings' own, else this computer's."""
+        if self.config.relay_wheel:
+            return RelayInstall(wheel=Path(self.config.relay_wheel).expanduser())
+        if self.config.relay_requirement:
+            return RelayInstall(requirement=self.config.relay_requirement)
+        return relay_install(self.context.state_dir / "relay-wheel")
+
     def placement_script(self, link: WorkerLink, *, session_owner_token: str) -> str:
         """Return the bash script the one ssh pass runs on the site."""
         from clio_relay.cluster_config import ClusterRegistry
@@ -481,20 +490,16 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             "  curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh >&2",
             "fi",
         ]
-        if self.config.relay_wheel:
-            wheel = Path(self.config.relay_wheel).expanduser()
-            name = wheel.name
+        relay = self._relay_install()
+        if relay.wheel is not None:
+            name = relay.wheel.name
             if not re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", name):
                 raise Refusal(RefusalReason.INVALID_CONFIG, "relay_wheel must be a .whl file")
-            parts.append(self._payload("WHEEL", f"$D/dist/{name}", wheel.read_bytes(), "600"))
+            parts.append(self._payload("WHEEL", f"$D/dist/{name}", relay.wheel.read_bytes(), "600"))
             install = f'"$D/dist/{name}"'
         else:
-            requirement = self.config.relay_requirement
-            if requirement is None:
-                from importlib.metadata import version
-
-                requirement = f"clio-relay=={version('clio-relay')}"
-            install = shlex.quote(requirement)
+            assert relay.requirement is not None
+            install = shlex.quote(relay.requirement)
         parts.append(
             'UV_TOOL_DIR="$D/tools" UV_TOOL_BIN_DIR="$D/bin" "$UV" tool install --force '
             f"--python {self.config.python} {install} >&2"
@@ -590,7 +595,10 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             link_mode=self.config.link_mode,
         )
         assert link.session_owner_token is not None
-        script = self.placement_script(link, session_owner_token=link.session_owner_token)
+        # It may fetch relay's own wheel, so off the event loop.
+        script = await asyncio.to_thread(
+            self.placement_script, link, session_owner_token=link.session_owner_token
+        )
         self._drop_connection()
         env = {**os.environ, **(env or {})}
         argv = programs.resolved(self.ssh_argv(), env)

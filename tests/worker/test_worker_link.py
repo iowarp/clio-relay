@@ -249,11 +249,11 @@ def _placing(tmp_path: Path, **config: Any) -> tuple[WorkerAdapter, WorkerLink]:
     token = tmp_path / "frps.token"
     token.write_text("frps-token", encoding="utf-8")
     rendezvous = Rendezvous(address="frps.example.test", port=7000, token_file=str(token))
+    config.setdefault("relay_requirement", "clio-relay==0.0.0")
     adapter = WorkerAdapter(
         WorkerConfig(
             ssh_profile="site-login",
             rendezvous=rendezvous,
-            relay_requirement="clio-relay==0.0.0",
             **config,
         ),
         context,
@@ -329,3 +329,29 @@ def test_placement_uses_the_sites_own_frpc_when_set(tmp_path: Path) -> None:
 
     assert 'FRPC_PATH="/opt/frp/frpc"' in script
     assert "CLIO_RELAY_FRPC" not in script
+
+
+def test_placement_with_no_relay_setting_sends_this_computers_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A site whose settings name no relay gets the wheel this computer's relay came from."""
+    from clio_relay.adapters.worker import adapter as worker_adapter
+    from clio_relay.adapters.worker.own_wheel import RelayInstall
+
+    wheel = tmp_path / "clio_relay-9.9.9-py3-none-any.whl"
+    wheel.write_bytes(b"relay wheel")
+    asked: list[Path] = []
+
+    def own(cache_dir: Path) -> RelayInstall:
+        asked.append(cache_dir)
+        return RelayInstall(wheel=wheel)
+
+    monkeypatch.setattr(worker_adapter, "relay_install", own)
+    adapter, link = _placing(tmp_path, relay_requirement=None)
+
+    script = adapter.placement_script(link, session_owner_token="owner-token")
+
+    assert asked == [tmp_path / "adapter" / "relay-wheel"]
+    assert base64.b64encode(b"relay wheel").decode("ascii") in script
+    assert '"$D/dist/clio_relay-9.9.9-py3-none-any.whl"' in script
+    assert "clio-relay==" not in script

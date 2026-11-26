@@ -94,8 +94,8 @@ picks those.
 | `rendezvous` | relay's `CLIO_RELAY_FRPS_ADDR` and `CLIO_RELAY_FRP_TOKEN` | The frps server, as below |
 | `remote_dir` | `~/.local/share/clio-relay/worker/<site>` | The worker's directory on the cluster |
 | `outputs_dir` | `clio-relay-runs` | Where runs write, outside relay's directories, as in the [ssh adapter](ssh.md#settings) |
-| `relay_wheel` | none | A local clio-relay wheel to install instead of the PyPI release |
-| `relay_requirement` | `clio-relay==<this version>` | What `uv` installs on the cluster |
+| `relay_wheel` | none | A local clio-relay wheel to install on the cluster |
+| `relay_requirement` | none | What `uv` installs on the cluster instead, such as `clio-relay==<version>` from an index |
 | `site_frpc` | none | An frpc already on the cluster |
 | `frpc_url` | relay's pinned frp release | Where the cluster fetches frpc instead: a `.tar.gz`, a `.tgz` or the binary. Needs `frpc_sha256` |
 | `frpc_sha256` | the pin's | The sha256 the download must have. A mismatch stops the sign-in |
@@ -106,6 +106,8 @@ picks those.
 | `jarvis_graph` | empty | The cluster's published JARVIS resource graph, as in the [ssh adapter](ssh.md#settings) |
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software, as in the [ssh adapter](ssh.md#settings) |
 | `link_mode` | `brokered_tcp` | `brokered_tcp` or `udp_rendezvous`; see [the link](#the-link) |
+
+With neither `relay_wheel` nor `relay_requirement` set, the cluster gets the relay this computer runs. If that relay came from a wheel URL, as the plugin installs it, the same wheel goes to the cluster once its files match the installed ones. If it came from an index, the cluster installs `clio-relay==<this version>`. An editable checkout, a local directory or a git source has no wheel to send, so the sign-in stops and says to set `relay_wheel` or `relay_requirement`.
 
 `rendezvous` takes:
 
