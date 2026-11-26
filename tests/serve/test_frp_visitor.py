@@ -431,6 +431,23 @@ def test_a_punch_with_no_answer_says_so_in_frps_words() -> None:
     asyncio.run(scenario())
 
 
+def test_the_punch_leaves_from_the_address_stun_saw(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def via_wifi(toward: str) -> str:
+        return "127.0.0.1" if toward == "stun.test:3478" else "10.68.0.51"
+
+    async def seen(sock: socket.socket, server: str) -> list[str]:
+        return ["69.243.157.178:55966", "69.243.157.178:55966"]
+
+    monkeypatch.setattr(nathole, "route_source", via_wifi)
+    monkeypatch.setattr(nathole, "discover", seen)
+    prepared = asyncio.run(nathole.prepare("stun.test:3478", "frps.test", disable_assisted=False))
+    try:
+        assert prepared.sock.getsockname()[0] == "127.0.0.1"
+        assert prepared.assisted == []
+    finally:
+        prepared.sock.close()
+
+
 def test_a_connection_with_no_hole_is_told_why_and_a_punch_is_asked_for() -> None:
     async def scenario() -> None:
         lines: list[str] = []

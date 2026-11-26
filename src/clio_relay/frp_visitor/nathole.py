@@ -86,12 +86,12 @@ def transaction_id() -> str:
     return f"{int(time.time())}{secrets.token_hex(8)}"
 
 
-def udp_socket() -> socket.socket:
-    """Return a non-blocking IPv4 UDP socket on a random port."""
+def udp_socket(host: str = "0.0.0.0") -> socket.socket:
+    """Return a non-blocking IPv4 UDP socket on a random port of ``host``."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setblocking(False)
-        sock.bind(("0.0.0.0", 0))
+        sock.bind((host, 0))
     except BaseException:
         sock.close()
         raise
@@ -226,6 +226,18 @@ def classify(addrs: list[str]) -> tuple[str, str]:
     return "EasyNAT", "BehaviorNoChange"
 
 
+async def route_source(toward: str) -> str | None:
+    """Return the source address the routing table picks toward ``toward``, if any."""
+    with contextlib.suppress(OSError, ValueError):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(await resolve(toward))
+            return str(probe.getsockname()[0])
+        finally:
+            probe.close()
+    return None
+
+
 async def local_ips(toward: list[str]) -> list[str]:
     """Return this machine's usable IPv4 addresses, at most ``MAX_LOCAL_IPS``.
 
@@ -234,27 +246,17 @@ async def local_ips(toward: list[str]) -> list[str]:
     rendezvous and STUN hosts), plus what the host name resolves to.
     """
     loop = asyncio.get_running_loop()
-    found: list[str] = []
-    for host in toward:
-        with contextlib.suppress(OSError, ValueError):
-            target = await resolve(host)
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                probe.connect(target)
-                found.append(str(probe.getsockname()[0]))
-            finally:
-                probe.close()
+    found = [ip for ip in [await route_source(host) for host in toward] if ip is not None]
     with contextlib.suppress(OSError):
         infos = await loop.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET)
         found.extend(str(cast(tuple[Any, ...], info[4])[0]) for info in infos)
-    usable: list[str] = []
-    for text in found:
-        ip = ipaddress.IPv4Address(text)
-        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
-            continue
-        if text not in usable:
-            usable.append(text)
+    usable = list(dict.fromkeys(ip for ip in found if _usable(ip)))
     return usable[:MAX_LOCAL_IPS]
+
+
+def _usable(text: str) -> bool:
+    ip = ipaddress.IPv4Address(text)
+    return not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified)
 
 
 async def precheck(transact: Transact, proxy_name: str) -> None:
@@ -267,8 +269,13 @@ async def precheck(transact: Transact, proxy_name: str) -> None:
 
 
 async def prepare(stun_server: str, rendezvous: str, *, disable_assisted: bool) -> Prepared:
-    """Open the punching socket and learn its public addresses."""
-    sock = udp_socket()
+    """Open the punching socket and learn its public addresses.
+
+    The socket is bound to the address toward the STUN server, so a split-tunnel
+    VPN can't carry the punch from an address STUN never saw (ledger, a44).
+    """
+    bound = await route_source(stun_server)
+    sock = udp_socket(bound or "0.0.0.0")
     try:
         try:
             addrs = await discover(sock, stun_server)
@@ -277,9 +284,10 @@ async def prepare(stun_server: str, rendezvous: str, *, disable_assisted: bool) 
         if len(addrs) < 2:
             raise HoleError("discover error: not enough addresses")
         nat_type, behavior = classify(addrs)
-        ips = await local_ips([rendezvous, stun_server])
+        # A bound socket hears only its own address.
+        ips = [bound] if bound else await local_ips([rendezvous, stun_server])
         port = int(sock.getsockname()[1])
-        assisted = [] if disable_assisted else [f"{ip}:{port}" for ip in ips]
+        assisted = [] if disable_assisted else [f"{ip}:{port}" for ip in ips if _usable(ip)]
     except BaseException:
         sock.close()
         raise
@@ -427,7 +435,7 @@ async def make_hole(sock: socket.socket, hole: Hole, secret: str) -> tuple[socke
             detect = [] if ranges else list(hole.candidates)
             for _ in range(int(behavior.get("listen_random_ports") or 0)):
                 with contextlib.suppress(OSError):
-                    socks.append(udp_socket())
+                    socks.append(udp_socket(str(sock.getsockname()[0])))
         for address in _compact(detect):
             for each in socks:
                 await _send_to(each, hole, tid, secret, address, ttl)

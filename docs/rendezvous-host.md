@@ -113,6 +113,10 @@ Two settings shape the direct path:
   the direct path never works from a place, turn `direct` off there so
   connections don't wait.
 
+The desktop punches from the address that leads to the STUN server, so the
+public address STUN reports is the one the punch leaves from. A split-tunnel
+VPN that carries the site's network doesn't take the punch into the tunnel.
+
 ## Per-site settings
 
 Each entry under `sites` says how that site's services reach the rendezvous
