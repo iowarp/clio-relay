@@ -1,9 +1,10 @@
 # The ssh adapter
 
-The `ssh` adapter reaches a site with the `ssh` and `scp` already on your
-machine. It needs no daemon, no agent and no open port on the site: every call
-is one `ssh` or `scp` run, so your keys, your `~/.ssh/config`, your jump hosts
-and your ssh agent all apply.
+The `ssh` adapter reaches a site the way your own `ssh` does. It needs no
+daemon, no agent and no open port on the site: relay holds one ssh connection
+to the site and runs every call on it, and your keys, your `~/.ssh/config`,
+your jump hosts and your ssh agent all apply (see
+[how relay connects](#how-relay-connects)).
 
 It serves `describe`, `run` (with `status`, `cancel` and `find` on the jobs it
 starts), `exec`, `files` and `serve`.
