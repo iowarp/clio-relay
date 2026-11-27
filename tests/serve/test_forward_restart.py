@@ -75,6 +75,12 @@ def held_(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Held]:
             pids.append(self.process.pid)
 
     monkeypatch.setattr(Forward, "_spawn", tracked)
+
+    # A hold script's command line has no forward marker: the ones spawned here are relay's.
+    def ours(pid: int, _marker: str) -> bool:
+        return pid in pids
+
+    monkeypatch.setattr(forward_module, "_is_ours", ours)
     yield Held(plan, pids)
     for pid in pids:
         _kill(pid)
@@ -408,3 +414,40 @@ def test_a_repicked_desktop_port_is_kept_through_a_stale_copy_and_a_restart(
         await restarted.close()
 
     asyncio.run(scenario())
+
+
+def test_a_port_another_program_took_from_a_gone_forward_is_repicked(
+    tmp_path: Path, held_: Held, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The forward relay recorded died and another program bound its port: relay moves."""
+    held = held_.plan
+    was = held.ports[0].local_port
+    script = tmp_path / "hold.py"
+
+    def command(self: Forward) -> tuple[list[str], dict[str, str]]:
+        return [sys.executable, str(script), str(self.plan.ports[0].local_port)], dict(os.environ)
+
+    monkeypatch.setattr(Forward, "_command", command)
+
+    def foreign(_pid: int, _marker: str) -> bool:
+        return False
+
+    monkeypatch.setattr(forward_module, "_is_ours", foreign)
+    other = subprocess.Popen([sys.executable, str(script), str(was)])
+    held.forward_pid = 999_999
+
+    async def scenario() -> None:
+        await _until(lambda: port_bound(was), "the other program binds")
+        saved: list[int | None] = []
+        forward = Forward(held, tmp_path / "fwd", lambda _c, pid: saved.append(pid))
+        await forward.start()
+        moved = forward.plan.ports[0].local_port
+        assert moved != was and not forward.adopted
+        await _until(forward.bound, "relay's own forward binds the new port")
+        assert len(held_.spawned) == 1 and saved[-1] == held_.spawned[0]
+        await forward.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        _kill(other.pid)

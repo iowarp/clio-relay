@@ -20,7 +20,6 @@ import contextlib
 import os
 import shlex
 import subprocess
-import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -34,6 +33,7 @@ from clio_relay.serve.forward_exit import (
     port_unusable,
 )
 from clio_relay.serve.forward_lock import ForwardLock
+from clio_relay.serve.forward_pid import is_ours as _is_ours
 from clio_relay.serve.plan import ServePlan, free_loopback_port
 
 MAX_BACKOFF_S = 30.0
@@ -154,50 +154,6 @@ def _jump_command(base: list[str], destination: str, env: dict[str, str]) -> str
     if os.name == "nt":
         return subprocess.list2cmdline([hop[0].replace("%", "%%"), *hop[1:]])
     return shlex.join([hop[0].replace("%", "%%"), *hop[1:]])
-
-
-def _windows_command_line(pid: int) -> str | None:
-    """Return a Windows process's command line, or None when Windows will not say."""
-    query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    line = result.stdout.strip()
-    return line if result.returncode == 0 and line else None
-
-
-def _is_ours(pid: int, marker: str) -> bool:
-    if sys.platform.startswith("linux"):
-        try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
-        except OSError:
-            return False
-        return marker.encode() in cmdline
-    if os.name == "nt":
-        command_line = _windows_command_line(pid)
-        if command_line is not None:
-            return marker in command_line
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return any(name in result.stdout.lower() for name in ("python", "ssh"))
-    try:
-        result = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, check=False
-        )
-    except OSError:
-        return False
-    return marker in result.stdout
 
 
 def forward_marker(plan: ServePlan, directory: Path) -> str:
@@ -374,6 +330,15 @@ class Forward:
             self.elsewhere = True
             return
         self.elsewhere = False
+        recorded = self.plan.forward_pid
+        if (
+            self.bound()
+            and recorded
+            and not await asyncio.to_thread(_is_ours, recorded, self.marker)
+        ):
+            # The forward relay recorded is gone and another program took its port.
+            self._log(f"the forward (pid {recorded}) is gone and another program holds its port")
+            self._repick()
         if self.bound():
             self.held = True
             self.adopted = True
