@@ -417,6 +417,9 @@ never types into ssh itself.
   you are asked once, not on every call. When the master closes, the site
   asks you to sign in again. The master closes when relay stops, so none is
   left running after it, and signing in again while one is up reuses it.
+  ssh on Windows cannot hold a master, so there the site refuses with
+  `interactive_auth_required` before anyone is asked, and names the `worker`
+  adapter.
 
 `askpass` replaces the program that shows the prompts, for example with a
 program of your own that reads codes from a token. With such a program, relay

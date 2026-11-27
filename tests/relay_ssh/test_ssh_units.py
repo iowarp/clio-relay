@@ -234,6 +234,21 @@ async def test_no_sign_in_without_interactive_sign_in(tmp_path: Path) -> None:
     assert await _adapter(tmp_path).sign_in_needed() is None
 
 
+@pytest.mark.asyncio
+async def test_a_code_site_without_an_ssh_master_refuses_before_asking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("clio_relay.adapters.ssh.transport.POSIX", False)
+    adapter = _adapter(tmp_path, interactive_sign_in=True)
+    with pytest.raises(Refusal) as refused:
+        await adapter.sign_in_needed()
+    assert refused.value.reason == RefusalReason.INTERACTIVE_AUTH_REQUIRED
+    assert refused.value.data["adapter"] == "worker"
+    assert refused.value.data["cause"] == "no_ssh_master"
+    with pytest.raises(Refusal):
+        adapter.ssh_argv()
+
+
 @pytest.mark.parametrize(
     ("lines", "state", "exit_code"),
     [

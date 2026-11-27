@@ -365,7 +365,7 @@ class SshTransport:
             "-o",
             "ServerAliveCountMax=4",
         ]
-        if self.config.interactive_sign_in:
+        if self.signs_in():
             options += [
                 "-o",
                 f"ControlPath={self.control_path}",
@@ -575,6 +575,28 @@ class SshTransport:
         )
 
     # interactive sign-in
+
+    def signs_in(self) -> bool:
+        """Return whether this site signs in through a master, refusing where none can run.
+
+        Windows' ssh, and Git's, cannot hold a ``ControlMaster``: the master
+        fails only after the person has answered, so refuse before anyone is asked.
+        """
+        if not self.config.interactive_sign_in:
+            return False
+        if not POSIX:
+            raise Refusal(
+                RefusalReason.INTERACTIVE_AUTH_REQUIRED,
+                (
+                    f"interactive_sign_in on {self.config.ssh_profile} needs an ssh master "
+                    "connection, and ssh on Windows cannot hold one. Use the worker "
+                    "adapter for this site: it signs in once on relay's page"
+                ),
+                site=self.site_id,
+                adapter="worker",
+                cause="no_ssh_master",
+            )
+        return True
 
     async def master_up(self) -> bool:
         """Return whether a signed-in master connection is running."""

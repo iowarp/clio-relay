@@ -1118,7 +1118,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # sign-in
 
     async def sign_in_needed(self) -> SignInNeed | None:
-        if not self.config.interactive_sign_in:
+        if not self.transport.signs_in():
             return None
         if await self.transport.master_up():
             return None
