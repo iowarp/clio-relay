@@ -336,3 +336,75 @@ def test_a_service_stopped_by_another_relay_process_is_not_bound_again(
         await watching.close()
 
     asyncio.run(scenario())
+
+
+def test_one_relay_process_runs_a_forward_and_the_next_takes_it_over(
+    tmp_path: Path, held_: Held
+) -> None:
+    """A prestarted relay and a session's share a state dir: only one binds the service."""
+    held = held_.plan
+    port = held.ports[0].local_port
+    ready = held.model_copy(update={"ready_at": utc_now()})
+
+    async def scenario() -> None:
+        first = ServeRuntime(tmp_path / "state", transport="stdio")
+        first._save(ready)  # pyright: ignore[reportPrivateUsage]
+        owner = await first._ensure_forward(ready, None)  # pyright: ignore[reportPrivateUsage]
+        await _until(owner.bound, "the owner binds")
+        second = ServeRuntime(tmp_path / "state", transport="stdio")
+        other = second._plan(ready.operation_id)  # pyright: ignore[reportPrivateUsage]
+        left = await second._ensure_forward(other, None)  # pyright: ignore[reportPrivateUsage]
+        assert left.elsewhere and left.task is None and left.serving()
+        await asyncio.sleep(0.3)
+        assert len(held_.spawned) == 1
+        await first.close()
+        taken = await second._ensure_forward(other, None)  # pyright: ignore[reportPrivateUsage]
+        assert not taken.elsewhere and taken.held and taken.lock.held()
+        assert len(held_.spawned) == 1 and _answers(port)
+        await second.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_repicked_desktop_port_is_kept_through_a_stale_copy_and_a_restart(
+    tmp_path: Path, held_: Held, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held = held_.plan
+    was = held.ports[0].local_port
+    script = tmp_path / "hold.py"
+
+    def command(self: Forward) -> tuple[list[str], dict[str, str]]:
+        return [sys.executable, str(script), str(self.plan.ports[0].local_port)], dict(os.environ)
+
+    state = forward_module.port_state
+
+    def reserved(port: int) -> str:
+        return "unusable" if port == was else state(port)
+
+    monkeypatch.setattr(Forward, "_command", command)
+    monkeypatch.setattr(forward_module, "port_state", reserved)
+    ready = held.model_copy(update={"ready_at": utc_now()})
+
+    async def scenario() -> None:
+        stale = ServeRuntime(tmp_path / "state", transport="stdio")
+        stale._save(ready)  # pyright: ignore[reportPrivateUsage]
+        copy = stale._plan(ready.operation_id).model_copy(deep=True)  # pyright: ignore[reportPrivateUsage]
+        first = ServeRuntime(tmp_path / "state", transport="stdio")
+        owned = await first._ensure_forward(first._plan(ready.operation_id), None)  # pyright: ignore[reportPrivateUsage]
+        await _until(owned.bound, "the forward binds the repicked port")
+        moved = owned.plan.ports[0].local_port
+        assert moved != was
+        stored = first.store.get(ready.operation_id)
+        assert stored is not None and stored.ports[0].local_port == moved
+        stale._save(copy)  # pyright: ignore[reportPrivateUsage]
+        stored = first.store.get(ready.operation_id)
+        assert stored is not None and stored.ports[0].local_port == moved
+        await first.close()
+        restarted = ServeRuntime(tmp_path / "state", transport="stdio")
+        await restarted.resume()
+        forward = restarted.forwards[ready.operation_id]
+        assert forward.held and forward.plan.ports[0].local_port == moved
+        assert len(held_.spawned) == 1 and _answers(moved)
+        await restarted.close()
+
+    asyncio.run(scenario())

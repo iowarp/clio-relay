@@ -33,6 +33,7 @@ from clio_relay.serve.forward_exit import (
     port_state,
     port_unusable,
 )
+from clio_relay.serve.forward_lock import ForwardLock
 from clio_relay.serve.plan import ServePlan, free_loopback_port
 
 MAX_BACKOFF_S = 30.0
@@ -263,6 +264,9 @@ class Forward:
         self.closing = False
         self.ssh_env: dict[str, str] = {}
         self.marker = forward_marker(plan, directory)
+        self.lock = ForwardLock(directory)
+        self.elsewhere = False
+        """Another live relay process runs this forward; this one leaves it be."""
 
     def alive(self) -> bool:
         """Return whether this relay process started the forward and it still runs."""
@@ -284,7 +288,8 @@ class Forward:
         earlier relay process left that this one adopted. A port that something
         else holds is not a served port.
         """
-        return self.failure is None and self.bound() and (self.alive() or self.adopted)
+        held = self.alive() or self.adopted or self.elsewhere
+        return self.failure is None and self.bound() and held
 
     def _new_lines(self) -> list[str]:
         try:
@@ -365,6 +370,10 @@ class Forward:
         """Start the forward unless one already holds the ports, which it then adopts."""
         if self.task is not None:
             return
+        if not self.lock.take():
+            self.elsewhere = True
+            return
+        self.elsewhere = False
         if self.bound():
             self.held = True
             self.adopted = True
@@ -387,6 +396,7 @@ class Forward:
                 was, port.local_port = port.local_port, free_loopback_port()
                 self._log(f"desktop port {was} cannot be bound here; using {port.local_port}")
         self.marker = forward_marker(self.plan, self.directory)
+        self.on_restart(self.rebound, None)
 
     def _fail(self, refusal: Refusal) -> None:
         self.failure = refusal
@@ -437,7 +447,6 @@ class Forward:
             self.restarts += 1
             if not self.held and port_unusable(lines):
                 self._repick()
-                self.on_restart(self.rebound, None)
             self._log(
                 f"forward ended, starting it again on the same port (restart {self.restarts})"
             )
@@ -470,6 +479,7 @@ class Forward:
         await self._stop_watching()
         if self.alive():
             self._log(f"relay is stopping; the forward stays up (pid {self.pid()})")
+        self.lock.release()
 
     async def close(self) -> None:
         """Close the desktop ports at once."""
@@ -486,3 +496,4 @@ class Forward:
                 await asyncio.to_thread(process.wait)
         elif self.bound():
             kill_recorded(self.plan.forward_pid, self.marker)
+        self.lock.release()

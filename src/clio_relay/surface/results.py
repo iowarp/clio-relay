@@ -38,13 +38,23 @@ def text(value: dict[str, Any]) -> str:
     return json.dumps(value, indent=2, sort_keys=True, default=str)
 
 
+def _comments(view: dict[str, Any]) -> str:
+    """Quote what the person said beside their answers, so the model reads it too."""
+    asks: list[dict[str, Any]] = view.get("asks") or []
+    return "".join(
+        f'\n\nThe person {ask["state"]} "{ask["message"]}" and said: {ask["comment"]}'
+        for ask in asks
+        if ask.get("comment")
+    )
+
+
 def _summary(view: dict[str, Any]) -> str:
     declined: dict[str, Any] | None = view.get("declined")
     if declined:
         return (
             f"Operation {view['operation_id']} on {view['site']} was declined: "
             f"{declined['question']}\n{declined['not_done']}"
-        )
+        ) + _comments(view)
     line = f"Operation {view['operation_id']} on {view['site']} is {view['state']}"
     if view.get("exit_code") is not None:
         line += f" with exit code {view['exit_code']}"
@@ -79,7 +89,7 @@ def _summary(view: dict[str, Any]) -> str:
     line += crashed_services(result.get("outcomes") or {})
     if view.get("error"):
         line += f"\n\n{view['error'].get('reason')}: {view['error'].get('message')}"
-    return line
+    return line + _comments(view)
 
 
 _APPLICATION = {"completed": "finished", "failed": "failed", "cancelled": "was cancelled"}

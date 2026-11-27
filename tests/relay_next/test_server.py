@@ -221,7 +221,11 @@ def test_task_asks_with_input_required_and_takes_tasks_update(relay_paths: Relay
                     params=UpdateTaskRequestParams(
                         task_id=task.task_id,
                         input_responses={
-                            ask_id: {"action": "accept", "content": {"approve": "approve"}}
+                            ask_id: {
+                                "action": "accept",
+                                "content": {"approve": "approve"},
+                                "_meta": {"io.iowarp/approval": {"comment": "one node is enough"}},
+                            }
                         },
                     )
                 ),
@@ -229,6 +233,7 @@ def test_task_asks_with_input_required_and_takes_tasks_update(relay_paths: Relay
             )
             result = await task.result()
             assert _structured(result)["state"] == "completed"
+            assert _structured(result)["asks"][0]["comment"] == "one node is enough"
 
     asyncio.run(scenario())
     assert _ask_answers(relay_paths) == ["tasks/update"]

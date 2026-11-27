@@ -75,6 +75,9 @@ def said_yes(content: dict[str, Any] | None) -> bool:
 CHOICE_META = "io.iowarp.clio-relay/choice"
 """The ``_meta`` key of a choose ask's typed options, keyed by ask id, then by field."""
 
+APPROVAL_META = "io.iowarp/approval"
+"""The ``_meta`` key an elicitation answer carries the person's ``comment`` under."""
+
 ASK_META = "io.iowarp.clio-relay/ask"
 """The ``_meta`` key of what surrounds every ask's short question, keyed by ask id.
 

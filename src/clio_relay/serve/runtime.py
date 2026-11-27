@@ -35,6 +35,7 @@ from clio_relay.login_load import light_argv
 from clio_relay.serve import config as serve_settings
 from clio_relay.serve import planning
 from clio_relay.serve.forward import Forward, forward_marker, kill_recorded, mark_closed
+from clio_relay.serve.forward_owner import ForwardOwning
 from clio_relay.serve.keys import ForwardCare
 from clio_relay.serve.mount import Mounter, tool_prefix
 from clio_relay.serve.plan import (
@@ -114,7 +115,7 @@ async def start_for(adapter: Any, spec: ServiceSpec, *, operation_id: str) -> En
     return await _runtime.start_for(adapter, spec, operation_id=operation_id)
 
 
-class ServeRuntime(ForwardCare):
+class ServeRuntime(ForwardCare, ForwardOwning):
     """Every service this relay host started, and their desktop ports."""
 
     def __init__(
@@ -556,14 +557,6 @@ class ServeRuntime(ForwardCare):
 
     # Observing
 
-    def _cached(self, operation_id: str) -> ServePlan | None:
-        plan = self.plans.get(operation_id)
-        if plan is None:
-            plan = self.store.get(operation_id)
-            if plan is not None:
-                self.plans[operation_id] = plan
-        return plan
-
     def _plan(self, operation_id: str) -> ServePlan:
         plan = self._cached(operation_id)
         if plan is None:
@@ -573,10 +566,6 @@ class ServeRuntime(ForwardCare):
                 operation_id=operation_id,
             )
         return plan
-
-    def _save(self, plan: ServePlan) -> None:
-        self.plans[plan.operation_id] = plan
-        self.store.put(plan)
 
     def _lock(self, operation_id: str) -> asyncio.Lock:
         return self._locks.setdefault(operation_id, asyncio.Lock())
@@ -780,27 +769,6 @@ class ServeRuntime(ForwardCare):
 
         with contextlib.suppress(RuntimeError):
             self._followers[plan.operation_id] = asyncio.get_running_loop().create_task(follow())
-
-    async def _ensure_forward(self, plan: ServePlan, adapter: Any) -> Forward:
-        forward = self.forwards.get(plan.operation_id)
-        if forward is None:
-
-            def restarted(count: int, pid: int | None) -> None:
-                plan.rebinds = count
-                plan.forward_pid = pid
-                self._save(plan)
-
-            directory = self.state_dir / "serve" / "forwards" / plan.operation_id
-            failed = self._failure_callback(plan.operation_id)
-            forward = Forward(plan, directory, restarted, on_failure=failed)
-            self.forwards[plan.operation_id] = forward
-        if adapter is not None and plan.mode == "ssh":
-            transport = getattr(adapter, "transport", None)
-            environment = getattr(transport, "environment", None)
-            if callable(environment):
-                forward.ssh_env = dict(await maybe(environment()) or {})
-        await forward.start()
-        return forward
 
     async def _mount(self, plan: ServePlan) -> str | None:
         port = next((item for item in plan.ports if item.protocol == "mcp"), None)

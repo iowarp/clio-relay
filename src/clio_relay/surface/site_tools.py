@@ -28,13 +28,13 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import canonical_digest
 from clio_relay.surface import exec_plan, job_card
 from clio_relay.surface.elicit import (
+    answer_response,
     elicit_inline,
     elicitation_modes,
     input_required,
     modern,
     reads_ask_meta,
     refusal_result,
-    response_parts,
 )
 from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.results import CHANGE, record_result, text
@@ -100,8 +100,7 @@ def _answer(service: RelayService, site: str, ask_id: str, responses: dict[str, 
         return
     if ask.binding.get("kind") != CLEAN_KIND:
         return
-    action, content = response_parts(responses[ask_id])
-    service.answer(ask_id, action, content, by="input_required")
+    answer_response(service, ask_id, responses[ask_id], by="input_required")
 
 
 def _needs_person(service: RelayService, ask: Ask) -> ToolResult:
@@ -140,8 +139,7 @@ async def site_clean_tool(
                 return InputRequiredToolResult(
                     input_required([ask], ask.ask_id, reads_meta=reads_ask_meta(ctx))
                 )
-            action, content = response_parts(await elicit_inline(ctx, ask))
-            service.answer(ask.ask_id, action, content, by="elicitation")
+            answer_response(service, ask.ask_id, await elicit_inline(ctx, ask), by="elicitation")
             try:
                 cleaned = await _clean(service, site, **options)
             except NeedsPerson as still:

@@ -9,7 +9,7 @@ any other.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mcp_types
 from fastmcp import Context
@@ -18,8 +18,19 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.tasks import TASKS_EXTENSION_ID
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from clio_relay.adapters.hooks import ASK_META, CHOICE_META, READS_ASK_META, Ask, short_ask
+from clio_relay.adapters.hooks import (
+    APPROVAL_META,
+    ASK_META,
+    CHOICE_META,
+    READS_ASK_META,
+    Ask,
+    ask_detail,
+    short_ask,
+)
 from clio_relay.jobs.refusals import Refusal, declined_outcome
+
+if TYPE_CHECKING:
+    from clio_relay.surface.service import RelayService
 
 _BY_ASK = (CHOICE_META, ASK_META)
 _LOOKUP_ERRORS = (AttributeError, RuntimeError, LookupError, TypeError)
@@ -203,3 +214,39 @@ def response_parts(response: Any) -> tuple[str, dict[str, Any] | None]:
         content = response.get("content")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         return action, dict(content) if isinstance(content, dict) else None  # pyright: ignore[reportUnknownArgumentType]
     return "cancel", None
+
+
+def response_comment(response: Any) -> str | None:
+    """The person's comment on an elicitation answer, from its ``APPROVAL_META``."""
+    if isinstance(response, mcp_types.ElicitResult):
+        meta: object = response.meta
+    elif isinstance(response, dict):
+        meta = cast(dict[str, object], response).get("_meta")
+    else:
+        meta = None
+    approval = cast(dict[str, object], meta).get(APPROVAL_META) if isinstance(meta, dict) else None
+    said = cast(dict[str, object], approval).get("comment") if isinstance(approval, dict) else None
+    return (said.strip() or None) if isinstance(said, str) else None
+
+
+def answer_response(service: RelayService, ask_id: str, response: Any, *, by: str) -> Ask:
+    """Record an elicitation answer to ``ask_id``, its comment included."""
+    action, content = response_parts(response)
+    return service.answer(ask_id, action, content, by=by, comment=response_comment(response))
+
+
+def ask_view(ask: Ask) -> dict[str, Any]:
+    """An ask as a client sees it on an operation, with the person's comment if any."""
+    shown: dict[str, Any] = {
+        "ask_id": ask.ask_id,
+        "kind": ask.kind,
+        "state": ask.state,
+        "message": ask.message,
+        "detail": ask_detail(ask),
+    }
+    if ask.kind == "url":
+        shown["url"] = ask.url
+        shown["completed"] = ask.completed_at is not None
+    if comment := (ask.answer or {}).get("comment"):
+        shown["comment"] = str(comment)
+    return shown

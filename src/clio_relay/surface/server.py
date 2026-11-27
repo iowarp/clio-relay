@@ -55,6 +55,7 @@ from clio_relay.surface.a2ui import install as install_compute_tab
 from clio_relay.surface.bearer import RelayBearer
 from clio_relay.surface.changes import ServerChanges
 from clio_relay.surface.elicit import (
+    answer_response,
     ask_mode,
     elicit_document,
     elicit_inline,
@@ -64,7 +65,6 @@ from clio_relay.surface.elicit import (
     reads_ask_meta,
     refusal_result,
     request_reads_ask_meta,
-    response_parts,
     tasks_opted_in,
 )
 from clio_relay.surface.endpoints import (
@@ -267,8 +267,7 @@ class RelayTasksExtension(ServerExtension):
         for ask_id, response in params.input_responses.items():
             if ask_id not in record.asks:
                 continue
-            action, content = response_parts(response)
-            answered.append(self.service.answer(ask_id, action, content, by="tasks/update"))
+            answered.append(answer_response(self.service, ask_id, response, by="tasks/update"))
         await advance_holders(self.service, params.task_id, answered)
         return UpdateTaskResult()
 
@@ -326,8 +325,8 @@ class RelayServer:
                 if ask_mode(ask) not in modes or ask.ask_id in asked:
                     break
                 asked.add(ask.ask_id)
-                action, content = response_parts(await elicit_inline(ctx, ask))
-                answered.append(self.service.answer(ask.ask_id, action, content, by="elicitation"))
+                said = await elicit_inline(ctx, ask)
+                answered.append(answer_response(self.service, ask.ask_id, said, by="elicitation"))
             if not answered:
                 return record
             record = await advance_holders(self.service, record.operation_id, answered)
@@ -522,8 +521,9 @@ class RelayServer:
         answered: list[Ask] = []
         for ask_id, response in (ctx.input_responses or {}).items():
             if ask_id in record.asks:
-                action, content = response_parts(response)
-                answered.append(self.service.answer(ask_id, action, content, by="input_required"))
+                answered.append(
+                    answer_response(self.service, ask_id, response, by="input_required")
+                )
         record = await advance_holders(self.service, operation_id, answered)
         return await self._deliver(ctx, record, wait_s)
 

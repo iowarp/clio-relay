@@ -24,7 +24,6 @@ from clio_relay.adapters.hooks import (
     HookContext,
     ServeHook,
     Transport,
-    ask_detail,
     hook_factory,
     said_yes,
     split_question,
@@ -74,6 +73,7 @@ from clio_relay.surface import (
 )
 from clio_relay.surface import plan_card as job_plan
 from clio_relay.surface.describing import relay_report, site_report
+from clio_relay.surface.elicit import ask_view
 from clio_relay.surface.endpoints import public_endpoint, service_ready
 from clio_relay.surface.exec_plan import ExecPlan
 from clio_relay.surface.job_card import snapshot as job_snapshot
@@ -495,21 +495,23 @@ class RelayService:
         content: dict[str, Any] | None = None,
         *,
         by: str,
+        comment: str | None = None,
     ) -> Ask:
-        """Record a person's answer to an ask, once."""
+        """Record a person's answer to an ask, once, with what they said beside it."""
         with self.asks.locked(ask_id):
             ask = self.asks.get(ask_id)
             if ask is None:
                 raise Refusal(
                     RefusalReason.ASK_NOT_FOUND, f"there is no ask {ask_id!r}", ask_id=ask_id
                 )
+            said = {"comment": comment} if comment else {}
             if action == "accept":
                 state = "accepted" if ask.kind != "approve" or said_yes(content) else "declined"
-                ask.resolve(state, {"action": "accept", "content": content}, by)
+                ask.resolve(state, {"action": "accept", "content": content, **said}, by)
             elif action == "decline":
-                ask.resolve("declined", {"action": "decline"}, by)
+                ask.resolve("declined", {"action": "decline", **said}, by)
             else:
-                ask.resolve("cancelled", {"action": "cancel"}, by)
+                ask.resolve("cancelled", {"action": "cancel", **said}, by)
             self.asks.put(ask_id, ask)
         return ask
 
@@ -1076,19 +1078,7 @@ class RelayService:
 
     def view(self, record: OperationRecord) -> dict[str, Any]:
         """Return what a client sees of an operation."""
-        asks: list[dict[str, Any]] = []
-        for ask in self.operation_asks(record):
-            shown: dict[str, Any] = {
-                "ask_id": ask.ask_id,
-                "kind": ask.kind,
-                "state": ask.state,
-                "message": ask.message,
-                "detail": ask_detail(ask),
-            }
-            if ask.kind == "url":
-                shown["url"] = ask.url
-                shown["completed"] = ask.completed_at is not None
-            asks.append(shown)
+        asks = [ask_view(ask) for ask in self.operation_asks(record)]
         declined_as = declines.outcome(record)
         return {
             "operation_id": record.operation_id,

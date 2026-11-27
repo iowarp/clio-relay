@@ -23,13 +23,13 @@ from clio_relay.jobs.handles import FileAccess
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface.elicit import (
+    answer_response,
     elicit_inline,
     elicitation_modes,
     input_required,
     modern,
     reads_ask_meta,
     refusal_result,
-    response_parts,
 )
 from clio_relay.surface.files_approval import (
     FILES_KIND,
@@ -292,8 +292,7 @@ async def files_tool(
                 return InputRequiredToolResult(
                     input_required([ask], ask.ask_id, reads_meta=reads_ask_meta(ctx))
                 )
-            action, content = response_parts(await elicit_inline(ctx, ask))
-            service.answer(ask.ask_id, action, content, by="elicitation")
+            answer_response(service, ask.ask_id, await elicit_inline(ctx, ask), by="elicitation")
             try:
                 structured, text = await files_call(service, site, args)
             except NeedsPerson as still:
@@ -316,8 +315,7 @@ def _answer(
     bound = ask.binding
     if bound.get("kind") != FILES_KIND or ask.site != site or bound.get("path") != args.path:
         return
-    action, content = response_parts(responses[ask_id])
-    service.answer(ask_id, action, content, by="input_required")
+    answer_response(service, ask_id, responses[ask_id], by="input_required")
 
 
 def _needs_person(service: RelayService, ask: Ask) -> ToolResult:

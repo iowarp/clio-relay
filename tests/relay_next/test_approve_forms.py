@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import mcp_types
 import pytest
 
 from clio_relay.adapters.hooks import (
@@ -19,7 +20,9 @@ from clio_relay.adapters.hooks import (
 )
 from clio_relay.adapters.ssh import pricing as ssh_pricing
 from clio_relay.jobs.spec import JobSpec
+from clio_relay.surface.elicit import answer_response, ask_view
 from clio_relay.surface.guarding import cost_text, node_hours_text
+from clio_relay.surface.results import operation_result
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
@@ -145,3 +148,36 @@ def test_two_choices_on_one_ask_keep_both() -> None:
     merged = with_choice_meta(with_choice_meta({"job": 1}, first), second)
     assert set(merged[CHOICE_META]["ask_1"]) == {"approve", "held"}
     assert merged["job"] == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        mcp_types.ElicitResult.model_validate(
+            {
+                "action": "decline",
+                "_meta": {"io.iowarp/approval": {"comment": "use the debug queue"}},
+            }
+        ),
+        {"action": "decline", "_meta": {"io.iowarp/approval": {"comment": "use the debug queue"}}},
+    ],
+)
+def test_the_persons_comment_reaches_the_model(relay_paths: RelayPaths, response: Any) -> None:
+    service = RelayService(relay_paths)
+    ask = Ask(ask_id="ask_c", kind="approve", site="fx", message="Spend 2 node-hours?")
+    service.asks.put(ask.ask_id, ask)
+    answered = answer_response(service, ask.ask_id, response, by="test")
+    shown = ask_view(answered)
+    assert (shown["state"], shown["comment"]) == ("declined", "use the debug queue")
+    view = {"operation_id": "op_1", "site": "fx", "state": "running", "asks": [shown]}
+    said = operation_result(view).content[0]
+    assert isinstance(said, mcp_types.TextContent)
+    assert said.text.endswith('declined "Spend 2 node-hours?" and said: use the debug queue')
+
+
+def test_no_comment_says_nothing_more(relay_paths: RelayPaths) -> None:
+    service = RelayService(relay_paths)
+    ask = Ask(ask_id="ask_n", kind="approve", site="fx", message="Spend 2 node-hours?")
+    service.asks.put(ask.ask_id, ask)
+    answered = answer_response(service, ask.ask_id, {"action": "accept"}, by="test")
+    assert "comment" not in ask_view(answered)

@@ -116,6 +116,7 @@ def _advance(service: RelayService, ask: Ask) -> None:
 def asks_answer(
     ask_id: str,
     value: Annotated[str | None, typer.Option(help="The choice, for a choose ask")] = None,
+    comment: Annotated[str | None, typer.Option(help="What to tell the agent beside it")] = None,
 ) -> None:
     """Approve, choose, or say a sign-in is finished."""
     from clio_relay.asks.core import stale_approval
@@ -134,7 +135,7 @@ def asks_answer(
             _fail(f"choose one of: {', '.join(options(ask))}")
         content = {field_name(ask): value}
     try:
-        ask = service.answer(ask_id, "accept", content, by="cli")
+        ask = service.answer(ask_id, "accept", content, by="cli", comment=comment)
         if ask.kind == "url" and ask.completed_at is None and ask.state == "accepted":
             with service.asks.locked(ask_id):
                 stored = service.asks.get(ask_id)
@@ -148,12 +149,15 @@ def asks_answer(
 
 
 @app.command("decline")
-def asks_decline(ask_id: str) -> None:
+def asks_decline(
+    ask_id: str,
+    comment: Annotated[str | None, typer.Option(help="What to tell the agent beside it")] = None,
+) -> None:
     """Say no. The operation waiting on it is cancelled."""
     service = _service()
     _ask(service, ask_id)
     try:
-        _advance(service, service.answer(ask_id, "decline", None, by="cli"))
+        _advance(service, service.answer(ask_id, "decline", None, by="cli", comment=comment))
     except Refusal as refusal:
         _fail(f"{refusal.reason.value}: {refusal.message}")
 
