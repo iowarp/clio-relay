@@ -8,7 +8,10 @@ runs on its own.
 from __future__ import annotations
 
 import asyncio
+import io
+import shlex
 import socket
+import tarfile
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,11 +88,27 @@ def _server(site: Site, client_key: asyncssh.SSHKey) -> type[asyncssh.SSHServer]
     return Server
 
 
-async def _handle(process: asyncssh.SSHServerProcess[str]) -> None:
+async def _handle(process: asyncssh.SSHServerProcess[bytes], root: Path) -> None:
     command = process.command or ""
     if command.startswith("sleep "):
         await asyncio.sleep(float(command.split()[1]))
-    process.stdout.write(f"ran:{command}\n")
+    if command.startswith("exit "):
+        process.exit(int(command.split()[1]))
+        return
+    if "tar -xpf" in command:
+        # Stands in for the site's sh and tar under a joined process's upload.
+        script = shlex.split(command)[2]
+        target = root / shlex.split(script.split(";")[0].removeprefix("d="))[0]
+        data = await process.stdin.read()
+        if not target.is_dir():
+            process.stderr.write(b"sftp: nowhere: No such file or directory\n")
+            process.exit(1)
+            return
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            archive.extractall(target, filter="data")
+        process.exit(0)
+        return
+    process.stdout.write(f"ran:{command}\n".encode())
     process.exit(0)
 
 
@@ -106,13 +125,17 @@ async def site(tmp_path: Path) -> AsyncIterator[Site]:
     def sftp(chan: asyncssh.SSHServerChannel[bytes]) -> asyncssh.SFTPServer:
         return asyncssh.SFTPServer(chan, chroot=str(root).encode())
 
+    async def handle(process: asyncssh.SSHServerProcess[bytes]) -> None:
+        await _handle(process, root)
+
     server = await asyncssh.create_server(
         lambda: _server(holder[0], client_key)(),
         "127.0.0.1",
         0,
         server_host_keys=[host_key],
-        process_factory=_handle,
+        process_factory=handle,
         sftp_factory=sftp,
+        encoding=None,
     )
     port = server.sockets[0].getsockname()[1]
     holder.append(Site(port=port, key_file=key_file, root=root))
@@ -137,10 +160,20 @@ def _profile(site: Site, *, user: str, keys: bool) -> Profile:
 
 
 def _held(
-    monkeypatch: pytest.MonkeyPatch, site: Site, *, signs_in: bool, channels: int = 8
+    monkeypatch: pytest.MonkeyPatch,
+    site: Site,
+    *,
+    signs_in: bool,
+    channels: int = 8,
+    share: Path | None = None,
 ) -> held.Held:
     connection = held.Held(
-        base=["ssh"], destination="loop", signs_in=signs_in, channels=channels, timeout_s=10
+        base=["ssh"],
+        destination="loop",
+        signs_in=signs_in,
+        channels=channels,
+        timeout_s=10,
+        share=share,
     )
     profile = _profile(site, user="person" if signs_in else "keyed", keys=not signs_in)
 
@@ -322,6 +355,59 @@ async def test_a_code_site_serves_over_the_signed_in_connection(
         assert not _bound(local)
     finally:
         await connection.close()
+        echo.close()
+
+
+async def test_relays_other_processes_share_one_sign_in(
+    site: Site, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    share = tmp_path / "state" / "ssh" / "loop.json"
+    owner = _held(monkeypatch, site, signs_in=True, share=share)
+    other = _held(monkeypatch, site, signs_in=True, share=share)
+    person = Person(password=["pw"], code=[CODE])
+    _asks_through(monkeypatch, person)
+    (site.root / "dest").mkdir()
+    source = tmp_path / "input.txt"
+    source.write_text("staged\n", encoding="utf-8")
+    echo, remote = await _echo_server()
+    local = _free_port()
+    try:
+        await owner.sign_in({})
+        assert share.is_file()
+
+        assert (await _run(other, "echo joined")).stdout == b"ran:echo joined\n"
+        assert (await _run(other, "exit 3")).exit_code == 3
+        done = await asyncio.gather(*(_run(other, f"sleep 0.1 {i}") for i in range(12)))
+        assert all(item.exit_code == 0 for item in done)
+        copied = await other.upload([source], "~/dest")
+        assert copied.exit_code == 0, copied.stderr
+        assert (site.root / "dest" / "input.txt").read_text(encoding="utf-8") == "staged\n"
+        missing = await other.upload([source], "~/nowhere")
+        assert missing.exit_code == 1
+        assert b"No such file or directory" in missing.stderr
+
+        forward = forwarder.InRelay.start(
+            other, [(local, remote)], node=None, known_hosts=None, log=tmp_path / "f.log"
+        )
+        await _until(lambda: _bound(local))
+        assert await _through(local) == b"hello"
+        forward.terminate()
+        await asyncio.to_thread(forward.wait, 10)
+        assert len(person.asked) == 2
+        assert len(site.conns) == 1
+
+        site.drop()
+        await _until(lambda: not other.signed_in() and not share.exists())
+        after = await _run(other, "echo after")
+        assert b"Permission denied (keyboard-interactive)." in after.stderr
+
+        await other.sign_in({})
+        assert len(person.asked) == 4
+        assert (await _run(owner, "echo back")).stdout == b"ran:echo back\n"
+        assert len(site.conns) == 2
+    finally:
+        await other.close()
+        await owner.close()
         echo.close()
 
 

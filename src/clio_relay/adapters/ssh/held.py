@@ -23,6 +23,7 @@ import contextlib
 import errno
 import logging
 import os
+import secrets
 import socket
 import subprocess
 import time
@@ -34,6 +35,7 @@ from typing import Any
 import asyncssh
 
 from clio_relay import programs
+from clio_relay.adapters.ssh import mux
 from clio_relay.adapters.ssh import profile as profiles
 from clio_relay.adapters.ssh.process import Completed, Sink, supervise
 from clio_relay.adapters.ssh.profile import Profile
@@ -165,6 +167,8 @@ class Conn:
     capacity: int
     hops: list[asyncssh.SSHClientConnection]
     active: int = 0
+    joined: bool = False
+    """Another relay process's signed-in connection, reached through ``mux``."""
 
     def alive(self) -> bool:
         return not self.client.lost.is_set()
@@ -380,8 +384,12 @@ class Held:
         channels: int,
         timeout_s: float,
         site: str = "",
+        share: Path | None = None,
     ) -> None:
         self.base = list(base)
+        self.share = share
+        self._shared: mux.Shared | None = None
+        self._token = secrets.token_hex(8)
         self.destination = destination
         self.signs_in = signs_in
         self.channels = channels
@@ -497,11 +505,47 @@ class Held:
         async with self._signing:
             if self.signed_in():
                 return
-            opened = await self._open(asker(env), env)
+            opened = await self._join()
+            if opened is None:
+                opened = await self._open(asker(env), env)
+                await self._publish(opened)
             cond = self._condition()
             async with cond:
                 self._conns = [item for item in self._conns if item.alive()] + [opened]
                 cond.notify_all()
+
+    async def _join(self) -> Conn | None:
+        """Join another relay process's signed-in connection to the site, if one is up."""
+        if self.share is None:
+            return None
+        profile = await self._resolve()
+        client = _Client(profile, None)
+        conn = await mux.join(self.share, lambda: client, self._token)
+        if conn is None:
+            return None
+        return Conn(conn=conn, client=client, capacity=self.channels, hops=[], joined=True)
+
+    async def _publish(self, opened: Conn) -> None:
+        """Offer a fresh sign-in to relay's other processes (see ``mux``)."""
+        if self.share is None:
+            return
+        if self._shared is not None:
+            self._shared.close()
+        try:
+            self._shared = await mux.publish(
+                self.share,
+                opened.conn,
+                opened.client.lost,
+                self._acquire,
+                self._release,
+                self._token,
+            )
+        except (OSError, asyncssh.Error) as exc:
+            logger.warning(
+                "%s: not sharing the sign-in with relay's other processes: %s",
+                self.destination,
+                exc,
+            )
 
     async def _acquire(self) -> Conn | Completed:
         cond = self._condition()
@@ -515,15 +559,20 @@ class Held:
                     return free
                 if self._failures > seen and not self._conns and self._failure is not None:
                     return self._failure
-                if self.signs_in and not self._conns and not self._opening:
-                    who = self.destination
-                    return self._failed(f"{who}: Permission denied (keyboard-interactive).")
-                if not self.signs_in and not self._opening and len(self._conns) < POOL:
+                if self.signs_in:
+                    if not self._conns and not self._opening:
+                        self._opening = True
+                        break
+                elif not self._opening and len(self._conns) < POOL:
                     self._opening = True
                     break
                 await cond.wait()
         try:
-            opened: Conn | Completed = await self._open(None)
+            if self.signs_in:
+                denied = f"{self.destination}: Permission denied (keyboard-interactive)."
+                opened: Conn | Completed = await self._join() or self._failed(denied)
+            else:
+                opened = await self._open(None)
         except SshFailure as failure:
             opened = self._failed(failure.text)
         async with cond:
@@ -639,6 +688,8 @@ class Held:
         )
 
     async def _sftp(self, slot: Conn, sources: Sequence[Path], destination: str) -> Completed:
+        if slot.joined:
+            return await self._tar(slot, sources, destination)
         target = destination.rstrip("/")
         if target.startswith("~/"):
             target = target[2:]
@@ -672,7 +723,25 @@ class Held:
             )
         return Completed(argv=["sftp", self.destination], exit_code=0, stdout=b"", stderr=b"")
 
+    async def _tar(self, slot: Conn, sources: Sequence[Path], destination: str) -> Completed:
+        """Copy over a joined connection, which carries no SFTP (see ``mux``)."""
+        try:
+            code, err = await mux.tar_upload(slot.conn, sources, destination)
+        except asyncssh.ChannelOpenError as exc:
+            if not slot.alive():
+                return self._closed(slot)
+            raise _Busy() from exc
+        except (asyncssh.Error, OSError):
+            return self._closed(slot)
+        if code and not slot.alive():
+            host = slot.client.profile.host
+            return self._failed(f"lost connection\nConnection to {host} closed by remote host.")
+        return Completed(argv=["sftp", self.destination], exit_code=code, stdout=b"", stderr=err)
+
     async def _close(self) -> int:
+        if self._shared is not None:
+            self._shared.close()
+            self._shared = None
         cond = self._condition()
         async with cond:
             conns, self._conns = self._conns, []

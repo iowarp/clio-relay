@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from clio_relay import programs
-from clio_relay.adapters.ssh import errors, held
+from clio_relay.adapters.ssh import errors, held, mux
 from clio_relay.adapters.ssh.config import SshConfig
 from clio_relay.adapters.ssh.process import (
     Completed,
@@ -65,6 +65,7 @@ class SshTransport:
             channels=config.channels,
             timeout_s=config.connect_timeout_s,
             site=site_id,
+            share=mux.path_for(state_dir, site_id) if config.interactive_sign_in else None,
         )
 
     # argv

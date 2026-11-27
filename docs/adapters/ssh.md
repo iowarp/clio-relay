@@ -439,9 +439,15 @@ Some sites ask for a one-time code or a password on every connection.
   each prompt there, a password and then a code, or a key and then a code.
   Every later call rides that signed-in connection, so you are asked once,
   not on every call, and starting several calls at once still asks once.
-  When the connection closes (the site drops it, or relay stops), the site
-  refuses with `needs_sign_in` and asks you to sign in again. A wrong code is
-  asked again, up to the profile's `NumberOfPasswordPrompts`.
+  Relay's other processes on this computer that share its state (the page
+  server CLIO starts, the agent's own server, a CLI command) use the same
+  signed-in connection, as OpenSSH's `ControlMaster` would share a master:
+  the process that signed in offers it on a loopback port that only takes a
+  key it writes to `<state>/ssh/<site>.json`, readable by your account only.
+  When the connection closes (the site drops it, or the process that signed
+  in stops), the site refuses with `needs_sign_in` and asks you to sign in
+  again. A wrong code is asked again, up to the profile's
+  `NumberOfPasswordPrompts`.
 - A site in the list above that needs the system `ssh` refuses with
   `interactive_auth_required` and `cause: openssh_only` before anyone is
   asked.
