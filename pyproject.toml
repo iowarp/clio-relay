@@ -4,7 +4,8 @@ version = "2.0.0a51"
 description = "An MCP server and command line that runs jobs, commands, files and services on your compute sites."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 dependencies = [
     "aioquic>=1.9.1,<1.10",
     "asyncssh>=2.24,<3",
@@ -56,6 +57,7 @@ include = [
     "tests",
     "README.md",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
     "pyproject.toml",
     "uv.lock",
 ]
