@@ -132,6 +132,20 @@ def test_jarvis_keeps_its_own_graph_in_relays_home_and_never_the_sites(tmp_path:
     own.parent.mkdir(parents=True)
     own.write_text("net: []\n")
     assert lookup("", str(own))[0] == "relay"
+    # The relay setting leaves the published graph aside for relay's own.
+    assert lookup(str(published), jarvis_submit.OWN_GRAPH) == ["relay", str(own), "", site_home]
+
+
+def test_the_relay_setting_names_relays_own_graph_over_the_sites() -> None:
+    own = jarvis_submit.OWN_GRAPH
+    assert jarvis_submit.published_graph(f" {own} ") == own
+    assert jarvis_submit.site_graph(HOME, own) == OWN
+    settings = jarvis_submit.site_environment(SPEC, HOME, own)
+    assert settings[jarvis_submit.GRAPH_ENV] == settings[jarvis_submit.GRAPH_OWN_ENV] == OWN
+    assert f"G={OWN}; GO={OWN}" in scripts.jarvis_command(HOME, "", own)[2]
+    assert f"G={OWN}; GO={OWN}" in scripts.graph_collect_command(HOME, "slurm", "", own)[2]
+    # Relay's own graph is not a site fact clean keeps.
+    assert site_keeps(HOME, own) == site_keeps(HOME)
 
 
 def test_describe_returns_the_published_graph_as_the_sites(tmp_path: Path) -> None:

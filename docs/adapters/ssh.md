@@ -42,7 +42,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
 | `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
-| `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty takes the graph the site's `$JARVIS_RESOURCE_GRAPH` names, else keeps one under `remote_dir`. Set it when the person names another: JARVIS reads it (with the install answers it holds) and never writes it, keeping what it records in its own graph under `remote_dir` (`info.facts.resource_graph.site_home`, jarvis-cd 1.9.16). `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it |
+| `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty takes the graph the site's `$JARVIS_RESOURCE_GRAPH` names, else keeps one under `remote_dir`. Set it when the person names another: JARVIS reads it (with the install answers it holds) and never writes it, keeping what it records in its own graph under `remote_dir` (`info.facts.resource_graph.site_home`, jarvis-cd 1.9.16). `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. `relay` keeps relay's own graph under `remote_dir` even where the site publishes one, so relay offers to collect it; the person's dotfiles stay as they are |
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software. Unset, JARVIS sizes it from its estimate of the build, within the partition's limit. Set it only to override JARVIS |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
@@ -355,7 +355,11 @@ person's login shell, names it. Relay reads that graph and never writes it, and
 `describe` reports it with `source: site`. The `jarvis_graph` setting, when set,
 comes first (`source: setting`). Only when neither names a readable graph does
 relay keep one for the site at `jarvis-cd/site/resource_graph.yaml` in the CLIO
-site home (`source: relay`). Whichever it is, relay exports it as
+site home (`source: relay`). A `jarvis_graph` of `relay` picks that graph even
+where the site publishes one, so a person can try relay's collection without
+editing their dotfiles: relay's JARVIS calls then run with
+`JARVIS_RESOURCE_GRAPH` unset and `JARVIS_SITE_HOME` naming the CLIO site home.
+Whichever it is, relay exports it as
 `JARVIS_RESOURCE_GRAPH` on every JARVIS call, so it never overrides the site's
 own. Only relay's own graph is collected: JARVIS collects its `net` section on
 compute nodes (with relay's own

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from clio_relay.jarvis_submit import (
     BOOTSTRAP_DIR,
     DECISIONS_FILE,
+    OWN_GRAPH,
     SITE_DIR,
     SPACK_CONFIG_DIR,
     SPACK_DIR,
@@ -53,11 +54,11 @@ def site_keeps(home: str, graph: str = "") -> list[str]:
     The answers (which MPI, which compiler) are facts about the cluster the
     person confirmed; without them the next install asks again. ``graph`` is the
     site's published resource graph (its ``jarvis_graph`` setting): a site fact
-    too, kept wherever it is.
+    too, kept wherever it is. Relay's own graph (:data:`OWN_GRAPH`) is not one.
     """
     base = home.rstrip("/") or "/"
     keeps = [*spack_keeps(home), posixpath.join(base, DECISIONS_TAIL)]
-    return [*keeps, graph] if graph else keeps
+    return [*keeps, graph] if graph and graph != OWN_GRAPH else keeps
 
 
 def is_decisions(path: str) -> bool:

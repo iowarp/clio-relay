@@ -93,7 +93,10 @@ def site_info(
             )
     else:
         unset = (
-            "The site's jarvis_graph setting names this graph. "
+            "The site's jarvis_graph setting is relay: relay's own graph, whatever the "
+            "site publishes. "
+            if graph_setting == jarvis_submit.OWN_GRAPH
+            else "The site's jarvis_graph setting names this graph. "
             if source == "setting"
             else "The site publishes no resource graph ($JARVIS_RESOURCE_GRAPH is unset). "
         )

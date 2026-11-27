@@ -661,6 +661,7 @@ def test_site_level_jarvis_calls_initialize_the_site_root_without_builtin() -> N
         "exec": jarvis_command(home)[2],
         "sched": sched_script(home),
         "collect": graph_collect_command(home, "slurm")[2],
+        "describe": graph_script(home),
     }
     init = 'JARVIS_ROOT="$R" "$JB" init "$R/config" "$R/private" "$R/shared"'
     for name, script in scripts.items():
@@ -672,7 +673,6 @@ def test_site_level_jarvis_calls_initialize_the_site_root_without_builtin() -> N
         assert "repo remove builtin" not in script, name
     assert 'ppl submit "$S/site_net.yaml" +json' in scripts["collect"]
     assert 'ppl run yaml "$S/site_net.yaml" +json' in graph_collect_command(home, "none")[2]
-    assert "JARVIS_NO_BUILTIN=1 " in graph_script(home)
 
 
 def test_a_site_named_jarvis_initializes_its_root_only_once() -> None:
@@ -682,6 +682,7 @@ def test_a_site_named_jarvis_initializes_its_root_only_once() -> None:
         jarvis_command(home, "/opt/jarvis")[2],
         sched_script(home, "/opt/jarvis"),
         graph_collect_command(home, "slurm", "/opt/jarvis")[2],
+        graph_script(home, "/opt/jarvis"),
     ):
         assert '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init' in script
         assert "no_builtin: true" not in script

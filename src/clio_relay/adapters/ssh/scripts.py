@@ -495,7 +495,9 @@ def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
     """Print where JARVIS keeps the site's record, and its net report when JARVIS is placed.
 
     ``jarvis rg net show +json`` only reads the site graph, so it is safe on a
-    login host. ``jarvis`` is the site's ``jarvis`` setting; empty is relay's pin.
+    login host. It needs relay's site-level root set up, which only writes under
+    the site home, so a describe right after placement reads the net too.
+    ``jarvis`` is the site's ``jarvis`` setting; empty is relay's pin.
     ``graph`` is the site's ``jarvis_graph`` setting; empty is the graph the site
     publishes as ``$JARVIS_RESOURCE_GRAPH``, else the home's own
     (:data:`jarvis_submit.GRAPH_LOOKUP`). ``@@graph_source`` says which.
@@ -510,10 +512,10 @@ def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
         'echo "@@graph_path $G"; echo "@@graph_source $GS"; echo "@@site_home $SH"; '
         'echo "@@decisions_path $D"\n'
         'if [ -x "$JB" ]; then\n'
-        '  mkdir -p "$R" 2>/dev/null; T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
-        '  echo "@@graph"\n'
-        '  JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$JG" JARVIS_SITE_HOME="$SH" '
-        f"{jarvis_graph.NO_BUILTIN_ENV}=1 "
+        + _init_site_root(jarvis)
+        + 'T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
+        'echo "@@graph"\n'
+        'JARVIS_ROOT="$R" JARVIS_RESOURCE_GRAPH="$JG" JARVIS_SITE_HOME="$SH" '
         '$T "$JB" rg net show +json </dev/null 2>&1\n'
         "fi\n"
     )

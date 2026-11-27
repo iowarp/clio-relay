@@ -139,13 +139,14 @@ JARVIS_SETTING_HELP = (
 """The description of an adapter's ``jarvis`` setting (:func:`explicit_jarvis`)."""
 GRAPH_SETTING_HELP = (
     "Leave empty: JARVIS uses the resource graph the site publishes as $JARVIS_RESOURCE_GRAPH "
-    "in the person's login environment, and only without one keeps a graph under the CLIO "
-    "site home. A site that publishes its graph elsewhere names that file here, absolute or "
-    "from ~/. JARVIS reads it and never writes it: what it records, including install "
-    "answers, goes to its own graph under the CLIO site home, and site clean keeps the "
-    "named file"
+    "in the person's login environment, else a graph under the CLIO site home. A site that "
+    "publishes its graph elsewhere names that file here, absolute or from ~/: JARVIS reads it "
+    "and records what it learns, install answers too, in its own graph under the CLIO site "
+    "home, and site clean keeps the named file. The value relay keeps relay's own graph even "
+    "where the site publishes one, so relay offers to collect it"
 )
 """The description of an adapter's ``jarvis_graph`` setting (:func:`published_graph`)."""
+OWN_GRAPH = "relay"  # jarvis_graph: relay's own graph over the site's; no dotfile edits
 PIPELINES_DIR = "pipelines"
 """Where the Spack env of each set of archives is kept, under :data:`BOOTSTRAP_DIR`."""
 SITE_DIR = "site"
@@ -297,16 +298,14 @@ def explicit_jarvis(value: str) -> str:
 
 
 def published_graph(value: str) -> str:
-    """Check an adapter's ``jarvis_graph`` setting; empty means the home's own graph.
-
-    The site's published resource graph is named by path on the site: absolute,
-    or from the home directory with a leading ``~/``.
+    """Check an adapter's ``jarvis_graph`` setting: a site path (absolute or ``~/``), or
+    :data:`OWN_GRAPH` for relay's own graph whatever the site publishes; empty is the default.
     """
     value = value.strip()
-    if value and not value.startswith(("/", "~/")):
+    if value and value != OWN_GRAPH and not value.startswith(("/", "~/")):
         raise ValueError(
-            f"jarvis_graph must be a path on the site (absolute or ~/...), not {value!r}. "
-            "Leave it empty to keep the graph under the CLIO site home"
+            f"jarvis_graph must be a path on the site (absolute or ~/...) or {OWN_GRAPH!r}, "
+            f"not {value!r}. Leave it empty to use the graph the site publishes, if any"
         )
     return value
 
@@ -316,17 +315,18 @@ def site_graph(home: str, published: str = "") -> str:
 
     ``published`` is the site's ``jarvis_graph`` setting (:func:`published_graph`).
     Without it, a graph the site publishes as ``$JARVIS_RESOURCE_GRAPH`` is found
-    on the site (:data:`GRAPH_LOOKUP`), and this path is the fallback.
+    on the site (:data:`GRAPH_LOOKUP`), and this path (or :data:`OWN_GRAPH`) is the fallback.
     """
-    return published or posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
+    own = posixpath.join(home, BOOTSTRAP_DIR, SITE_DIR, GRAPH_FILE)
+    return own if published in ("", OWN_GRAPH) else published
 
 
 def graph_lines(home: str, published: str, expression: Callable[[str], str]) -> str:
-    """Shell lines that set ``G`` to the site's resource graph and ``GS`` to its source.
+    """Shell lines setting ``G`` to the site's graph, ``GS`` to its source (:data:`GRAPH_LOOKUP`).
 
-    ``expression`` turns a site path into a shell expression. See :data:`GRAPH_LOOKUP`.
+    ``expression`` turns a site path into a shell expression.
     """
-    setting = expression(published) if published else "''"
+    setting = expression(site_graph(home, published)) if published else "''"
     return f"G={setting}; GO={expression(site_graph(home))}\n" + GRAPH_LOOKUP
 
 
@@ -408,7 +408,7 @@ def site_environment(spec: JobSpec, home: str | None, graph: str = "") -> dict[s
     return {
         FALLBACK_ENV: bootstrap_path(home),
         PIN_ENV: JARVIS_PIN,
-        GRAPH_ENV: graph,
+        GRAPH_ENV: site_graph(home, graph) if graph else "",
         GRAPH_OWN_ENV: site_graph(home),
         DECISIONS_ENV: site_decisions(home),
         SPACK_ENV_ENV: posixpath.join(kept, "spack-env"),
