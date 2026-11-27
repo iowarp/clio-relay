@@ -49,8 +49,11 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
         state["cleaned"].append(targets)
         return {"removed": targets, "kept": keep, **state["report"]}
 
-    async def live_jobs(self: FixtureAdapter, known: list[str]) -> list[dict[str, str]]:
+    async def live_jobs(
+        self: FixtureAdapter, known: list[str], *roots: str
+    ) -> list[dict[str, str]]:
         state["asked"].append(known)
+        state["roots"] = list(roots)
         return list(state["live"])
 
     async def cancel(self: FixtureAdapter, handle: JobHandle) -> JobStatus:
@@ -112,6 +115,7 @@ def test_the_plan_refuses_while_the_scheduler_lists_relays_jobs(
     refusal = asyncio.run(scenario())
     assert refusal.reason is RefusalReason.POLICY_REFUSED
     assert site["asked"] == [["28050"]]
+    assert site["roots"][0] == "~/relay-worker"
     assert "op_abc (job 28048, running)" in refusal.message
     assert "op_ended (job 28050, pending)" in refusal.message
     assert "clio-relay cancel OPERATION" in refusal.message
@@ -241,16 +245,33 @@ def test_the_cli_cancels_like_the_tool(
 
 @pytest.mark.release_platform("posix")
 def test_the_jobs_script_asks_the_scheduler(tmp_path: Path) -> None:
-    """A fake ``squeue``: relay's named job and a known id count, another job does not."""
+    """A fake ``squeue``: relay's named job and a known id count, another job does not.
+
+    With roots, a named job working in another relay home is that home's, so it
+    does not count; a known id, or a named job in a root or with no reported
+    directory, still does.
+    """
     if shutil.which("bash") is None:
         pytest.skip("no bash")
+    mine = tmp_path / "home-a"
+    (mine / "jobs" / "op_abc").mkdir(parents=True)
+    other = tmp_path / "home-b" / "jobs" / "op_xyz"
+    other.mkdir(parents=True)
     squeue = tmp_path / "squeue"
     squeue.write_text(
-        "#!/bin/sh\nprintf '%s\\n' '28048|relay-op_abc|RUNNING' '28050|jarvis|PENDING' "
-        "'99|someone-else|RUNNING'\n"
+        "#!/bin/sh\nprintf '%s\\n' "
+        f"'28048|relay-op_abc|RUNNING|{mine}/jobs/op_abc' '28050|jarvis|PENDING|{other}' "
+        f"'99|someone-else|RUNNING|{mine}' '29191|relay-op_xyz|RUNNING|{other}' "
+        "'29192|relay-op_nodir|PENDING|'\n"
     )
     squeue.chmod(0o755)
     env = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
-    command = jobs_script(["28050"])
-    done = subprocess.run(command, shell=True, env=env, capture_output=True, text=True, check=True)
-    assert [job["native_id"] for job in parse_live(done.stdout)] == ["28048", "28050"]
+
+    def listed(command: str) -> list[str]:
+        done = subprocess.run(
+            command, shell=True, env=env, capture_output=True, text=True, check=True
+        )
+        return [job["native_id"] for job in parse_live(done.stdout)]
+
+    assert listed(jobs_script(["28050"])) == ["28048", "28050", "29191", "29192"]
+    assert listed(jobs_script(["28050"], [str(mine)])) == ["28048", "28050", "29192"]

@@ -717,9 +717,9 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         self._drop_connection()
         return parse_report(await self._plain_ssh(prune_script(targets, keep), "cleaning"))
 
-    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+    async def live_jobs(self, known: list[str], *roots: str) -> list[dict[str, str]]:
         """Ask the site's scheduler, over a plain ``ssh``, which of relay's jobs still run."""
-        return parse_live(await self._plain_ssh(jobs_script(known), "listing relay's jobs on"))
+        return parse_live(await self._plain_ssh(jobs_script(known, roots), "listing jobs on"))
 
     async def _plain_ssh(self, script: str, what: str) -> str:
         """Run ``script`` over a plain ``ssh`` that signs in without a prompt."""

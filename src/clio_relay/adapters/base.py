@@ -359,13 +359,15 @@ class ListsLiveJobs(Protocol):
     """An adapter that can ask its site's scheduler which of relay's jobs still run. Optional.
 
     ``clio-relay site clean`` asks before it removes anything, so a job relay's
-    records no longer show as live (its record ended early, or another relay
-    started it) still stops the clean. ``known`` are native job ids from relay's
-    records; any job named ``relay-...`` counts too. It returns
+    records no longer show as live (its record ended early, or another relay host
+    started it in this site's directories) still stops the clean. ``known`` are
+    native job ids from relay's records and always count; a job named
+    ``relay-...`` counts too, unless ``roots`` is given and the scheduler reports
+    it working outside every root (another relay home's job). It returns
     ``[{native_id, name, state}, ...]``.
     """
 
-    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+    async def live_jobs(self, known: list[str], *roots: str) -> list[dict[str, str]]:
         """Return relay's jobs the site's scheduler still lists."""
         ...
 

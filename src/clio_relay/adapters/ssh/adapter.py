@@ -198,10 +198,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
             )
         return parse_report(result.text())
 
-    async def live_jobs(self, known: list[str]) -> list[dict[str, str]]:
+    async def live_jobs(self, known: list[str], *roots: str) -> list[dict[str, str]]:
         """Ask the site's scheduler which of relay's jobs still run."""
         result = await self.transport.ssh(
-            jobs_script(known),
+            jobs_script(known, roots),
             timeout_s=self.config.command_timeout_s,
             what="listing relay's jobs",
         )

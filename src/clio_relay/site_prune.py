@@ -5,14 +5,17 @@ Adapters that implement :class:`~clio_relay.adapters.base.CleansSite` send
 :func:`parse_report`. Before anything goes, the site's scheduler is asked for the
 person's live jobs that are relay's (:func:`jobs_script`): the site, not relay's
 local records, says what still runs, so a job whose record ended early, or that
-another relay started, still stops the clean.
+another relay host started in this site's directories, still stops the clean.
 """
 
 from __future__ import annotations
 
 import posixpath
 import shlex
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from clio_relay.jarvis_submit import (
     BOOTSTRAP_DIR,
@@ -83,21 +86,47 @@ def kept(keep: list[str], *, spack: bool = True, decisions: bool = True) -> list
     return list(dict.fromkeys(path for path in keep if stays(path)))
 
 
-def _jobs_bash(known: list[str]) -> str:
+def _jobs_bash(known: list[str], roots: Sequence[str] = ()) -> str:
     """Bash that prints ``live<TAB>id|name|state`` for each of relay's live jobs.
 
     A job is relay's when its name starts with :data:`JOB_PREFIX` or its id is in
-    ``known`` (jobs JARVIS named, such as an install). Slurm, LSF, Flux and PBS
-    are asked, whichever the site has; a site with none has no jobs to wait for.
+    ``known`` (jobs JARVIS named, such as an install). With ``roots`` (a clean's
+    targets), a named job whose working directory the scheduler reports (Slurm's
+    ``%Z``) counts only when that directory is in one of them, so another relay
+    home's job on the same account does not stop this site's clean. A job in the
+    same roots that another relay host started still does. Slurm, LSF, Flux and
+    PBS are asked, whichever the site has; a site with none has no jobs to wait for.
     """
     ids = " ".join(
         item for item in known if item and all(c.isalnum() or c in "._-[]" for c in item)
     )
+    quoted_roots = " ".join(shlex.quote(item) for item in roots)
     return f"""relay_known=' {ids} '
 relay_user=$(id -un)
+relay_roots=()
+for relay_root in {quoted_roots}; do
+  case $relay_root in
+    "~") relay_root=$HOME ;;
+    "~/"*) relay_root="$HOME/${{relay_root#??}}" ;;
+    /*) ;;
+    *) relay_root="$HOME/$relay_root" ;;
+  esac
+  [ -d "$relay_root" ] && relay_root=$(cd "$relay_root" && pwd -P)
+  relay_roots+=("${{relay_root%/}}")
+done
+relay_in_roots() {{
+  [ "${{#relay_roots[@]}}" -eq 0 ] && return 0
+  [ -n "$1" ] || return 0
+  relay_dir=$1
+  [ -d "$relay_dir" ] && relay_dir=$(cd "$relay_dir" && pwd -P)
+  for relay_root in "${{relay_roots[@]}}"; do
+    case "$relay_dir/" in "$relay_root"/*) return 0 ;; esac
+  done
+  return 1
+}}
 relay_listed() {{
   if command -v squeue >/dev/null 2>&1; then
-    squeue -h -u "$relay_user" -o '%i|%j|%T' 2>/dev/null
+    squeue -h -u "$relay_user" -o '%i|%j|%T|%Z' 2>/dev/null
   elif command -v bjobs >/dev/null 2>&1; then
     bjobs -noheader -o 'jobid job_name stat delimiter="|"' 2>/dev/null
   elif command -v flux >/dev/null 2>&1; then
@@ -107,11 +136,14 @@ relay_listed() {{
   fi
 }}
 relay_live() {{
-  while IFS='|' read -r id name state; do
+  while IFS='|' read -r id name state workdir; do
     [ -n "$id" ] || continue
-    case $name in
-      {JOB_PREFIX}*) ;;
-      *) case $relay_known in *" $id "*) ;; *) continue ;; esac ;;
+    case $relay_known in
+      *" $id "*) ;;
+      *)
+        case $name in {JOB_PREFIX}*) ;; *) continue ;; esac
+        relay_in_roots "$workdir" || continue
+        ;;
     esac
     printf 'live\t%s|%s|%s\n' "$id" "$name" "$state"
   done
@@ -120,11 +152,12 @@ relay_running=$(relay_listed | relay_live)
 """
 
 
-def jobs_script(known: list[str] | None = None) -> str:
+def jobs_script(known: list[str] | None = None, roots: Sequence[str] = ()) -> str:
     """Return the shell command that lists relay's live jobs on a site; read it with
-    :func:`parse_live`. ``known`` adds native job ids from relay's own records."""
+    :func:`parse_live`. ``known`` adds native job ids from relay's own records, and
+    ``roots`` limits named jobs to those working in them (:func:`_jobs_bash`)."""
     script = (
-        _jobs_bash(list(known or []))
+        _jobs_bash(list(known or []), roots)
         + '[ -n "$relay_running" ] && printf \'%s\\n\' "$relay_running"\nexit 0\n'
     )
     return shlex.join(["bash", "-c", script, "clio-relay-jobs"])
@@ -160,7 +193,7 @@ def _prune_bash(targets: list[str], keep: list[str]) -> str:
     quoted_targets = " ".join(shlex.quote(item) for item in targets)
     quoted_keep = " ".join(shlex.quote(item) for item in keep)
     return (
-        _jobs_bash([])
+        _jobs_bash([], targets)
         + 'if [ -n "$relay_running" ]; then printf \'%s\\n\' "$relay_running"; exit 0; fi\n'
         + _prune_body(quoted_targets, quoted_keep)
     )

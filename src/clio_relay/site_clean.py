@@ -132,11 +132,14 @@ def _known_jobs(service: RelayService, site_id: str) -> dict[str, str]:
     return known
 
 
-async def _live_on_site(cleaners: list[Any], known: dict[str, str]) -> list[dict[str, str]]:
-    """Ask the site's scheduler, through the first adapter that can, which of relay's jobs run."""
+async def _live_on_site(
+    cleaners: list[Any], known: dict[str, str], roots: list[str]
+) -> list[dict[str, str]]:
+    """Ask the site's scheduler, through the first adapter that can, which of relay's jobs run
+    in ``roots`` (or are known by id)."""
     for cleaner in cleaners:
         if isinstance(cleaner, ListsLiveJobs):
-            return await cleaner.live_jobs(sorted(known))
+            return await cleaner.live_jobs(sorted(known), *roots)
     return []
 
 
@@ -234,9 +237,6 @@ async def plan(
     running, waiting = await _reconcile(service, site_id)
     cleaners, names = _cleaners(service, site_id)
     known = _known_jobs(service, site_id)
-    live = await _live_on_site(cleaners, known)
-    if running or live:
-        raise still_running(site_id, running, live, known)
     targets: list[str] = []
     keep: list[str] = []
     for cleaner in cleaners:
@@ -245,6 +245,9 @@ async def plan(
         keep += spared
     targets = list(dict.fromkeys(targets))
     targets += [hop for hop in _hop_dirs(service, site_id, cleaners) if not under(hop, targets)]
+    live = await _live_on_site(cleaners, known, [*targets, *outputs_dirs(cleaners)])
+    if running or live:
+        raise still_running(site_id, running, live, known)
     outputs = run_outputs(service, site_id, targets, outputs_dirs(cleaners))
     outputs = with_writes(outputs, site_writes.written(service.paths.state_dir, site_id), targets)
     return {

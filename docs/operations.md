@@ -146,8 +146,11 @@ Clean removes nothing while one of relay's jobs still runs on the site, since
 its directory is among what goes. It does not trust relay's records alone: it
 asks the site's scheduler (`squeue`, `bjobs`, `flux jobs` or `qstat`) for your
 jobs named `relay-...` and the job ids relay's records hold in any state, so a
-job whose operation already ended, or that another relay started, still counts,
-and the prune on the site checks once more before it deletes. The refusal
+job whose operation already ended, or that another relay host started in this
+site's directories, still counts, and the prune on the site checks once more
+before it deletes. A `relay-...` job the scheduler reports working outside this
+site's directories and outputs directory (Slurm's working directory) belongs to
+another relay home and does not stop the clean. The refusal
 names each job, its operation and its state. Cancel them first, then clean
 again:
 

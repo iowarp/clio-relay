@@ -452,7 +452,9 @@ def test_a_check_a_dead_process_left_runs_again(relay_paths: RelayPaths, site: _
 def test_an_install_start_a_dead_process_left_starts_again_once_no_job_is_listed(
     relay_paths: RelayPaths, site: _Site, monkeypatch: pytest.MonkeyPatch, listed: bool
 ) -> None:
-    async def live_jobs(self: FixtureAdapter, known: list[str]) -> list[dict[str, str]]:
+    async def live_jobs(
+        self: FixtureAdapter, known: list[str], *roots: str
+    ) -> list[dict[str, str]]:
         jobs = [{"native_id": "9", "name": f"relay-{op}", "state": "RUNNING"} for op in ops]
         return jobs if listed else []
 
