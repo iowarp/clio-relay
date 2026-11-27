@@ -1,460 +1,581 @@
-"""Command-line interface for clio-relay."""
+"""``clio-relay``: serve relay over MCP, and manage sites, asks and services."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import re
-import subprocess  # noqa: F401 -- test_cli.py monkeypatches cli.subprocess.run directly
+import secrets
 import sys
-from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from typing import Annotated, Any, cast
 
 import typer
-from filelock import FileLock
+import yaml
 
-import clio_relay.cli_agent as cli_agent
-import clio_relay.cli_api as cli_api
-import clio_relay.cli_cluster as cli_cluster
-import clio_relay.cli_cluster_deploy as cli_cluster_deploy  # noqa: F401 -- registers cluster_app's deployment commands
-import clio_relay.cli_diagnostics as cli_diagnostics
-import clio_relay.cli_endpoint as cli_endpoint
-import clio_relay.cli_gateway as cli_gateway
-import clio_relay.cli_gateway_runtime as cli_gateway_runtime  # noqa: F401 -- registers gateway_app's runtime commands
-import clio_relay.cli_init as cli_init
-import clio_relay.cli_installation_receipt as cli_installation_receipt
-import clio_relay.cli_jarvis_mcp as cli_jarvis_mcp
-import clio_relay.cli_jarvis_mcp_validate as cli_jarvis_mcp_validate
-import clio_relay.cli_job as cli_job
-import clio_relay.cli_job_records as cli_job_records  # noqa: F401 -- registers job_app's records commands
-import clio_relay.cli_monitor as cli_monitor
-import clio_relay.cli_queue as cli_queue
-import clio_relay.cli_queue_maintenance as cli_queue_maintenance  # noqa: F401 -- registers queue_app's maintenance commands
-import clio_relay.cli_relay_host as cli_relay_host
-import clio_relay.cli_release as cli_release
-import clio_relay.cli_remote_mcp as cli_remote_mcp
-import clio_relay.cli_remote_mcp_validate as cli_remote_mcp_validate  # noqa: F401 -- registers remote_mcp_app's validate command
-import clio_relay.cli_scheduler as cli_scheduler
-import clio_relay.cli_session as cli_session
-import clio_relay.cli_session_attach as cli_session_attach  # noqa: F401 -- registers session_app's attach/reconnect commands  # pyright: ignore[reportUnusedImport]
-import clio_relay.cli_session_owned as cli_session_owned  # noqa: F401 -- registers session_app's owned-session commands
-import clio_relay.cli_session_start as cli_session_start  # noqa: F401 -- registers session_app's start command
-import clio_relay.cli_session_teardown as cli_session_teardown  # noqa: F401 -- registers session_app's teardown command
-import clio_relay.cli_storage as cli_storage
-import clio_relay.cli_support as cli_support
-import clio_relay.cli_worker as cli_worker
-import clio_relay.remote_cli as remote_cli
-from clio_relay.cluster_config import (
-    ClusterDefinition,
-    # cli.py has no internal caller of its own; kept here only because
-    # test_cli.py reaches it as
-    # `cli.release_private_configuration_windows_parent_guard` to undo a
-    # Windows configuration-parent guard a fixture acquired directly.
-    release_private_configuration_windows_parent_guard,  # noqa: F401
-)
-from clio_relay.config import RelaySettings  # noqa: F401 -- test_cli.py uses cli.RelaySettings
-from clio_relay.errors import ConfigurationError, RelayError
-from clio_relay.identifiers import validate_durable_record_id
-from clio_relay.installation import (
-    InstallReceipt,  # noqa: F401 -- test_cli_api.py builds cli.InstallReceipt directly
-)
-from clio_relay.jarvis_mcp import (
-    # test_cli.py builds a fake binding via
-    # cli.jarvis_mcp_artifact_binding_from_entry
-    jarvis_mcp_artifact_binding_from_entry,  # noqa: F401
-)
-from clio_relay.mcp_stdio_validation import (
-    PackagedMcpStdioSession,  # noqa: F401 -- test_cli.py types fakes as cli.PackagedMcpStdioSession
-)
-from clio_relay.models import (
-    ArtifactUse,
-    JobKind,
-    RelayJob,
-)
-from clio_relay.owner_session_admission import (
-    desktop_owner_session_admission_id as _desktop_owner_session_admission_id,  # noqa: F401
-)
-from clio_relay.owner_session_admission import (
-    owner_session_transition_lock,
-)
-from clio_relay.pagination import (
-    MAX_RESPONSE_PAGE_RECORDS,  # noqa: F401 -- test_cli.py paginates via cli.MAX_RESPONSE_PAGE_RECORDS
-)
-from clio_relay.process_containment import consume_broker_child_environment
-from clio_relay.remote_mcp import (
-    # cli_cluster_deploy.py and its tests reach both as
-    # cli.RemoteMcpSchemaCache / cli.default_remote_mcp_cache_path.
-    RemoteMcpSchemaCache,  # noqa: F401
-    default_remote_mcp_cache_path,  # noqa: F401
-)
-from clio_relay.storage_runtime import StorageAdmissionError, StorageManagedQueue
-from clio_relay.validation_report import (
-    LiveValidationReport,
-    load_validation_report,
-    redact_sensitive_values,
-)
-from clio_relay.worker_concurrency import parse_kind_concurrency_options
+from clio_relay import catalog
+from clio_relay.adapters import registry
+from clio_relay.adapters.worker.cli import worker_app
+from clio_relay.cli_asks import app as asks_app
+from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.sites.models import SiteEntry
+from clio_relay.sites.routing import routes
+from clio_relay.sites.store import SiteStore
+from clio_relay.surface.settings import RelayPaths
 
-# R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
-# these two symbols' real bodies moved to cli_support.py -- see the longer
-# note beside `_write_failed_acceptance_report`'s re-export below. Bound
-# here, under this exact name, purely for cli.py's own ~15 other command
-# groups' `@_acceptance_report_command` decorator applications (a real
-# attribute lookup evaluated at each of *those* def sites' module-load time,
-# so this must be defined before the first one runs). `cli_relay_host.py`
-# does NOT reach this through `cli.py` -- its own four commands apply
-# `@cli_support._acceptance_report_command` straight from the owner (see
-# that module's docstring), specifically to avoid the import-cycle hazard
-# a `cli.<symbol>` module-level decorator read would create.
-_ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE = (
-    cli_support._ACCEPTANCE_REPORT_COMMAND_ATTRIBUTE  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-)
-_acceptance_report_command = (
-    cli_support._acceptance_report_command  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-)
+app = typer.Typer(no_args_is_help=True, help="Relay: run work on the sites you use.")
+site_app = typer.Typer(no_args_is_help=True, help="Add, edit and remove sites.")
+rendezvous_app = typer.Typer(no_args_is_help=True, help="Where services meet relay's forwards.")
+app.add_typer(site_app, name="site")
+app.add_typer(rendezvous_app, name="rendezvous")
 
 
-app = typer.Typer(no_args_is_help=True)
-
-app.add_typer(cli_endpoint.endpoint_app, name="endpoint")
-app.add_typer(cli_relay_host.relay_host_app, name="relay-host")
-app.add_typer(cli_job.job_app, name="job")
-app.add_typer(cli_cluster.cluster_app, name="cluster")
-app.add_typer(cli_agent.agent_app, name="agent")
-app.add_typer(cli_monitor.monitor_app, name="monitor")
-app.add_typer(cli_api.api_app, name="api")
-app.add_typer(cli_session.session_app, name="session")
-app.add_typer(cli_gateway.gateway_app, name="gateway")
-app.add_typer(cli_queue.queue_app, name="queue")
-app.add_typer(cli_worker.worker_app, name="worker")
-app.add_typer(cli_scheduler.scheduler_app, name="scheduler")
-app.add_typer(cli_remote_mcp.remote_mcp_app, name="remote-mcp")
-app.add_typer(cli_release.release_app, name="release")
-app.add_typer(cli_storage.storage_app, name="storage")
-
-# Flat, un-namespaced top-level commands whose bodies live in a sibling
-# module (docs/design/relay-architecture-2026-08.md SS5's cli.py top-level
-# command-module row): `app` is defined here, in cli.py, not owned by a
-# sub-Typer the sibling module could decorate directly onto, so cli.py
-# imports each sibling for its plain, fully-annotated function object and
-# applies the registration itself -- one line per command, ground rule 2.
-app.command("doctor")(cli_diagnostics.doctor)
-app.command("live-test")(cli_diagnostics.live_test)
-app.command()(cli_init.init)
-app.command("install-frp")(cli_init.install_frp)
-app.command("installation-write-receipt")(cli_installation_receipt.installation_write_receipt)
-app.command("installation-info")(cli_installation_receipt.show_installation_info)
-app.command("bootstrap-inspect", hidden=True)(cli_installation_receipt.bootstrap_inspect)
-app.command("jarvis-runtime-authority", hidden=True)(cli_jarvis_mcp.jarvis_runtime_authority)
-app.command("mcp-call")(cli_jarvis_mcp.mcp_call)
-app.command("jarvis-mcp-call")(cli_jarvis_mcp.jarvis_mcp_call)
-app.command("jarvis-mcp-refresh")(cli_jarvis_mcp.jarvis_mcp_refresh)
-app.command("mcp-server")(cli_jarvis_mcp.mcp_server)
-app.command("jarvis-mcp-validate")(cli_jarvis_mcp_validate.jarvis_mcp_validate)
+app.add_typer(asks_app, name="asks")
+app.add_typer(worker_app, name="worker")
 
 
-@app.callback()
-def main() -> None:
-    """Run clio-relay commands."""
-    consume_broker_child_environment()
+def _paths() -> RelayPaths:
+    return RelayPaths.from_env()
 
 
-def _none_if_blank(value: str | None) -> str | None:
-    if value is None or value.strip() == "":
+def _print(value: Any) -> None:
+    typer.echo(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+def _fail(refusal: Refusal) -> None:
+    typer.echo(f"{refusal.reason.value}: {refusal.message}", err=True)
+    raise typer.Exit(2)
+
+
+def _grant_files(values: list[str]) -> dict[str, Path]:
+    grants: dict[str, Path] = {}
+    for value in values:
+        provider, sep, target = value.partition("=")
+        if not sep or not provider.strip() or not target.strip():
+            typer.echo(f"--grant-file takes PROVIDER=PATH, not {value!r}", err=True)
+            raise typer.Exit(2)
+        grants[provider.strip().lower()] = Path(target.strip())
+    return grants
+
+
+@app.command()
+def serve(
+    http: Annotated[bool, typer.Option(help="Serve Streamable HTTP instead of stdio")] = False,
+    host: str = "127.0.0.1",
+    port: int = 8766,
+    path: str = "/mcp",
+    token_file: Annotated[
+        Path | None, typer.Option(help="File holding the HTTP bearer token")
+    ] = None,
+    grant_file: Annotated[
+        list[str] | None,
+        typer.Option(help="PROVIDER=PATH: a grant file the host keeps current. Repeatable"),
+    ] = None,
+    tls_cert: Annotated[Path | None, typer.Option(help="TLS certificate, for HTTPS")] = None,
+    tls_key: Annotated[Path | None, typer.Option(help="TLS private key, for HTTPS")] = None,
+) -> None:
+    """Serve relay as an MCP server."""
+    from clio_relay.surface.server import create_server
+
+    paths = _paths()
+    if grant_file:
+        paths = replace(paths, grant_files={**paths.grant_files, **_grant_files(grant_file)})
+    if not http:
+        create_server(paths, transport="stdio").run(transport="stdio", show_banner=False)
+        return
+    if (tls_cert is None) != (tls_key is None):
+        typer.echo("give both --tls-cert and --tls-key, or neither", err=True)
+        raise typer.Exit(2)
+    token = os.environ.get("CLIO_RELAY_TOKEN")
+    if token is None:
+        target = token_file or paths.state_dir / "http-token"
+        if target.is_file():
+            token = target.read_text(encoding="utf-8").strip()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            token = secrets.token_urlsafe(32)
+            target.write_text(token, encoding="utf-8")
+            target.chmod(0o600)
+        typer.echo(f"bearer token in {target}", err=True)
+    normalized = "/" + path.strip("/")
+    public = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    origin = f"{'https' if tls_cert else 'http'}://{public}:{port}"
+    server = create_server(
+        paths,
+        transport="http",
+        token=token,
+        base_url=f"{origin}{normalized}",
+        public_base_url=origin,
+    )
+    # Page URLs carry single-use tokens, so requests are never logged.
+    uvicorn_config: dict[str, Any] = {"access_log": False}
+    if tls_cert is not None and tls_key is not None:
+        uvicorn_config.update(ssl_certfile=str(tls_cert), ssl_keyfile=str(tls_key))
+    from clio_relay.shutdown import register_server
+
+    register_server(
+        paths, server, f"{origin}{normalized}", origin, tls_cert=tls_cert if tls_key else None
+    )
+    server.run(
+        transport="http",
+        host=host,
+        port=port,
+        path=normalized,
+        show_banner=False,
+        uvicorn_config=uvicorn_config,
+    )
+
+
+@app.command()
+def connect(
+    handle: Annotated[str, typer.Argument(help="The handle in the serve result's connect_command")],
+) -> None:
+    """Forward a running service's ports to this machine and hold them open."""
+    try:
+        from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
+            connect as connect_service,  # pyright: ignore[reportUnknownVariableType]
+        )
+    except ModuleNotFoundError as exc:
+        _no_service_runtime(exc)
+        return
+    try:
+        connect_service(handle, paths=_paths())
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@rendezvous_app.command("show")
+def rendezvous_show() -> None:
+    """Show the rendezvous settings."""
+    _print(_rendezvous(None))
+
+
+@rendezvous_app.command("set")
+def rendezvous_set(
+    values: Annotated[list[str], typer.Argument(help="KEY=VALUE settings to change")],
+) -> None:
+    """Change rendezvous settings."""
+    changes: dict[str, str] = {}
+    for value in values:
+        key, sep, setting = value.partition("=")
+        if not sep or not key.strip():
+            typer.echo(f"settings are KEY=VALUE, not {value!r}", err=True)
+            raise typer.Exit(2)
+        changes[key.strip()] = setting.strip()
+    _print(_rendezvous(changes))
+
+
+def _rendezvous(changes: dict[str, str] | None) -> Any:
+    try:
+        from clio_relay.serve import (  # pyright: ignore[reportMissingImports]
+            settings as rendezvous_settings,  # pyright: ignore[reportUnknownVariableType]
+        )
+    except ModuleNotFoundError as exc:
+        _no_service_runtime(exc)
         return None
+    try:
+        return rendezvous_settings(_paths(), changes)  # pyright: ignore[reportUnknownVariableType]
+    except Refusal as refusal:
+        _fail(refusal)
+        return None
+
+
+def _no_service_runtime(exc: ModuleNotFoundError) -> None:
+    if exc.name not in ("clio_relay.serve", "clio_relay"):
+        raise exc
+    typer.echo("verb_not_implemented: the service runtime is not installed", err=True)
+    raise typer.Exit(2)
+
+
+def _json_flag(extra: list[str] | None) -> None:
+    """Accept the trailing ``+json``; relay's commands print JSON either way."""
+    unknown = [item for item in extra or [] if item != "+json"]
+    if unknown:
+        typer.echo(f"unexpected arguments: {' '.join(unknown)}", err=True)
+        raise typer.Exit(2)
+
+
+@app.command()
+def shutdown(
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+    site: Annotated[str | None, typer.Option(help="Stop one site's relay processes")] = None,
+    all_sites: Annotated[
+        bool, typer.Option("--all", help="Stop every site's, and relay on this host")
+    ] = False,
+    timeout_s: Annotated[float | None, typer.Option(help="Seconds per site; 15 by default")] = None,
+) -> None:
+    """Stop relay's long-lived processes. Jobs keep running and are listed."""
+    from clio_relay.shutdown import shutdown as stop_all
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+    if (site is None) == (not all_sites):
+        typer.echo("give exactly one of --site S or --all", err=True)
+        raise typer.Exit(2)
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return await stop_all(
+                service, {"all": all_sites or None, "site": site, "timeout_s": timeout_s}
+            )
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@app.command()
+def cancel(
+    operation: Annotated[str, typer.Argument(help="The operation id run or serve returned")],
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+) -> None:
+    """Cancel a job from run, or stop a service from serve, the way the cancel tool does."""
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return service.view(await service.cancel(operation))
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@app.command()
+def adapters() -> None:
+    """List installed adapters and their verbs."""
+    found: dict[str, Any] = {}
+    for name in registry.names():
+        try:
+            found[name] = sorted(registry.load(name).implements)
+        except Refusal as refusal:
+            found[name] = {"unavailable": refusal.reason.value, "message": refusal.message}
+    _print(found)
+
+
+@app.command()
+def describe(
+    site_id: Annotated[str | None, typer.Argument(help="A site; all sites when left out")] = None,
+) -> None:
+    """Describe a site the way the describe tool does, which checks relay reaches it."""
+    from clio_relay.surface.service import RelayService
+
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            return await service.describe(site_id)
+        finally:
+            await service.close()
+
+    try:
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
+
+
+@site_app.command("list")
+def site_list() -> None:
+    """List your sites."""
+    _print([entry.model_dump(mode="json") for entry in SiteStore(_paths().sites_file).list()])
+
+
+def _saved(entry: SiteEntry) -> None:
+    """Print a saved site and what its adapters set up for it."""
+
+    async def set_up() -> dict[str, Any]:
+        from clio_relay.surface.service import RelayService
+
+        service = RelayService(_paths())
+        try:
+            return await service.site_added(entry.id)
+        finally:
+            await service.close()
+
+    shown = entry.model_dump(mode="json")
+    set_up_by = asyncio.run(set_up())
+    if set_up_by:
+        shown["set_up"] = set_up_by
+    _print(shown)
+
+
+@site_app.command("show")
+def site_show(site_id: str) -> None:
+    """Show one site and which adapter serves each verb."""
+    try:
+        entry = SiteStore(_paths().sites_file).get(site_id)
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _print(
+        {
+            "site": entry.model_dump(mode="json"),
+            "routes": [item.model_dump(mode="json") for item in routes(entry)],
+        }
+    )
+
+
+@site_app.command("defaults")
+def site_defaults(
+    adapter: Annotated[
+        str | None, typer.Option(help="The adapter a new site uses when --adapter is left out")
+    ] = None,
+    policy: Annotated[
+        str | None, typer.Option(help="open or guarded, for a new site without --policy")
+    ] = None,
+    spend: Annotated[
+        str | None,
+        typer.Option(
+            help="always, never, or a node-hour threshold, for a new site without --spend"
+        ),
+    ] = None,
+) -> None:
+    """Show the defaults for new sites, or change them."""
+    store = SiteStore(_paths().sites_file)
+    try:
+        if adapter is None and policy is None and spend is None:
+            shown = store.defaults()
+        else:
+            if adapter is not None:
+                registry.load(adapter)
+            shown = store.set_defaults(
+                adapter=adapter,
+                policy=policy,
+                spend=None if spend is None else _spend_ask(spend),
+            )
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _print(shown.model_dump(mode="json"))
+
+
+def _spend_ask(text: str) -> str | float:
+    """Read ``--spend``: always, never, or a node-hour threshold above zero."""
+    if text in ("always", "never"):
+        return text
+    try:
+        value = float(text)
+    except ValueError:
+        value = 0.0
+    if value <= 0:
+        typer.echo("--spend takes always, never, or a number of node-hours above 0", err=True)
+        raise typer.Exit(2)
     return value
 
 
-def _parse_age_seconds(value: str) -> int:
-    """Parse a positive operator age threshold such as ``30m`` or ``2h``."""
-    match = re.fullmatch(r"(?P<count>[1-9][0-9]*)(?P<unit>[smhd]?)", value.strip().lower())
-    if match is None:
-        raise typer.BadParameter("age threshold must be a positive integer with s, m, h, or d")
-    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86_400}[match.group("unit")]
-    return int(match.group("count")) * multiplier
-
-
-def _public_json(value: object) -> str:
-    """Serialize operator-facing JSON without exposing durable credentials."""
-    return json.dumps(redact_sensitive_values(value), indent=2)
-
-
-# #231 cli.py decomposition, shared-plumbing relocation pass: this symbol's
-# real body moved to cli_support.py -- see that module's own docstring. A
-# thin forwarder, not a bare object re-binding, for the same F3/F4 reason
-# every other forwarder below carries: re-reading `cli_support.<symbol>` on
-# every call keeps both `monkeypatch.setattr(cli_support, ...)` and the
-# pre-existing `monkeypatch.setattr(cli, ...)` patch points effective.
-def _managed_queue_from_env() -> StorageManagedQueue:
-    return cli_support._managed_queue_from_env()  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-
-def _submit_managed_job(job: RelayJob) -> RelayJob:
-    return cli_support._submit_managed_job(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        job
-    )
-
-
-# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): a bare object re-binding
-# (`_echo_storage_admission_error = cli_support._echo_storage_admission_error`)
-# captures the owner's function object at import time, so
-# `monkeypatch.setattr(cli_support, "_echo_storage_admission_error", ...)`
-# never reaches this module's own two call sites -- a silent no-op patch.
-# A thin forwarder re-reads `cli_support.<symbol>` on every call, so both
-# `monkeypatch.setattr(cli_support, ...)` and the pre-existing
-# `monkeypatch.setattr(cli, ...)` patch points bite.
-def _echo_storage_admission_error(error: StorageAdmissionError) -> None:
-    cli_support._echo_storage_admission_error(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        error
-    )
-
-
-def _json_object(value: str) -> dict[str, object]:
-    return cli_support._json_object(value)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-
-
-def _json_text_from_option(source: str, source_file: Path | None) -> str:
-    return cli_support._json_text_from_option(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        source, source_file
-    )
-
-
-_JARVIS_NONTERMINAL_VALIDATION_CHECKS = frozenset(
-    {
-        "remote-mcp.jarvis-live-progress",
-        "remote-mcp.jarvis-execution-query",
-    }
-)
-_JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA_V1 = "clio-relay.jarvis-mcp-validation-resume.v1"
-_JARVIS_VALIDATION_RESUME_CHECKPOINT_SCHEMA = "clio-relay.jarvis-mcp-validation-resume.v2"
-_JARVIS_VALIDATION_PHASE_INTENT = "jarvis_run_intent"
-_JARVIS_VALIDATION_PHASE_DISPATCH = "jarvis_run_dispatch"
-_JARVIS_VALIDATION_PHASE_QUERY = "execution_query"
-
-
-_MAX_JARVIS_EXECUTION_QUERY_OBSERVATIONS = 512
-_JARVIS_QUERY_INTEGRITY_KEY = "relay_query_integrity"
-_JARVIS_QUERY_INTEGRITY_SCHEMA = "clio-relay.jarvis-query-integrity.v1"
-_JARVIS_VERIFIED_GAP_KEY = "relay_query_verified_gap"
-_JARVIS_VERIFIED_GAP_SCHEMA = "clio-relay.jarvis-query-verified-gap.v1"
-_JARVIS_EXECUTION_STATE_RANK = {
-    "preparing": 0,
-    "scripted": 1,
-    "submitting": 2,
-    "submitted": 3,
-    "running": 4,
-    "completed": 5,
-    "failed": 5,
-    "canceled": 5,
-}
-_JARVIS_PACKAGE_PROGRESS_STATES = frozenset(
-    {"pending", "starting", "running", "ready", "completed", "failed", "canceled"}
-)
-
-
-# R8(ii) interim seam (docs/design/relay-architecture-2026-08.md §4.1/§5):
-# this symbol's real body moved to cli_support.py -- the doc's cli_support.py
-# row for cli.py's shared-plumbing fan-out. cli.py keeps it defined under its
-# original name at its original definition site so its own ~200 existing
-# bare-name call sites keep working unchanged; migrating cli.py's other 15
-# sub-apps onto `cli_support.X(...)` directly is separate, unsequenced future
-# work, not something this slice's `relay-host` extraction should absorb as
-# a side effect.
-#
-# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): this is a thin forwarder,
-# not a bare object re-binding (`_write_failed_acceptance_report =
-# cli_support._write_failed_acceptance_report`). The bare form captures the
-# owner's function object at import time, so
-# `monkeypatch.setattr(cli_support, "_write_failed_acceptance_report", ...)`
-# never reaches callers here -- a silent no-op patch that only
-# `monkeypatch.setattr(cli, "_write_failed_acceptance_report", ...)` could
-# see. Re-reading `cli_support.<symbol>` on every call restores both patch
-# directions.
-def _write_failed_acceptance_report(
-    *,
-    path: Path,
-    scenario: str,
-    cluster: str,
-    check_id: str,
-    summary: str,
-    error: BaseException,
-    launcher: str | None,
-    install_source: str | None,
-    artifact: Path | None,
-    partial_report: LiveValidationReport | None = None,
+@site_app.command("add")
+def site_add(
+    site_id: str,
+    adapter: Annotated[
+        str | None, typer.Option(help="The adapter in use; `site defaults` when left out")
+    ] = None,
+    config: Annotated[str, typer.Option(help="Adapter settings, as JSON or YAML")] = "{}",
+    name: str | None = None,
+    policy: Annotated[
+        str | None, typer.Option(help="open or guarded; `site defaults` when left out")
+    ] = None,
+    spend: Annotated[
+        str | None,
+        typer.Option(help="always, never, or a node-hour threshold; `site defaults` when left out"),
+    ] = None,
+    skill: Annotated[
+        str | None, typer.Option(help="A skill name, or the path of your own Markdown skill")
+    ] = None,
 ) -> None:
-    cli_support._write_failed_acceptance_report(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        path=path,
-        scenario=scenario,
-        cluster=cluster,
-        check_id=check_id,
-        summary=summary,
-        error=error,
-        launcher=launcher,
-        install_source=install_source,
-        artifact=artifact,
-        partial_report=partial_report,
-    )
-
-
-def _load_current_acceptance_report(
-    path: Path,
-    *,
-    expected_report_id: str,
-) -> LiveValidationReport | None:
-    """Load strict evidence only when it belongs to the current CLI invocation."""
+    """Add a site."""
+    store = SiteStore(_paths().sites_file)
     try:
-        report = load_validation_report(path)
-    except ConfigurationError:
-        return None
-    return report if report.report_id == expected_report_id else None
-
-
-def _echo_lines(lines: list[str]) -> None:
-    for line in lines:
-        typer.echo(_console_safe_text(line))
-
-
-def _console_safe_text(value: str) -> str:
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    return value.encode(encoding, errors="replace").decode(encoding, errors="replace")
-
-
-def _try_remote_cluster_passthrough(cluster: str | None, args: list[str]) -> bool:
-    if cluster is None:
-        return False
-    if os.getenv("CLIO_RELAY_CLI_MODE", "auto").strip().lower() == "local":
-        return False
-    definition = _require_cluster(cluster)
-    if not remote_cli.should_execute_on_cluster(definition):
-        return False
-    _run_remote_or_exit(definition, args)
-    return True
-
-
-def _run_remote_or_exit(
-    definition: ClusterDefinition,
-    args: list[str],
-    *,
-    cluster_registry_path: str | None = None,
-) -> None:
-    if cluster_registry_path is None:
-        _run_or_exit(
-            lambda: typer.echo(
-                _console_safe_text(remote_cli.run_remote_clio(definition, args)),
-                nl=False,
-            )
+        defaults = store.defaults()
+        adapter = adapter or defaults.adapter
+        loaded: Any = yaml.safe_load(config) or {}
+        if not isinstance(loaded, dict):
+            typer.echo("config must be a mapping", err=True)
+            raise typer.Exit(2)
+        settings = cast(dict[str, Any], loaded)
+        registry.validate_config(adapter, settings)
+        ask = defaults.spend if spend is None else _spend_ask(spend)
+        entry = SiteEntry.model_validate(
+            {
+                "id": site_id,
+                "name": name,
+                "adapter": adapter,
+                "config": settings,
+                "policy": policy or defaults.policy,
+                "spend": {"ask": ask},
+                "skill": skill,
+            }
         )
+        added = store.add(entry)
+    except Refusal as refusal:
+        _fail(refusal)
         return
-    _run_or_exit(
-        lambda: typer.echo(
-            _console_safe_text(
-                remote_cli.run_remote_clio(
-                    definition,
-                    args,
-                    cluster_registry_path=cluster_registry_path,
-                )
-            ),
-            nl=False,
+    _saved(added)
+
+
+@site_app.command("catalog")
+def site_catalog(
+    schema: Annotated[bool, typer.Option(help="Print the schema of a catalog site file")] = False,
+) -> None:
+    """List the sites relay ships."""
+    if schema:
+        _print(catalog.schema())
+        return
+    _print([entry.model_dump(mode="json") for entry in catalog.sites()])
+
+
+@site_app.command("add-from-catalog")
+def site_add_from_catalog(catalog_id: str, site_id: str | None = None) -> None:
+    """Copy a catalog site into your sites file."""
+    try:
+        added = SiteStore(_paths().sites_file).add_from_catalog(catalog.site(catalog_id), site_id)
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _saved(added)
+
+
+@site_app.command("edit")
+def site_edit(
+    site_id: str,
+    changes: Annotated[str, typer.Argument(help="Top-level field changes, as JSON or YAML")],
+) -> None:
+    """Change a site's fields."""
+    try:
+        loaded = yaml.safe_load(changes)
+        if not isinstance(loaded, dict):
+            typer.echo("changes must be a mapping", err=True)
+            raise typer.Exit(2)
+        edited = SiteStore(_paths().sites_file).edit(site_id, dict(loaded))  # pyright: ignore[reportUnknownArgumentType]
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _saved(edited)
+
+
+@site_app.command("remove")
+def site_remove(site_id: str) -> None:
+    """Remove a site."""
+    try:
+        removed = SiteStore(_paths().sites_file).remove(site_id)
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _print(removed.model_dump(mode="json"))
+
+
+@site_app.command("switch")
+def site_switch(site_id: str, adapter: str) -> None:
+    """Make an alternative adapter the one in use."""
+    try:
+        switched = SiteStore(_paths().sites_file).switch(site_id, adapter)
+    except Refusal as refusal:
+        _fail(refusal)
+        return
+    _saved(switched)
+
+
+@site_app.command("clean")
+def site_clean(
+    site_id: str,
+    extra: Annotated[list[str] | None, typer.Argument(help="+json, accepted")] = None,
+    yes: Annotated[bool, typer.Option("--yes", help="Skip the ask: you approve here")] = False,
+    remove_spack: Annotated[
+        bool,
+        typer.Option(
+            help="Delete the Spack store and JARVIS's Miniforge too; rebuilding them takes hours"
+        ),
+    ] = False,
+    forget_decisions: Annotated[
+        bool,
+        typer.Option(help="Delete JARVIS's recorded install answers; they are asked again"),
+    ] = False,
+    remove_outputs: Annotated[
+        bool,
+        typer.Option(
+            help="Delete what relay's runs and file uploads wrote outside its directories too"
+        ),
+    ] = False,
+    wait_s: Annotated[float, typer.Option(help="How long to wait for the answer")] = 600.0,
+) -> None:
+    """Remove relay's deployment on a site, so the next use deploys it again.
+
+    It stops relay's processes there first, and keeps the Spack store, JARVIS's
+    recorded install answers and the runs' outputs outside relay's directories
+    unless told.
+    """
+    from clio_relay import site_clean as cleaning
+    from clio_relay.adapters.hooks import ask_text
+    from clio_relay.surface.service import RelayService
+
+    _json_flag(extra)
+
+    async def approved(service: RelayService, planned: dict[str, Any]) -> bool:
+        if yes:
+            return True
+        ask = await service.ask_provider.approve(
+            site=service.site(site_id),
+            operation_id=None,
+            message=cleaning.describe_plan(planned),
+            binding={"action": "site_clean", **planned},
+            plain=False,
         )
-    )
+        if service.asks.get(ask.ask_id) is None:
+            service.asks.put(ask.ask_id, ask)
+        if sys.stdin.isatty():
+            if typer.confirm(ask_text(ask), default=False, err=True):
+                service.answer(ask.ask_id, "accept", {"approve": True}, by="cli")
+            else:
+                service.answer(ask.ask_id, "decline", by="cli")
+        else:
+            page = service.ask_provider.page_address(ask)
+            where = f"Answer at {page}" if page else f"Answer: clio-relay asks answer {ask.ask_id}"
+            typer.echo(f"waiting for ask {ask.ask_id}: {ask.message} {where}", err=True)
+        deadline = asyncio.get_running_loop().time() + wait_s
+        while True:
+            current = service.asks.get(ask.ask_id)
+            state = current.state if current is not None else "cancelled"
+            if state != "pending":
+                return state == "accepted"
+            if asyncio.get_running_loop().time() > deadline:
+                service.answer(ask.ask_id, "cancel", by="cli")
+                return False
+            await asyncio.sleep(1.0)
 
+    async def go() -> dict[str, Any]:
+        service = RelayService(_paths())
+        try:
+            planned = await cleaning.plan(
+                service,
+                site_id,
+                remove_spack=remove_spack,
+                forget_decisions=forget_decisions,
+                remove_outputs=remove_outputs,
+            )
+            if not await approved(service, planned):
+                raise Refusal(RefusalReason.POLICY_REFUSED, f"cleaning {site_id} was not approved")
+            return await cleaning.clean(service, planned)
+        finally:
+            await service.close()
 
-# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
-# object re-binding -- see the longer note beside
-# `_write_failed_acceptance_report`'s forwarder above. Re-reading
-# `cli_support._require_cluster` on every call keeps both
-# `monkeypatch.setattr(cli_support, "_require_cluster", ...)` and
-# `monkeypatch.setattr(cli, "_require_cluster", ...)` effective.
-def _require_cluster(cluster: str) -> ClusterDefinition:
-    return cli_support._require_cluster(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        cluster
-    )
-
-
-def _session_transition_lock(*, cluster: str, session_id: str) -> FileLock:
-    """Return the shared cluster-scoped owner-session transition lock."""
-    return owner_session_transition_lock(cluster=cluster, session_id=session_id)
-
-
-def _require_durable_session_identity(value: str, *, field: str) -> str:
-    """Validate a session identity before it reaches local or remote persistence."""
     try:
-        return validate_durable_record_id(value)
-    except ValueError as error:
-        raise RelayError(f"invalid {field}: {error}") from error
+        _print(asyncio.run(go()))
+    except Refusal as refusal:
+        _fail(refusal)
 
 
-def _kind_concurrency_options(
-    items: list[str] | None,
-    *,
-    param_hint: str = "--kind-concurrency",
-) -> dict[JobKind, int]:
+def main() -> None:
+    """Entry point."""
     try:
-        return parse_kind_concurrency_options(items)
-    except ConfigurationError as exc:
-        raise typer.BadParameter(
-            str(exc),
-            param_hint=param_hint,
-        ) from exc
-
-
-def _require_frp_server_addr(  # pyright: ignore[reportUnusedFunction]
-    server_addr: str, cluster: str
-) -> str:
-    if server_addr.strip():
-        return server_addr
-    raise ConfigurationError(
-        f"frp server address is not configured for cluster {cluster}; "
-        "set it with `clio-relay cluster add --frp-server-addr ...`"
-    )
-
-
-# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
-# object re-binding -- see the longer note beside
-# `_write_failed_acceptance_report`'s forwarder above. Re-reading
-# `cli_support._resolve_env_secret` on every call keeps both
-# `monkeypatch.setattr(cli_support, "_resolve_env_secret", ...)` and
-# `monkeypatch.setattr(cli, "_resolve_env_secret", ...)` effective.
-def _resolve_env_secret(value: str | None, env_name: str, label: str) -> str:
-    return cli_support._resolve_env_secret(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        value, env_name, label
-    )
-
-
-# #231 cli.py decomposition, shared-plumbing relocation pass: these four
-# symbols' real bodies moved to cli_support.py -- see that module's own
-# docstring. Thin forwarders, not bare object re-bindings, for the same
-# F3/F4 reason every other forwarder in this file carries.
-def _environment_references(items: list[str] | None) -> dict[str, str]:
-    return cli_support._environment_references(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        items
-    )
-
-
-def _artifact_use_refs(items: list[str] | None) -> list[ArtifactUse]:
-    return cli_support._artifact_use_refs(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        items
-    )
-
-
-def _artifact_use_cli_value(ref: ArtifactUse) -> str:
-    return cli_support._artifact_use_cli_value(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        ref
-    )
-
-
-def _artifact_use_idempotency_suffix(refs: list[ArtifactUse]) -> str:
-    return cli_support._artifact_use_idempotency_suffix(  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        refs
-    )
-
-
-# F3/F4 fix (iowarp/clio-relay#231 R8(ii) review): thin forwarder, not a bare
-# object re-binding -- see the longer note beside
-# `_write_failed_acceptance_report`'s forwarder above. Re-reading
-# `cli_support._run_or_exit` on every call keeps both
-# `monkeypatch.setattr(cli_support, "_run_or_exit", ...)` and
-# `monkeypatch.setattr(cli, "_run_or_exit", ...)` effective.
-def _run_or_exit(action: Callable[[], None]) -> None:
-    cli_support._run_or_exit(action)  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+        app()
+    except KeyboardInterrupt:
+        sys.exit(130)

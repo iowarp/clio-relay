@@ -1,0 +1,149 @@
+"""The server's ``instructions``: what relay does, and on which sites and packages.
+
+Clients read ``instructions`` from ``initialize`` or ``server/discover``, and many
+put it in the agent's system prompt. It names the sites and the staged packages,
+so an agent asked to run a code on a site knows relay is the way before it
+calls any tool. The text comes from the sites file and the package catalog, and
+:func:`keep_current` refreshes it while the server runs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
+
+from clio_relay.packages import PackageEntry
+from clio_relay.sites.models import SiteEntry
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
+    from clio_relay.surface.service import RelayService
+
+logger = logging.getLogger(__name__)
+
+LEAD = (
+    "Relay is the way to reach a compute site, and it owns the connection to each one, "
+    "whatever its transport. Reach a configured site only through relay's tools "
+    "(describe, run, exec, files, serve and their reads), never from a shell: run no "
+    "ssh, scp or scheduler command (such as sbatch, squeue or qsub) for it, and do not "
+    "check its connection, host or credentials yourself; describe(site=...) reaches the "
+    "site and says when relay cannot. If the site you need is not listed here, ask the "
+    "person to add it on the Compute page."
+)
+"""The opening line, before anything else, so no agent reaches or checks a site around relay.
+
+It names no transport's own files or commands to look at: a site's transport is how
+relay reaches it, never something the agent opens or tests itself.
+"""
+SITES_LEAD = "Compute sites configured for relay, each with the transport relay reaches it by"
+GENERAL = (
+    "Relay runs work on the sites in its sites file. Call describe first. "
+    "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
+    "exec runs one short command; files lists, reads, writes and stages files; "
+    "serve starts a service, and serve(service=..., until='steps') waits for its job's "
+    "compute steps to end; packages stages a JARVIS package (from relay's package "
+    "sources, or a directory on the relay host) before its first run, or removes one. "
+    "install installs a staged package's software on a site ahead of a run, and runs "
+    "nothing: JARVIS builds it where the site chose, and relay installs JARVIS "
+    "first when the site lacks it. "
+    "Reads never change anything and never ask: describe (a site, an operation or a "
+    "service with job=..., the staged packages with packages=true), exec_read (a command "
+    "on relay's read-only list, such as squeue or jarvis sched info +json), files_read "
+    "(list, stat, read, has) and packages_read (the packages relay can run). "
+    "cancel cancels a job or stops a service; site_clean removes relay's deployment from "
+    "a site after the person's yes, keeping the Spack store. "
+    "Refusals carry a typed reason in structuredContent.refusal. "
+    "A site's guide, when it has one, comes back in describe(site=...) as skill.text; "
+    "it is also the resource relay://sites/<site>/skill, which files cannot read."
+)
+NO_SITES = (
+    "No compute sites are configured yet: the person adds one on the Compute page, "
+    "and relay names it here."
+)
+MAX_LISTED = 12
+SUMMARY_CHARS = 100
+REFRESH_S = 5.0
+
+
+def site_line(site: SiteEntry) -> str:
+    """``ares (ssh)``, or ``ares (Ares cluster; ssh)`` when the site has its own name.
+
+    The site and how relay reaches it, so a search for the site's name finds relay;
+    describe(site=...) gives the rest.
+    """
+    named = f"{site.name}; " if site.name and site.name.lower() != site.id.lower() else ""
+    return f"{site.id} ({named}{site.adapter})"
+
+
+def package_line(entry: PackageEntry) -> str:
+    """``repo.pkg 1.0 (the summary's first sentence)``."""
+    summary = " ".join((entry.summary or "").split())
+    first = summary.split(". ", 1)[0].rstrip(".")
+    if len(first) > SUMMARY_CHARS:
+        first = first[: SUMMARY_CHARS - 3].rstrip() + "..."
+    return f"{entry.name} {entry.version}" + (f" ({first})" if first else "")
+
+
+def _listed(lines: Iterable[str]) -> str:
+    items = list(lines)
+    shown = items[:MAX_LISTED]
+    if len(items) > MAX_LISTED:
+        shown.append(f"and {len(items) - MAX_LISTED} more (describe lists them all)")
+    return "; ".join(shown)
+
+
+def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
+    """The instructions for these sites and packages."""
+    if not sites:
+        return f"{LEAD} {GENERAL} {NO_SITES}"
+    parts = [
+        LEAD,
+        GENERAL,
+        f"{SITES_LEAD}: {_listed(map(site_line, sites))}.",
+    ]
+    if packages:
+        ordered = sorted(packages, key=lambda entry: entry.name)
+        parts.append(f"Packages staged to run on them: {_listed(map(package_line, ordered))}.")
+    parts.append(
+        "To run a code or a package on these sites, use relay's describe and run tools "
+        "instead of building or launching it by hand: describe(site=...) gives a site's "
+        "packages with their parameters, and run takes package: {name, parameters}."
+    )
+    return " ".join(parts)
+
+
+def current(service: RelayService) -> str:
+    """Compose the instructions from what relay has now."""
+    try:
+        sites = service.sites.list()
+    except Exception:  # a broken sites file is reported by describe, not here
+        logger.debug("relay could not read the sites file for its instructions", exc_info=True)
+        sites = []
+    try:
+        packages = service.packages.newest()
+    except Exception:
+        logger.debug("relay could not read the package catalog", exc_info=True)
+        packages = []
+    return compose(sites, packages)
+
+
+async def keep_current(
+    server: FastMCP[Any], service: RelayService, interval_s: float = REFRESH_S
+) -> None:
+    """Refresh ``server.instructions`` until cancelled.
+
+    The CLI and the Compute page edit the sites file, and packages are staged, from
+    any process, so relay looks again every ``interval_s`` seconds. A client reads the
+    text when it connects (``initialize``) or asks again (``server/discover``, which
+    answers with the current text), so a site added or removed reaches it there: MCP
+    has no notification for changed instructions.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            server.instructions = await asyncio.to_thread(current, service)
+        except Exception:
+            logger.debug("relay could not refresh its instructions", exc_info=True)

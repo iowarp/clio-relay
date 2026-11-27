@@ -1,165 +1,64 @@
 # Release process
 
-`clio-relay` uses a release-first patch workflow. Publication is a maintainer
-action, not the final step of a long GitHub Actions pipeline.
+A release is a tag. Pushing a `v<version>` tag runs `release.yml`, which
+checks that the tag matches the package version, builds the wheel and source
+distribution once, and records their `SHA256SUMS`. It attaches all three to
+a GitHub Release for the tag, and publishes them to PyPI through trusted
+publishing and the `pypi` environment. A pre-release version (PEP 440, such
+as `2.0.0a1` or `2.0.0rc1`) goes to PyPI too, where installers skip it unless
+asked for it by version or with `--prerelease allow`; its GitHub Release is
+marked a pre-release and is never the latest. Nothing else gates publication.
 
-## Operating rule
-
-For a bug fix, add a focused test that reproduces the failure, implement the
-fix, and run only that focused test locally. Then push the branch, open and
-merge the pull request, tag the merged commit, and publish the GitHub Release
-immediately. Do not wait for pull-request, `main`, tag, or release workflows.
-
-GitHub runs the full regression matrix on the tag. After the GitHub Release is
-published, `release.yml` downloads its wheel and source distribution by numeric
-release-asset ID, verifies `SHA256SUMS` and archive metadata, and sends those
-exact attached bytes to PyPI through trusted publishing and the `pypi`
-environment. These jobs are asynchronous. Check their state after publication,
-but continue live testing while they run. If an asynchronous check fails,
-reproduce that failure locally and include its fix with the next patch.
-
-The older staged evidence workflows remain available for acceptance reporting.
-They do not authorize or block immediate GitHub publication or the normal PyPI
-path.
+`ci.yml` runs on pull requests, on `main` and on tags. It runs ruff, pyright
+(held to the error count in `scripts/check_pyright_ratchet.py`), the file
+size and nested class checks, and pytest, and builds the wheel to check its
+entry point. Do not wait on it to cut a release; check it after, and fix any
+failure in the next patch.
 
 ## Version
 
-Update the release version in:
+Set the same version in both places:
 
-- `pyproject.toml`
-- `src/clio_relay/__init__.py`
-- `docs/release-gate-1.0.yaml`
-- `examples/release-gate/report-matrix-1.0.json`
-- the version-specific acceptance examples and assertions
+- `version` in `pyproject.toml`
+- `__version__` in `src/clio_relay/__init__.py`
 
-After editing the matrix, recompute its canonical SHA-256 with the
-`matrix_sha256` field omitted, then store that digest in both `matrix_sha256`
-and the policy's `acceptance_matrix_sha256` field.
+## Tag and publish
 
-## Focused validation
-
-Run the new test only. For a release-workflow change, for example:
+Merge the change, then tag the merged commit on `main` and push the tag:
 
 ```powershell
-uv run pytest tests/test_release_workflows.py `
-  -k "tag_workflow_validates_identity or published_release_uploads_exact"
-```
-
-Formatting or package construction required by the changed surface is not a
-substitute for the focused behavioral test. Do not run the full regression
-suite locally as part of the patch release loop.
-
-## Merge and create the exact local tag
-
-Push and merge the focused patch, then update the local `main` checkout and
-create the package-version tag locally. The tag must exist before Hatch builds
-the release artifacts because the build hook embeds the exact tag in both
-distributions.
-
-```powershell
-git push -u origin HEAD
-gh pr create --title "fix: ..." --body-file PR.md
-gh pr merge --squash --delete-branch
 git switch main
 git pull --ff-only origin main
-$Tag = "v1.6.8"
-$Commit = (git rev-parse HEAD).Trim()
 if (git status --porcelain) { throw "release checkout is dirty" }
-if (git tag --list $Tag) { throw "release tag already exists locally: $Tag" }
-git tag $Tag $Commit
-```
-
-Do not push the tag yet. Building before the local tag exists produces an
-artifact without an exact source-tag identity.
-
-## Build exact distributions
-
-Build once from the merged release commit:
-
-```powershell
-Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
-$env:CLIO_RELAY_RELEASE_BUILD = "1"
-try {
-  uv build --out-dir dist
-  if ($LASTEXITCODE -ne 0) { throw "release distribution build failed" }
-} finally {
-  Remove-Item Env:CLIO_RELAY_RELEASE_BUILD -ErrorAction SilentlyContinue
-}
-uv run twine check dist/*
-$files = Get-ChildItem dist -File | Where-Object {
-  $_.Name.EndsWith(".whl") -or $_.Name.EndsWith(".tar.gz")
-}
-if ($files.Count -ne 2) { throw "expected one wheel and one source distribution" }
-$lines = foreach ($file in $files | Sort-Object Name) {
-  $digest = (Get-FileHash -Algorithm SHA256 $file.FullName).Hash.ToLower()
-  "$digest  $($file.Name)"
-}
-Set-Content -Encoding ascii -Path dist/SHA256SUMS -Value $lines
-$Wheel = @(Get-ChildItem dist -File -Filter "clio_relay-*.whl")
-if ($Wheel.Count -ne 1) { throw "expected one clio-relay wheel" }
-$Wheel = $Wheel[0]
-$RelayWheelSha256 = (Get-FileHash -Algorithm SHA256 $Wheel.FullName).Hash.ToLower()
-```
-
-`CLIO_RELAY_RELEASE_BUILD=1` makes the build hook require a commit, a clean
-tree, and the exact `v<project.version>` tag. An untagged, differently tagged,
-or dirty source tree fails the build instead of creating a release artifact
-with incomplete provenance. Ordinary untagged CI candidate builds remain
-supported because they do not set release-build mode.
-
-Do not rebuild between GitHub publication and PyPI publication. PyPI receives
-the distributions downloaded from the published GitHub Release, not a second
-CI build.
-
-## Push the tag and publish
-
-After the exact distributions have passed their local checks, push the tag and
-publish those already-built bytes:
-
-```powershell
+$Tag = "v$(uv version --short)"
+git tag $Tag
 git push origin $Tag
-gh release create $Tag --draft --target $Commit --title "clio-relay 1.6.8" `
-  dist/*.whl dist/*.tar.gz dist/SHA256SUMS --notes-file RELEASE.md
-gh release edit $Tag --draft=false
 ```
 
-Creating the draft with all assets first avoids a release-event race: the
-`published` event is emitted only after the exact distributions and checksum
-manifest are attached. Draft state is not a validation pause; publication
-follows immediately in the same command sequence.
+`release.yml` builds with `CLIO_RELAY_RELEASE_BUILD=1`, so the build hook
+requires a commit, a clean tree and the exact `v<project.version>` tag. An
+untagged, differently tagged or dirty tree fails the build. Ordinary builds
+outside a release do not set it and still work.
 
-Repository rules may require a temporary maintainer bypass for an immediate
-merge. If used, snapshot the complete ruleset, change only what is necessary,
-merge, and restore the exact prior ruleset before tagging.
+A pre-release can be tagged from a branch other than `main`. A plugin that
+needs a fixed build can depend on the release's wheel by URL; its lock records
+the wheel's hash, which matches the release's `SHA256SUMS`.
 
-## Post-publication check
+## Publish an earlier release
 
-Check once; do not wait:
+A tag cut before its version could go to PyPI can still be published, with the
+exact files of its GitHub Release. Run `release.yml` by hand from a `v*` tag
+ref (the `pypi` environment admits only those and `main`), naming the earlier
+tag; the job checks the files against the release's `SHA256SUMS` first:
 
 ```powershell
-gh run list --branch $Tag --limit 10
-gh release view $Tag
+gh workflow run release.yml --ref v2.0.0a37 -f tag=v2.0.0a36
 ```
 
-The expected asynchronous work is:
+## After publication
 
-- the tag identity receipt in `release.yml`;
-- the full tagged regression matrix in `ci.yml`;
-- the published-release trusted PyPI upload in `release.yml`.
-
-Live released-artifact validation can begin as soon as the GitHub Release is
-public. The acceptance procedure and machine-readable report schema remain in
-[`release-acceptance-1.0.md`](release-acceptance-1.0.md) and
-[`release-gate-1.0.yaml`](release-gate-1.0.yaml).
-
-Every release bootstrap command must carry the exact wheel identity computed
-above, whether it asks the target to install from PyPI or transports the local
-release wheel:
+Install the published wheel in a clean environment and check the entry point:
 
 ```powershell
-clio-relay cluster bootstrap --cluster $Cluster `
-  --relay-artifact-sha256 $RelayWheelSha256
-# Candidate bytes instead of PyPI transport:
-clio-relay cluster bootstrap --cluster $Cluster --relay-wheel $Wheel.FullName `
-  --relay-artifact-sha256 $RelayWheelSha256
+uv run --no-project --with "clio-relay==$(uv version --short)" clio-relay --help
 ```

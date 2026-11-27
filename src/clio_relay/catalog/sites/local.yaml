@@ -1,0 +1,8 @@
+id: local
+name: This computer
+summary: Where relay runs, no scheduler needed
+description: >-
+  The computer relay runs on. Jobs run as local processes, or under a local
+  scheduler when it has one, so nothing needs a sign-in.
+adapter: local
+config: {}

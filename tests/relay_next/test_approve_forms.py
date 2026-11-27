@@ -1,0 +1,183 @@
+"""A plain approval is one boolean; an approval naming new facts is a choice."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import mcp_types
+import pytest
+
+from clio_relay.adapters.hooks import (
+    CHOICE_META,
+    Ask,
+    Charge,
+    ChoiceOption,
+    approve_schema,
+    choice_meta,
+    explain_approval,
+    said_yes,
+    with_choice_meta,
+)
+from clio_relay.adapters.ssh import pricing as ssh_pricing
+from clio_relay.jobs.spec import JobSpec
+from clio_relay.surface.elicit import answer_response, ask_view
+from clio_relay.surface.guarding import cost_text, node_hours_text
+from clio_relay.surface.results import operation_result
+from clio_relay.surface.service import RelayService
+from clio_relay.surface.settings import RelayPaths
+
+
+def test_plain_is_one_boolean() -> None:
+    schema = approve_schema()
+    assert schema["properties"]["approve"]["type"] == "boolean"
+    assert schema["required"] == ["approve"]
+
+
+def test_typed_is_a_titled_choice() -> None:
+    answer = approve_schema(plain=False)["properties"]["approve"]
+    assert answer["type"] == "string"
+    assert [item["const"] for item in answer["oneOf"]] == ["approve", "decline"]
+
+
+@pytest.mark.parametrize(
+    ("content", "yes"),
+    [
+        ({"approve": True}, True),
+        ({"approve": "approve"}, True),
+        ({"approve": False}, False),
+        ({"approve": "decline"}, False),
+        ({"approve": "yes"}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_said_yes(content: dict[str, object] | None, yes: bool) -> None:
+    assert said_yes(content) is yes
+
+
+@pytest.mark.parametrize(("value", "state"), [("approve", "accepted"), ("decline", "declined")])
+def test_answer_reads_the_choice(relay_paths: RelayPaths, value: str, state: str) -> None:
+    service = RelayService(relay_paths)
+    ask = Ask(
+        ask_id="ask_typed",
+        kind="approve",
+        site="fx",
+        message="Spend 2 node-hours?",
+        requested_schema=approve_schema(plain=False),
+    )
+    service.asks.put(ask.ask_id, ask)
+    assert service.answer(ask.ask_id, "accept", {"approve": value}, by="test").state == state
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (1, "1 node-hour"),
+        (0.5, "0.5 node-hours"),
+        (0.1667, "about 0.17 node-hours"),
+        (2.26, "about 2.3 node-hours"),
+        (12.4, "about 12 node-hours"),
+        (0.004, "under 0.01 node-hours"),
+        (0, "0 node-hours"),
+    ],
+)
+def test_node_hours_read_as_a_person_says_them(value: float, text: str) -> None:
+    assert node_hours_text(value) == text
+
+
+def test_the_cost_names_the_walltime_the_nodes_and_the_node_hours() -> None:
+    lammps = Charge(site="ares", nodes=1, walltime_s=600, node_hours=0.1667)
+    assert cost_text(lammps) == "up to 10 min on 1 node (about 0.17 node-hours)"
+    wide = Charge(site="ares", nodes=2, walltime_s=5400, node_hours=3)
+    assert cost_text(wide) == "up to 1 h 30 min on 2 nodes (3 node-hours)"
+    assert cost_text(Charge(site="ares", nodes=1)) is None
+
+
+def test_the_cost_takes_the_nodes_and_walltime_from_the_job() -> None:
+    # The live LAMMPS run: 2 nodes for 5 minutes is the 0.1667 node-hours it asked for.
+    spec = JobSpec.model_validate(
+        {"executable": "x", "resources": {"node_count": 2}, "attributes": {"duration": "PT5M"}}
+    )
+    charge = ssh_pricing.charge("ares", spec)
+    assert charge.node_hours == 0.1667
+    assert cost_text(charge) == "up to 5 min on 2 nodes (about 0.17 node-hours)"
+
+
+def test_an_approval_says_what_each_answer_does() -> None:
+    ask = Ask(
+        ask_id="ask_spend",
+        kind="approve",
+        site="fx",
+        message="Run LAMMPS on Ares?",
+        requested_schema=approve_schema(plain=False),
+        meta={"other": 1},
+    )
+    explain_approval(ask, title="Run LAMMPS on Ares", yes="Submits it.", no="Nothing runs.")
+    schema: dict[str, Any] = ask.requested_schema or {}
+    field = schema["properties"]["approve"]
+    assert field["title"] == "Run LAMMPS on Ares"
+    assert field["oneOf"] == [
+        {"const": "approve", "title": "Approve", "description": "Submits it."},
+        {"const": "decline", "title": "Decline", "description": "Nothing runs."},
+    ]
+    assert schema["required"] == ["approve"]
+    meta = ask.meta or {}
+    assert meta["other"] == 1
+    typed = meta[CHOICE_META]["ask_spend"]["approve"]
+    assert [item["label"] for item in typed["options"]] == ["Approve", "Decline"]
+    assert typed["recommended"] is None
+    assert said_yes({"approve": "approve"})
+    plain = Ask(
+        ask_id="ask_plain",
+        kind="approve",
+        site="fx",
+        message="m",
+        requested_schema=approve_schema(),
+    )
+    explain_approval(plain, title="t", yes="y", no="n")
+    assert plain.requested_schema == approve_schema() and plain.meta is None
+
+
+def test_two_choices_on_one_ask_keep_both() -> None:
+    first = choice_meta(
+        "ask_1", "approve", [ChoiceOption(value="approve", label="Approve")], title="Run it"
+    )
+    second = choice_meta(
+        "ask_1", "held", [ChoiceOption(value="keep", label="Keep")], title="Services"
+    )
+    merged = with_choice_meta(with_choice_meta({"job": 1}, first), second)
+    assert set(merged[CHOICE_META]["ask_1"]) == {"approve", "held"}
+    assert merged["job"] == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        mcp_types.ElicitResult.model_validate(
+            {
+                "action": "decline",
+                "_meta": {"io.iowarp/approval": {"comment": "use the debug queue"}},
+            }
+        ),
+        {"action": "decline", "_meta": {"io.iowarp/approval": {"comment": "use the debug queue"}}},
+    ],
+)
+def test_the_persons_comment_reaches_the_model(relay_paths: RelayPaths, response: Any) -> None:
+    service = RelayService(relay_paths)
+    ask = Ask(ask_id="ask_c", kind="approve", site="fx", message="Spend 2 node-hours?")
+    service.asks.put(ask.ask_id, ask)
+    answered = answer_response(service, ask.ask_id, response, by="test")
+    shown = ask_view(answered)
+    assert (shown["state"], shown["comment"]) == ("declined", "use the debug queue")
+    view = {"operation_id": "op_1", "site": "fx", "state": "running", "asks": [shown]}
+    said = operation_result(view).content[0]
+    assert isinstance(said, mcp_types.TextContent)
+    assert said.text.endswith('declined "Spend 2 node-hours?" and said: use the debug queue')
+
+
+def test_no_comment_says_nothing_more(relay_paths: RelayPaths) -> None:
+    service = RelayService(relay_paths)
+    ask = Ask(ask_id="ask_n", kind="approve", site="fx", message="Spend 2 node-hours?")
+    service.asks.put(ask.ask_id, ask)
+    answered = answer_response(service, ask.ask_id, {"action": "accept"}, by="test")
+    assert "comment" not in ask_view(answered)

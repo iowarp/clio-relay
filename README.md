@@ -4,272 +4,134 @@
 
 <h1 align="center">clio-relay</h1>
 
-`clio-relay` lets a desktop tool submit work to a remote cluster, follow it while it runs, and collect logs, artifacts, progress, and provenance without putting job state in the network tunnel.
+`clio-relay` runs work on the computers you use: your own machine, a cluster
+you reach over ssh, a Tapis tenant, a Globus Compute endpoint, an IRI facility
+or a cloud through SkyPilot. It is a standard MCP server, so any agent that
+speaks MCP can use it: Claude Code, Copilot CLI, Codex, CLIO, or a plain `mcp`
+client. It is also a command line for people.
 
-It is a piece of the federation layer for [`clio-agent`](https://github.com/iowarp/clio-agent): a local CLIO experience can delegate work to a remote machine, keep observing it, detach, reconnect, and clean up after itself. The project is also designed for use outside CLIO. Any client that can call the CLI, HTTP API, or MCP tools can use the same relay model.
+## How it works
 
-> Version `1.6.8` uses a release-first patch process. A maintainer builds the
-> wheel and source distribution once, attaches those exact bytes and their
-> checksums to a GitHub Release, and publishes the release immediately. Tag
-> regression jobs and the trusted PyPI upload then run asynchronously; they do
-> not hold the maintainer session open or delay continued live testing. A
-> failure is reproduced with a focused test and corrected in the next patch.
-> The `ares` and `homelab` names in the current acceptance policy are evidence
-> labels for this release, not product allowlists. Operators can register other
-> clusters without changing relay code.
+Relay keeps a list of sites in `sites.yaml`. Each site names an adapter, which
+knows how to reach it, and a policy that says what may run there. Every site
+answers the same five verbs:
 
-## How It Works
+| Verb | What it does |
+| --- | --- |
+| `describe` | Lists the sites, describes one site, or observes one operation |
+| `run` | Submits a job, written as a PSI/J job spec, and follows it to the end |
+| `exec` | Runs one short command and returns its output |
+| `files` | Lists, reads, writes, deletes and stages files, with resumable chunks for large ones |
+| `serve` | Starts a long-running service and forwards its ports to you |
 
-`clio-relay` has three long-running roles:
+`run` and `serve` are MCP tasks when the client supports the tasks extension:
+the client gets progress on the task, can leave and come back, and answers
+questions (a one-time code, a spend approval) through the task. A client
+without tasks gets an operation id instead, which `describe(job=...)` follows.
+`install` installs a package's software on a site ahead of any run, with the
+same questions as a run's install, and launches nothing.
+See [MCP tasks](docs/mcp-tasks.md). `files` behaves the same on every site; see
+[files](docs/files.md).
 
-- `desktop`: submits work and exposes CLI, HTTP, and MCP surfaces for local tools.
-- `worker`: runs on a configured cluster, leases work, invokes JARVIS-CD, and records results.
-- `relay-host`: carries bytes for frp deployments. It does not store jobs or queue state.
-
-The durable boundary is `clio-core`. The filesystem queue in this repository is the development backend for that record contract. Jobs, task timelines, progress, scheduler state, gateway sessions, logs, artifacts, and provenance are recorded there so clients can detach, reconnect, and replay state. JARVIS-CD owns scheduler execution, package behavior, output collection, and provenance.
-Lease admission uses a crash-replayed aggregate for constant-read capacity
-checks, while an explicit full audit retains exact canonical and operational
-index verification for repair and production diagnostics.
-
-A connection is the desktop relay and the cluster relay joined by exactly one persistent link. Every operation for that connection rides it — submission, status, events, logs, artifact content, input staging, watch, cancellation, teardown — and the link is established once at bring-up and held. Transport is replaceable because it only carries HTTP bytes between endpoints:
-
-- Relay mode is the primary path. Both relays dial outbound to a public relay host, which brokers a handshake joining them; neither side accepts inbound. It supports WebSocket/TLS for Cloudflare-style HTTPS infrastructure and raw TCP for environments that provide a direct public port.
-- NAT bypass uses frp XTCP to try a direct peer path between desktop and cluster. It is an optimization for lower-latency or higher-volume traffic, with fallback to relay mode and the durable queue.
-- SSH forwarding is the fallback for closed environments that permit no other path. One local port forward is established at bring-up and held for the life of the connection.
-
-SSH is a bootstrap mechanism or that one held forward. A connection opens at most one ssh connection in the frp modes — deploying the cluster relay, skipped when it is already there — and at most two in the SSH fallback. After bring-up it opens none, for any number of operations, because a protected cluster asks for interactive 2FA and the user is present only for the first connection. One desktop relay manages many cluster connections at once, behind one MCP endpoint.
-
-Remote agent tasks, remote MCP calls, JARVIS pipelines, and gateway sessions all use the same queue and observation model. The transport can change without changing where state lives. See [connection model](docs/connection-model.md) for the normative statement, including how run inputs reach the cluster.
+A site that is `guarded` runs only reviewed packages, and asks before it spends
+an allocation. See [guarded sites](docs/guarded-sites.md).
 
 ## Install
 
-For normal use, install the released package once as a persistent uv tool. No
-checkout is required, and every later command reuses the same isolated tool
-environment and cache.
-
 ```powershell
 uv tool install --python 3.12 --no-config clio-relay
-clio-relay init
-clio-relay install-frp
 ```
 
-Add a cluster. The cluster name and agent executable are local configuration.
+Add the extras for the adapters you need, for example
+`clio-relay[tapis,globus]`.
+
+## Add a site
+
+Pick one from the catalog, or describe your own:
 
 ```powershell
-clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --agent-adapter exec --agent-bin agent
-$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
-clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
-clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --kind-concurrency remote_agent=2 --kind-concurrency mcp_call=1 --start --enable
+clio-relay site catalog
+clio-relay site add-from-catalog ares
+clio-relay site add my-cluster --adapter ssh --config '{"ssh_profile": "my-cluster"}' --policy open
+clio-relay site list
 ```
 
-The enabled worker is an always-on cluster service, not a desktop-session
-process. Its installer therefore requires `loginctl` to report `Linger=yes`
-before it writes or starts the unit. Enable lingering once on the cluster when
-site policy permits (`loginctl enable-linger "$USER"`), or ask the site
-administrator to enable it. `--allow-login-scoped` is an explicit diagnostic
-opt-out for sites that forbid lingering; that service may stop after the final
-login exits and cannot satisfy release validation.
+`clio-relay adapters` lists the adapters installed. Each adapter page below
+lists its settings. Leave out `--adapter` or `--policy` and `site add` uses the
+defaults for new sites, which `clio-relay site defaults` shows and changes; the
+Compute page in CLIO shares them.
 
-## Submit Work
+## Use it from an agent
 
-Submit a JARVIS pipeline:
+Point the agent's MCP configuration at the stdio server:
+
+```json
+{"mcpServers": {"relay": {"command": "clio-relay", "args": ["serve"]}}}
+```
+
+For Streamable HTTP, run `clio-relay serve --http`. It listens on
+`127.0.0.1:8766/mcp` and requires a bearer token, which it writes to its state
+directory the first time unless `CLIO_RELAY_TOKEN` is set.
+
+## Answer what a site asks
+
+Some sites ask for a one-time code, a sign-in or a spend approval. An agent
+with tasks or elicitation shows the question to you. From a terminal:
 
 ```powershell
-clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml
-clio-relay job watch <job-id> --cluster my-cluster
-clio-relay job read-log <job-id> --cluster my-cluster --stream stdout
-clio-relay job list-artifacts <job-id> --cluster my-cluster
+clio-relay asks list
+clio-relay asks answer <ask-id>
+clio-relay asks identities
 ```
 
-Pin consumed artifacts at submission with repeatable
-`--used-artifact <artifact-id>=<sha256>` arguments. The job then exposes its
-immutable inputs with `job used-artifacts`, while `job used-by` follows the
-reverse edge from an artifact to downstream jobs. The same bidirectional
-lineage is available through HTTP and the single agent-facing
-`relay_artifact_lineage` MCP tool.
+## Connect to a service
 
-Expose relay tools to an agent:
+`serve` returns a connect command for each running service. Run it on your
+machine to forward the service's ports and hold them open:
 
 ```powershell
-clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
-clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
+clio-relay connect <handle>
 ```
 
-`--prompt` and `--mcp-config` name cluster-side paths for operator material
-placed once at bootstrap. They are not a transfer channel: run inputs reach the
-cluster through relay's schema-declared input staging, which snapshots a file
-from the desktop workspace and records its lineage on the job.
+## Bring your own machine or facility
 
-The MCP server is native FastMCP and can project long-running relay operations
-through standard SEP-2663 task handles without introducing a second scheduler.
-Stdio is the default. Authenticated Streamable HTTP is also available:
+A machine you reach over ssh, or one behind Tapis, Globus Compute or IRI, is a
+new site: one entry in `sites.yaml`, no code. A facility with its own API needs
+an adapter: one Python class in your own package, registered by an entry
+point, with relay's conformance kit to prove it works. Relay's code does not
+change.
 
-```powershell
-$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
-clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
-```
-
-See [MCP background tasks](docs/mcp-tasks.md) for official FastMCP client usage,
-reconnect, cancellation, input, and security semantics.
-
-Operators can expose selected tools from any cluster-side stdio MCP server
-through the same local relay MCP. Registration is allowlisted, and schema
-discovery is an explicit durable job:
-
-```powershell
-uv tool install --python 3.12 --no-config C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl
-clio-relay remote-mcp register --cluster my-cluster --name science --command science-mcp --allow-tool inspect_dataset --profile user
-clio-relay remote-mcp refresh --cluster my-cluster --name science
-```
-
-User-profile federation requires an exact immutable wheel path (or a unique,
-non-editable console installation whose complete `RECORD` closure verifies).
-A mutable install or a package-index spec such as `science-mcp-kit==1.4.0`
-fails closed and is not exposed to agents.
-
-See [remote MCP federation](docs/remote-mcp-federation.md) for cache,
-freshness, alias, collision, profile, and live-acceptance semantics.
-
-## Observe Remote Agent Work
-
-Remote agents can emit structured task timeline events while they work. This is useful when a UI needs to show discovery and planning before the final answer exists.
-
-```powershell
-clio-relay job tasks <job-id> --cluster my-cluster
-clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
-clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
-```
-
-The same contract is available over HTTP at `/tasks/{task_id}/events`, `/tasks/{task_id}/events/sse`, and `/tasks/{task_id}/events/ws`, and through MCP tools `relay_record_task_event` and `relay_watch_task_events`.
-
-## Manage Gateway Sessions
-
-Long-running remote services should be tracked as durable gateway sessions. A session records the scheduler job, node, logs, published or forwarded endpoint, health metadata, and reconnect hints. Production service runtimes should be launched by a JARVIS package or pipeline, which owns application-specific monitoring and emits structured status/events back to the relay.
-
-```powershell
-clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
-clio-relay gateway update <session-id> --cluster my-cluster --state ready --node compute-01 --gateway-json-file .\gateway-ready.json
-clio-relay gateway get <session-id> --cluster my-cluster
-clio-relay gateway close <session-id> --cluster my-cluster
-```
-
-The HTTP API exposes `/gateway-sessions`, `/gateway-sessions/{session_id}`, and `/gateway-sessions/{session_id}/close`. MCP tools expose the same create, read, update, and close operations.
-
-These generic gateway operations manage ordinary endpoint metadata only. They cannot write scheduler identity, relay runtime specifications or ownership intents, connector ownership, or relay owner metadata. Use `gateway start-runtime`, `detach-runtime`, and `stop-runtime` for relay-owned scheduler-backed services.
-
-`gateway start-runtime` submits at most once and makes one bounded readiness
-observation. A workload that is queued, allocated but not healthy yet, or temporarily
-unobservable returns `outcome: "pending"` with its durable gateway-session selector.
-Before the scheduler response is known, that selector contains the exact submission ID
-and marker; after acceptance, it contains the native scheduler job ID. Advance that
-exact submission with `gateway resume-runtime <gateway_session_id>` after any delay;
-hours or days of scheduler residence never become a relay failure, cancellation, or
-resubmission. Only provider-proven terminal scheduler state is terminal.
-`observation_unknown` records missing observation evidence without claiming that the
-scheduler job is still queued.
-
-When JARVIS already owns a live application, agents use the user-profile
-`relay_bind_jarvis_runtime` MCP tool instead of supplying a runtime specification.
-The relay verifies a completed `jarvis_get_execution` MCP result produced with
-`include_service_runtimes=true`. A waited query returns compact
-`service_runtime_bindings`; the agent passes one entry unchanged as
-`relay_bind_jarvis_runtime.binding` instead of guessing opaque job, artifact, or
-service identifiers. The relay persists its execution, service, scheduler, and
-dataset identities, starts only
-the connector path, and returns local connect, health, stream, events, state, and
-command URLs. Detach and stop retain the scheduler job unless cancellation is
-explicitly requested and the original binding can be re-verified.
-The immutable JARVIS binding plus owner identity deterministically names one
-gateway. If connector delivery or the bounded health observation is inconclusive,
-the tool returns `outcome: "pending"`, an exact `retry_selector`,
-`scheduler_action: "none"`, `relay_action: "none"`, and null URLs. Reissue the
-same bind arguments after any delay to advance that gateway in place; it does not
-create another gateway, connector generation, scheduler job, cancellation, or
-resubmission. Changing its name, transport, or desktop-port policy is rejected.
-Only use the URLs after `outcome: "ready"`. Proven binding/authentication/integrity
-violations and provider-proven terminal scheduler states fail closed.
-New live services use `jarvis.service-runtime.v2`: every cluster-side endpoint
-requires an execution-owned bearer capability, but the public JARVIS report exposes
-only `authorization.scheme` and `authorization.token_sha256`. After re-verifying the
-durable source, relay passes the exact execution, pipeline, package, service-instance,
-revision, and digest identities to JARVIS's private resolver. Relay resolves the
-returned bearer independently for each operation. Browser attachment transfers it
-over anonymous stdin to the owned loopback proxy, which retains it only in process
-memory for that attachment and injects it solely on the private proxy-to-service
-hop; gateway provenance stores only its digest. Previously released
-v1 execution records remain readable for existing bindings, but they cannot produce a
-new handoff or authenticated binding.
-
-Sandboxed viewers obtain browser-safe URLs only through the internal
-`gateway browser-attach` command after verifying that binding. Its one-time,
-short-lived capability is never stored in normal gateway output; a loopback proxy
-requires the capability plus exact `Origin: null` without wildcard CORS.
-The proxy strips that browser capability and independently injects the verified
-JARVIS bearer upstream; neither secret appears in the public gateway record.
-`gateway browser-detach` revokes it before stopping the proxy. For SLURM-owned
-loopback services, the cluster connector is pinned to a provider-verified,
-single-node `BatchHost` rather than guessing an allocation node.
-
-## Choose Transport
-
-Choose the mode that builds the connection's one link. The primary path is frp through a public relay point; SSH forwarding is the fallback for infrastructure that permits nothing else. Both carry the same traffic afterwards.
-
-For a public relay through Cloudflare or another HTTPS edge, use frp with `transport.protocol = "wss"`:
-
-```powershell
-$env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
-$env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
-clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --frp-server-addr relay.example.edu
-clio-relay relay-host render-frpc-config --cluster my-cluster --local-port 8848
-clio-relay relay-host render-frpc-visitor-config --cluster my-cluster --bind-port 8765
-clio-relay relay-host test-http-transport --cluster my-cluster --local-bind-port 18765
-```
-
-For closed environments where no relay point is reachable, use SSH local forwarding. The forward is established once and held; nothing re-dials ssh for status, polling, recovery, or staging afterwards:
-
-```powershell
-clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
-```
-
-To leave the remote API alive for a desktop detach and later reattach:
-
-```powershell
-clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
-clio-relay session status --cluster my-cluster --session-id desktop-session
-clio-relay session detach --cluster my-cluster --session-id desktop-session
-clio-relay session teardown --cluster my-cluster --session-id desktop-session
-```
-
-Automation that must recover an interrupted start should persist the JSON from
-`session plan-start`, invoke `session start` with those exact selectors,
-and query the returned current-transition `status_selector`. Per-observation
-transport deadlines never imply terminal failure, and session lifecycle operations
-never cancel or time out queued scheduler/JARVIS jobs.
-
-Use `session teardown --stop-worker` only when the user chooses to clean up the persistent remote worker too. Teardown keeps relay and scheduler jobs running without prompting. Use `--cancel-jobs` only for an explicit user choice, and add `--cancel-scheduler-jobs` only when the scheduler allocation should also be canceled. The JSON result identifies verified ownership and any residual resources.
+- [Adding a machine or an adapter](docs/adding-an-adapter.md): the walkthrough
+- [The adapter template](examples/adapter-template): a complete adapter and a fake facility to copy
+- [Contributing](CONTRIBUTING.md): setting up, the checks, and the layout
 
 ## Documentation
 
-- [connection model](docs/connection-model.md) — normative
+- [MCP tasks](docs/mcp-tasks.md): how `run` and `serve` behave as tasks, and without them
+- [files](docs/files.md): paths, large files and resuming, the same on every site
+- [guarded sites](docs/guarded-sites.md): what a guarded site runs, and how packages are reviewed
+- [rendezvous host](docs/rendezvous-host.md): the meeting point where a service and your machine both dial out
+- [adding a machine or an adapter](docs/adding-an-adapter.md)
 - [architecture](docs/architecture.md)
 - [operations](docs/operations.md)
 - [release](docs/release.md)
 - [brand prompt](docs/brand.md)
-- [ai context](docs/ai/README.md)
+- adapters
+  - [globus](docs/adapters/globus.md): jobs through Globus Compute, files through Globus Transfer
+  - [iri](docs/adapters/iri.md): the IRI Facility API that NERSC, ALCF, OLCF and ESnet serve
+  - [sky](docs/adapters/sky.md): SkyPilot managed jobs on clouds, Kubernetes and Slurm
+  - [ssh](docs/adapters/ssh.md): any site you can reach with ssh, with or without a batch scheduler
+  - [tapis](docs/adapters/tapis.md): TACC and other Tapis tenants, with no ssh from your machine
+  - [worker](docs/adapters/worker.md): a small relay worker on the cluster, reached through a rendezvous server after one ssh sign-in
 
 ## Development
 
+See [CONTRIBUTING](CONTRIBUTING.md).
+
 ```powershell
-uv sync
+uv sync --all-extras
 uv run ruff check --fix
 uv run ruff format
 uv run pyright
 uv run pytest
 ```
-
-The optional staged acceptance workflows build and attest a digest-bound draft
-candidate, then collect independent candidate and released-artifact evidence.
-Normal patch publication follows the release-first process in
-[`docs/release.md`](docs/release.md) and does not wait for those acceptance
-workflows. A release must not be described as acceptance-validated unless the
-corresponding evidence stages actually completed.

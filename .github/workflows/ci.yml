@@ -2,6 +2,7 @@ name: ci
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   pull_request:
     branches: ["main"]
@@ -12,32 +13,9 @@ permissions:
   contents: read
 
 jobs:
-  workflow-lint:
-    name: GitHub Actions syntax and semantics
+  lint:
+    name: ruff and pyright
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - name: install checksum-pinned actionlint
-        shell: bash
-        run: |
-          archive=actionlint_1.7.12_linux_amd64.tar.gz
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --output "$archive" \
-            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/$archive"
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" \
-            | sha256sum --check --strict
-          tar --extract --gzip --file "$archive" actionlint
-      - name: lint workflows
-        run: ./actionlint
-
-  build:
-    name: ubuntu-latest / python 3.12
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -48,224 +26,134 @@ jobs:
         with:
           enable-cache: true
           version: "0.11.28"
-      - name: set up python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
       - name: install dependencies
-        run: uv sync --python "3.12" --locked --all-groups
-      - name: check committed cross-repo schema goldens
-        run: uv run --no-sync python -m tests.generate_schema_equality_goldens --check
-      - name: stage exact clio-kit release wheel
-        shell: bash
-        env:
-          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.10.6-py3-none-any.whl
-          CLIO_KIT_WHEEL_SHA256: bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d
-          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
-        run: |
-          set -euo pipefail
-          umask 077
-          wheel_dir="$RUNNER_TEMP/clio-kit-v2.7.2"
-          mkdir "$wheel_dir"
-          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
-          curl --fail --show-error --silent --location \
-            --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
-            --connect-timeout 20 --max-time 180 \
-            --output "$wheel" "$CLIO_KIT_WHEEL_URL"
-          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$wheel" \
-            | sha256sum --check --strict
-          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$wheel" >> "$GITHUB_ENV"
-          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
-            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
-      - name: run the sole artifact-building release gate
-        run: >-
-          uv run --python 3.12 clio-relay release validate-local
-          --project-root .
-          --report dist/reports/validation-local-ubuntu-latest-3.12.json
-          --artifact-dir dist/build-output
-      - name: stage the exact build-once distributions
-        shell: bash
-        run: |
-          mkdir -p dist/candidate
-          mapfile -t wheels < <(find dist/build-output -maxdepth 1 -type f -name '*.whl' -print)
-          mapfile -t sdists < <(find dist/build-output -maxdepth 1 -type f -name '*.tar.gz' -print)
-          test "${#wheels[@]}" -eq 1
-          test "${#sdists[@]}" -eq 1
-          cp -- "${wheels[0]}" "${sdists[0]}" dist/candidate/
-          (
-            cd dist/candidate
-            mapfile -t distributions < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
-            test "${#distributions[@]}" -eq 2
-            sha256sum --binary "${distributions[@]}" > SHA256SUMS
-            sha256sum --check --strict SHA256SUMS
-          )
-      - name: upload build-once distributions
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: build-once-${{ github.sha }}
-          path: dist/candidate
-          if-no-files-found: error
-          retention-days: 90
-      - name: upload primary matrix report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: matrix-report-ubuntu-latest-3.12
-          path: dist/reports/validation-local-ubuntu-latest-3.12.json
-          if-no-files-found: warn
-          retention-days: 90
+        # The pyright ratchet is measured with every extra installed: without
+        # globus-sdk and tapipy their adapters type-check as unknown.
+        run: uv sync --python "3.12" --locked --all-groups --all-extras
+      - name: ruff check
+        run: uv run --no-sync ruff check
+      - name: ruff format
+        run: uv run --no-sync ruff format --check
+      - name: pyright, held to the error ratchet
+        run: uv run --no-sync python scripts/check_pyright_ratchet.py
+      - name: file size ratchet
+        run: uv run --no-sync python scripts/check_file_size.py
+      - name: no classes inside functions
+        run: uv run --no-sync python scripts/check_no_class_in_function.py
 
-  validate:
+  test:
     name: ${{ matrix.os }} / python ${{ matrix.python-version }}
-    needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            python-version: "3.13"
-          - os: ubuntu-latest
-            python-version: "3.14"
-          - os: windows-latest
-            python-version: "3.12"
-          - os: windows-latest
-            python-version: "3.13"
-          - os: windows-latest
-            python-version: "3.14"
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - name: check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: download the one build produced by the primary leg
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: build-once-${{ github.sha }}
-          path: dist/prebuilt
       - name: install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           enable-cache: true
           version: "0.11.28"
-      - name: set up python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: ${{ matrix.python-version }}
       - name: install dependencies
-        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups
-      - name: verify matrix interpreter
-        run: >-
-          uv run --python "${{ matrix.python-version }}" python -c
-          "import sys; expected = tuple(map(int, '${{ matrix.python-version }}'.split('.'))); assert sys.version_info[:2] == expected, (sys.version, expected)"
-      - name: stage exact clio-kit release wheel
-        shell: bash
-        env:
-          CLIO_KIT_WHEEL_FILENAME: clio_kit-2.10.6-py3-none-any.whl
-          CLIO_KIT_WHEEL_SHA256: bfbdba1252de18daf4954399e8b973143a709d834109c294661d859dae30353d
-          CLIO_KIT_WHEEL_URL: https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
-        run: |
-          set -euo pipefail
-          umask 077
-          wheel_dir="$RUNNER_TEMP/clio-kit-v2.7.2"
-          mkdir "$wheel_dir"
-          wheel="$wheel_dir/$CLIO_KIT_WHEEL_FILENAME"
-          curl --fail --show-error --silent --location \
-            --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 180 \
-            --connect-timeout 20 --max-time 180 \
-            --output "$wheel" "$CLIO_KIT_WHEEL_URL"
-          printf '%s  %s\n' "$CLIO_KIT_WHEEL_SHA256" "$wheel" \
-            | sha256sum --check --strict
-          if [ "$RUNNER_OS" = Windows ]; then
-            exported_wheel="$(cygpath --windows --absolute "$wheel")"
-          else
-            exported_wheel="$wheel"
-          fi
-          printf 'CLIO_RELAY_CLIO_KIT_WHEEL=%s\n' "$exported_wheel" >> "$GITHUB_ENV"
-          printf 'CLIO_RELAY_CLIO_KIT_WHEEL_SHA256=%s\n' \
-            "$CLIO_KIT_WHEEL_SHA256" >> "$GITHUB_ENV"
-      - name: validate without rebuilding the distributions
-        run: >-
-          uv run --python "${{ matrix.python-version }}"
-          clio-relay release validate-local
-          --project-root .
-          --report dist/reports/validation-local-${{ matrix.os }}-${{ matrix.python-version }}.json
-          --artifact-dir dist/validation-output
-          --prebuilt-artifact-dir dist/prebuilt
-      - name: upload matrix report
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: matrix-report-${{ matrix.os }}-${{ matrix.python-version }}
-          path: dist/reports/validation-local-${{ matrix.os }}-${{ matrix.python-version }}.json
-          if-no-files-found: warn
-          retention-days: 90
+        run: uv sync --python "${{ matrix.python-version }}" --locked --all-groups --all-extras
+      - name: pytest
+        run: uv run --no-sync pytest
 
-  seal:
-    name: seal tested release candidate
-    needs: [workflow-lint, build, validate]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  adapter-template:
+    name: adapter template conformance / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: examples/adapter-template
     steps:
-      - name: check out the exact tested commit
+      - name: check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: download the build-once distributions
-        if: github.event_name == 'merge_group'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
-          name: build-once-${{ github.sha }}
-          path: dist/candidate
-      - name: download every matrix report
-        if: github.event_name == 'merge_group'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+          version: "0.11.28"
+      # What the template's README tells a newcomer to run: the conformance kit
+      # against the fake facility, with clio-relay from this checkout.
+      - name: pytest
+        run: uv run --python "3.12" pytest
+
+  # A regression check that does not gate merges: the conformance kit for the
+  # ssh adapter (W2's fx-ssh, fx-slurm and fx-pbs) and the worker adapter
+  # (placed on fx-slurm, linked through fx-frps), on Docker fixtures.
+  adapter-conformance:
+    name: ssh and worker conformance on the fixture sites
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      FX_SITES: ssh slurm pbs frps
+    steps:
+      - name: name the fixture and worker paths
+        run: |
+          {
+            echo "FX_STATE_DIR=$RUNNER_TEMP/fx"
+            echo "CLIO_RELAY_FIXTURES_ENV=$RUNNER_TEMP/fx/fixtures.env"
+            echo "RELAY_TEST_WORKER_CONFIG=$RUNNER_TEMP/worker-config.json"
+            echo "RELAY_TEST_WORKER_DIR=$RUNNER_TEMP/worker-state"
+          } >>"$GITHUB_ENV"
+      - name: check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          pattern: matrix-report-*
-          path: dist/reports
-          merge-multiple: true
-      - name: bind all six reports to the one candidate tree
-        id: candidate
-        if: github.event_name == 'merge_group'
-        env:
-          BASE_REF: ${{ github.event.merge_group.base_ref }}
-          HEAD_REF: ${{ github.event.merge_group.head_ref }}
-          REPOSITORY: ${{ github.repository }}
+          persist-credentials: false
+      - name: install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          enable-cache: true
+          version: "0.11.28"
+      - name: install dependencies
+        run: uv sync --python "3.12" --locked --all-groups
+      - name: build the wheel the worker site installs
+        run: uv build --wheel -o "$RUNNER_TEMP/dist"
+      - name: start the fixture sites
+        run: scripts/ares/fixtures.sh up
+      - name: write the worker config
+        run: |
+          mkdir -p "$RELAY_TEST_WORKER_DIR"
+          uv run --no-sync python scripts/ares/fixtures_worker_config.py \
+            "$CLIO_RELAY_FIXTURES_ENV" "$(ls "$RUNNER_TEMP"/dist/clio_relay-*.whl)" \
+            "$RELAY_TEST_WORKER_CONFIG"
+      - name: pytest
+        run: >
+          uv run --no-sync pytest
+          tests/relay_ssh/test_ssh_conformance.py
+          tests/worker/test_conformance_worker.py
+      - name: remove the fixture sites
+        if: always()
+        run: scripts/ares/fixtures.sh down --images
+
+  build:
+    name: build the wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          version: "0.11.28"
+      - name: build
+        run: uv build
+      - name: install the wheel and run its entry point
         shell: bash
         run: |
-          tree="$(git rev-parse 'HEAD^{tree}')"
-          python src/clio_relay/ci_validation.py candidate-build-receipt \
-            --candidate-dir dist/candidate \
-            --reports-dir dist/reports \
-            --repository "$REPOSITORY" \
-            --source-commit "$GITHUB_SHA" \
-            --source-tree "$tree" \
-            --event "$GITHUB_EVENT_NAME" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --head-ref "$HEAD_REF" \
-            --base-ref "$BASE_REF" \
-            --output dist/candidate/CANDIDATE-BUILD.json
-          cp dist/reports/validation-local-ubuntu-latest-3.12.json \
-            dist/candidate/validation-local.json
-          (
-            cd dist/candidate
-            mapfile -t subjects < <(
-              find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort
-            )
-            test "${#subjects[@]}" -eq 4
-            sha256sum --binary "${subjects[@]}" > SHA256SUMS
-            sha256sum --check --strict SHA256SUMS
-          )
-          echo "tree=$tree" >> "$GITHUB_OUTPUT"
-      - name: upload the sealed merge-queue candidate
-        if: github.event_name == 'merge_group'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-candidate-${{ steps.candidate.outputs.tree }}
-          path: dist/candidate
-          if-no-files-found: error
-          retention-days: 90
+          set -euo pipefail
+          wheel="$(ls dist/clio_relay-*.whl)"
+          uv run --python 3.12 --no-project --with "$wheel" clio-relay --help

@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+import os
+import re
+import sys
+import threading
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, cast
+
+import httpx
+import pytest
+
+from clio_relay.adapters import base as adapter_base
+from clio_relay.adapters.hooks import set_hook
+from clio_relay.sites.models import SiteEntry
+from clio_relay.sites.store import SiteStore
+from clio_relay.surface.settings import RelayPaths
+from clio_relay.surface.stubs import DefaultGuard
+
+# The Slurm suite needs a directory the compute nodes share; without one it is not collected.
+collect_ignore = [] if os.environ.get("RELAY_TEST_SLURM_DIR") else ["test_conformance_slurm.py"]
+
+RELAY_ENTRY = (
+    "from clio_relay.adapters import registry; "
+    "from clio_relay.testing.fixture_adapter import FixtureAdapter; "
+    "registry.register(FixtureAdapter); "
+    "from clio_relay.cli import main; main()"
+)
+"""``python -c`` text that runs relay's CLI with the fixture adapter registered.
+
+The fixture adapter is test-only, not an entry point, so a relay subprocess
+whose sites use it starts through this."""
+
+
+@pytest.fixture
+def relay_paths(tmp_path: Path) -> RelayPaths:
+    return RelayPaths(config_dir=tmp_path / "config", state_dir=tmp_path / "state")
+
+
+def add_site(
+    paths: RelayPaths,
+    site_id: str = "fx",
+    *,
+    adapter: str = "fixture",
+    config: dict[str, Any] | None = None,
+    policy: str = "open",
+    spend: str | float = "never",
+) -> SiteEntry:
+    entry = SiteEntry.model_validate(
+        {
+            "id": site_id,
+            "adapter": adapter,
+            "config": config if config is not None else {"queue_s": 0.2, "run_s": 0.3},
+            "policy": policy,
+            "spend": {"ask": spend},
+        }
+    )
+    return SiteStore(paths.sites_file).add(entry)
+
+
+def answer_page(
+    url: str,
+    action: str = "accept",
+    value: str | None = None,
+    auth: tuple[str, str] | None = None,
+) -> int:
+    """Open a loopback ask page and submit it the way a person would.
+
+    Over HTTP the page sits behind the operator credential, passed as ``auth``.
+    """
+    with httpx.Client(timeout=10, auth=auth) as client:
+        page = client.get(url)
+        page.raise_for_status()
+        token = re.search(r"name='t' value='([^']+)'", page.text)
+        csrf = re.search(r"name='csrf' value='([^']+)'", page.text)
+        assert token is not None and csrf is not None, page.text
+        form = {"t": token.group(1), "csrf": csrf.group(1), "action": action}
+        if value is not None:
+            form["value"] = value
+        posted = client.post(url.split("?", 1)[0], data=form)
+        return posted.status_code
+
+
+@pytest.fixture
+def stub_guard() -> Iterator[None]:
+    """Use relay's guard stub even when a guard package is installed."""
+    set_hook("guard", DefaultGuard)
+    try:
+        yield
+    finally:
+        set_hook("guard", None)
+
+
+@pytest.fixture(autouse=True)
+def forget_patched_adapter_verbs() -> Iterator[None]:
+    """Clear the isinstance caches of the optional adapter protocols after each test.
+
+    A test that patches a verb such as ``live_jobs`` onto ``FixtureAdapter`` makes
+    ABCMeta cache the class as having it, and the cache outlives the patch.
+    """
+    yield
+    for value in vars(adapter_base).values():
+        if isinstance(value, type) and getattr(value, "_is_runtime_protocol", False):
+            cast(Any, value)._abc_caches_clear()
+
+
+@pytest.fixture(autouse=True)
+def stop_psij_queue_pollers() -> Iterator[None]:
+    """Stop psij's queue polling threads a test leaves behind.
+
+    psij keeps one daemon poller per batch executor until the executor is collected, and
+    it keeps calling ``time.sleep`` and the scheduler's status command, which leaks into
+    later tests in the same process.
+    """
+    yield
+    batch = sys.modules.get("psij.executors.batch.batch_scheduler_executor")
+    poller = getattr(batch, "_QueuePollThread", None)
+    if poller is None:
+        return
+    for thread in threading.enumerate():
+        if isinstance(thread, poller):
+            cast(Any, thread).done = True

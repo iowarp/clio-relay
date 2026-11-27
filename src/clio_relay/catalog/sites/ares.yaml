@@ -1,0 +1,19 @@
+id: ares
+name: Ares
+summary: Illinois Tech, Slurm
+featured: 1
+address: ares.cs.iit.edu
+description: >-
+  The Gnosis Research Center's Slurm cluster at Illinois Tech. Relay reaches it
+  with your own ssh and an ssh key, from the IIT network or the IIT VPN.
+source: https://grc.iit.edu/docs/ares/ares-user-guide/
+adapter: ssh
+config:
+  ssh_profile: ares
+alternatives:
+  worker:
+    ssh_profile: ares
+protocols:
+  ssh: Your own ssh and key, from the IIT network or VPN
+  tapis: Through TACC's Tapis, with your TACC account
+  worker: A relay worker on Ares, over an frp tunnel

@@ -1,12 +1,12 @@
 """``RelayTransport`` implementations for modes (a) ``brokered_tcp`` and (b)
 ``udp_rendezvous`` (iowarp/clio-relay#231 R5, tracked by iowarp/clio-relay#188
-items 1-3+5; the design is ``docs/design/relay-architecture-2026-08.md`` §8).
+items 1-3+5).
 
 ``control_channel.py``'s ``SshForwardTransport`` is the reference lifecycle for
 mode (c): dial once, hold the process for the connection's lifetime, prove the
 bring-up identity document out of band, refuse to redial internally. Both
 classes here hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor`
-(the R4 substrate) instead -- a local ``frpc`` process holding an stcp/xtcp
+(the R4 substrate) instead -- a local frp visitor process holding an stcp/xtcp
 visitor tunnel through the cluster's configured relay point -- and follow the
 same discipline: ``establish`` is callable once (§8.5's R10 fix: a failed
 attempt permanently consumes the instance, exactly like ``SshForwardTransport``
@@ -31,8 +31,7 @@ check the response's HMAC against -- see ``OwnedSessionChannelBootstrap``'s
 docstring); only the later re-proof in
 ``remote_connection.verify_session_identity`` closes that gap. The
 ``preshared_link_secret`` anchor (§8.3) does not cover the LOCAL bind end (the
-loopback port) either -- see ``docs/connection-model.md``'s "Still deviating"
-entry.
+loopback port) either -- see §8.6's R1 entry.
 
 That anchor gap is why §8.3 requires a cluster to explicitly opt into
 ``preshared_link_secret`` before either mode may be used at all;
@@ -43,17 +42,16 @@ from ``control_channel.py``).
 
 ``udp_rendezvous``'s hole-punch failure is a typed :class:`TransportPunchFailed`
 refusal in this slice, not the automatic in-mode fallback to ``brokered_tcp``'s
-stcp visitor that ``docs/connection-model.md`` and §8.4 describe as the mode's
-eventual sanctioned behavior -- see that class's docstring and
-``docs/connection-model.md``'s "Still deviating" entry for the tracked
-follow-up. This path must never render OR spawn an stcp visitor -- proven at
+stcp visitor that §8.4 describes as the mode's eventual sanctioned behavior --
+see that class's docstring and §8.5's correction for the tracked follow-up.
+This path must never render OR spawn an stcp visitor -- proven at
 the render call itself, not only by inspecting rendered text
 (``tests/test_frp_transport_dials.py``'s sabotage twin spies on
 ``frp_link.render_visitor_config``): ``transport_probe.py``'s probe-only
 ``allow_stcp_fallback`` has no equivalent here.
 
 No real sockets are held open by anything in this module's own tests: no real
-``frpc``, no real cluster, only a temp dir for rendered TOML and (for the one
+visitor, no real cluster, only a temp dir for rendered TOML and (for the one
 health-timeout test that deliberately does not mock ``wait_for_channel_health``)
 a real, immediately-refused loopback connection attempt against a port nothing
 is listening on.
@@ -63,6 +61,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import urllib.parse
 from typing import ClassVar, Final, cast
 
@@ -89,8 +88,11 @@ from clio_relay.frp_link import (
 )
 from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.frp_visitor_reconciliation import reconcile_stale_frp_visitors
-from clio_relay.job_identity import OWNER_SESSION_ID_HEADER, SESSION_GENERATION_ID_HEADER
-from clio_relay.session_api import SESSION_IDENTITY_SCHEMA
+from clio_relay.session_api import (
+    OWNER_SESSION_ID_HEADER,
+    SESSION_GENERATION_ID_HEADER,
+    SESSION_IDENTITY_SCHEMA,
+)
 
 MAX_BRING_UP_FETCH_BYTES: Final = MAX_CHANNEL_BOOTSTRAP_BYTES
 
@@ -112,8 +114,8 @@ class TransportPunchFailed(RelayError):
     """The ``udp_rendezvous`` hole-punch handshake did not establish a tunnel.
 
     This is a typed refusal, not the "fall back to brokered_tcp" degradation
-    ``docs/connection-model.md`` and §8.4 describe as the mode's eventual
-    sanctioned behavior: automatically switching this held visitor's proxy type
+    §8.4 describes as the mode's eventual sanctioned behavior (§8.5 records the
+    correction): automatically switching this held visitor's proxy type
     mid-connection is a bigger, separate change this slice does not build, and
     this path must never render or spawn an stcp visitor to simulate it.
     Reconnecting after this error retries the same xtcp handshake in the same
@@ -126,7 +128,7 @@ class _FrpChannelTransport:
 
     Both modes hold exactly one :class:`~clio_relay.frp_link.HeldFrpVisitor` for
     the connection's lifetime. ``establish`` writes its rendered visitor config,
-    spawns ``frpc`` once, waits for the mapped local port to answer, then
+    starts relay's frp visitor once, waits for the mapped local port to answer, then
     fetches the bring-up document -- identity first -- over that SAME held
     link. Subclasses fix ``_mode``/``_visitor_type`` and may override
     :meth:`_translate_tunnel_failure` to turn a failed tunnel into a
@@ -146,7 +148,6 @@ class _FrpChannelTransport:
         remote_api_port: int,
         api_token: str,
         identity_anchor: IdentityAnchor,
-        frpc_bin: str,
         process_factory: FrpProcessFactory | None = None,
         local_bind_port: int | None = None,
         ready_timeout_seconds: float = DEFAULT_CHANNEL_READY_TIMEOUT_SECONDS,
@@ -168,7 +169,6 @@ class _FrpChannelTransport:
         self._remote_api_port = remote_api_port
         self._api_token = api_token
         self._identity_anchor: IdentityAnchor = identity_anchor
-        self._frpc_bin = frpc_bin
         self._process_factory = process_factory
         self._local_bind_port = local_bind_port
         self._ready_timeout_seconds = ready_timeout_seconds
@@ -176,6 +176,7 @@ class _FrpChannelTransport:
         self._visitor: HeldFrpVisitor | None = None
         self._established = False
         self._failure_detail: str | None = None
+        self._failed_cleanup: str | None = None
         # iowarp/clio-relay#285: populated by the reconciliation pass at the
         # START of establish(), before this instance's own new visitor is
         # even rendered. RemoteConnection._establish reads
@@ -197,9 +198,8 @@ class _FrpChannelTransport:
         """Neither mode blocks on an interactive prompt.
 
         Both relays simply dial out to the already-deployed relay point
-        (§8.4's dial-count invariants; ``connection-model.md``'s "at most 1
-        [ssh]... skipped when already deployed" covers only the separate,
-        skippable deploy step, not this tunnel).
+        (§8.4's dial-count invariants; that table's "at most 1 ssh (deploy,
+        skippable)" covers only the separate deploy step, not this tunnel).
         """
         return False
 
@@ -230,10 +230,10 @@ class _FrpChannelTransport:
         (``RelayTransport``'s own Protocol docstring).
 
         iowarp/clio-relay#285: BEFORE any of that, one stale-visitor
-        reconciliation pass runs for this exact ``frpc_bin`` -- re-verified,
+        reconciliation pass runs for relay's own frp visitors -- re-verified,
         pid-reuse-safe reaping (D1) of any prior visitor whose owning CLI
-        process is gone (a ``kill -9`` or crash the atexit hook in
-        ``remote_connection_registry.py`` could never have caught), each
+        process is gone (a ``kill -9`` or crash the worker adapter's atexit
+        hook could never have caught), each
         reap also removing its own secret-bearing config dir (D3), plus a
         once-per-process sweep (D8) of aged crash-orphaned config dirs
         regardless of emptiness. This never blocks a legitimate concurrent
@@ -246,7 +246,7 @@ class _FrpChannelTransport:
         if self._established:
             raise RelayError(f"{self._mode} transport was already established")
         validate_channel_nonce(nonce)
-        reconciliation = reconcile_stale_frp_visitors(frpc_bin=self._frpc_bin)
+        reconciliation = reconcile_stale_frp_visitors()
         self._reaped_orphan_visitor_pids = reconciliation.reaped_pids
         self._swept_config_dirs = reconciliation.swept_config_dirs
         self._reconciliation_skipped_reason = reconciliation.skipped_reason
@@ -258,7 +258,6 @@ class _FrpChannelTransport:
             proxy_name=self._proxy_name,
         )
         visitor = HeldFrpVisitor(
-            frpc_bin=self._frpc_bin,
             config=config,
             local_bind_port=local_bind_port,
             visitor_type=self._visitor_type,
@@ -289,6 +288,7 @@ class _FrpChannelTransport:
         except BaseException as exc:
             visitor.close()
             self._failure_detail = _combined_failure_detail(visitor)
+            self._failed_cleanup = visitor.config_cleanup_error
             self._visitor = None
             translated = self._translate_tunnel_failure(exc)
             if translated is exc:
@@ -319,13 +319,19 @@ class _FrpChannelTransport:
     def _translate_tunnel_failure(self, exc: BaseException) -> BaseException:
         """Return the exception to raise for a failed tunnel establish.
 
-        The default passes it through unchanged (``BrokeredTcpTransport``);
+        The default passes it through unchanged (``BrokeredTcpTransport``),
+        except that the visitor's own last word on why it failed (frpc's
+        format, ``[E]`` or ``[W]``) is added to the message. Without it a
+        refused login or an unreachable proxy reads as a bare timeout.
         ``UdpRendezvousTransport`` overrides this to translate into
         :class:`TransportPunchFailed`. Returning the SAME object (identity,
         not equality) tells :meth:`establish` to plain-``raise`` rather than
         chain a new exception.
         """
-        return exc
+        reason = _visitor_reason(self._failure_detail)
+        if reason is None or not isinstance(exc, RelayError) or type(exc) is not RelayError:
+            return exc
+        return RelayError(f"{exc}; the visitor said: {reason}")
 
     def open_stream_channel(self, *, name: str, remote_port: int) -> ChannelEndpoint:
         """Refuse: multiplexing additional channels onto the held link is not built."""
@@ -367,7 +373,7 @@ class BrokeredTcpTransport(_FrpChannelTransport):
     Both relays dial out; the relay point brokers the handshake that joins
     them. Bring-up costs exactly one frp visitor pair and zero ssh connections
     (§8.4), held for the connection's lifetime -- the same one-held-process
-    dial-count shape as ``ssh_forward``, just over ``frpc`` instead of ``ssh``.
+    dial-count shape as ``ssh_forward``, just over relay's frp visitor instead of ``ssh``.
     """
 
     _mode: ClassVar[TransportMode] = "brokered_tcp"
@@ -390,13 +396,55 @@ class UdpRendezvousTransport(_FrpChannelTransport):
         if isinstance(exc, TransportPunchFailed):
             return exc
         detail = self._failure_detail or str(exc)
+        said = _visitor_said(self._failure_detail)
+        if said is not None:
+            detail = "; ".join(part for part in (said, self._failed_cleanup) if part)
         return TransportPunchFailed(
             f"udp_rendezvous hole punch failed for cluster {self._cluster!r}: {detail}. "
             "Reconnecting retries the same xtcp handshake in the same configured mode; it "
             "never substitutes brokered_tcp's stcp visitor automatically. If punching keeps "
-            "failing, configure this cluster's remote_transport_mode as brokered_tcp instead, "
+            "failing, configure this link as brokered_tcp instead, "
             "or verify UDP reachability/firewall rules between both relays and the relay point."
         )
+
+
+def _visitor_reason(detail: str | None) -> str | None:
+    """Return the last error or warning line the visitor logged, without its stamp."""
+    if not detail:
+        return None
+    for line in reversed(detail.splitlines()):
+        for level in ("[E]", "[W]"):
+            if level in line:
+                return _SOURCE.sub("", line.split(level, 1)[1].strip())[:400] or None
+    return None
+
+
+def _visitor_said(detail: str | None) -> str | None:
+    """Return each distinct error or warning line the visitor logged, once, with its count.
+
+    A failed punch retries for its whole deadline, so the raw output repeats one line many
+    times and can hide the line that names the cause.
+    """
+    if not detail:
+        return None
+    counts: dict[str, int] = {}
+    for line in detail.splitlines():
+        for level in ("[E]", "[W]"):
+            if level in line:
+                reason = _SOURCE.sub("", line.split(level, 1)[1].strip())[:400]
+                if reason:
+                    counts[reason] = counts.get(reason, 0) + 1
+                break
+    if not counts:
+        return None
+    said = "; ".join(
+        reason if count == 1 else f"{reason} ({count} times)" for reason, count in counts.items()
+    )
+    return f"the visitor said: {said}"
+
+
+_SOURCE = re.compile(r"^(\[[^\]\s]*[/.][^\]\s]*\]\s*)+")
+"""frpc's ``[client/service.go:389]`` and relay's ``[relay/visitor]`` source tags."""
 
 
 def _combined_failure_detail(visitor: HeldFrpVisitor) -> str | None:
@@ -455,8 +503,7 @@ def _verify_pinned_identity(
     pinned cluster/session/generation/nonce could still pass this specific
     check -- only the later re-proof
     (``remote_connection.verify_session_identity``, against THIS document)
-    closes that gap. See ``docs/connection-model.md``'s "Still deviating"
-    entry: the preshared anchor does not cover the local bind end.
+    closes that gap: the preshared anchor does not cover the local bind end.
     """
     if identity.get("schema_version") != SESSION_IDENTITY_SCHEMA or any(
         identity.get(field) != expected

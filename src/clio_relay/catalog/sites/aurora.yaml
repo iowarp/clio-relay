@@ -1,0 +1,33 @@
+# ALCF facility pages this entry was written from:
+#   https://docs.alcf.anl.gov/aurora/running-jobs-aurora/ (queues, PBS options)
+#   https://docs.alcf.anl.gov/services/globus-compute/ (Aurora has no multi-user endpoint)
+#   https://github.com/argonne-lcf/alcf-globus-compute (endpoint templates, configs/aurora)
+#   https://docs.alcf.anl.gov/data-management/data-transfer/using-globus/ (collections)
+# Aurora runs no facility endpoint. Each person configures their own once on a
+# login node and puts its id in config.endpoint; relay starts it when it is offline.
+id: aurora
+name: ALCF Aurora
+summary: Argonne, PBS
+address: aurora.alcf.anl.gov
+adapter: globus
+identity: globus
+config:
+  scheduler: pbs
+  queues: [debug, debug-scaling, prod, capacity, visualization]
+  start:
+    adapter: worker
+    config:
+      ssh_profile: aurora
+    command: [globus-compute-endpoint, start, clio-relay]
+policy: guarded
+spend:
+  ask: always
+defaults:
+  queue: debug
+  duration: PT1H
+skill: alcf-aurora
+source: https://docs.alcf.anl.gov/aurora/running-jobs-aurora/
+description: >-
+  ALCF's exascale system, 10,624 nodes with six Intel Data Center GPU Max 1550 each,
+  under PBS. Relay runs jobs through your own Globus Compute endpoint on an Aurora
+  login node. Configure it once, then set config.endpoint and defaults.account.

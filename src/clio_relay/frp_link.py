@@ -1,15 +1,14 @@
 """The frp process substrate shared by mode (c) and the modes (a)/(b) frp link.
 
-``docs/design/relay-architecture-2026-08.md`` §8.2 (iowarp/clio-relay#231 R4,
-tracked by iowarp/clio-relay#188 item 4) sizes this module from two duplicated
+iowarp/clio-relay#231 R4 (tracked by iowarp/clio-relay#188 item 4) sizes this
+module from two duplicated
 copies of "write frpc TOML, spawn ``frpc``, track it": the local-visitor half
 of ``transport_probe.py``'s ``run_frp_http_probe``/
 ``_run_frp_http_probe_with_proxy_type`` (the remote-side SSH probe scripts
 stay in that module -- only the LOCAL visitor lifecycle moves here) and the
 mode-agnostic held-process primitives ``control_channel.py``'s
 ``SshForwardTransport`` already carries. Issue #233 adds the durable service
-visitor profile here while keeping its remote shell programs in the sibling
-``frp_remote_scripts.py`` owner.
+visitor profile here.
 
 This module owns two concerns:
 
@@ -32,12 +31,15 @@ This module owns two concerns:
     second copy, and its own behavior is unchanged (both the thread name and
     the ``wait_for_channel_health`` message text are parameterized rather
     than hardcoded, so control_channel.py's defaults stay byte-equivalent).
-    ``HeldFrpVisitor`` is one spawned local ``frpc -c <toml>`` process
-    holding an stcp/xtcp visitor tunnel, built with
+    ``HeldFrpVisitor`` is one local visitor process holding an stcp/xtcp
+    visitor tunnel. The process is relay's own frp visitor
+    (``python -m clio_relay.frp_visitor``, see :func:`clio_relay.frp_visitor.command`),
+    the same one ``serve`` runs for a served port, so the desktop needs no
+    ``frpc``. It is built with
     ``control_channel.SshForwardTransport``'s exact lifecycle discipline
     (the mode-(c) reference implementation), extended by one thing
-    ``SshForwardTransport`` doesn't need: ``frpc`` logs to stdout by
-    default, so both stdout and stderr are drained into their own bounded
+    ``SshForwardTransport`` doesn't need: the visitor logs to stdout,
+    so both stdout and stderr are drained into their own bounded
     buffers (never just stderr -- an unread stdout pipe wedges the child
     once its OS pipe buffer fills). Otherwise identical discipline:
     ``poll()``-based liveness, never a blocking wait; ``close()`` escalating
@@ -49,7 +51,7 @@ This module owns two concerns:
 
 ``frp_transport.py`` (R5) builds the ``brokered_tcp``/``udp_rendezvous``
 ``RelayTransport`` implementations on top of ``HeldFrpVisitor`` rather than
-spawning ``frpc`` a fourth time. ``transport_probe.py``'s probe-only
+starting a visitor a second way. ``transport_probe.py``'s probe-only
 ``allow_stcp_fallback`` behavior (§8.2) is explicitly PROBE-ONLY and must
 never be reachable from this module.
 """
@@ -59,11 +61,10 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,6 +72,7 @@ from typing import IO, Any, Final, Literal, Protocol, cast
 
 import httpx
 
+from clio_relay import frp_visitor, programs
 from clio_relay.cluster_config import ClusterDefinition
 from clio_relay.errors import ConfigurationError, RelayError
 from clio_relay.relay_host import (
@@ -80,6 +82,7 @@ from clio_relay.relay_host import (
     render_frpc_config,
     render_frpc_visitor_config,
 )
+from clio_relay.scratch import ScratchDir
 
 # Deliberately the same value as control_channel.py's
 # MAX_CHANNEL_EVENT_DETAIL_CHARS -- a different concern (this bounds a
@@ -113,6 +116,7 @@ class FrpLinkConfig:
     token: str
     secret_key: str
     proxy_name: str
+    stun_server: str | None = None
 
     @classmethod
     def from_cluster(
@@ -162,6 +166,7 @@ class FrpLinkConfig:
             token=token,
             secret_key=secret_key,
             proxy_name=proxy_name,
+            stun_server=transport.stun_server,
         )
 
 
@@ -171,7 +176,7 @@ def require_frp_server_addr(server_addr: str, cluster: str) -> str:
         return server_addr
     raise ConfigurationError(
         f"frp server address is not configured for cluster {cluster}; "
-        "set it with `clio-relay cluster add --frp-server-addr ...`"
+        "set it with `clio-relay worker cluster add --frp-server-addr ...`"
     )
 
 
@@ -280,6 +285,7 @@ def render_visitor_config(
             bind_port=local_bind_port,
             secret_key=config.secret_key,
             keep_tunnel_open=keep_tunnel_open,
+            stun_server=config.stun_server if visitor_type == "xtcp" else None,
         )
     )
 
@@ -303,122 +309,8 @@ def render_proxy_config(
             local_ip=local_ip,
             local_port=local_port,
             secret_key=config.secret_key,
+            stun_server=config.stun_server if proxy_type == "xtcp" else None,
         )
-    )
-
-
-class OwnedFrpProcess(Protocol):
-    """A durable frp visitor process returned by an injected owner runner."""
-
-    pid: int
-
-
-class OwnedFrpIdentity(Protocol):
-    """Immutable identity captured for a durable frp visitor process group."""
-
-    @property
-    def process_group_id(self) -> int: ...
-
-    @property
-    def process_start_marker(self) -> str: ...
-
-    @property
-    def owner_token(self) -> str: ...
-
-
-class OwnedFrpProcessFactory(Protocol):
-    """Spawn seam for a durable visitor whose streams are owned files."""
-
-    def __call__(
-        self,
-        command: Sequence[str],
-        *,
-        stdout_path: Path,
-        stderr_path: Path,
-        env: dict[str, str] | None = None,
-        isolate_process_group: bool = False,
-        input_bytes: bytes | None = None,
-    ) -> OwnedFrpProcess: ...
-
-
-OwnedFrpIdentityFactory = Callable[..., OwnedFrpIdentity]
-
-
-@dataclass(frozen=True)
-class OwnedFrpVisitor:
-    """Identity of one durable, independently recoverable frp visitor."""
-
-    pid: int
-    process_group_id: int
-    process_start_marker: str
-    owner_token: str
-    config_path: Path
-    stdout_path: Path
-    stderr_path: Path
-
-
-def start_owned_frp_visitor(
-    *,
-    frpc_bin: str,
-    config: FrpLinkConfig,
-    local_bind_addr: str,
-    local_bind_port: int,
-    visitor_type: FrpVisitorType,
-    keep_tunnel_open: bool,
-    config_path: Path,
-    stdout_path: Path,
-    stderr_path: Path,
-    owner_token: str,
-    connector_generation_id: str,
-    command_prefix: Sequence[str],
-    process_factory: OwnedFrpProcessFactory,
-    identity_factory: OwnedFrpIdentityFactory,
-    rollback: Callable[[int], None],
-) -> OwnedFrpVisitor:
-    """Start a durable service visitor with its existing owner policy.
-
-    Unlike :class:`HeldFrpVisitor`, this profile intentionally keeps its config
-    and file-backed logs after the launching CLI exits. The caller owns durable
-    discovery and later process-group cleanup.
-    """
-    config_path.write_text(
-        render_visitor_config(
-            config,
-            local_bind_addr=local_bind_addr,
-            local_bind_port=local_bind_port,
-            visitor_type=visitor_type,
-            keep_tunnel_open=keep_tunnel_open,
-        ),
-        encoding="utf-8",
-    )
-    config_path.chmod(0o600)
-    environment = os.environ.copy()
-    environment["CLIO_RELAY_CONNECTOR_OWNER_TOKEN"] = owner_token
-    environment["CLIO_RELAY_CONNECTOR_GENERATION_ID"] = connector_generation_id
-    process = process_factory(
-        [*command_prefix, frpc_bin, "-c", str(config_path)],
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        env=environment,
-        isolate_process_group=True,
-    )
-    try:
-        identity = identity_factory(
-            pid=process.pid,
-            owner_token=owner_token,
-            expected_config=str(config_path),
-        )
-    except BaseException:
-        rollback(process.pid)
-        raise
-    return OwnedFrpVisitor(
-        pid=process.pid,
-        process_group_id=identity.process_group_id,
-        process_start_marker=identity.process_start_marker,
-        owner_token=identity.owner_token,
-        config_path=config_path,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
     )
 
 
@@ -567,12 +459,21 @@ fake factory rather than monkeypatching :mod:`subprocess` directly.
 
 
 def spawn_frp_process(*args: Any, **kwargs: Any) -> FrpProcess:
-    """Spawn one real ``frpc`` process (the production dial)."""
-    return cast(FrpProcess, subprocess.Popen(*args, **kwargs))
+    """Spawn one real ``frpc`` process (the production dial), its program found on the PATH."""
+    argv = list(args[0]) if args else list(kwargs.pop("args"))
+    program = programs.resolved(argv, kwargs.get("env"))
+    if program is None:
+        raise FileNotFoundError(programs.missing(argv[0] if argv else "frpc"))
+    try:
+        return cast(FrpProcess, subprocess.Popen(program, *args[1:], **kwargs))
+    except OSError as exc:
+        if programs.blocked(exc):
+            raise PermissionError(exc.errno, programs.start_failed(argv[0], exc)) from exc
+        raise
 
 
 class HeldFrpVisitor:
-    """One spawned local ``frpc -c <toml>`` process holding a visitor tunnel.
+    """One local frp visitor process (``clio_relay.frp_visitor``) holding a visitor tunnel.
 
     The substrate ``frp_transport.py`` (R5) builds the ``brokered_tcp``/
     ``udp_rendezvous`` :class:`~clio_relay.control_channel.RelayTransport`
@@ -593,7 +494,6 @@ class HeldFrpVisitor:
     def __init__(
         self,
         *,
-        frpc_bin: str,
         config: FrpLinkConfig,
         local_bind_port: int,
         visitor_type: FrpVisitorType = "stcp",
@@ -602,7 +502,6 @@ class HeldFrpVisitor:
     ) -> None:
         if local_bind_port <= 0:
             raise ConfigurationError("local_bind_port must be positive")
-        self._frpc_bin = frpc_bin
         self._config = config
         self._local_bind_port = local_bind_port
         self._visitor_type: FrpVisitorType = visitor_type
@@ -613,7 +512,7 @@ class HeldFrpVisitor:
         self._stdout_thread: threading.Thread | None = None
         self._stderr_buffer: BoundedStderrBuffer | None = None
         self._stderr_thread: threading.Thread | None = None
-        self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._temp_dir: ScratchDir | None = None
         self._config_path: Path | None = None
         self._config_cleanup_error: str | None = None
         self._established = False
@@ -629,10 +528,10 @@ class HeldFrpVisitor:
         return self._config_path
 
     def establish(self) -> None:
-        """Write the visitor TOML to a 0600 temp file and spawn ``frpc -c <toml>``."""
+        """Write the visitor TOML to a 0600 temp file and start relay's frp visitor on it."""
         if self._established:
             raise RelayError("frp visitor was already established")
-        temp_dir = tempfile.TemporaryDirectory(prefix=VISITOR_CONFIG_DIR_PREFIX)
+        temp_dir = ScratchDir(VISITOR_CONFIG_DIR_PREFIX)
         try:
             config_path = Path(temp_dir.name) / "frpc-visitor.toml"
             rendered = render_visitor_config(
@@ -647,8 +546,7 @@ class HeldFrpVisitor:
             # keep this plaintext-secret-bearing file private.
             config_path.chmod(0o600)
             # Deliberately NOT isolated into its own process group
-            # (contrast service_runtime.py's isolate_process_group=True for
-            # its long-lived, independently-signalable connector): this
+            # (unlike a long-lived, independently-signalable connector): this
             # visitor's lifetime is scoped to its holder -- a transport_probe
             # call or a future held R5 connection -- and should die with
             # that parent rather than survive it as an orphan if cleanup
@@ -656,7 +554,7 @@ class HeldFrpVisitor:
             # start_new_session, matching SshForwardTransport's own
             # unisolated spawn.
             process = self._process_factory(
-                [self._frpc_bin, "-c", str(config_path)],
+                frp_visitor.command(config_path),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -712,7 +610,7 @@ class HeldFrpVisitor:
         )
 
     def is_alive(self) -> bool:
-        """Return whether the held frpc visitor process is still running."""
+        """Return whether the held visitor process is still running."""
         process = self._process
         return process is not None and process.poll() is None
 

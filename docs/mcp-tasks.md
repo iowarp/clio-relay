@@ -1,183 +1,295 @@
-# MCP background tasks
+# MCP tasks
 
-`clio-relay mcp-server` is a native FastMCP 4 server. It implements the
-[`io.modelcontextprotocol/tasks`](https://modelcontextprotocol.io/seps/2663-tasks-extension)
-extension so an MCP client can detach from a long-running relay operation and
-reattach through the standardized task methods.
+Relay is a standard MCP server. `run`, `install` and `serve` can take a long time, so they
+support the `io.modelcontextprotocol/tasks` extension of MCP protocol
+`2026-07-28`. Task support is optional: a client that does not opt in still
+gets everything, through an operation id it follows with `describe`.
 
-The protocol adapter does not create another execution system. A task is a
-projection of an existing durable relay job:
+## with tasks
 
-- the MCP `taskId` is the relay `job_id`;
-- relay and clio-core job state remains authoritative;
-- relay routing, leasing, workers, JARVIS execution, artifacts, events,
-  recovery, and cancellation are unchanged;
-- task projections retain the exact tool, arguments, catalog revision, initial
-  receipt, and input rounds needed for reconnect. The SEP-2663 create response
-  never carries a result or error -- only a status claim -- regardless of
-  whether the underlying job already finished before the claim was minted; a
-  client always resolves the final result through `tasks/get`. The projection
-  records that result as `completed_result` once known: immediately, if the
-  job was already terminal when the task was created, or on the first
-  `tasks/get` that observes it turn terminal otherwise; and
-- a new MCP client can reconstruct a `ToolTask` from its retained task handle
-  while the same relay state remains available.
+A client that declares the tasks extension and calls `run`, `install` or `serve` gets a
+task back as soon as relay has accepted the work. The task id is relay's
+operation id, so the same work can be followed through either.
 
-FastMCP's stock `TasksExtension` is not enabled. The server has no Docket
-instance, Docket worker, Redis task queue, or second scheduler. The
-`fastmcp-tasks` package supplies the standard wire models, client support, and
-the currently required claimed-result serialization hook. Its Docket-backed
-execution path is installed as a dependency but remains inactive.
+| Task status | When |
+| --- | --- |
+| `working` | The job is queued or running, or the service is starting |
+| `input_required` | The site asked something and is waiting for an answer |
+| `completed` | The job reached a final state, whether it succeeded or failed, the service is ready, or the person declined (see below) |
+| `cancelled` | The work was cancelled |
 
-## server transports
+`tasks/get` returns the status and a status message that carries the latest
+progress, such as the step a simulation reached or the endpoint a service is
+listening on. Relay suggests polling every two seconds and keeps a task for
+seven days. When the work is done, `tasks/get` carries the final tool result:
+the exit code, the outputs with their view descriptors, and the provenance.
 
-Stdio remains the default:
+A `serve` task completes as soon as the service is ready: JARVIS reports the
+service running and relay's forward answers. A client that polls is woken by a
+status change, not by a new status message, so the ready service is the task's
+result: the operation `running`, `result.endpoint` with each port's `address`,
+and `result.ready_at`. A poll does not wait behind relay's own look at the
+site: while relay brings the service up, it answers with the latest state it
+saw, so the task completes within seconds of the service being ready, not a
+whole check later. The service keeps running after that, until
+`cancel(operation=<task id>)`, `serve(stop=<task id>)`, `tasks/cancel` or its
+job's end. Relay keeps watching it after the task ends, so the record and its
+card reach the job's end without anyone asking (see the job card below);
+`describe(job=<task id>)` and `serve(service=<task id>)` follow it. Questions
+relay asks after the service is ready reach the person through relay's page and
+`clio-relay asks`, not as `input_required` on the finished task.
 
-```powershell
-clio-relay mcp-server --profile user
-```
+A service relay cannot bring to this desktop also completes the task, at once,
+rather than retrying: the tool result is an error with `result.service_error`,
+a typed reason and a message. `host_key_unverified` means relay could not
+verify the compute node's ssh host key (it reads the node's keys from the
+login node and checks them again once); `unreachable` means the node refused
+the forward, for example because the job's allocation ended. The job's own end
+then ends the operation as usual. Relay never reports a port as forwarded
+before its own forward holds it.
 
-Authenticated Streamable HTTP uses the existing relay API token:
+### answering questions
 
-```powershell
-$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
-clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
-```
+Some sites ask for something before they continue: a one-time code, a sign-in,
+or approval to spend an allocation. The task then turns `input_required`, and
+`tasks/get` lists each question under `input_requests`, keyed by its ask id, as
+a form or URL elicitation. Answer with `tasks/update`, giving
+`input_responses` with the same keys. The task returns to `working` once every
+question is answered.
 
-HTTP startup fails when `CLIO_RELAY_API_TOKEN` is absent. Clients send
-`Authorization: Bearer <token>`. Binding beyond loopback changes network
-exposure and should be combined with the deployment's existing private
-transport and access controls.
+### what a question says
 
-The tasks extension is available only on the modern MCP `2026-07-28` protocol.
-Older handshake connections continue to receive ordinary foreground tool
-results and cannot call `tasks/*`. Modern MCP removed the old core
-`Tool.execution` field; task support is therefore negotiated through the
-extension capability returned by `server/discover`, not through
-`tools/list.execution`.
+A question's message is the whole question, then what it rests on: the
+commands, log paths and evidence behind it. Each question also carries those
+facts typed in its `_meta`, under `io.iowarp.clio-relay/ask` keyed by ask id as
+`{detail, evidence}`, and a choice's options under `io.iowarp.clio-relay/choice`.
+A client that shows the typed facts itself, behind a disclosure say, declares
+the client extension `io.iowarp.clio-relay/ask` (or `io.iowarp.clio-relay/choice`).
+On a `2026-07-28` connection the declaration is in each request's `_meta`, on an
+older one in the client's `extensions` or `experimental` capabilities. Such a
+client gets the question sentence alone as the message.
 
-## client behavior
+### cancelling
 
-Importing `fastmcp-tasks` registers its standard client extension with FastMCP.
-An ordinary `Client(mode="auto")` advertises the capability and transparently
-polls a tasked `call_tool` to its final `CallToolResult`:
+`tasks/cancel` cancels the operation on its site. A job is cancelled through
+its scheduler, and a service is stopped.
 
-```python
-from fastmcp import Client
-import fastmcp_tasks  # noqa: F401
+## without tasks
 
-async with Client("http://127.0.0.1:8766/mcp", auth=token, mode="auto") as client:
-    result = await client.call_tool("jarvis_run", arguments)
-```
+A client without the tasks extension calls the same tools:
 
-Client-only hosts can use the same wire support without installing
-`clio-relay`:
+- `run` waits up to `wait_s` seconds (20 by default, at most 300). If the job
+  is done by then, the call returns its result. Otherwise it returns the
+  operation, with its id in the result's `_meta` under
+  `ai.iowarp.relay/operation`.
+- `describe(job=<operation id>)` observes the operation at any later time,
+  from the same client or another one.
+- `run(cancel=<operation id>)` cancels it, as does `cancel(operation=<operation
+  id>)`, the tool a host can name as a cancel.
+- `run(resume=<operation id>)` continues an operation that was waiting for a
+  person, once the question is answered.
+- `serve` waits up to `wait_s` for the service to be ready and returns how to
+  reach it. `serve(service=<operation id>)` observes it and
+  `serve(stop=<operation id>)` or `cancel(operation=<operation id>)` stops it.
 
-```text
-pip install "fastmcp-slim[client]==4.0.0b1" "fastmcp-tasks==4.0.0b1"
-```
+Questions reach the person in the best way the connection allows. On a
+`2026-07-28` connection they are input requests on the tool call. On an older
+connection whose client supports elicitation, relay elicits. Otherwise the
+call returns a typed refusal that names the ask and the page where it can be
+answered, and `clio-relay asks` answers it from a terminal.
 
-`fastmcp-tasks` currently brings its server/task-runner dependencies even in a
-client-only environment, but the client path does not start Docket or a worker.
-This server remains interoperable with that official client package because it
-implements the same negotiated extension and standard methods.
+## tools that confirm themselves
 
-Use `call_tool_task` when the caller wants the handle immediately:
+`run`, `serve`, `exec` and `site_clean` confirm their own side effects. Each
+declares it in its tool `_meta` as `io.iowarp/confirm: {"version": 1}`. A host
+can then skip its own permission prompt for such a call and say so in the
+request's `params._meta` with `io.iowarp/confirm: "server"`. For that call
+relay asks the person exactly once, with a typed form:
 
-```python
-from fastmcp import Client
-from fastmcp_tasks.client import call_tool_task
+- `approve`, a choice of approve or decline, and, when another of relay's
+  services still runs on the site, `running_services` (keep or end them when
+  the job is submitted);
+- approval to spend an allocation and a package review fold into the same form;
+  a sign-in stays its own ask, since it is a page, not a choice;
+- `run(cancel=...)` and `serve(stop=...)` get a form of their own, and `exec`
+  asks for that command on a site with no guard. `exec_read` never asks.
+- `site_clean` always asks, flagged or not, naming what goes and what stays.
 
-async with Client("http://127.0.0.1:8766/mcp", auth=token, mode="auto") as client:
-    task = await call_tool_task(client, "jarvis_run", arguments)
-    print(task.task_id)
-    print((await task.status()).status)
-```
+A declined form stops the job before anything is submitted. A client
+without form elicitation gets a `needs_approval` refusal and nothing runs.
+When a flagged call only observes, or acts on answers given earlier, its
+result's `_meta` carries `io.iowarp/confirm: "not_needed"`, so the host knows
+no form was due.
 
-The standard `ToolTask` surface supports `status()`, `wait()`, `result()`, and
-`cancel()`. A caller that reconnects can retain the returned
-`ClientCreateTaskResult` and construct a new `ToolTask` against a new client.
-The durable task ID remains sufficient for direct `tasks/get`,
-`tasks/update`, and `tasks/cancel` clients.
+### when the person declines
 
-## state mapping
+A decline is the person's answer, not an error. Every call whose question the
+person declines, in any of the ways above, returns a result that is not an
+error, with `structuredContent.declined`:
 
-Relay state maps to SEP-2663 without changing relay semantics:
+| Field | What it is |
+| --- | --- |
+| `operation_id` | The operation the question belonged to, or null for a call that has none (`exec`, `files`, `site_clean`) |
+| `ask_id` | The question the person declined |
+| `question` | The question, as one sentence |
+| `not_done` | What relay therefore did not do, such as "Relay submitted nothing, so the job did not run." |
+| `use_operation_id` | Only when the person chose a live operation of the same job instead of starting another (see below): that operation |
 
-| Relay observation | MCP task status |
-|---|---|
-| queued, leased, or running | `working` |
-| durable outstanding client input | `input_required` |
-| succeeded | `completed` with `isError: false` |
-| failed tool work | `completed` with `isError: true` |
-| protocol-level execution error | `failed` |
-| canceled | `cancelled` |
+An operation the person declined keeps the state `cancelled`, with `error`
+null, and its job card's outcome is `declined`. Its task completes rather than
+being cancelled, and the status message says what was declined.
 
-A tool-level failure is a completed MCP task because the tool call itself
-finished and returned an error result. A JSON-RPC failure is a failed task.
-Cancellation is cooperative and eventually consistent: `tasks/cancel`
-acknowledges the relay cancellation request, while subsequent `tasks/get`
-observes canonical relay state.
+### the same job already live
 
-Low-level status, read, and cancellation tools, and every low-level
-submission tool except the two below, are never task-negotiated
-(`forbidden`): they always answer inline, whether or not the calling client
-declares the tasks extension. Task augmentation is enabled for the virtual
-remote-operation catalog, the JARVIS operation surface, and the two
-remote-agent submission tools (`relay_submit_agent`,
-`relay_submit_remote_agent`), all of which carry a durable job receipt to
-project. The adapter creates a task only after relay admission succeeds;
-validation errors or calls that return no relay job remain ordinary
-synchronous results. Task-capable tools are `optional`, not `required`: a
-client that does not declare the tasks extension keeps receiving the
-ordinary inline result, exactly like the never-task-negotiated tools above;
-only a client that declares it receives a task envelope. Admission gates
-that envelope, not the job's speed -- an instant-settling call (the job is
-already terminal by the time admission completes) still becomes a task,
-terminal-at-birth: the create response reports a completed/failed status
-immediately, with `completed_result` already resolved rather than left for
-the first `tasks/get` (see the create-response bullet above).
+Relay does not fold a repeated submit into a live one by itself, and a client
+passes no key for it. When a run or service hashes the same as one of the
+site's that is submitted and not ended, the job's approval (its card, or the
+approval relay asks for it) carries the typed fact
+`io.iowarp.clio-relay/same_run` in `_meta` (`operation_id`, `state`, `job_id`,
+`created_at`, `resource`) and a `same_run` choice: "use the live one"
+(recommended) or "start another". Using it ends the new operation as declined,
+with `use_operation_id` naming the live one; starting another submits it. A job
+that asks the person nothing is submitted as before.
 
-## input and elicitation
+## the job card
 
-Foreground guard tools may return `InputRequiredResult`. The FastMCP client
-answers that request and re-enters the tool; only the leg that admits a durable
-relay job becomes a task.
+Each job also travels as one typed snapshot under `io.iowarp.clio-relay/job`: its
+site, scheduler, phase (`planned`, `submitted`, `queued`, `running`, `ended`),
+outcome, partition, account, wall time, and its components with their node
+counts and state. A host can draw it as the job's card. An install job's
+`label` names what it installs: "Install" and, once JARVIS's check reports,
+the spec of each package it builds (a Spack spec's root, such as
+`lammps@20240829.1`), else the packages the install names. Other jobs' `label`
+is null, and a host titles them from their components. Relay sends the whole
+snapshot each time, and `revision` rises with each change, so a host keeps the
+newest one per `operation_id`. The text of every message stays as it is, so a
+host that ignores the snapshot loses nothing.
 
-A remote-agent submission can opt into one post-admission message round with
-`request_followup_message: true`. The relay admits the job first, then the
-operation returns `InputRequiredResult` and durably projects the
-`agent_message` request as `input_required`. The matching `tasks/update`
-re-enters the guard with `ctx.input_responses` and `ctx.request_state`; after it
-consumes the answer, ordinary relay-state projection resumes. The JARVIS lane
-does not invent equivalent application input semantics.
+On a guarded site, the ask for a command that submits a job carries a card
+too, before any operation exists: `kind` is `exec_plan`, `operation_id` and
+`resource` are empty, and `argv_sha256` binds it to the command. For the
+resource graph's collect command that `describe` offered, its components are
+the packages of the pipeline relay offered, producer first; for any other
+command, the card is the plan as one component.
 
-Unknown or stale keys are ignored, partial answers are retained, repeated
-answers are replay-safe, and concurrent updates use compare-and-swap retry.
-Input request identities, answers, arguments, and the complete projection are
-finite, depth-bounded, and size-bounded before persistence.
+For a package job, the card is JARVIS's own plan of the job
+(`jarvis ppl submit +plan`), made before anything is submitted: the
+directives, each package with its nodes, ranks and node range, the couplings
+between packages, and the batch script. Its `source` is `jarvis`. The yes is
+bound to that plan: relay submits with its `plan_sha256`, and if the job JARVIS
+would submit has changed since (an edited pipeline, a new wall time), JARVIS
+refuses and relay shows the new plan as a second card rather than submitting
+what the person did not see. That card opens with what changed: each directive
+with its old and new value, each component's changed field, new couplings or
+notes, and the batch script's changed lines. When JARVIS's plan changed only in
+the input it seals and the card does not show, such as the environment a
+software check filled in after the yes, the directives, components and script
+are the same, so relay submits under the new plan without asking again and
+records the step in the operation's `plan_rebinds`. While the job runs, each
+component's state comes
+from JARVIS's record of it (`waiting`, `starting`, `running`, `done`, `failed`,
+`cancelled`), with its hosts. A package not yet reviewed, a site whose JARVIS
+cannot plan, and an install job show the card as relay records it, with
+`source: relay`.
 
-Imperative `await ctx.elicit(...)` is not supported inside background work. It
-would hold a worker open for a client round trip. Background-capable tools use
-the guard pattern: return `InputRequiredResult`, then read
-`ctx.input_responses` and `ctx.request_state` on re-entry.
+A pipeline's couplings say which way data moves, producer to consumer, and a
+host draws its arrows from them alone. The order of the packages is the order
+JARVIS starts them in, which runs against the data: JARVIS starts a service
+before the solver that feeds it, so a pvserver watching gray_scott starts
+first while gray_scott feeds it. The card's components come producer first,
+each with its `launch_order` (1 starts first). Relay declares the couplings to
+JARVIS as the pipeline's `couplings:`. A job can name them
+(`couplings: [{from, to, kind, label}]`, each end a package or a step id), and
+when it names none relay takes them from the packages' contracts: a service
+whose contract's `service.data_flow` is `in`, as pvserver's is, is fed by every
+other step whose contract declares outputs; one whose `data_flow` is `out` feeds
+them. The text says the same, as in "Start the pipeline clio_jarvis.gray_scott
+feeding clio_jarvis.pvserver (clio_jarvis.pvserver starts first)". With no
+couplings, the card draws no arrows and the text names the packages in launch
+order, joined by "then".
 
-## retention and security limits
+A card stays current after its task ends. A `serve` task completes at
+readiness, but the service's job runs on, and a host stops polling a finished
+task. So relay looks at each open job itself every 30 s, unless a poll looked
+in that time. When the card changes, for example when the service's job ends,
+relay announces the resource `relay://jobs/{operation_id}` updated. That
+resource holds the newest card as JSON, and every card names it in `resource`,
+so a host reads the URI from the card (or the task's `_meta`) and does not
+build it. A host that keeps a card after the task ends either subscribes to
+that resource or reads it again (or `describe(job=...)`) on the announcement.
 
-Task projections are immutable by identity and conflict when the same task ID
-is reused with different tool semantics. The current wire library requires a
-numeric `ttlMs`, so the server advertises 30 days rather than SEP-2663's
-nullable unlimited value. Relay job retention remains separately governed by
-relay policy.
+A service's card is JARVIS's plan of the job its start submits, connector and
+all: the directives, components, couplings and advisories, the batch script,
+and the binding. Relay plans that whole job before the ask, with the
+connector's settings and the ports it chose, and the start keeps those ports,
+so JARVIS seals the job the person said yes to. The per-start secrets (the
+rendezvous token, the frp key and any per-port secret) are never in it: they
+travel only in the staged `serve/secrets.env`, which JARVIS does not seal and
+the connector deletes once read. If the job has changed by the start (a
+desktop port taken meanwhile, a new path to the site), JARVIS refuses and
+relay shows the new plan as a second card. A service that is not a package
+job, or a serve runtime that cannot say which job it submits, keeps a card
+with no script and no binding, and the confirm text says relay makes the batch
+script when it starts the service.
 
-Arguments are limited to 512 KiB of canonical UTF-8 JSON. Input rounds are
-limited to 256 KiB, complete projections to 768 KiB, nesting to 64 levels, and
-JSON trees to 100,000 nodes. Non-finite numbers and non-JSON values are
-rejected. Dynamic tools remain bound to the exact catalog and cluster-route
-revision used at dispatch. An optional `Mcp-Name` header on task-management
-requests must equal the task ID.
+`started_at` is when the job itself started on its nodes, not when the
+operation did: the scheduler's start when the site reports one, else the
+first state JARVIS wrote from inside the allocation, else the start of the
+job's latest running stretch, after any install job before it. `advisories`
+lists the picks JARVIS went ahead with but that the person should see, such as
+a launch over TCP because UCX could not be verified on a node. Each has
+JARVIS's `issue_id`, `reason_codes`, `message`, `pick`,
+`consequence_if_wrong` and `remedy`. `message` is the person's line. What
+JARVIS tells the agent goes in `agent_guidance`, with the read-only `probes`
+JARVIS suggests: any sentence that names one of the issue's own fields, such
+as "Investigate with details.probes", or JARVIS's own `agent_guidance` when
+it sends `person_message`. `settled_at_launch` is true when JARVIS settles
+every reason of the issue itself once the job's nodes are known (each reason's
+`plan` is `collect_at_launch`), such as `hosts_not_in_graph` for a job larger
+than the nodes the graph was collected on: the launch collects the facts on
+its own hosts, merges them into the site graph and supersedes the advisory.
+Such an advisory asks nothing of the person, so it is not in `advisories`, the
+confirm's text or a changed plan's list: the card lists it under its own
+`settled_at_launch`, for the agent. None of them holds the job: the person
+accepts one later with `jarvis rg facts answer <issue_id> --value accept`
+through relay's JARVIS exec, or overrides it with `jarvis rg net set`. The
+confirm's text repeats each advisory's message.
 
-These controls protect the relay's protocol and durable-record boundaries.
-They do not expand tool authorization, grant a generated process new
-credentials, or replace the execution and artifact checks of the underlying
-relay operation.
+| Where | How |
+| --- | --- |
+| The confirm form | phase `planned`, in the elicitation's `params._meta`; on a `2026-07-28` connection, in the `input_required` result's `_meta` |
+| Task status | each `tasks/get` result's `_meta` |
+| Tool results | `structuredContent.job` on `run`, `serve` and `describe(job=...)` |
+| Job lists | `describe(site=...)` lists the site's jobs under `jobs` |
+| Job resource | `relay://jobs/{operation_id}`, announced updated on each change |
+
+## waiting for a service's compute steps
+
+A `serve` task completes at readiness, and its job runs on. A job that also
+computes, such as a solver beside the viewer that watches it, has a second
+moment the agent waits for: its compute steps ending. The ready result names
+the steps still running and the call that waits for them:
+`serve(service=<operation_id>, until="steps")`.
+
+With tasks, that call is a task of its own, `<operation_id>.steps`. It stays
+`working` while a compute step runs, its status message names each step's
+state, and it completes when every compute step has ended or the job has. The
+completion is the wake, so the agent waits on the task rather than polling the
+job's files or the scheduler. The result carries each step's state, reason,
+hosts and time under `structuredContent.until`, then the operation as `serve`
+shows it, with the job's outputs and its card. It is an error when a step
+failed. Without tasks, the call waits up to `wait_s` (at most 300 s) and
+returns the same result; `until.ended` says whether the steps have ended, and
+the agent calls again while it is false.
+
+The compute steps are the card's `compute` components. A JARVIS job's step
+ends when JARVIS records it, and a job without steps ends with the job, so the
+same call works on every site and access means. The task's state is read from
+the operation's record, so it survives a relay restart. Cancelling the task
+stops the waiting, not the job; `serve(stop=...)` stops the job.
+
+## refusals
+
+Every refusal is a tool error whose `structuredContent.refusal` carries a typed
+reason and a message, so an agent can tell a missing sign-in from a policy
+refusal or an unsupported verb without reading prose.

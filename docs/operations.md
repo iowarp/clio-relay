@@ -1,1438 +1,228 @@
 # Operations
 
-This page covers the common operator paths. Use the README for the short overview and `docs/ai/` for the full implementation context.
+Most people never need this page. An agent reaches a cluster through relay's
+tools, and a `worker` site places and signs in its own worker the first
+time it is used (see [the worker adapter](adapters/worker.md)). There are no
+commands to install, start or stop the worker by hand.
 
-For a complete first-connection walkthrough from a local desktop through a
-homelab relay to a cluster worker and remote agent, see
-`docs/connect-desktop-homelab-cluster.md`.
+This page is for operators who want to know what placement leaves on a cluster
+and how to look after it.
 
-`docs/connection-model.md` is normative for everything transport-related on this
-page: one held link per connection, the ssh budget, the 2FA operating
-assumption, reconnect, and relay-owned input staging. The operator paths below
-are ways to build and drive that one connection, not independent ways to reach
-the cluster.
+## What the worker leaves on the cluster
 
-## Add a Cluster
+Everything lives in the worker directory, `remote_dir` in the site's settings
+(by default `~/.local/share/clio-relay/worker/<site>`):
 
-```powershell
-uv tool install --python 3.12 --no-config clio-relay
-clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --scheduler-provider slurm --agent-adapter exec --agent-bin agent
-$RelayWheelSha256 = "REPLACE_WITH_SHA256_FROM_THE_RELEASE"
-clio-relay cluster bootstrap --cluster my-cluster --relay-artifact-sha256 $RelayWheelSha256
-clio-relay cluster install-endpoint-service --cluster my-cluster --start --enable
-```
+| Path | What it is |
+| --- | --- |
+| `bin/clio-relay`, `tools/` | The relay install `uv tool install` made |
+| `bin/frpc`, `bin/frpc.sha256` | frpc, when the sign-in fetched it or copied in the site's `frpc_binary`, and the sha256 of the fetched download |
+| `dist/` | The wheel relay installed from, when the site sets `relay_wheel` |
+| `run/settings.json`, `run/registry.json`, `run/frp.env` | The worker's ids, tokens and rendezvous settings (0600) |
+| `run/site.pid`, `run/ready.json` | The running worker, and its ready report |
+| `run/site.log`, `run/frpc.log` | The worker's and frpc's output |
+| `adapter/<namespace>/` | Each relay's jobs and staged content, apart from any other relay's |
 
-Use the SHA-256 published for the exact wheel installed on the desktop (from
-the GitHub Release `SHA256SUMS` asset or PyPI file details). Release-mode
-bootstrap requires this value even when `--relay-wheel` is omitted. It lets an
-unchanged cluster complete its preflight offline without reading, building, or
-transferring local payload bytes, while distinguishing rebuilt wheels that
-share a version string. A fresh bootstrap may finish with the endpoint service
-reported as `pending_install`; the explicit `install-endpoint-service` command
-above owns unit creation and activation.
+The secrets in `run/` are new at every sign-in. Nothing else on the cluster
+holds them.
 
-Bootstrap is an install/reconcile operation, not a desktop-session startup
-requirement. An ordinary reconnect reuses the persistent endpoint directly.
-When an operator explicitly repeats bootstrap with the same release artifact,
-an exact healthy deployment must finish end to end within 30 seconds without
-reading or transferring the wheel, downloading components, invoking JARVIS,
-changing its configuration or resource graph, or touching scheduler state. If
-only the already-installed managed endpoint service is stopped, bootstrap may
-perform one bounded service activation and must converge within 60 seconds;
-that repair still performs no payload, component, JARVIS, or scheduler work.
-The bootstrap validation report records the observed outcome, total duration,
-operation counts, component actions, and byte-preservation evidence.
+## Check that the worker is up
 
-An enabled endpoint worker is expected to survive every desktop disconnect and
-the operator's final cluster logout. Before installing it, verify the cluster's
-systemd user manager is persistent:
+On the cluster:
 
 ```bash
-loginctl show-user "$USER" -p Linger --value
-loginctl enable-linger "$USER"  # one-time; site authorization may be required
+D=~/.local/share/clio-relay/worker/my-site
+kill -0 "$(cat "$D/run/site.pid")" && cat "$D/run/ready.json"
+tail -n 40 "$D/run/site.log" "$D/run/frpc.log"
 ```
 
-`install-endpoint-service` requires the first command to return exactly `yes`
-and fails before writing the unit otherwise. If site policy intentionally
-forbids lingering, `--allow-login-scoped` installs a diagnostic, login-scoped
-worker. It may stop after the last login and is not eligible for live release
-claims. Desktop detach and default teardown never stop either service; only an
-explicit `session teardown --stop-worker` does. The persistent unit restarts
-after both clean and failed worker-process exits; an explicit systemd stop is
-still respected and remains stopped until an operator starts it again or runs
-an explicit bootstrap reconciliation that reports the bounded service repair.
+From relay, a site that was never signed in refuses calls with
+`needs_sign_in`. While its worker is not answering, calls are refused with
+`unreachable`, and signing in again places a new worker.
 
-Worker capacity is part of the cluster definition, not a property reconstructed
-from whichever restart command happened to run last. New and legacy cluster
-definitions default to three total slots with one slot reserved for control
-queries. A normal reinstall uses that persisted policy. To restart the exact
-installed unit without replacing its `ExecStart` or capacity policy, use:
+## Restart or replace the worker
 
-```powershell
-clio-relay cluster restart-endpoint-service --cluster my-cluster
-```
+Sign in to the site again. Each sign-in stops the worker it finds in the
+directory, frpc included, installs the current relay and starts a new worker
+generation with new secrets. Jobs and content under `adapter/` stay.
 
-Inspect persistence and recovery without mutating the service, relay queue, or
-scheduler:
+A worker that an older relay placed is refused with a sign-in rather than used,
+so upgrading relay on your machine upgrades the worker at the next sign-in.
 
-```powershell
-clio-relay cluster endpoint-service-status --cluster my-cluster
-```
+## Keep the worker running
 
-The JSON result distinguishes `ready`, `recovering`, `intentional-stop`,
-`failed`, `inactive-unexpected`, `not-installed`, and `degraded`. A production
-unit is ready only when it is installed, enabled, active, configured for
-persistent crash recovery, and backed by systemd user lingering. A process
-crash is therefore observable as recovery or a failed restart rather than as a
-normal desktop detach. Conversely, an explicit `systemctl --user stop` is an
-`intentional-stop`; systemd respects that operator action and relay does not
-silently start it from a read-only status probe. Use the returned
-`operator_action` or the explicit restart command above when the unit should run
-again. Service restart preserves the durable relay queue and never cancels a
-scheduler job.
+The worker starts in the background at sign-in and needs no systemd user
+manager, so it runs on clusters that have none. It stops when the login node
+reboots, or when the site kills user processes at logout. Sign in again after
+either.
 
-The restart-only command verifies the installed unit's total, reserved-control,
-and per-kind capacity arguments against the persisted cluster policy before it
-restarts anything. A legacy or drifted unit is left untouched and must be
-reinstalled with `cluster install-endpoint-service`.
+frpc reconnects on its own while the worker runs. If the rendezvous server was
+down, the link comes back once it is up again.
 
-### verify the execution interpreter and startup boundary
+## Stop the worker and clean up
 
-Release bootstrap records both the lexical provider-interpreter path and its
-resolved file identity. Relay deliberately launches the lexical path inside the
-persistent `uv tool` environment instead of replacing it with the final symlink
-target. This preserves the tool environment's `sys.prefix`, distribution
-metadata, and imports while still verifying the interpreter digest and checking
-that its file identity does not change during spawn.
-
-An owned session API follows the same rule. Its containment broker establishes
-the exact systemd scope before releasing the generation-scoped child
-environment. The API imports and binds the process-local application while the
-one-time owner credential is available, publishes its signed startup receipt,
-and then removes `CLIO_RELAY_SESSION_OWNER_TOKEN` from the process environment.
-The already validated application retains the session identity needed for
-authenticated requests; later child processes cannot acquire that one-time
-credential from the environment.
-
-If startup fails, relay adds only a bounded tail of the owned `api.log` to the
-error as `api_log=...`. It replaces known secret values and assignments whose
-names identify tokens, secrets, passwords, credentials, API keys, or
-authorization before returning the diagnostic. This is defense in depth, not
-permission to log credentials: operators and application code must still keep
-secret values out of stdout and stderr.
-
-Service installation, restart, and managed bootstrap serialize an exact
-state/job preflight and optional enqueue under a short per-service `flock`.
-They fail closed without mutation if either inventory cannot be read, and a
-fresh process observes an already queued exact job instead of duplicating it.
-Relay enqueues only when `LoadState=loaded` and the preflight `ActiveState` is
-stable (`active`, `inactive`, or `failed`). Non-loaded units and transitional,
-maintenance, refreshing, or future active states are reported without mutation.
-A requested `start` can adopt an exact existing `start` or `restart` job. A
-requested `restart` can adopt an exact `restart` job, including its later
-`start` phase under the same systemd job ID; a standalone pre-existing `start`
-is not restart provenance. Relay pins the first adopted job ID and rejects a
-later different job. A `start` first observed after relay's own successful
-restart enqueue can be bound to that request. A timed-out or failed restart
-enqueue cannot adopt a newly observed `start` or a jobless transition. Queued
-`reload`, `stop`, `verify-active`, `nop`, and unknown jobs are likewise
-nonpassing `in-progress` evidence without mutation; retry after the exact job
-clears. A transitional unit state without an exact queued job is also
-nonpassing and requires retry after the unit reaches a stable state.
-After enqueueing at most one systemd job with `--no-block`, they observe the
-exact unit and job for up to 5 minutes 30 seconds. The generated unit bounds
-`ExecStartPre` queue-index migration and process startup with
-`TimeoutStartSec=5min`; the SSH lifecycle command retains an additional
-90-second transport margin. State transitions
-and 15-second progress snapshots are emitted as
-`endpoint_service.activation` key/value records. A terminal systemd failure is
-returned immediately. If the observer itself expires while systemd still owns
-an activating job, relay reports `outcome=in-progress`, leaves that job intact,
-and does not enqueue a duplicate recovery start. Structured failure output
-includes the exact operator `journalctl --user --unit=...` command without
-copying journal contents into relay output.
-For a restart, known initial and final systemd `InvocationID` values must differ;
-an observed, provenance-bound state transition is used only when either ID is
-unavailable. An always-active unit with no new invocation remains unverified.
-
-### Upgrade durable queue indexes
-
-The worker service runs this preflight before it accepts work:
-
-```powershell
-clio-relay queue migrate-indexes --all --batch-size 500
-```
-
-Inspect the durable checkpoint without advancing it:
-
-```powershell
-clio-relay queue migration-status
-```
-
-Migration holds the queue lock for one bounded batch at a time and resumes from
-durable checkpoints after interruption. Jobs, endpoints, gateway sessions, and
-monitor rules receive stable global sequence indexes; task, artifact, progress,
-active-resource, and terminal-retention indexes are migrated in the same gated
-upgrade. Existing queues also receive a crash-replayed lease-capacity aggregate
-only after canonical leases and every exact operational index have been rebuilt
-and reconciled. While any checkpoint is incomplete, submission, endpoint
-registration, gateway creation, monitor creation, worker acquisition, paged
-reads, and terminal collection fail with an actionable `queue migrate-indexes`
-error. They never fall back to an unbounded scan or read a partial index. The
-generated systemd user unit uses `ExecStartPre` with `--all`, so a migration
-error prevents the worker from starting and remains visible in the unit journal.
-
-### Upgrade v0.9 output records
-
-Some v0.9 workers stored a complete stdout or stderr callback twice in one
-event. Those records can be larger than the current event limit. A normal
-`clio-relay init` audits this state but does not change it; when migration is
-required, it stops with the exact operator command:
-
-```powershell
-clio-relay init --migrate-legacy-output
-```
-
-Run that command only after every process writing the same queue has stopped.
-This includes endpoint workers, `clio-relay api start`, and any retained
-`clio-relay mcp-server` process.
-It preserves the original bytes in an owner-private archive, replaces the
-oversized event with a bounded compatibility record, and writes durable
-receipts so an interrupted migration resumes safely. Managed `cluster
-bootstrap` performs this sequence itself: it stops the configured worker before
-replacing packages, refuses to continue while any installed `clio-relay`
-process still owns the same physical queue, runs a final bounded source-to-index
-reconciliation under the queue lock, and restarts the service only if it was
-previously active. The complete remote bootstrap script has a 30-minute outer
-bound, which outlives its 5-minute 30-second service observer while preventing a
-lost SSH session from waiting forever. New managed queues hold shared core
-ownership for their full lifetime, so later migrations cannot overlap an API,
-MCP server, worker, or new queue-backed writer. Explicit migration returns a
-closed inspection object,
-never an unfenced writable queue. The migration does not delete jobs, logs, or
-scheduler work.
-
-Cluster names are local labels. `ares`, `homelab`, or a later institutional target are registry entries, not hardcoded behavior.
-Use `--scheduler-provider external` when JARVIS or another deployment driver owns
-all scheduler observation and cancellation.
-
-Pin the physical identity of an existing entry without replacing its transport,
-remote MCP registrations, paths, live-test inputs, or agent settings:
-
-```powershell
-clio-relay cluster pin-target --cluster my-cluster --target-hostname login-1.example.edu --ssh-host-key-sha256 SHA256:REPLACE_WITH_PIN --scheduler-cluster-name my-cluster
-```
-
-Repeat either identity option during hostname aliases or SSH host-key rotations.
-`cluster pin-target --cluster my-cluster --clear` removes only the target identity
-pin and cannot be combined with identity values. Target pinning first reads the
-effective `UserKnownHostsFile` entries from `ssh -G` (including hashed entries
-and nondefault ports), then uses a bounded `ssh-keyscan` only when no configured
-key is available.
-
-A COLD `cluster bootstrap` (nothing pinned yet) fills a missing target-identity
-pin automatically from the same one-pass install session, instead of requiring
-`pin-target` first: this is trust-on-first-use over the one authenticated
-session that just installed the relay, not a verification, and the receipt and
-registry both mark it that way (`trust: first_use`, never `verified`) rather
-than reusing the verified state a real re-check produces. The bootstrap output
-names exactly what got pinned -- hostnames, SSH host-key fingerprints, and the
-site marker -- so the operator can compare it out-of-band before trusting it
-further; the fingerprint source is also reported, since a fingerprint already
-present in `known_hosts` (the operator's own ssh client already accepted it) is
-materially more trustworthy than one observed fresh through a bare
-`ssh-keyscan` fallback, which does not authenticate the host at all. The pinned
-hostnames are the union of what the remote observed and the cluster's own
-configured ssh alias/name, so a round-robin cluster's next login node cannot
-lock the operator out of their own pin. An identity ALREADY pinned (by
-`pin-target`, or by an earlier bootstrap's first-use pin) is never silently
-replaced by a later observation -- run `cluster pin-target` explicitly to
-assert a different identity out-of-band. `scheduler_cluster_name` is never
-learned this way (it needs the full scheduler-provider registry, unavailable
-from inside the remote install session) and stays unpinned until an operator
-sets it directly with `pin-target`.
-
-### manage system software and external application plugins
-
-The generic `linux-user` bootstrap installs relay, transport, JARVIS, and
-configured agent dependencies only. It does not install, load, or shim
-scientific application binaries, Spack environments, MPI launchers, or site
-modules. No application installer or progress parser ships inside
-`clio-relay`.
-
-For agent-driven system-software operations, register a cluster-side generic
-Spack MCP server through the normal `remote_mcp_servers` cluster configuration.
-The audited clio-kit user contract is `spack_find`, `spack_locate`, and
-`spack_install`. There is deliberately no stateful `spack_load` tool: an MCP
-child's process environment cannot survive into a later JARVIS process.
-Declare `contract: clio-kit-spack-user-v2.1` on new registrations so the live
-gate checks the exact upstream schemas; the operator's server name has no
-semantic effect.
-Existing `clio-kit-spack-user-v2` registrations remain accepted and are
-verified against the preserved v2 digest; changing the declared identifier
-requires a fresh discovery of the matching server surface.
-`jarvis_run(spack_specs=[...])` resolves the requested specs immediately before
-execution and persists the filtered environment into the JARVIS pipeline so
-direct execution and scheduler reload see the same values. Use the server's
-discovered `tools/list` schema as the authority for arguments, and allowlist
-only the operations permitted by site policy.
-
-Sites that require a non-agent installation workflow can install an external
-Python distribution that contributes a profile through the
-`clio_relay.application_profiles` Python entry-point group without changing
-generic bootstrap code. After that distribution is installed, operators may
-invoke `cluster install-app --app <external-profile-name>`. The separate
-`clio_relay.package_progress_adapters` entry-point group remains a compatibility
-surface for older packages that only expose application log parsers. Those
-adapters are inspectable, but they cannot satisfy the 1.0 execution/progress
-gate. Production acceptance requires the JARVIS-owned execution handle, durable
-record, and application-independent progress snapshot described below.
-The cluster bootstrap downloads one exact JARVIS-CD GitHub release wheel,
-verifies its pinned SHA-256, and installs those same bytes normally in the
-JARVIS execution environment and with `--no-deps` in the relay provider
-environment. The latter exposes only the provider entry point to the worker; it
-does not move application semantics into relay core. The install receipt records
-the release URL, wheel digest, distribution name/version, both interpreters, the
-JARVIS executable, and exported entry points. The running worker verifies that
-both environments still resolve to the receipt-bound wheel before release
-acceptance.
-
-An older compatibility pipeline may declare its provider explicitly under the
-package, for example `progress.adapter: lammps`. The worker replaces all
-plugin-supplied provenance with the bound entry-point and distribution identity.
-Every provider-produced, structurally valid observation is persisted with
-`provider_validated=true`; warm-up observations remain visible with
-`acceptance_validated=false`, while observations satisfying the package's live
-acceptance predicate carry `acceptance_validated=true`. Desktop acceptance
-therefore needs no local copy of JARVIS-CD: it verifies the explicit YAML
-contract against the durable worker attestation. Providers must also flush
-buffered fragments from
-`finalize_jarvis_stdout()` and `finalize_stdout()` at their respective EOFs.
-The two inputs are mutually exclusive for one execution. If the provider
-declares one `progress_log_paths()` entry, that package log is authoritative and
-JARVIS stdout is not parsed. Scoped JARVIS stdout is used only when the provider
-declares no host-visible log, including container-private log configurations.
-Filesystem location alone does not prove host visibility: node-local paths such
-as `/tmp` also use stdout fallback. A provider may expose a host-tail path only
-when the package explicitly declares `progress.log_visibility: shared`; the
-Ares acceptance pipelines opt into that contract.
-Only the selected source's EOF finalizer runs. A provider may expose at most one
-log path in 1.0. Relative paths are resolved against the exact JARVIS child
-working directory. Provider logs must be regular files; symlinks, devices, and
-FIFOs are rejected. The worker opens and identifies one descriptor before use,
-reads it in bounded chunks, and checkpoints its size, file identity, and trailing
-bytes before launch. Historical bytes are skipped, while replacement,
-truncation, or rewrite resets the tail and provider log parser before new bytes
-are consumed.
-
-## Run a Job
-
-```powershell
-clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml
-clio-relay job watch <job-id> --cluster my-cluster
-clio-relay job read-log <job-id> --cluster my-cluster --stream stdout
-clio-relay job list-artifacts <job-id> --cluster my-cluster
-```
-
-Submissions are asynchronous by default. CLI, HTTP, and MCP callers get a `job_id` and can monitor events and logs by cursor or byte offset.
-
-### Record consumed artifact lineage
-
-Every submission surface accepts a bounded list of content-pinned dependencies.
-On the CLI, repeat `--used-artifact ARTIFACT_ID=SHA256`:
-
-```powershell
-clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml `
-  --used-artifact artifact_input=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-clio-relay job used-artifacts <consumer-job-id> --cluster my-cluster
-clio-relay job used-by artifact_input --cluster my-cluster
-```
-
-The relay verifies each digest before reserving the submission, stores one
-immutable `used` edge, and maintains the reverse `used_by` index. A retained
-consumer protects its producer artifact from garbage collection. Owned-session
-APIs require producer and consumer to belong to the exact same session
-generation. HTTP exposes `/jobs/{job_id}/used-artifacts` and
-`/artifacts/{artifact_id}/used-by`; MCP exposes both directions through
-`relay_artifact_lineage` by accepting exactly one of `job_id` or `artifact_id`.
-
-The `ARTIFACT_ID=SHA256` form remains the compatibility form and retains its
-existing wire identity and idempotency digest. To explain how the dependency was
-identified, pass the additive canonical JSON form instead:
-
-```powershell
-clio-relay job submit --cluster my-cluster --jarvis-yaml .\pipeline.yaml `
-  --used-artifact '{"artifact_id":"artifact_input","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","provenance":{"schema_version":"clio-relay.artifact-use-provenance.v1","evidence":"schema-arg","arg":"script"}}'
-```
-
-Edge evidence can identify a schema argument, an explicit hash pair, a bounded
-lease window, an external authority, or an assertion. The complete provenance
-object is part of the immutable edge identity: the same artifact and digest
-cannot be resubmitted under the same job identity with changed evidence. Relay
-copies it unchanged into both the job-to-artifact `used` record and the reverse
-artifact-to-job index. Legacy records with no provenance remain valid and do not
-receive an invented explanation.
-
-### record transform activity
-
-An artifact edge says *what* a job consumed. The optional
-`clio-relay.transform-ref.v1` record says *what activity occurred*: one bounded
-activity id, mechanism, non-secret execution-environment identity, replay
-contract, and its used evidence. `reproducible` is a stronger claim than
-`re-runnable`; use `re-runnable` when mutable external authority or another
-uncontrolled input prevents byte-for-byte reproduction. Environment tiers are
-`declared`, `lockfile-hash`, and `image-digest`. The fixed environment fields
-can identify the launcher, provider/model, OS, architecture, Python, lockfile,
-or image, but the record does not accept arbitrary environment variables or
-secret-bearing metadata.
-
-There is at most one immutable transform per relay job. Internal artifact
-evidence must cover every content-pinned job dependency with the same artifact
-id, digest, and edge provenance. Authority-only evidence and zero-input
-activities are also valid, so a catalog lookup or generated output need not
-invent an internal artifact. An identical retry is idempotent; any changed
-record conflicts. The transform is collected with its terminal job and cannot
-outlive it.
-
-Transform mutation is an internal execution boundary rather than another
-agent-facing tool. An authenticated, exact-generation owned session API can
-`POST /jobs/{job_id}/transform` once and `GET /jobs/{job_id}/transform`; the GET
-returns JSON `null` until a transform exists. Both operations verify that the
-job belongs to the session, and the POST requires the session submission
-binding. Existing authenticated job/status reads and the admin MCP
-`relay_get_job`/`relay_get_job_status` projections include the nullable
-transform. There is deliberately no `relay_record_transform` MCP tool.
-
-For inline YAML, path, and command JARVIS runs, the endpoint captures and hashes
-the exact materialized pipeline bytes before launching that same spool file.
-Named JARVIS pipelines currently retain a name reference rather than a resolved,
-content-hashed pipeline snapshot; a name alone must not be claimed as
-artifact-backed replay evidence.
-
-### inspect structured runtime metadata
-
-For JARVIS-owned execution, the authoritative source is the exact native
-document set returned by JARVIS and polled by the relay-owned broker:
-
-- `jarvis.execution.handle.v1` is the stable execution identity and contains
-  the JARVIS execution id, pipeline id, execution mode, and native scheduler
-  identity when applicable;
-- `jarvis.execution.record.v1` is the durable lifecycle record;
-- `jarvis.execution.progress.v1` is the queryable, package-independent progress
-  snapshot whose latest events use `jarvis.progress.v1`.
-
-The broker requires all three documents to agree on execution, pipeline,
-provider, native scheduler identity, lifecycle, and reconciliation marker. It
-then writes the bounded document set to the authenticated relay sidecar. The
-normalized `clio-relay.jarvis-runtime.v1` record can include:
-
-- execution and pipeline ids;
-- scheduler provider, type, job id, and phase;
-- scheduler script, hostfile, stdout, and stderr paths;
-- allocated nodes;
-- package names, versions, ids, sources, and paths;
-- terminal state, return code, reason, and timestamps.
-
-The current record is stored in both job and task `metadata.runtime_metadata`,
-and `runtime-metadata.json` is indexed as a job artifact. A claimed scheduler id
-is authoritative only when the mutually bound native documents prove the
-scheduler provider and native id and the authenticated sidecar belongs to the
-durable relay job and task. Missing, wrong, stale, or internally inconsistent
-documents fail closed: they cannot create scheduler ownership, polling, or
-cancellation eligibility. `field_sources` preserves that field-level trust
-decision. Older `jarvis.runtime.v1`, package-adapter, and log-only paths remain
-visible as compatibility evidence but cannot satisfy the 1.0 gate. Scheduler
-cancellation additionally requires an exact `scheduler_job_ownership` record;
-it is opt-in, and detach/exit does not cancel scheduler jobs by default.
-
-An MCP result is treated as owned JARVIS metadata only when its command matches
-the operator-configured JARVIS MCP command and its successful result envelope
-matches the durable relay job's server, arguments, operation, and tool. A
-different server cannot gain scheduler ownership merely by naming a tool
-`jarvis_run`.
-
-For the legacy clio-kit 2.2.6 compatibility path, a successful synchronous
-`jarvis_run` MCP return is normalized to a terminal `completed` record even
-though that release labels the result `status=running`; the original status and
-completion basis remain in `details.completion_normalization` for auditability.
-The pinned clio-kit 2.7.2 production path removes that ambiguity upstream and
-returns a structured durable execution handle immediately. The legacy normalization is
-diagnostic compatibility evidence and cannot satisfy the 1.0 gate. Scheduler
-submissions remain non-terminal and are observed through `jarvis_get_execution`.
-
-Exercise the agent-facing virtual `jarvis_run` tool, its cluster routing, durable
-result, and non-legacy runtime artifact in one canonical acceptance run:
-
-```powershell
-clio-relay jarvis-mcp-validate `
-  --cluster my-cluster `
-  --package-search-query lammps `
-  --arguments-json-file .\jarvis-run.json `
-  --report .\validation\jarvis-mcp.json
-```
-
-The package-search query must identify at least one installed application; its
-bounded summary page is retained in the same machine-readable report.
-`jarvis-run.json` must contain the remote `pipeline_id` and any `execution` or
-`submit` fields accepted by the cluster-local JARVIS MCP. Internal `wait` is not
-part of the public handle-first contract. The local
-`cluster` selector is injected by clio-relay and is never forwarded to JARVIS.
-
-Runtime observations are emitted only by the relay-owned JARVIS execution
-broker or returned through an owned `jarvis_run` MCP result. Application and
-package code does not receive the runtime sidecar path or HMAC key and must not
-write the sidecar directly. The following older `jarvis.runtime.v1` payload is
-accepted for compatibility inspection only; it is not native 1.0 evidence:
-
-```json
-{
-  "schema_version": "jarvis.runtime.v1",
-  "execution_id": "run-42",
-  "scheduler_provider": "site-scheduler",
-  "scheduler_type": "batch",
-  "scheduler_job_id": "12345",
-  "scheduler_phase": "allocated",
-  "package_provenance": [
-    {"package_name": "example.package", "package_version": "1.2.3"}
-  ],
-  "details": {
-    "scheduler_submission": {
-      "schema_version": "jarvis.scheduler.submission.v1",
-      "provider": "site-scheduler",
-      "scheduler_job_id": "12345",
-      "identity_source": "scheduler_submit_api",
-      "submitted": true
-    }
-  }
-}
-```
-
-The private adapter wraps each observation with a monotonic `sequence` and a
-canonical HMAC by calling `runtime_sidecar_record`; the HMAC key is never
-serialized. The scheduled wrapper receives that key once through the
-containment broker after dump and trace access have been disabled. Any invalid,
-out-of-order, oversized, replaced, or unreadable sidecar record durably latches
-the channel failed closed. Later signed records cannot restore authority; only
-an exact one-match scheduler-marker reconciliation can resolve the latch, and
-the quarantined sidecar remains with the job spool as evidence.
-
-## Manage the Relay Queue
-
-Relay queue state is separate from cluster scheduler state. A queued relay job
-has not been leased by a worker yet. A running relay job may already have
-submitted scheduler work through its JARVIS package.
-
-```powershell
-clio-relay queue list --cluster my-cluster --kind remote_agent
-clio-relay queue diagnose <job-id> --cluster my-cluster
-clio-relay queue stale --cluster my-cluster --older-than 2h
-clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h
-clio-relay worker status --cluster my-cluster
-```
-
-Queue reads and cleanup scans are bounded. Their JSON includes
-`scan_truncated` and `result_truncated`; increase `--scan-limit` or `--limit`
-explicitly when an operator needs a larger window. Diagnosis is job-specific
-and reports raw submission order separately from effective admission blockers,
-plus the durable lease and owner heartbeat, worker capacity, scheduler
-observations, current tasks, and the most recent event and progress record. The
-admission snapshot applies the same fresh worker slots, per-kind limits, active
-leases, pending-cleanup exclusions, and global lease bound as worker admission.
-If any bounded input is truncated or inconsistent, diagnosis returns
-`admission_analysis_incomplete` instead of presenting a raw earlier job as a
-proven blocker. Every job-specific mutation verifies the requested cluster.
-The same payloads expose `active_job_capacity` with `limit`, `used`,
-`remaining`, and `over_capacity`. Admission rejects the next job with the
-stable `active_job_capacity_reached` error before the durable active population
-can exceed 10,000 records. A queue inherited above that bound remains readable
-and drainable, but accepts no additional work until it is below the limit.
-Live lease admission uses the durable two-record capacity pair for a constant
-number of filesystem reads, then selects the requested cluster-kind count in
-memory. The pair is self-digested and independently checkpointed with one epoch,
-monotonic generation, and checkpoint identity; missing, torn, duplicated,
-hard-linked, oversized, or mismatched records fail closed. It is updated under
-the same cross-process lock and transition journal as canonical leases.
-
-Run the full exact audit whenever diagnosing storage damage, after offline
-maintenance, or before and after a repair:
-
-```powershell
-clio-relay queue audit-lease-capacity --cluster my-cluster
-clio-relay queue repair-lease-indexes --cluster my-cluster
-clio-relay queue audit-lease-capacity --cluster my-cluster
-```
-
-The audit returns `clio-relay.lease-capacity-audit.v1` JSON and exits nonzero
-unless canonical leases, manifests, identity/expiry references, endpoint and
-cluster-kind scopes, and aggregate totals all agree within the explicit
-10,000-record bound. Repair is separately explicit: it rebuilds exact indexes
-from canonical leases, creates a new aggregate epoch, and leaves jobs and
-scheduler work untouched.
-
-Stale cleanup is a dry run by default. Executing it can recover an expired
-lease or stop a stale owned relay task, but it never requests scheduler
-cancellation. Queued jobs are retained unless both queued cancellation and
-execution are explicit:
-
-An expired lease is requeued only when no scheduler observation exists. If the
-job has any durable scheduler identity or status, automatic recovery leaves it
-stale and explicit cleanup cancels only the relay side; this prevents an
-unattended lease recovery from submitting duplicate scheduler work.
-
-```powershell
-clio-relay queue cleanup-stale --cluster my-cluster --older-than 2h --cancel-queued --no-dry-run
-```
-
-Cancel queued jobs without touching any scheduler:
-
-```powershell
-clio-relay queue cancel <job-id> --cluster my-cluster
-```
-
-For leased or running jobs, scheduler cancellation is explicit:
-
-```powershell
-clio-relay queue cancel <job-id> --cluster my-cluster --cancel-scheduler-job
-```
-
-Use `--keep-scheduler-job` or omit the flag when the user only wants the relay
-job/session to stop observing or driving the work. Use `--cancel-scheduler-job`
-only when the user explicitly wants the package or scheduler adapter to stop the
-remote scheduler job too.
-
-Every cancellation persists a versioned `metadata.cancellation_request` on the
-job before the terminal state transition. Workers use that durable policy after
-restart and reconcile a cluster-routable scheduler-cancellation index rather
-than reconstructing retry state from event history. A successful cancellation
-command remains pending until provider polling proves the exact scheduler id is
-canceled, otherwise terminal, or explicitly not found. Query failures remain
-retryable. Scheduler identifiers still require durable ownership proof before
-any provider cancellation is attempted.
-
-Each owner-session generation has a separate durable membership index, with a
-10,000-job capacity and separate legacy-generation coverage. The stable
-`owner_session_job_capacity_reached` error prevents an unbounded desktop
-generation from making teardown enumeration unsafe. Terminal jobs remain in
-that membership through verified generation closure.
-
-The user MCP profile exposes the read-only `relay_queue_list`,
-`relay_queue_diagnose`, and `relay_queue_stale` tools. The admin profile also
-exposes `relay_queue_cleanup_stale`, `relay_cancel_job`, and worker status.
-When `cluster` names a configured remote cluster, these tools operate on that
-cluster's queue over its established connection and return a `route_revision`;
-exact follow-up operations can echo that revision so a changed cluster route is
-rejected instead of silently acting on a different queue. The `cluster` argument
-selects a connection the local relay already holds. It is not an instruction to
-open one.
-
-For release evidence, configure at least three live worker slots and the exact
-per-kind cap `jarvis=2`, then run during a quiet window with an otherwise empty
-relay queue. The validator creates only bounded harmless commands and runs the
-canonical acceptance command from the exact artifact under test:
-
-```powershell
-clio-relay queue validate --cluster my-cluster --older-than 1m --report .\validation\queue-management.json --validation-launcher uv-tool --validation-install-source pypi
-```
-
-The validator requires two generated commands to be concurrently running with
-real leases on distinct registered worker-slot endpoints. While an otherwise
-idle third slot continues to heartbeat, a third JARVIS command must remain
-queued with no lease. It then executes an exact stale cleanup target and cancels
-one real running worker process. Passing evidence includes the worker's
-`execution.canceled` acknowledgment, task cancellation, lease release, and the
-absence of both the outer JARVIS PID and embedded command PID. A bounded held
-scheduler fixture must remain pending through that relay-only cancellation; it
-is then released and allowed to complete naturally. Scheduler cancellation is
-used only as failure cleanup. The report is subsequently bound to the remote
-worker's exact released relay artifact, source identity, released clio-kit
-component, scheduler provider, and operator-pinned physical target. An optional
-positional job id is treated only as an expendable queued compatibility anchor:
-it is canceled before the live fixtures and never executed or copied.
-
-For targeted operator cleanup, pass `--job-id` to `queue stale` or
-`queue cleanup-stale`. The exact-job form still computes bounded queue context,
-but it cannot recover or cancel a neighboring stale record.
-
-Worker capacity is persisted per cluster and applied whenever the user-level
-worker service is installed:
-
-```powershell
-clio-relay cluster install-endpoint-service --cluster my-cluster --concurrency 4 --control-query-concurrency 1 --kind-concurrency jarvis=2 --kind-concurrency remote_agent=2 --start --enable
-```
-
-This keeps one sudo-less user service per cluster and runs multiple in-process
-worker slots inside that service. `--concurrency` is the total process capacity.
-`--control-query-concurrency` carves a strict control-query lane out of that
-total; managed policies retain at least one control slot and one workload slot.
-This allows status, progress, artifact, and runtime-binding queries to execute
-while a long-lived workload is still running. Repeat `--kind-concurrency
-KIND=LIMIT` to add a ceiling for `jarvis`, `remote_agent`, or `mcp_call`;
-omitted kinds remain governed only by their lane and total capacity. Kind limits
-are caps, not reserved slots. An `mcp_call` kind limit applies to workload-class
-MCP calls; reserved control queries use the separately configured control-query
-cap, so a long-running workload MCP call cannot consume its query lane. The
-queue checks these limits atomically with
-durable lease creation across slots and processes. A saturated kind is skipped
-so it cannot block an eligible job of another kind. Explicit install overrides
-are saved back to the cluster registry, so a later install with no capacity
-flags cannot silently reset the worker to one slot. Use
-`--clear-kind-concurrency` to remove every persisted per-kind override.
-`clio-relay worker status`, HTTP
-`/workers`, and the equivalent MCP operation report the configured policy,
-whether fresh worker registrations agree, and active leases by kind.
-
-## Expose Tools to an Agent
-
-```powershell
-clio-relay agent render-mcp-config --output .\clio-relay-agent.config.toml
-clio-relay agent run --cluster my-cluster --prompt /path/on/cluster/prompt.md --mcp-config /path/on/cluster/clio-relay-agent.config.toml
-```
-
-The `--prompt` and `--mcp-config` values are cluster-side paths for operator
-material placed once at bootstrap, before the connection carries work. They are
-not a transfer channel and must not be used as a precedent for getting other
-files onto the cluster. A file that a job reads is staged by relay from the
-desktop workspace through the connection's one link; see `stage declared local
-package inputs` in `docs/remote-mcp-federation.md`.
-
-Agents should submit child cluster work asynchronously and return the child `job_id`. A single cluster worker cannot execute a child job while it is blocked inside a parent agent job waiting for that child to finish.
-
-Agents can also record structured task timeline events:
-
-```powershell
-clio-relay job record-task-event <task-id> --cluster my-cluster --event-type dataset_found --label dataset --summary "found staged dataset" --path-ref /mnt/common/datasets/example_001
-clio-relay job task-events <task-id> --cluster my-cluster --cursor 1
-```
-
-Use timeline events for UI-visible agent work such as repository scans, dataset discovery, generated scripts, planned commands, scheduler submissions, warnings, and completion. Use normal job logs for stdout and stderr.
-
-## serve MCP background tasks
-
-The relay MCP server uses native FastMCP. Stdio remains the default:
-
-```powershell
-clio-relay mcp-server --profile user
-```
-
-To expose authenticated Streamable HTTP on loopback:
-
-```powershell
-$env:CLIO_RELAY_API_TOKEN = "<random-secret>"
-clio-relay mcp-server --profile user --transport http --host 127.0.0.1 --port 8766 --path /mcp
-```
-
-HTTP refuses to start without the relay API token. Modern FastMCP clients can
-use ordinary `call_tool` for transparent polling or `call_tool_task` for an
-immediate standard task handle. Closing the client does not cancel the relay
-job; reconnect with the retained task ID. Cancellation remains a separate
-explicit operation.
-
-The server implements SEP-2663 over existing relay jobs and does not start
-FastMCP's Docket execution backend. See [MCP background
-tasks](mcp-tasks.md) for status mapping, input rounds, limits, client examples,
-and protocol-version behavior.
-
-## Use Remote JARVIS MCP
-
-Install the cluster-side server once, then launch its persistent executable:
+To stop the worker on the cluster:
 
 ```bash
-uv tool install --python 3.12 --no-config \
-  https://github.com/iowarp/clio-kit/releases/download/v2.10.6/clio_kit-2.10.6-py3-none-any.whl
-clio-kit mcp-server jarvis
+D=~/.local/share/clio-relay/worker/my-site
+kill "$(cat "$D/run/site.pid")"
 ```
 
-Release bootstrap is stricter: it downloads and hashes the exact released
-wheel first, installs that wheel with `uv tool install`, and records the uv
-binary/version, tool and environment directories, provider interpreter,
-`pyvenv.cfg` uv marker, installed RECORD closure, and retained wheel digest.
-Repeated worker calls execute that receipt-bound tool directly; they do not
-create a new `uvx` environment per call.
+frpc stops with it. To remove everything relay placed, delete the worker
+directory once no jobs you need remain under `adapter/`. Remove the site with
+`clio-relay site remove my-site` so relay stops offering it.
 
-The default agent MCP profile exposes compact relay tools and the compact JARVIS tools:
+## Stop every relay process
 
-- `relay_remote_mcp_context`
-- `relay_submit_agent`
-- `relay_status`
-- `relay_cancel`
-- `relay_observe`
-- `relay_wait`
-- `relay_queue_list`
-- `relay_queue_diagnose`
-- `relay_queue_stale`
-- `relay_storage_status`
-- `relay_bind_jarvis_runtime`
-- `relay_artifact_lineage`
-- `jarvis_create_pipeline`
-- `jarvis_describe`
-- `jarvis_add_step`
-- `jarvis_edit_step`
-- `jarvis_get_execution`
-- `jarvis_run`
-
-Operator-registered remote MCP aliases are added to this user surface from the
-profile-filtered durable schema cache. Administrative mutation, worker, raw
-dispatch, and direct gateway tools remain hidden and are rejected at dispatch.
-
-The pre-1.0 user contract merges removal into
-`jarvis_edit_step(operation="remove")`; `operation="edit"` requires `config`.
-Removal unlinks pipeline membership and intentionally does not clean package
-files. There is no `jarvis_remove_step` alias, including in admin/all profiles;
-admin retains the lower-level `unlink_pkg` compatibility tool.
-`jarvis_run(spack_specs=[...])` applies the runtime Spack
-environment inside JARVIS rather than relying on a process-local load command.
-
-The expected workflow is to create or load a pipeline through those JARVIS
-tools, use `jarvis_describe` for package and pipeline inspection, and call
-`jarvis_run` to submit the configured pipeline through the cluster-local JARVIS
-environment. Discover an application with
-`jarvis_describe(target="package_search", query="visualization", page_size=10)`.
-The query is required and limited to 256 characters; `page_size` defaults to 10
-and is bounded from 1 through 25. Results contain lightweight package summaries
-rather than package settings and never exceed 64 KiB. When `next_cursor` is
-present, repeat the same query with that opaque cursor to read the next page.
-The cursor is limited to 1,024 characters and is bound to both the query and the
-current package inventory, so a different query or a changed inventory fails
-closed. After selecting a result, use `target="package"` with its canonical
-`name` as `package_name` to retrieve the package-owned settings. The exhaustive
-`target="packages"` inventory remains available for explicit legacy use, but it
-is not the normal discovery path. `relay_observe` and `relay_wait` are the
-agent-facing monitor loop for progress and terminal output. `relay_wait` omits
-stdout and stderr unless `include_logs=true`; its inline MCP result prioritizes
-the authoritative `structured_result`, while the complete protocol response
-remains available in the SHA-verified immutable result artifact.
-After submission, `jarvis_get_execution` is the single durable query. It always
-returns the execution handle, lifecycle record, and runtime metadata; progress
-is included by default and can be disabled with `include_progress=false`.
-Artifacts remain opt-in: pass `artifacts={}` or bounded filters for one page,
-then pass the returned opaque cursor with the same filters for the next page.
-The call requires the local `cluster` selector plus the returned `pipeline_id`
-and `execution_id`. The relay forwards the query as a durable remote MCP job and
-validates the returned identities, lifecycle, progress, artifact filters,
-counts, and cursor bounds before marking its result valid.
-
-Virtual `jarvis_run` returns a durable execution handle without waiting for the
-workload. The short relay MCP job may be waited only long enough to obtain that
-handle; its completion is not workload completion and its progress
-notifications are not live-workload evidence. `jarvis-mcp-validate` repeatedly
-calls `jarvis_get_execution`, requiring an identity-coherent running package
-progress snapshot followed by a coherent terminal snapshot. Package progress
-adapters, stdout scraping, and `clio-kit.jarvis-package-progress.v1`
-notifications remain legacy compatibility paths and are invalid as 1.0
-acceptance evidence.
-
-`--wait-timeout-seconds` bounds one validation observation window; it is not a
-workload deadline. If the exact execution is still queued or running, or its
-terminal artifact page is not observable yet, the command writes a `pending`
-report containing a query-only resume checkpoint. Resume it with
-`jarvis-mcp-validate --cluster <cluster> --resume-report <report.json>` after any
-delay. Resume never calls `jarvis_run`, cancels the scheduler job, or creates a
-replacement execution. A pending report is useful operational evidence but
-cannot satisfy the release gate until the same execution reaches a validated
-terminal result with its requested artifacts.
-
-Cluster bootstrap stores the exact clio-kit wheel path, digest, persistent-tool
-environment, and JARVIS MCP command in the installation receipt. The worker
-service reads that receipt and invokes the installed executable directly; it
-does not resolve a package version or create another cache environment at call
-time. Desktop CLI and MCP submissions defer JARVIS command selection to the
-target, so a desktop package default cannot replace the cluster receipt. For
-prerelease diagnostics, `CLIO_RELAY_JARVIS_MCP_COMMAND` can still
-override the command with a JSON string array. The override is interpreted on
-the cluster, but it cannot satisfy released evidence unless it exactly matches
-the receipt-bound command and wheel. A Git
-branch is diagnostic only and cannot satisfy the 1.0 released-artifact gate.
-
-Operational queue, gateway-session, raw MCP-call, and low-level log tools are available through:
+When a host closes, it can ask relay to stop what it left running, without
+touching any job:
 
 ```bash
-clio-relay mcp-server --profile admin
+clio-relay shutdown --site my-site +json
+clio-relay shutdown --all +json
 ```
 
-## Bound Worker Output Storage
+The `shutdown` tool on the relay server does the same, with
+`{"site": "my-site"}` or `{"all": true}` and an optional `timeout_s` (15 s by
+default). Relay stops, for each site in parallel and locally: the worker's
+site-serve, the login hop, serve connectors and tunnels, frpc, and a relay
+server you detached with `clio-relay serve --http`. It never cancels a JARVIS
+job. The JSON result (`relay.shutdown.v1`) lists what stopped, each job still
+running (`kind: job`), and each site relay could not reach as a failure. A
+detached server that relay cannot see, for example one that runs as another
+user or outside the host's sandbox, is asked to exit over HTTP. Each server
+writes a private record (mode 0600) under relay's state directory, holding a stop
+secret made for that process alone. Shutdown sends that secret as a bearer token
+to the server's `POST /relay/stop` route, which refuses any other request. A
+process relay still cannot confirm or stop is a failure with the reason, and its
+record stays so a later call can try again. The next call to a site signs in and
+starts what it needs again.
 
-Worker stdout and stderr are durable artifacts, so their write limits are set at
-the worker rather than only at the read API. The defaults retain at most 64 MiB
-per stream and 128 MiB across both streams for one job. Override them with
-positive byte counts when launching a worker:
+## Clean a site so the next use deploys again
 
 ```bash
-export CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_STREAM=67108864
-export CLIO_RELAY_SPOOL_MAX_LOG_BYTES_PER_JOB=134217728
+clio-relay site clean my-site +json
 ```
 
-When either limit is reached, execution continues and live structured sidecars
-continue to be ingested. The relay persists only a complete UTF-8 prefix, emits
-one `<stream>.truncated` event, and indexes `log-capture.json`. Execution
-provenance records the configured limits and exact observed, persisted, and
-dropped byte counts. Changing these limits while retrying an existing job is
-rejected because it would make the durable accounting ambiguous.
+This asks you first, since it deletes files on the site. After a yes it stops
+relay's processes there, then removes this site's own deployment: its
+configured `remote_dir`, which holds the worker and its binaries, site-serve,
+relay's scripts and job directories, the login hop and the JARVIS bootstrap
+venv. Nothing outside it goes, so another relay home on the same account,
+with its own `remote_dir`, is left alone. If you moved the login hop with the
+site's serve `hop_dir`, clean also removes this site's directory in it. It
+keeps the Spack store (`<site home>/spack`, with every package built there):
+rebuilding ParaView takes hours. It also keeps JARVIS's recorded install
+answers (`<site home>/jarvis-cd/site/decisions.yaml`: which MPI, which
+compiler, where checks and builds run), facts about the cluster you confirmed, so the next install does not
+ask them again. Pass `--remove-spack` to delete the Spack store too,
+`--forget-decisions` to delete the answers, and `--yes` to approve on the
+command line. To forget one answer rather than all of them, use JARVIS's
+`jarvis ppl install --forget <selector>` on the site. The next call signs in
+and deploys everything again. Every live proof starts with it, so deployment is
+tested each time.
 
-See `docs/remote-mcp-federation.md` for the full agent-facing model.
+What relay's runs wrote outside its own directories, such as a case's results
+under your home, is yours, so clean keeps it. Runs write under the site's
+`outputs_dir` (`~/clio-relay-runs` unless set), outside relay's directories:
+JARVIS's shared directory for each job lives there, linked from the job
+directory, so a clean removes the link and never the outputs. Relay names a
+run's outputs where they live, under the outputs directory, never through that
+link. A run or service
+whose job names a path inside relay's directories is refused before anything is
+asked, with the outputs directory to use instead. The question names the
+outputs, taken from the operations' records, and the result lists them as
+`outputs_kept`. Each job relay sent to the site, an install's check and build
+included, has its directory under the outputs directory even when its record
+names no file there, so the question lists those directories too. Pass
+`--remove-outputs` (`remove_outputs` over MCP) to delete
+them with the rest; the question then says it deletes them.
 
-## Federate a registered remote MCP server
+A clean keeps JARVIS's recorded answers unless you pass `--forget-decisions`, and
+its question says so. A take that must start from nothing, asking which MPI and
+where installs run again, cleans with `--forget-decisions`.
 
-Register only the tools an agent should see, then refresh their schemas through
-a durable cluster-side `tools/list` job:
+Clean removes nothing while one of relay's jobs still runs on the site, since
+its directory is among what goes. It does not trust relay's records alone: it
+asks the site's scheduler (`squeue`, `bjobs`, `flux jobs` or `qstat`) for your
+jobs named `relay-...` and the job ids relay's records hold in any state, so a
+job whose operation already ended, or that another relay host started in this
+site's directories, still counts, and the prune on the site checks once more
+before it deletes. A `relay-...` job the scheduler reports working outside this
+site's directories and outputs directory (Slurm's working directory) belongs to
+another relay home and does not stop the clean. The refusal
+names each job, its operation and its state. Cancel them first, then clean
+again:
 
-```powershell
-uv tool install --python 3.12 --no-config C:\artifacts\science_mcp_kit-1.4.0-py3-none-any.whl
-clio-relay remote-mcp register --cluster my-cluster --name science --command science-mcp --env-from SCIENCE_API_TOKEN=SITE_SCIENCE_API_TOKEN --allow-tool inspect_dataset --profile user --call-timeout-seconds 300
-clio-relay remote-mcp refresh --cluster my-cluster --name science
-clio-relay remote-mcp reload --profile user
-clio-relay remote-mcp validate --cluster my-cluster --name science --tool inspect_dataset --arguments-json-file .\inspect-arguments.json --output-json .\validation\remote-mcp.json
+```bash
+clio-relay cancel op_3f9c... +json
 ```
 
-Release validation can additionally require contract-specific
-`structuredContent` semantics with `--result-expectation-json` or
-`--result-expectation-json-file`. The expectation is validated against the
-registered semantic contract and selected tool before relay dispatch. For the
-Spack user contract, it can bind an exact package name and DAG hash, the unique
-locate prefix and canonical `/hash` load spec, or installed status with the
-requested reuse setting. The resulting `remote-mcp.structured-result` check and
-`structured_result_assertion` job metadata are suitable for release-policy
-constraints; successful text content cannot substitute for structured data.
+`cancel` does what the `cancel` tool does: it cancels a job from `run` or stops
+a service from `serve`, withdraws the questions still pending on it, and prints
+the operation as it ends. On an operation that already ended whose job the
+scheduler still lists, it cancels that job and notes it in the operation's
+history.
 
-For clio-kit's scientific catalog, register the current
-`clio-kit-scientific-catalog-user-v1.1` contract. Its describe result exposes an
-exact top-level `dataset_descriptor` for direct handoff to
-`jarvis_add_step(config.dataset_descriptor=...)`; do not pass the surrounding
-catalog `dataset` record to JARVIS. Historical
-`clio-kit-scientific-catalog-user-v1` registrations remain valid against their
-own preserved digest, but do not claim this explicit handoff shape.
+Over MCP the `site_clean` tool does the same, keeping the Spack store, the
+answers and the runs' outputs; its `forget_decisions` argument deletes the
+answers and `remove_outputs` the outputs. It asks
+the person on every call, open site or guarded, with a question bound to what
+it will remove; once the person says yes, the same call, or the next one with
+the same site, cleans. It refuses while one of relay's jobs still runs, the
+same way.
 
-The wheel path is an operator-supplied immutable artifact. A PyPI requirement
-string is insufficient for user-profile evidence. A direct console script is
-accepted only when it belongs to one non-editable installed distribution and
-every file in that distribution's `RECORD` closure verifies.
+## Stage and remove packages
 
-The generated alias is normally `remote_science_inspect_dataset`. Its local
-schema contains a `cluster` selector; the remote call receives only the
-discovered server arguments. Stale schemas and command-changed cache entries
-are hidden until the operator refreshes them. `reload` is local and performs no
-remote execution.
-
-The alias returns a durable relay job handle, so its local `outputSchema`
-describes that handle rather than copying the remote tool's synchronous result
-schema. The worker enforces the registration's call timeout and bounded MCP
-stdout, stderr, and response sizes. Read the completed `mcp_result` artifact for
-the upstream tool result.
-
-`--env-from` stores variable-name references only. The worker gives the MCP
-child a minimal runtime environment plus those references; it does not inherit
-the worker's remaining environment. Relay API, frp, progress, runtime-metadata,
-and STCP credentials cannot be referenced. Schema discovery follows bounded
-MCP pagination and records its page, tool, and response-byte limits in the
-durable result.
-
-## Manage Streaming Service Runtimes
-
-Use gateway sessions for scheduler-backed services that need to survive long enough for a desktop to connect, such as a visualization service, Jupyter-like service, remote MCP server, or long-running agent service.
-
-For a managed runtime, describe the application generically with `ServiceRuntimeSpec`. In production, `submit_command` should invoke a JARVIS package or pipeline. That package owns the application launch, scheduler script, readiness behavior, logs, provenance, and any application-specific stream protocol. The relay waits for the allocated node and service health, starts the cluster-side frp connector, starts the desktop visitor, records both owned PIDs/configs/logs, and returns desktop-local URLs.
+`run` takes only packages relay has staged, so a package is staged before its
+first run. The catalog and the archives live on the relay host, under relay's
+state directory, not on any site: `site clean` leaves them alone, and staging
+deploys nothing. The `packages` tool does it over MCP:
 
 ```json
-{
-  "kind": "streaming-http-service",
-  "deployment_driver": "jarvis",
-  "submit_command": [
-    "jarvis",
-    "run",
-    "/remote/service-runtime.yaml",
-    "--set",
-    "RELAY_APPLICATION_PORT=18777"
-  ],
-  "status_command": [
-    "jarvis",
-    "runtime",
-    "status",
-    "{scheduler_job_id}"
-  ],
-  "cancel_command": [
-    "jarvis",
-    "runtime",
-    "cancel",
-    "{scheduler_job_id}"
-  ],
-  "service_port": 18777,
-  "health_path": "/healthz",
-  "stream_mode": "push",
-  "stream_path": "/live-data",
-  "event_stream_path": "/events",
-  "state_path": "/state",
-  "compatibility_paths": {
-    "snapshot": "/debug/snapshot"
-  },
-  "desktop_bind_addr": "127.0.0.1",
-  "desktop_bind_port": 28777,
-  "proxy_name": "my-service-session",
-  "transport_mode": "frp-stcp-wss",
-  "readiness_timeout_seconds": 900,
-  "poll_seconds": 5,
-  "scheduler": "external",
-  "connect_url_template": "http://{bind_addr}:{bind_port}"
-}
+{"op": "stage", "package": "clio_jarvis.xcompact3d"}
+{"op": "stage", "package": "demo.hello", "dir": "/home/me/src/demo"}
+{"op": "remove", "package": "clio_jarvis.xcompact3d"}
 ```
 
-```powershell
-clio-relay gateway start-runtime --cluster my-cluster --name my-live-service --runtime-json-file .\runtime.json --owner-session-id desktop-session --owner-session-generation-id <generation-id>
-clio-relay gateway get <session-id>
-clio-relay gateway detach-runtime <session-id> --cluster my-cluster
-clio-relay gateway attach-runtime <session-id> --cluster my-cluster
-clio-relay gateway stop-runtime <session-id> --cluster my-cluster --keep-scheduler-job
-```
-
-When JARVIS already owns the application execution, an agent must not construct a
-second runtime specification or submit another scheduler job. The user MCP profile
-exposes `relay_bind_jarvis_runtime` for this case. Call
-`jarvis_get_execution` with `include_service_runtimes=true` and
-`wait_for_terminal=true`, then pass one returned `service_runtime_bindings` entry
-unchanged as `binding`:
-
-```json
-{
-  "binding": {
-    "cluster": "my-cluster",
-    "source_job_id": "<relay-job-id>",
-    "source_artifact_id": "<mcp-result-artifact-id>",
-    "package_id": "paraview-1",
-    "package_name": "builtin.paraview",
-    "service_instance_id": "paraview-live-1"
-  },
-  "name": "paraview-live"
-}
-```
-
-For live acceptance, the outer relay/JARVIS source job is deliberately not
-waited to terminal. The runner polls the supported `clio-relay job status`
-surface until that running `RelayJob` contains valid structured JARVIS runtime
-metadata, then performs the query and bind while retaining the source job. A
-failed or canceled source job, malformed metadata, or the existing acceptance
-timeout fails closed. If the execution is running before its selected service
-reports ready, the runner repeats the identity-bound execution query within the
-same deadline; a nonempty selector mismatch or multiple matches fails
-immediately. The `wait_for_terminal=true` argument above is scoped to
-the inner `jarvis_get_execution` MCP dispatch; it does not replace the live
-source-job poll or wait for the scheduler allocation to end.
-
-The compact binding contains selectors only. The bind operation accepts no host,
-port, endpoint path, dataset descriptor,
-scheduler identity, or lifecycle command from the caller. It verifies the exact
-completed relay job, artifact SHA-256, installed MCP-server artifact digest,
-structured protocol result, native JARVIS execution identity, scheduler-provider
-boundary, ready `jarvis.service-runtime.v2` report, execution-owned bearer digest,
-and dataset fingerprint. It
-accepts only `clio-kit.jarvis-execution.v2` from the configured artifact-bound
-clio-kit JARVIS MCP; `jarvis_run` and historical execution v1 results are not
-reinterpreted as containing service runtimes. It then starts only the remote frp
-connector and desktop visitor and persists an
-immutable `clio-relay.jarvis-service-runtime-binding.v2` provenance record in the
-gateway session. The result returns the gateway session plus `connect_url`,
-`health_url`, `stream_url`, `events_url`, `state_url`, and `command_url`.
-Those URLs are strings only when `outcome` is `ready`. A connector or health
-observation miss returns a normal `outcome: "pending"` result with all six URLs
-null, `scheduler_action` and `relay_action` both `none`, and an exact
-`retry_selector`. Repeat `relay_bind_jarvis_runtime` with the same binding, name,
-and transport policy to resume the deterministic gateway; observation timeout
-never authorizes a second connector, scheduler submission, cancellation, or
-gateway. Immutable policy drift is rejected before mutation. The CLI
-`gateway attach-runtime` command preserves the same pending outcome and selector.
-
-Detach stops only the owned desktop connector. Stop removes the owned relay
-connectors while retaining the JARVIS scheduler job by default. An explicit
-scheduler cancellation is fail-closed: the relay re-reads and re-verifies the
-source artifact and exact provider/native identity immediately before requesting
-provider cancellation. Generic gateway create/update/close calls cannot modify or
-erase the binding.
-
-JARVIS service endpoints remain loopback-only inside the allocation and require
-the exact 256-bit execution-owned bearer capability on every request, including
-health probes. Public `jarvis.service-runtime.v2` output contains only
-`{scheme: "bearer", token_sha256: ...}`. Once the complete durable MCP artifact has
-been re-verified, relay invokes JARVIS's private authority resolver with the exact
-execution, pipeline, package, service-instance, revision, and digest identities.
-The resolver response is rejected on any identity or digest drift. The raw bearer is
-never written to MCP artifacts, gateway records, connector configuration, command
-arguments, browser URLs, model-facing results, or process logs. Relay resolves it
-independently for each readiness, reconnect, or proxy-launch operation. A browser
-attachment transfers it over anonymous stdin to the owned loopback proxy, which
-retains it only in process memory for the attachment lifetime. Unauthenticated v1
-records may re-verify an already persisted v1 binding but cannot create a new binding.
-
-For SLURM,
-relay resolves the exact job with the configured scheduler provider, requires
-`NumNodes=1`, verifies that `BatchHost` is the sole expansion of `NodeList`, and
-launches a detached `srun --jobid ... --overlap --exact --nodes=1 --ntasks=1
---nodelist=<verified-BatchHost>` with private launcher output, then boundedly resolves
-its exact `job.step` by a unique step marker and host. That step identity is durably
-stored with the placement evidence; the login-node `srun` launcher is never recorded
-as the connector PID. Failed registration terminates the launcher. Missing,
-ambiguous, or multi-node placement and ambiguous marker recovery are rejected.
-Detach checks that exact step with `squeue --steps=job.step`. Stop cancels only
-`scancel job.step`, waits for provider-confirmed step absence, and retains the
-parent scheduler job by default. Relay readiness re-verifies the exact durable
-JARVIS execution, package, service, endpoint, dataset-descriptor, revision, and
-authorization identities. For authenticated v2 services it then proves the health
-endpoint is protected (the request without authorization must return 401) and live
-(the request with the resolved bearer must return 2xx), without interpreting the
-application response body. JARVIS packages own application-specific readiness
-before reporting `READY`; consumers such as VIGIL own ParaView health, state,
-dataset, and scene validation after browser attachment. Relay continues to proxy
-the declared state and command endpoints but contains no ParaView-specific schema
-or scene policy.
-
-Sandboxed MCP-UI iframes have the browser origin `null` and cannot attach headers
-to `EventSource`. Do not add broad CORS to the remote application and do not put a
-browser capability in the normal bind or gateway record. After verifying the exact
-ready gateway and `gateway.jarvis_runtime_binding`, the trusted desktop viewer
-issues an explicit short-lived attachment:
-
-```powershell
-clio-relay gateway browser-attach <session-id> --cluster my-cluster --ttl-seconds 1800
-clio-relay gateway browser-detach <session-id> --cluster my-cluster --attachment-id <attachment-id>
-```
-
-`browser-attach` returns one `clio-relay.browser-attachment.v1` document containing
-the attachment id, expiry, and capability-bearing connect, health, stream, events,
-state, and command URLs. This is the only output containing the raw 256-bit
-capability. The gateway record stores only the digest, expiry, local proxy identity,
-and revocation metadata. The loopback proxy requires the exact capability and
-`Origin: null` on every request, emits only `Access-Control-Allow-Origin: null`,
-never emits a wildcard, accepts only the advertised paths and narrow
-GET/POST/OPTIONS contract, bounds request bodies and upstream idle time, and strips
-the browser capability before forwarding and injects the independently verified
-JARVIS service bearer only on the private upstream hop. The capability and service
-bearer reach the proxy in one bounded JSON document over an anonymous inherited
-stdin pipe that is immediately closed; they never enter its environment,
-configuration file, process arguments, records, sidecars, or logs. Detach durably
-writes a revocation marker before
-stopping the owned proxy; same-id retries return an idempotent revoked result, while
-a different attachment id is refused.
-
-Use `transport_mode: "frp-stcp-wss"` for the relay path and `transport_mode: "frp-xtcp-wss"` for direct NAT-bypass attempts. By design the application stream rides the connection's one link like all other traffic — compute node to the cluster relay over cluster-internal connectivity, then the cluster relay to the local relay over whatever link the connection is configured with (relay-point TCP, or the held ssh forward; the stream's semantics are identical in every mode). The current `transport_mode` implementation deviates: it opens a compute-node-side frp transport that bypasses the cluster relay and has no ssh-pathway equivalent — tracked on the connection-model restoration, issue #179.
-
-The default service contract is push-based. A desktop client subscribes once to `stream_url`, and the remote application pushes data, images, frames, or domain records as they are emitted. The relay does not assume any application-specific endpoint shape. Pull-style endpoints are represented only as named `compatibility_paths`, such as `snapshot`, `render_once`, or `state_dump`.
-
-The JARVIS package must emit structured JSON records for the runtime supervisor. The submit command must eventually print a JSON object with `scheduler_job_id` and may include `service_host` when allocation is already known:
-
-```json
-{"scheduler_job_id":"12345","service_host":"compute-01"}
-```
-
-If `service_host` is not known at submission time, provide `status_command`. The status command must print JSON such as:
-
-```json
-{"state":"allocated","service_host":"compute-01","reason":null,"events":[{"type":"progress","source":"jarvis_package","package":"example_stream","message":"runtime allocated"}]}
-```
-
-The JARVIS package is the source of application monitoring. It can watch stdout, stderr, readiness files, or application-specific control channels, then report generic structured events and the allocated `service_host` through its status output or through the service's push stream. The service runtime supervisor does not parse scheduler command output, scheduler environment variables, or application logs.
-
-`scheduler` is an explicit ownership boundary. Use `external` only when the deployment driver owns scheduler observation and cancellation; in that mode `status_command` and `cancel_command` provide those lifecycle operations. Use a registered provider name such as `slurm` when relay owns scheduler observation and cancellation. The relay then invokes that provider on the cluster for normalized status, queue metadata, target identity, and exact-job cancellation, while the deployment-driver status remains responsible for application events and `service_host`. A site profile for a SLURM cluster must therefore declare `"scheduler": "slurm"`; the generic gateway supervisor contains no site or scheduler branch.
-
-`stop-runtime` stops owned relay connector processes. It keeps the scheduler job by default; pass `--cancel-scheduler-job` only when the user explicitly wants to stop the remote application.
-Both `detach-runtime` and `stop-runtime` return JSON resource reports and write a
-canonical validation report by default. Supplying `--validation-report` changes
-only the destination path; it does not weaken remote worker, target identity, or
-artifact provenance checks. A requested stop that cannot prove ownership is
-refused and appears under `residual_resources`. If the retained scheduler state
-cannot be observed, the gateway stays `degraded` with `cleanup_retryable: true`
-instead of being closed.
-
-Gateway submission writes a private pre-submit intent and a bounded, fsynced
-output record before publishing the canonical scheduler sidecar. Restart may
-recover the exact scheduler id from that output only when its session id,
-submission id, scheduler provider, marker, size, and digest all match. Missing
-or unreadable connector process evidence is likewise unresolved: cleanup stays
-retryable and never treats an observation error as verified absence.
-
-Manual gateway record updates remain available for ordinary endpoint metadata:
-
-```powershell
-clio-relay gateway create --cluster my-cluster --name live-service-example --gateway-json-file .\gateway.json
-clio-relay gateway update <session-id> --cluster my-cluster --state ready --node compute-01 --gateway-json-file .\gateway-ready.json
-clio-relay gateway get <session-id> --cluster my-cluster
-clio-relay gateway close <session-id> --cluster my-cluster
-```
-
-Generic CLI, HTTP, and MCP gateway writes reject scheduler provider/native ids,
-relay runtime specifications and ownership intents, connector ownership, and
-relay owner metadata. Use `start-runtime` for a relay-owned scheduler-backed
-service and `detach-runtime` or `stop-runtime` for its lifecycle. `close` only
-marks an ordinary durable record closed; the core refuses it for an owned
-runtime until `stop-runtime` has proven connector cleanup.
-
-## Use FRP Transport
-
-frp is the primary transport. Use it whenever the desktop and cluster can both
-reach a relay host, including when SSH between them also happens to work. Both
-sides dial outbound and the relay host brokers a handshake that joins them into
-the connection's one link; neither side accepts inbound, and the relay host
-stores nothing. After bring-up this mode opens no ssh connections at all.
-
-```powershell
-$env:CLIO_RELAY_FRP_TOKEN = "<shared-frp-token>"
-$env:CLIO_RELAY_STCP_SECRET = "<shared-stcp-secret>"
-clio-relay cluster add --name my-cluster --ssh-host my-cluster-login --frp-server-addr relay.example.edu
-clio-relay relay-host render-frpc-config --cluster my-cluster --local-port 8848
-clio-relay relay-host render-frpc-visitor-config --cluster my-cluster --bind-port 8765
-clio-relay relay-host test-http-transport --cluster my-cluster --local-bind-port 18765
-```
-
-For Cloudflare-backed homelab deployments, configure the cluster transport as `wss` over port `443`. For a raw public relay host, configure `tcp`.
-
-## Use SSH Forwarding
-
-SSH forwarding is the fallback. Use it when no relay host is reachable from both
-sides, as on DOE-class infrastructure. One local port forward is established at
-bring-up, with the user present for its interactive authorization, and is held
-for the lifetime of the connection; every later message rides the mapped port.
-
-The connection's ssh budget in this mode is two: deploying the cluster relay
-(skipped when it is already deployed) and that one forward. Nothing re-dials ssh
-afterwards for status, watch, polling, recovery, cancellation, or staging. A
-protected cluster asks for interactive 2FA on each connection and the user is
-present only at bring-up, so an unattended dial is a defect even when it
-succeeds on a key-based test host. `ControlMaster` multiplexing and forward
-pooling are not remedies; they keep the wrong shape at lower cost.
-
-```powershell
-clio-relay relay-host test-ssh-transport --cluster my-cluster --local-bind-port 18766 --remote-api-port 8766 --session-id relay-ssh-test
-```
-
-For detach and reattach workflows:
-
-```powershell
-clio-relay session start --cluster my-cluster --session-id desktop-session --remote-api-port 8766 --replace
-clio-relay session status --cluster my-cluster --session-id desktop-session
-clio-relay session detach --cluster my-cluster --session-id desktop-session
-clio-relay session attach --cluster my-cluster
-clio-relay session teardown --cluster my-cluster --session-id desktop-session
-```
-
-`session start` writes a durable last-session record for the cluster (session
-id, generation id, remote API port); `session attach` reads it back, so a new
-process -- after a clean detach, after closing the terminal, or after the
-desktop process itself crashed -- finds its way back to the same remote
-session without re-supplying `--session-id`. Attach re-verifies the exact
-session/generation before reporting it live and prints the session's still-running
-jobs. `session detach` never clears this record (the remote session is left
-running on purpose); only an authoritatively closed `session teardown` does.
-
-`session attach` is also how a dropped SSH-forwarded channel is
-re-established: per the 2FA operating assumption above, a dropped channel is
-never redialed automatically from inside an operation. An owned-session
-operation that discovers the drop fails with a typed
-`authorization_required` refusal naming the recovery command; running
-`clio-relay session attach --cluster my-cluster` (or its alias, `clio-relay
-session reconnect --cluster my-cluster`) is the one explicit, user-present
-action that performs that single new dial. An already-live channel is reused
-untouched -- zero new dials.
-
-For a recorder or other client that must survive loss of the initiating process,
-run `session plan-start` first and persist its JSON. Pass the plan's operation id,
-route revision, and release digest to `session start`. The returned
-`status_selector` is self-contained and can be submitted to `session start-status`
-one observation at a time. A start result has one of these states:
-
-- `starting`: the exact durable transition is accepted; poll again whenever the
-  client chooses.
-- `ambiguous`: transport or lock evidence cannot yet prove acceptance or failure;
-  retry or query with the exact same selector.
-- `ready`: the transition completed and `session_generation_id` is the durable
-  session handle.
-- `failed`: the exact journal proves terminal failure; do not retry that operation.
-- `not_current`: another operation owns the current transition, so this selector
-  was never accepted or is no longer current; it is not retryable.
-
-Only `state="ready"` has `usable=true`. A nonterminal result may include a
-`session_generation_id` because teardown and exact recovery need to identify the
-accepted generation, but clients must treat it only as an opaque lifecycle
-handle until `usable` becomes true. They must not attach a connector, submit
-work, or present that generation as a live session. This rule also applies after
-a transport deadline: a discovered generation is not readiness evidence.
-
-`session start-status` performs one bounded observation. `session start-watch`
-repeats that exact observation for a caller-selected aggregate duration (120
-seconds by default, bounded to one hour) and can be invoked again with the same
-selector after any delay. A watch deadline returns the still-current handle with
-`watch_deadline_exceeded=true`, `terminal=false`, and `usable=false`; it does not
-change or cancel the remote transition. Exit status is 0 only for ready, 1 for a
-terminal failure/non-current selector, and 2 for a detached nonterminal watch.
-
-`session start` always emits the closed `owner-session-start-result.v1` JSON
-contract. The cluster-local mutation returns one closed
-`owner-session-start-receipt.v1` JSON object that is validated before the public
-result is built. No key/value output parser or alternate text result can infer
-readiness. Exit status is 2 for a nonterminal handle so callers cannot mistake it
-for an attached API. Automation should persist the returned secret-free status
-selector.
-
-There is deliberately no aggregate start wait deadline in the relay contract.
-Each status observation is bounded so a client remains responsive, but a
-deadline produces `starting` or `ambiguous`, never a fabricated terminal failure.
-A status observation is a request over the connection's established link; it
-never opens transport of its own, and a bounded deadline is never a reason to
-dial again.
-The same operation id and immutable route/port/auth/release policy must be reused
-until it becomes terminal. A changed route or policy fails closed before mutation.
-
-Detach succeeds only after the exact owned remote API generation is observed
-running after the desktop resources are removed. Teardown closes the owner
-generation only after the API, connectors, gateway records, scheduler
-dispositions, and any requested worker service stop are verified. Worker stop
-evidence must report the exact service as `inactive` or `not-found`; transitional
-or unknown systemd states remain retryable. The default canonical report has the
-same checks and remote installation provenance as an explicitly named report.
-Gateway records must carry that same owner-session generation. A legacy or damaged
-record with only the session id is reported as an ambiguous residual and is not
-stopped or closed automatically.
-
-Teardown writes a durable cleanup intent before its first side effect. Its
-operation id and job/worker policy are returned in `cleanup_evidence`; retry with
-the same flags only. A different policy is rejected, and a committed teardown
-cannot be changed into attach or detach. Evidence must contain exactly one local
-and remote connector result for each owned gateway record. Closed-gateway retries
-recreate that evidence idempotently. Remote session commands are wall-clock
-bounded, so an unavailable host produces an explicit failed report instead of an
-unbounded shutdown.
-
-If `session start` reaches its local transport deadline after the remote command was
-accepted, query `session start-status` with the persisted selector. A later ready
-transition is adopted only after the signed startup receipt, exact systemd scope,
-API leader, auth policy, generation-scoped registry, and durable core admission all
-agree. A concurrent transition lock remains `starting` or `ambiguous`; it is not
-converted into terminal failure. A later `session teardown` also waits on that
-protected transition lock before reading metadata. Successful cleanup replaces
-secret-bearing metadata with a sanitized generation receipt, removes only the
-verified session PID, log, and cluster-registry files, and uses that receipt for
-same-policy idempotent retries.
-
-Failure before normal API metadata is committed follows the same fail-closed
-cleanup model. Teardown validates the start journal, exact generation admission,
-predeclared or contained systemd scope, bounded owned-job membership, and exact
-startup-file identities before stopping or deleting anything. It then persists
-a sanitized `clio-relay.owner-session-failed-cleaned-receipt.v1`; recovery
-reports this terminal internal state as `failed_cleaned`, while the public start
-result remains terminal `failed` and non-retryable. The receipt makes an
-identical cleanup retry safe and allows a later fresh start to distinguish a
-finished cleanup from abandoned startup state. This path preserves owned relay
-and scheduler jobs by default. It cancels relay jobs only with `--cancel-jobs`,
-cancels their proven scheduler jobs only with the additional
-`--cancel-scheduler-jobs`, and stops the persistent endpoint only with
-`--stop-worker`.
-
-Owned-session start/status is control-plane lifecycle only. It does not wait for,
-cancel, or assign a terminal deadline to scheduler or JARVIS work. A scheduler job
-may remain queued or `PENDING` for hours or days and remains queryable by its own
-durable execution/job handle. Scheduler cancellation is performed only by the
-explicit teardown flags documented below; the default remains to preserve jobs.
-
-`session start` requires `CLIO_RELAY_API_TOKEN` by default and fails before opening
-the remote API when it is absent. An unauthenticated API requires the explicit
-`--no-require-token` operator choice and must not be used for release acceptance.
-That restricted loopback mode exposes health and identity diagnostics only;
-session-scoped submissions and private authority resolution remain unavailable.
-Owner-bound desktop clients set `CLIO_RELAY_OWNER_SESSION_CLUSTER` to the selected
-cluster. `CLIO_RELAY_REMOTE_CLUSTER` identifies the cluster where the current
-process is running and must not be set on the desktop merely to select an owned
-session route. When both variables are present, they must identify the same
-cluster; a mismatch is rejected before admission.
-
-To clean up the persistent worker too:
-
-```powershell
-clio-relay session teardown --cluster my-cluster --session-id desktop-session --stop-worker
-```
-
-The safe teardown default is `--keep-jobs --keep-scheduler-jobs`. Canceling both
-relay and scheduler work requires both explicit flags:
-
-```powershell
-clio-relay session teardown --cluster my-cluster --session-id desktop-session --cancel-jobs --cancel-scheduler-jobs --preserve-scheduler-job-id unrelated-validation-job
-```
-
-Jobs submitted through the owned session API are stamped with the server-side
-`owner_session_id` and `owner_session_generation_id`; clients cannot supply those
-metadata fields. Every owned job submission must authenticate with the relay API
-token and send `X-Clio-Relay-Owner-Session-Id` and
-`X-Clio-Relay-Session-Generation-Id` matching the API process exactly. Missing,
-stale, or mismatched bindings are rejected before queue admission. Teardown
-discovers active jobs with that exact ownership record, plus terminal relay
-submission jobs that still carry an owned scheduler identity. It never treats all
-jobs on a cluster as session-owned. A scheduler id is cancelable only when an
-authenticated JARVIS ownership record binds it to the exact relay job and task and
-agrees with the cluster's configured provider. Raw runtime fields and legacy stdout
-ids are reported as refused residuals. The scheduler flag is rejected unless
-`--cancel-jobs` is also present; relay jobs are canceled relay-only, followed by one
-exact scheduler cancellation and verification path so duplicate provider
-cancellation requests cannot race. Release acceptance
-also supplies one or more repeatable `--preserve-scheduler-job-id` values. Each
-sentinel must be active and absent from both owned and unowned scheduler identities
-for the target session generation before cancellation. After owned cancellation it
-must still be active or have completed naturally; canceled, failed, unknown, or
-unqueryable sentinels fail the cleanup report. The option is rejected unless both
-cancellation flags are explicit.
-
-If the scheduler reports `completed` or `failed` while cancellation is being
-requested, cleanup records a verified terminal outcome and can close the owned
-session. The explicit scheduler-canceled validation check still fails, because a
-natural terminal race is not cancellation evidence.
-
-Queued relay cancellation is acknowledged immediately. Leased and running jobs are
-cooperative: teardown waits for the worker to terminate its owned execution and
-write durable cleanup acknowledgment before stopping gateways or the session API.
-The wait defaults to 30 seconds and can be tuned with
-`--relay-cancel-timeout-seconds` and `--relay-cancel-poll-seconds`. A timeout leaves
-the session generation intake quiesced for a safe retry. Teardown does not start
-gateway/API cleanup when an initially discovered cancellation is still pending; it
-also rescans for in-flight submissions after the API stops and before gateway
-cleanup.
-
-Inspect provider-normalized scheduler state independently:
-
-```powershell
-clio-relay scheduler status 12345 --cluster my-cluster
-```
-
-For release acceptance, use the deterministic held-job orchestrator instead of
-hoping a normal job remains pending long enough to sample:
-
-```powershell
-clio-relay scheduler validate-lifecycle --cluster my-cluster --report .clio-relay/validation-reports/scheduler-lifecycle.json
-```
-
-It owns one bounded validation job, observes pending before release, proves allocation
-from assigned nodes, observes a fresh running state, and waits for completion. A failed
-run cancels only the exact job id it submitted and records cleanup in the JSON report.
-
-## Live Acceptance
-
-```powershell
-clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --report .clio-relay\validation-reports\validation-my-cluster-live-test.json
-```
-
-A complete live acceptance should verify the cluster bootstrap, worker service, transport, JARVIS package execution, logs, artifacts, provenance, progress, and agent tool submission path.
-
-`--timeout-seconds` bounds one observation, not the lifetime of an HPC job. If
-the primary relay job remains queued or running, live JARVIS metadata is not yet
-available, or a secure-runtime query/bind remains nonterminal, `live-test`
-writes a `pending` report. Its strict checkpoint records the exact cluster,
-run id, relay job, idempotency key, phase, and any known pipeline, execution,
-source-artifact, service, or gateway identities. It has no TTL and requests no
-scheduler or relay cancellation.
-
-Resume that exact observation after any delay while passing the same semantic
-inputs:
-
-```powershell
-clio-relay live-test --cluster my-cluster --jarvis-yaml .\path\to\site-acceptance.yaml --resume-report .clio-relay\validation-reports\pending-live-test.json --timeout-seconds 900
-```
-
-The resume writes a new sibling report and preserves the source checkpoint. It
-queries the recorded phase/job in place; it does not submit another primary
-JARVIS run. Changed cluster configuration, pipeline content, validation intent,
-or checkpoint evidence is rejected before any remote command. A deterministic
-failed/canceled workload or malformed/integrity-invalid runtime result remains
-a failed validation. The release gate continues to reject `pending` reports.
-
-When a package adapter or runtime metadata artifact is present, the text and machine-readable reports also record `application_boundary`, `application_profile`, `package_adapter`, `package_owner`, `runtime_metadata_source`, `runtime_scheduler_provider`, `runtime_scheduler_job_id`, its field-level source, and the runtime artifact id. `structured_runtime_metadata=legacy_fallback` is evidence of a compatibility path, not proof that structured runtime ingestion passed the 1.0 gate.
+The `packages_read` tool lists what is staged. It takes no arguments and only
+reads, so a host that allows only reads (a plan mode) can call it.
+
+With only a package name, relay stages it from its package sources: the
+directories `CLIO_RELAY_PACKAGE_SOURCES` names (`os.pathsep` apart), listed in
+the result's `sources`. Each is a JARVIS repository, a checkout that holds one,
+or a folder of such checkouts. The host fills them when it installs relay, so
+staging fetches nothing and runs no git, and it works for anyone, with no
+account and no write access to any repository. The CLIO plugin ships a copy of
+clio-jarvis at its pinned commit and points `CLIO_RELAY_PACKAGE_SOURCES` at it.
+A copy says where it came from in a `.clio-relay-source.json`, which goes into
+the archive; a git checkout says it through git, read only. With no source that
+holds the package, the refusal names the repository and the directories relay
+looked in. A `dir` is a directory on the relay host, such as a package the
+person wrote: it is never pushed anywhere, and its archive reaches a site as a
+job input through the site adapter's transfer (scp for ssh). Each call returns
+`relay.packages.v1`: what
+it staged or removed, and the catalog after it. Removing takes every version
+of the package out of the catalog unless `version` or `sha256` narrows it, and
+drops each archive from the content store unless an unfinished operation still
+needs it (`archive_kept`). `python -m clio_relay.packages stage` and `list` do
+the same from a shell. See [guarded sites](guarded-sites.md#running-a-package)
+for how a guarded site reviews a staged package.
+
+When the package sources change, for example after a plugin update ships a
+newer clio-jarvis, a name follows them. A stage or run by name, `list` and
+`describe` build the name's archive from the current sources. If its SHA-256
+is new, relay stages it and marks the older archives of that name with
+`superseded_by`. A name then never resolves to a superseded archive, so a run
+pins the new one and a guarded site asks its review again. A superseded archive
+stays in the catalog: an operation that pinned it keeps working, and a run that
+gives its `sha256` still uses it. An archive staged from a `dir` is never
+superseded, and `site clean` leaves the catalog alone.
+
+The archive of the same files has the same SHA-256 on any relay host, from any
+checkout and under any Python: members are sorted, with no times or owners, text
+files keep LF line ends (a Windows checkout's CRLF is packed as LF), and a file's
+mode is 0755 when it starts with `#!` and 0644 otherwise. The gzip holds stored
+(uncompressed) deflate blocks, because compressed bytes differ between zlib builds
+(CPython 3.14 on Windows links zlib-ng), so an archive is about the size of its
+files.

@@ -13,13 +13,13 @@ Read this file before changing the repository.
 
 ## Detailed Context
 
-Agent-oriented context lives in `docs/ai/`:
+Read these before making non-trivial implementation changes:
 
-- `docs/ai/README.md`: map of the agent context files.
-- `docs/ai/system-context.md`: full architecture and behavior notes.
-- `docs/ai/testing-context.md`: verification expectations and live acceptance notes.
-
-Read those files before making non-trivial implementation changes.
+- `CONTRIBUTING.md`: the layout, read top-down, and the checks.
+- `docs/architecture.md`: how a call moves through relay.
+- `src/clio_relay/adapters/base.py` and `docs/adding-an-adapter.md`: the adapter contract.
+- `docs/files.md`: the files semantics every adapter follows.
+- `docs/design/relay-rework-ledger.md`: decisions and their history.
 
 ## Local Checks
 

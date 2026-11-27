@@ -1,0 +1,434 @@
+"""The desktop end of a served port: a loopback bind that comes back (RL20, RL22, RL23).
+
+A forward is relay's own frp visitor (``clio_relay.frp_visitor``), or relay's own
+ssh forwarder (``clio_relay.adapters.ssh.forwarder``). A site that signs in with a
+code forwards over the connection relay holds instead, and that forward ends with relay.
+Relay watches its process and starts it again on the same port when it dies,
+counting each restart so the person can see it. Whether the port is bound is
+read by trying to bind it, never by connecting, because some services (a
+``pvserver``) give themselves to the first client that connects.
+
+The forward's process is started apart from relay's (see ``detach``): a host
+may restart relay's MCP server at any time, and the desktop port stays up through
+it. The next relay process finds the ports bound and adopts the forward rather
+than starting a second one.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from clio_relay import frp_visitor, programs
+from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.serve import detach, frp
+from clio_relay.serve.forward_exit import (
+    classify_exit,
+    port_bound,
+    port_state,
+    port_unusable,
+)
+from clio_relay.serve.forward_lock import ForwardLock
+from clio_relay.serve.forward_pid import is_ours as _is_ours
+from clio_relay.serve.plan import ServePlan, free_loopback_port
+
+MAX_BACKOFF_S = 30.0
+POLL_S = 1.0
+CLOSED_MARKER = "closed"
+"""In a forward's directory: relay shut, stopped or cancelled it, so no process restarts it."""
+
+
+def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[str, str]]:
+    """Write the visitor configuration and return the visitor's argv and environment.
+
+    The visitor is relay's own (``clio_relay.frp_visitor``), run by this interpreter,
+    so the desktop needs no frpc program.
+    """
+    rendezvous = plan.rendezvous
+    if rendezvous is None:
+        raise Refusal(RefusalReason.INVALID_CONFIG, "no rendezvous host is set")
+    ca_file: str | None = None
+    if rendezvous.protocol == "wss":
+        ca_file = (
+            os.path.expanduser(rendezvous.ca_file) if rendezvous.ca_file else frp.default_ca_file()
+        )
+    common = frp.desktop_common(rendezvous, ca_file)
+    config = frp.render_visitor(
+        common,
+        [(port.name, port.local_port) for port in plan.ports],
+        plan.operation_id,
+        direct=rendezvous.direct,
+        direct_wait_s=rendezvous.direct_wait_s,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "visitor.toml"
+    path.write_text(config, encoding="utf-8")
+    env = dict(os.environ)
+    env[frp.ENV_TOKEN] = rendezvous.token()
+    env[frp.ENV_SECRET_KEY] = plan.secret_key
+    return frp_visitor.command(path), env
+
+
+def ssh_command(
+    plan: ServePlan, env: dict[str, str] | None = None, known_hosts: Path | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """Return relay's detached forwarder that holds every port of an ``ssh`` site's service.
+
+    ``known_hosts`` holds the compute node's keys read on the login host; the
+    forwarder checks it after the person's own known_hosts.
+    """
+    from clio_relay.adapters.ssh import forwarder
+
+    if not plan.ssh_argv:
+        raise Refusal(RefusalReason.INVALID_CONFIG, "the adapter gave no ssh command")
+    merged = {**os.environ, **(env or {})}
+    base, destination = plan.ssh_argv[:-1], plan.ssh_argv[-1]
+    ports = [(port.local_port, port.remote_port) for port in plan.ports]
+    argv = forwarder.command(base, destination, ports, _node(plan), known_hosts)
+    return argv, merged
+
+
+def _node(plan: ServePlan) -> str | None:
+    """Return the compute node behind the login host, if the service runs on one."""
+    if plan.host and plan.login_host and plan.host != plan.login_host:
+        return plan.host
+    return None
+
+
+def forward_marker(plan: ServePlan, directory: Path) -> str:
+    """Return what a forward's command line holds, to tell it from another process."""
+    if plan.mode == "frp":
+        return str(directory)
+    return f"127.0.0.1:{plan.ports[0].local_port}:127.0.0.1"
+
+
+def mark_closed(directory: Path) -> Path:
+    """Mark a forward closed, so no relay process's watcher starts it again."""
+    with contextlib.suppress(OSError):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / CLOSED_MARKER).touch()
+    return directory
+
+
+def kill_recorded(pid: int | None, marker: str) -> bool:
+    """Stop a forward a previous relay process left behind, if it is still ours.
+
+    Returns whether it signalled one.
+    """
+    if not pid or not _is_ours(pid, marker):
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
+        else:
+            import signal
+
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+class Forward:
+    """One held desktop forward, restarted on the same port while the service runs."""
+
+    def __init__(
+        self,
+        plan: ServePlan,
+        directory: Path,
+        on_restart: Callable[[int, int | None], None],
+        *,
+        detached: bool = True,
+        on_failure: Callable[[Refusal], None] | None = None,
+    ) -> None:
+        self.plan = plan
+        self.directory = directory
+        self.on_restart = on_restart
+        self.on_failure = on_failure
+        self.detached = detached
+        self.process: detach.Process | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.restarts = 0
+        self.rebound = 0
+        self.held = False
+        self.adopted = False
+        self.failure: Refusal | None = None
+        self._respawned = False
+        self._mark = 0
+        self._in_use_polls = 0
+        self.closing = False
+        self.ssh_env: dict[str, str] = {}
+        self.connection: Any = None
+        """Relay's held ssh connection, for a site that signs in with a code; else None."""
+        self.marker = forward_marker(plan, directory)
+        self.lock = ForwardLock(directory)
+        self.elsewhere = False
+        """Another live relay process runs this forward; this one leaves it be."""
+
+    def alive(self) -> bool:
+        """Return whether this relay process started the forward and it still runs."""
+        return self.process is not None and self.process.poll() is None
+
+    @property
+    def log_path(self) -> Path:
+        """Return the forward's log."""
+        return self.directory / "forward.log"
+
+    def bound(self) -> bool:
+        """Return whether every desktop port is bound."""
+        return all(port_bound(port.local_port) for port in self.plan.ports)
+
+    def serving(self) -> bool:
+        """Return whether this forward holds every desktop port, so the service is reachable.
+
+        The ports must be bound by this relay's own running forward, or by one an
+        earlier relay process left that this one adopted. A port that something
+        else holds is not a served port.
+        """
+        held = self.alive() or self.adopted or self.elsewhere
+        return self.failure is None and self.bound() and held
+
+    def _new_lines(self) -> list[str]:
+        try:
+            with self.log_path.open("rb") as handle:
+                handle.seek(self._mark)
+                data = handle.read()
+        except OSError:
+            return []
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        return [line for line in lines if not line.startswith("relay: ")]
+
+    def last_error(self) -> str | None:
+        """Return the last line the forward logged, for a status message."""
+        try:
+            lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        return lines[-1][-300:] if lines else None
+
+    def direct_note(self) -> str | None:
+        """Return which path an XTCP forward is on, or None when it is not direct."""
+        rendezvous = self.plan.rendezvous
+        if self.plan.mode != "frp" or rendezvous is None or not rendezvous.direct:
+            return None
+        try:
+            lines = self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        return frp.direct_note(lines, rendezvous.direct_wait_s)
+
+    def _known_hosts(self) -> Path | None:
+        if not self.plan.host_keys:
+            return None
+        self.directory.mkdir(parents=True, exist_ok=True)
+        known_hosts = self.directory / "known_hosts"
+        known_hosts.write_text("\n".join(self.plan.host_keys) + "\n", encoding="utf-8")
+        return known_hosts
+
+    def _command(self) -> tuple[list[str], dict[str, str]]:
+        if self.plan.mode == "frp":
+            return visitor_command(self.plan, self.directory)
+        return ssh_command(self.plan, self.ssh_env, self._known_hosts())
+
+    def _ride_connection(self) -> None:
+        """Forward over the connection relay holds for a site that signs in with a code."""
+        from clio_relay.adapters.ssh.forwarder import InRelay
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self._mark = self.log_path.stat().st_size
+        except OSError:
+            self._mark = 0
+        ports = [(port.local_port, port.remote_port) for port in self.plan.ports]
+        self.process = InRelay.start(
+            self.connection,
+            ports,
+            node=_node(self.plan),
+            known_hosts=self._known_hosts(),
+            log=self.log_path,
+        )
+
+    async def _spawn(self) -> None:
+        if not self.held and any(
+            port_state(port.local_port) == "unusable" for port in self.plan.ports
+        ):
+            self._repick()
+        if self.plan.mode == "ssh" and self.connection is not None:
+            self._ride_connection()
+            return
+        argv, env = self._command()
+        program = programs.resolved(argv, env)
+        if program is None:
+            raise Refusal(RefusalReason.UNREACHABLE, programs.missing(argv[0]), command=argv[0])
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self._mark = self.log_path.stat().st_size
+        except OSError:
+            self._mark = 0
+        try:
+            if self.detached:
+                self.process = await asyncio.to_thread(
+                    detach.spawn, program, env, self.directory, self.log_path
+                )
+                return
+            with self.log_path.open("ab") as log:
+                self.process = subprocess.Popen(
+                    program,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=str(self.directory),
+                )
+        except OSError as exc:
+            raise Refusal(
+                RefusalReason.INVALID_CONFIG,
+                programs.start_failed(argv[0], exc),
+                command=argv[0],
+            ) from exc
+
+    async def start(self) -> None:
+        """Start the forward unless one already holds the ports, which it then adopts."""
+        if self.task is not None:
+            return
+        if not self.lock.take():
+            self.elsewhere = True
+            return
+        self.elsewhere = False
+        recorded = self.plan.forward_pid
+        if (
+            self.bound()
+            and recorded
+            and not await asyncio.to_thread(_is_ours, recorded, self.marker)
+        ):
+            # The forward relay recorded is gone and another program took its port.
+            self._log(f"the forward (pid {recorded}) is gone and another program holds its port")
+            self._repick()
+        if self.bound():
+            self.held = True
+            self.adopted = True
+            self._log(f"the ports are already bound; adopting that forward (pid {self.pid()})")
+        else:
+            await self._spawn()
+            self.on_restart(self.rebound, self.process.pid if self.process else None)
+        self.task = asyncio.create_task(self._watch())
+
+    def pid(self) -> int | None:
+        """Return the forward's process id: this process's child, else the one recorded."""
+        if self.alive() and self.process is not None:
+            return self.process.pid
+        return self.plan.forward_pid
+
+    def _repick(self) -> None:
+        """Before the first bind: move a port this desktop will not let relay bind."""
+        for port in self.plan.ports:
+            if port_state(port.local_port) != "free":
+                was, port.local_port = port.local_port, free_loopback_port()
+                self._log(f"desktop port {was} cannot be bound here; using {port.local_port}")
+        self.marker = forward_marker(self.plan, self.directory)
+        self.on_restart(self.rebound, None)
+
+    def _fail(self, refusal: Refusal) -> None:
+        self.failure = refusal
+        self._log(f"not starting the forward again: {refusal.message}")
+        if self.on_failure is not None:
+            self.on_failure(refusal)
+
+    async def _watch(self) -> None:
+        backoff = 1.0
+        while not self.closing:
+            await asyncio.sleep(POLL_S)
+            if self.closing:
+                return
+            alive = self.alive()
+            bound = self.bound()
+            if alive or bound:
+                if not alive:
+                    # Another relay process's forward holds the ports: adopt it, once
+                    # they stay held, not on one look that another socket answered.
+                    self.process = None
+                    self._in_use_polls += 1
+                    if self._in_use_polls >= 2:
+                        self.adopted = True
+                        self.held = True
+                elif bound:
+                    backoff = 1.0
+                    self._in_use_polls = 0
+                    if not self.held:
+                        # The first hold is a bind, not a rebind, even after failed tries.
+                        self.held = True
+                        self._respawned = False
+                    elif self._respawned:
+                        # Count a rebind only once the new forward holds the ports.
+                        self._respawned = False
+                        self.rebound += 1
+                        self.on_restart(self.rebound, self.process.pid if self.process else None)
+                continue
+            self._in_use_polls = 0
+            self.adopted = False
+            if (self.directory / CLOSED_MARKER).exists():
+                self._log("relay closed this forward; not starting it again")
+                return
+            lines = self._new_lines()
+            failure = classify_exit(lines, self.plan.host)
+            if failure is not None:
+                self._fail(failure)
+                return
+            self.restarts += 1
+            if not self.held and port_unusable(lines):
+                self._repick()
+            self._log(
+                f"forward ended, starting it again on the same port (restart {self.restarts})"
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
+            if self.closing:
+                return
+            try:
+                await self._spawn()
+            except Refusal as exc:
+                self._log(str(exc))
+                continue
+            self._respawned = True
+            self.on_restart(self.rebound, self.process.pid if self.process else None)
+
+    def _log(self, line: str) -> None:
+        with contextlib.suppress(OSError), self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"relay: {line}\n")
+
+    async def _stop_watching(self) -> None:
+        self.closing = True
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
+            self.task = None
+
+    async def release(self) -> None:
+        """Stop watching and leave the forward up, for the next relay process to adopt."""
+        await self._stop_watching()
+        if self.alive():
+            self._log(f"relay is stopping; the forward stays up (pid {self.pid()})")
+        self.lock.release()
+
+    async def close(self) -> None:
+        """Close the desktop ports at once."""
+        await self._stop_watching()
+        process = self.process
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.to_thread(process.wait, 5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await asyncio.to_thread(process.wait)
+        elif self.bound():
+            kill_recorded(self.plan.forward_pid, self.marker)
+        self.lock.release()

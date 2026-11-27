@@ -53,6 +53,7 @@ class FrpcConfig:
     local_ip: str = "127.0.0.1"
     local_port: int = 0
     secret_key: str = ""
+    stun_server: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class FrpcVisitorConfig:
     bind_port: int = 0
     secret_key: str = ""
     keep_tunnel_open: bool = False
+    stun_server: str | None = None
 
 
 def render_frpc_config(config: FrpcConfig) -> str:
@@ -85,6 +87,7 @@ def render_frpc_config(config: FrpcConfig) -> str:
         f"auth.token = {_toml_string(config.token)}",
         f"transport.protocol = {_toml_string(config.transport_protocol.value)}",
         "transport.tcpMux = true",
+        *_stun_lines(config.stun_server),
         "",
         "[[proxies]]",
         f"name = {_toml_string(config.proxy_name)}",
@@ -109,6 +112,7 @@ def render_frpc_visitor_config(config: FrpcVisitorConfig) -> str:
         f"auth.token = {_toml_string(config.token)}",
         f"transport.protocol = {_toml_string(config.transport_protocol.value)}",
         "transport.tcpMux = true",
+        *_stun_lines(config.stun_server),
         "",
         "[[visitors]]",
         f"name = {_toml_string(config.visitor_name)}",
@@ -126,6 +130,10 @@ def render_frpc_visitor_config(config: FrpcVisitorConfig) -> str:
 def _toml_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _stun_lines(stun_server: str | None) -> list[str]:
+    return [f"natHoleStunServer = {_toml_string(stun_server)}"] if stun_server else []
 
 
 def _toml_bool(value: bool) -> str:

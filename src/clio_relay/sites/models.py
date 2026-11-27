@@ -1,0 +1,131 @@
+"""Site entries (RL4)."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+SITE_ID_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,62}$"
+
+SitePolicy = Literal["open", "guarded"]
+SpendAsk = Literal["always", "never"] | Annotated[float, Field(gt=0)]
+
+
+class SpendPolicy(BaseModel):
+    """When the spend gate asks (RL25). A number is a threshold in node-hours."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ask: SpendAsk = "always"
+
+    def needs_approval(self, node_hours: float | None) -> bool:
+        """Return whether a job of ``node_hours`` needs a yes.
+
+        An unknown cost (None) always asks, unless the site never asks.
+        """
+        if self.ask == "always":
+            return True
+        if self.ask == "never":
+            return False
+        return node_hours is None or node_hours > self.ask
+
+
+class SiteDefaults(BaseModel):
+    """Values a job spec gets when it leaves them out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    account: str | None = None
+    queue: str | None = None
+    duration: timedelta | None = None
+    queue_wait: timedelta | None = Field(
+        default=None,
+        description=(
+            "How far off the scheduler's start estimate may be before relay asks the "
+            "person whether to move a waiting job to a partition with room for it now. "
+            "Unset means one hour"
+        ),
+    )
+
+
+class SiteEntry(BaseModel):
+    """One site in ``sites.yaml``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=SITE_ID_PATTERN)
+    name: str | None = None
+    address: str | None = None
+    adapter: str = Field(min_length=1, description="The adapter in use")
+    identity: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict[str, Any])
+    alternatives: dict[str, dict[str, Any]] = Field(
+        default_factory=dict[str, dict[str, Any]],
+        description="Other ways in: adapter name to its config, in routing order",
+    )
+    policy: SitePolicy = Field(
+        default="guarded",
+        description="open runs what the agent writes; guarded runs reviewed packages only",
+    )
+    spend: SpendPolicy = Field(default_factory=SpendPolicy)
+    defaults: SiteDefaults = Field(default_factory=SiteDefaults)
+    skill: str | None = None
+    serve: dict[str, Any] = Field(
+        default_factory=dict[str, Any],
+        description="Service settings for this site, validated by the serve hook",
+    )
+
+    @property
+    def title(self) -> str:
+        """Return the name to show a person."""
+        return self.name or self.id
+
+
+_CATALOG_ONLY = {
+    "source",
+    "description",
+    "site",
+    "site_name",
+    "summary",
+    "protocols",
+    "featured",
+}
+
+
+class CatalogEntry(SiteEntry):
+    """A site relay ships. ``source`` is the facility page its facts came from.
+
+    Entries that reach one machine in different ways share a ``site``: the page
+    shows them as one site with each entry's protocols. ``site_name`` names that
+    site when it differs from the entry's own name, ``summary`` is its short
+    line ("Illinois Tech, Slurm"), and ``protocols`` says, per protocol, what
+    reaching this site that way means.
+    """
+
+    source: str | None = None
+    description: str | None = None
+    site: str | None = Field(default=None, pattern=SITE_ID_PATTERN)
+    site_name: str | None = None
+    summary: str | None = None
+    protocols: dict[str, str] = Field(default_factory=dict[str, str])
+    featured: int | None = None
+    """Where the add dialog lists the site before the rest, 1 first; others follow by name."""
+
+    @property
+    def group(self) -> str:
+        """Return the id of the site this entry reaches."""
+        return self.site or self.id
+
+    def to_site(self, site_id: str | None = None, adapter: str | None = None) -> SiteEntry:
+        """Return a copy for ``sites.yaml``, using ``adapter`` when it is an alternative."""
+        data = self.model_dump(exclude=_CATALOG_ONLY)
+        if site_id is not None:
+            data["id"] = site_id
+        if adapter and adapter != self.adapter and adapter in self.alternatives:
+            alternatives = dict(self.alternatives)
+            data["config"] = alternatives.pop(adapter)
+            data["alternatives"] = {self.adapter: self.config} | alternatives
+            data["adapter"] = adapter
+        return SiteEntry.model_validate(data)

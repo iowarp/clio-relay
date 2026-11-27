@@ -1,0 +1,522 @@
+"""``clio-relay site clean``: remove what relay deployed on a site, so the next use redeploys.
+
+It stops relay's processes on the site first (:mod:`clio_relay.shutdown`), then
+removes this site's own deployment: its configured ``remote_dir``, which holds the
+worker and its binaries, relay's scripts and job directories, the JARVIS bootstrap
+venv with JARVIS's resource graph, and the login hop. Nothing outside it goes, so
+another relay home on the same account (its own ``remote_dir``) is untouched; a
+``hop_dir`` setting elsewhere adds only this site's hop directory. The person's
+Spack store (``<site home>/spack`` and
+``<site home>/spack-config``), and the Miniforge JARVIS installed for conda
+packages (``<site home>/jarvis-cd/site/miniforge3``), are kept unless
+``remove_spack`` says otherwise; rebuilding them takes hours. JARVIS's recorded install answers
+(``<site home>/jarvis-cd/site/decisions.yaml``: which MPI, which compiler) are
+facts about the cluster the person confirmed, so they are kept too unless
+``forget_decisions`` says otherwise; the next install then asks them again. Then it
+drops relay's local state for the site, so the next call signs in and places
+everything again. It observes the site's open operations first, through JARVIS's
+execution record, so one whose job was cancelled outside relay ends, and it
+refuses while a job of the site still runs: its directory is among what goes.
+Relay's records are not the only word on that: the site's scheduler is asked too
+(:class:`~clio_relay.adapters.base.ListsLiveJobs`), for jobs named ``relay-...``
+and the job ids relay's records hold in any state, so a job whose record ended
+while it ran, or that another relay started, also stops the clean. The prune
+on the site checks once more before it removes anything. The refusal names each
+job and its operation; cancel them with relay's ``cancel`` first. Operations still
+waiting on a person, with no job yet, are cancelled with the clean.
+
+What the site's runs wrote (a case's results, say) is the person's, not relay's
+deployment, even when a run wrote it inside relay's directories: a job writes its
+outputs to the site's outputs directory, outside them. The ask names those
+outputs, from the operations' records, and the clean keeps them unless
+``remove_outputs`` says otherwise; the result lists the ones it kept. Only what a
+run left in its own job directory (its streams, relay's records) goes with it.
+The files relay's ``files`` verb wrote or uploaded outside its directories are
+listed and kept the same way, from relay's record of them
+(:mod:`clio_relay.site_writes`).
+"""
+
+from __future__ import annotations
+
+import logging
+import posixpath
+import shutil
+from typing import TYPE_CHECKING, Any, cast
+
+from clio_relay import jarvis_plan, site_writes
+from clio_relay.adapters.base import CleansSite, ListsLiveJobs, ShutsDown
+from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
+from clio_relay.jobs.refusals import Refusal, RefusalReason
+from clio_relay.relay_state import under
+from clio_relay.shutdown import shutdown
+from clio_relay.site_prune import is_decisions, kept
+from clio_relay.surface import installing, queue_switch
+
+if TYPE_CHECKING:
+    from clio_relay.surface.service import RelayService
+
+logger = logging.getLogger(__name__)
+
+SCHEMA = "relay.site_clean.v1"
+_LISTED_OUTPUTS = 6
+
+
+def _cleaners(service: RelayService, site_id: str) -> tuple[list[Any], list[str]]:
+    """The site's adapters that can clean, primary first, and every adapter name."""
+    site = service.site(site_id)
+    names = [site.adapter, *site.alternatives]
+    cleaners: list[Any] = []
+    for name in names:
+        try:
+            adapter = service.adapter_named(site, name)
+        except Refusal:
+            continue
+        if isinstance(adapter, CleansSite):
+            cleaners.append(adapter)
+    if not cleaners:
+        raise Refusal(
+            RefusalReason.VERB_NOT_IMPLEMENTED,
+            f"no adapter of {site_id!r} can clean the site",
+            site=site_id,
+        )
+    return cleaners, names
+
+
+async def _reconcile(service: RelayService, site_id: str) -> tuple[list[str], list[str]]:
+    """Observe the site's open operations, so one whose job is gone ends first.
+
+    Returns the operations whose job still runs, and those with no job on the
+    site yet (waiting on a person), which the clean cancels. An operation
+    waiting on answered asks is not refreshed: that would submit it.
+    """
+    for record in service.operations.all():
+        if (
+            record.site != site_id
+            or record.kind not in ("run", "serve", "install")
+            or record.state.final
+        ):
+            continue
+        if record.state == OperationState.AWAITING_INPUT and not queue_switch.asking(record):
+            continue
+        try:
+            await service.refresh(record.operation_id)
+        except Exception:  # noqa: BLE001 - an op relay cannot observe still counts as running
+            logger.warning("observing %s before cleaning", record.operation_id, exc_info=True)
+    running: list[str] = []
+    waiting: list[str] = []
+    for record in service.operations.all():
+        if (
+            record.site != site_id
+            or record.kind not in ("run", "serve", "install")
+            or record.state.final
+        ):
+            continue
+        has_job = (
+            record.handle is not None
+            or installing.install_handle(record) is not None
+            or record.state not in (OperationState.AWAITING_INPUT, OperationState.SUBMITTING)
+        )
+        (running if has_job else waiting).append(record.operation_id)
+    return running, waiting
+
+
+def _known_jobs(service: RelayService, site_id: str) -> dict[str, str]:
+    """Native job ids relay's records hold for the site, in any state, and their operations."""
+    known: dict[str, str] = {}
+    for record in service.operations.all():
+        if record.site != site_id:
+            continue
+        for handle in (record.handle, installing.install_handle(record)):
+            if handle is not None and handle.native_id and not handle.native_id.startswith("pid:"):
+                known[handle.native_id] = record.operation_id
+    return known
+
+
+async def _live_on_site(
+    cleaners: list[Any], known: dict[str, str], roots: list[str]
+) -> list[dict[str, str]]:
+    """Ask the site's scheduler, through the first adapter that can, which of relay's jobs run
+    in ``roots`` (or are known by id)."""
+    for cleaner in cleaners:
+        if isinstance(cleaner, ListsLiveJobs):
+            return await cleaner.live_jobs(sorted(known), *roots)
+    return []
+
+
+async def leftover_cancel(service: RelayService, record: OperationRecord) -> OperationRecord:
+    """Cancel the job of an ended operation that the site's scheduler still lists.
+
+    A record can end while its job runs on (a lost connection read as a failure),
+    and site clean then names that job. Relay's cancel ends it all the same, and
+    notes that in the operation's history.
+    """
+    handles = [
+        handle
+        for handle in (record.handle, installing.install_handle(record))
+        if handle is not None and handle.native_id and not handle.native_id.startswith("pid:")
+    ]
+    if not handles:
+        return record
+    try:
+        adapter = service.adapter_named(service.site(record.site), record.adapter)
+        if not isinstance(adapter, ListsLiveJobs):
+            return record
+        listed = await adapter.live_jobs([str(handle.native_id) for handle in handles])
+        live = {job.get("native_id") for job in listed}
+        cancelled: list[str] = []
+        for handle in handles:
+            if handle.native_id in live:
+                await adapter.cancel(handle)
+                cancelled.append(str(handle.native_id))
+    except Refusal as refusal:
+        logger.info("cancel of ended %s: %s", record.operation_id, refusal.message)
+        return record
+    if not cancelled:
+        return record
+    note = f"cancelled job {', '.join(cancelled)}, which still ran after the operation ended"
+    with service.operations.locked(record.operation_id):
+        stored = service.operations.get(record.operation_id) or record
+        stored.history.append(StateChange(state=stored.state, note=note))
+        service.operations.put(record.operation_id, stored)
+    return stored
+
+
+def _job_operation(job: dict[str, str], known: dict[str, str]) -> str | None:
+    operation_id = known.get(job.get("native_id", ""))
+    name = job.get("name", "")
+    if operation_id is None and name.startswith("relay-op_"):
+        operation_id = name.removeprefix("relay-")
+    return operation_id
+
+
+def still_running(
+    site_id: str, running: list[str], live: list[dict[str, str]], known: dict[str, str]
+) -> Refusal:
+    """The refusal while relay's jobs run on the site: each job, its operation, and what to do."""
+    named: list[str] = []
+    jobs: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for job in live:
+        operation_id = _job_operation(job, known)
+        state = (job.get("state") or "").lower() or "live"
+        named.append(
+            f"{operation_id or job.get('name') or 'a job'} (job {job['native_id']}, {state})"
+        )
+        jobs.append({**job, "operation_id": operation_id})
+        if operation_id:
+            seen.add(operation_id)
+    named += [operation_id for operation_id in running if operation_id not in seen]
+    return Refusal(
+        RefusalReason.POLICY_REFUSED,
+        f"relay's jobs still run on {site_id}: {', '.join(named)}. Their directories are "
+        "among what goes, so the clean removes nothing while they run. Cancel them with "
+        "relay's cancel (the cancel tool, or clio-relay cancel OPERATION), or wait for "
+        "them to end, then clean again",
+        site=site_id,
+        operations=sorted({*running, *seen}),
+        jobs=jobs,
+    )
+
+
+async def plan(
+    service: RelayService,
+    site_id: str,
+    *,
+    remove_spack: bool = False,
+    forget_decisions: bool = False,
+    remove_outputs: bool = False,
+) -> dict[str, Any]:
+    """Return what clean would remove and keep, or refuse while a job of the site runs.
+
+    The site's open operations are observed first, so one whose job was
+    cancelled outside relay, or ended while nobody looked, no longer blocks it.
+    The first adapter that can clean does it, with every cleaning adapter's paths.
+    ``outputs`` are what the site's runs wrote outside their job directories; the
+    clean keeps them unless ``remove_outputs`` says otherwise.
+    """
+    running, waiting = await _reconcile(service, site_id)
+    cleaners, names = _cleaners(service, site_id)
+    known = _known_jobs(service, site_id)
+    targets: list[str] = []
+    keep: list[str] = []
+    for cleaner in cleaners:
+        found, spared = cleaner.clean_targets()
+        targets += found
+        keep += spared
+    targets = list(dict.fromkeys(targets))
+    targets += [hop for hop in _hop_dirs(service, site_id, cleaners) if not under(hop, targets)]
+    live = await _live_on_site(cleaners, known, [*targets, *outputs_dirs(cleaners)])
+    if running or live:
+        raise still_running(site_id, running, live, known)
+    outputs = run_outputs(service, site_id, targets, outputs_dirs(cleaners))
+    outputs = with_writes(outputs, site_writes.written(service.paths.state_dir, site_id), targets)
+    return {
+        "site": site_id,
+        "adapter": cleaners[0].name,
+        "adapters": names,
+        "targets": targets,
+        "keep": kept(keep, spack=not remove_spack, decisions=not forget_decisions),
+        "cancels": waiting,
+        "outputs": outputs,
+        "remove_outputs": remove_outputs,
+    }
+
+
+def _in_job_dir(path: str, operation_id: str, targets: list[str]) -> bool:
+    """Say whether ``path`` is in the operation's own job directory, inside relay's."""
+    return under(path, targets) and f"/{operation_id}/" in path + "/"
+
+
+def outputs_dirs(cleaners: list[Any]) -> list[str]:
+    """The cleaning adapters' outputs directories (``outputs_dir``), as configured."""
+    found = (getattr(getattr(cleaner, "config", None), "outputs_dir", None) for cleaner in cleaners)
+    return list(dict.fromkeys(str(item) for item in found if item))
+
+
+def _op_dir(outputs_dir: str, operation_id: str) -> str:
+    """Where the site script keeps an operation's JARVIS shared directory."""
+    base = outputs_dir.strip().rstrip("/")
+    if not base.startswith(("/", "~")):
+        base = "~/" + base
+    return f"{base}/{operation_id}"
+
+
+def _touched_site(record: Any) -> bool:
+    """Say whether the operation's JARVIS job made its directory on the site.
+
+    A run or serve does once its job is submitted; an install's first step is
+    JARVIS's check on the site, so every install does. So does a run that had an
+    install stage, which ran that check in the run's directory, even when it
+    ended before its own job was submitted. So does one JARVIS planned for its
+    card, cancelled or declined there, since the plan builds the job's directory.
+    """
+    result = cast(dict[str, Any], getattr(record, "result", None) or {})
+    staged: object = result.get(installing.INSTALL_KEY)
+    return (
+        record.kind == "install"
+        or getattr(record, "handle", None) is not None
+        or isinstance(staged, dict)
+        or isinstance(result.get(jarvis_plan.KEY), dict)
+    )
+
+
+def run_outputs(
+    service: RelayService,
+    site_id: str,
+    targets: list[str],
+    outputs_dirs: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """What the site's operations wrote outside their own job directories.
+
+    A clean leaves these unless the person asks: a case's results are the
+    person's, not relay's deployment, even when a run put them inside relay's
+    ``targets``. A path inside another listed one is left out, since keeping or
+    removing the outer one does the same to it. An output in a directory named
+    for its operation (the site's outputs directory keeps one per job) is
+    listed as that directory, which holds everything the run wrote there.
+
+    Every JARVIS job, an install's check and build too, has that directory in
+    each of ``outputs_dirs``, whether or not its record names a file in it, so
+    each run, serve and install that reached the site lists it. An install's
+    recorded outputs (the packages it built) are not listed.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    records = [
+        record
+        for record in service.operations.all()
+        if record.site == site_id and record.kind in ("run", "serve", "install")
+    ]
+    for record in records:
+        if record.kind == "install":
+            continue
+        for output in record.outputs:
+            path = output.path.rstrip("/")
+            if not path.startswith("/"):
+                continue
+            if _in_job_dir(path, record.operation_id, targets):
+                continue
+            own = f"/{record.operation_id}/"
+            size = output.size
+            if own in path:
+                path, size = path[: path.index(own) + len(own) - 1], None
+            if path in found:
+                continue
+            found[path] = {
+                "path": path,
+                "name": output.name if size is not None else record.operation_id,
+                "operation_id": record.operation_id,
+                "size": size,
+            }
+    for record in records:
+        if not _touched_site(record):
+            continue
+        for outputs_dir in outputs_dirs or []:
+            own = _op_dir(outputs_dir, record.operation_id)
+            tail = own.removeprefix("~")
+            if any(path == own or path.endswith(tail) for path in found):
+                continue
+            found[own] = {
+                "path": own,
+                "name": record.operation_id,
+                "operation_id": record.operation_id,
+                "size": None,
+            }
+    paths = sorted(found)
+    return [found[path] for path in paths if not any(path.startswith(o + "/") for o in paths)]
+
+
+def with_writes(
+    outputs: list[dict[str, Any]], written: dict[str, dict[str, Any]], targets: list[str]
+) -> list[dict[str, Any]]:
+    """Add the files relay's ``files`` verb made on the site (:mod:`clio_relay.site_writes`).
+
+    One inside relay's ``targets`` goes with them, and one inside a listed
+    output goes or stays with it, so neither is listed again.
+    """
+    listed = [str(item["path"]) for item in outputs]
+    added = [
+        {
+            "path": path,
+            "name": posixpath.basename(path),
+            "operation_id": None,
+            "size": row.get("size"),
+        }
+        for path, row in sorted(written.items())
+        if not under(path, targets) and not under(path, listed)
+    ]
+    return sorted([*outputs, *added], key=lambda item: str(item["path"]))
+
+
+def _size(count: int) -> str:
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if count >= scale:
+            return f"{count / scale:.1f} {unit}"
+    return f"{count} bytes"
+
+
+def _outputs_line(planned: dict[str, Any]) -> str:
+    outputs = cast(list[dict[str, Any]], planned.get("outputs") or [])
+    if not outputs:
+        return ""
+    shown = [
+        item["path"] + (f" ({_size(int(item['size']))})" if item.get("size") else "")
+        for item in outputs[:_LISTED_OUTPUTS]
+    ]
+    if len(outputs) > _LISTED_OUTPUTS:
+        shown.append(f"{len(outputs) - _LISTED_OUTPUTS} more")
+    named = ", ".join(shown)
+    if planned.get("remove_outputs"):
+        return f" It also deletes what relay's runs and file uploads wrote: {named}."
+    return (
+        f" It keeps what relay's runs and file uploads wrote: {named}. To delete those too, "
+        "clean again with remove_outputs."
+    )
+
+
+def _hop_dirs(service: RelayService, site_id: str, cleaners: list[Any]) -> list[str]:
+    """This site's own login hop directory, as each cleaning adapter places it.
+
+    By default it is under the adapter's relay directory, already a target; a
+    ``hop_dir`` setting puts it elsewhere, and then only this site's directory in
+    it goes, never the other sites' hops beside it.
+    """
+    try:
+        from clio_relay.serve import config as serve_settings
+    except ModuleNotFoundError:
+        return []
+    site = service.site(site_id)
+    loaded = serve_settings.load(serve_settings.settings_path(service.paths.state_dir))
+    try:
+        serve = serve_settings.site_serve(loaded, site_id, getattr(site, "serve", None))
+    except Refusal:
+        return []
+    return list(
+        dict.fromkeys(serve_settings.hop_dir_for(serve, cleaner, site_id) for cleaner in cleaners)
+    )
+
+
+def describe_plan(planned: dict[str, Any]) -> str:
+    """Return the ask's text: what goes and what stays."""
+    keeping = ", ".join(planned["keep"]) or "nothing: the Spack store and JARVIS's answers go too"
+    if planned["keep"] and not any(is_decisions(path) for path in planned["keep"]):
+        keeping += (
+            ". JARVIS's recorded install answers (which MPI, which compiler) go, so the "
+            "next install asks them again"
+        )
+    elif planned["keep"]:
+        keeping += (
+            ". JARVIS's recorded install answers (which MPI, which compiler, where installs "
+            "run) stay, so the next install does not ask them again; to be asked again, clean "
+            "with forget_decisions"
+        )
+    cancels = list(planned.get("cancels") or [])
+    waiting = (
+        f" It cancels {', '.join(cancels)}, which wait on a person and have no job yet."
+        if cancels
+        else ""
+    )
+    return (
+        f"Clean {planned['site']}? Relay stops its processes there, then deletes "
+        f"{', '.join(planned['targets'])} on the site, keeping {keeping}. The next use "
+        f"places the worker and JARVIS again.{_outputs_line(planned)}{waiting}"
+    )
+
+
+async def clean(service: RelayService, planned: dict[str, Any]) -> dict[str, Any]:
+    """Stop the site's relay processes, remove the deployment, then the local state.
+
+    A cleaner that prunes over its own connection keeps it until the prune is done.
+    """
+    site_id = str(planned["site"])
+    cleaners, _names = _cleaners(service, site_id)
+    cleaner = cleaners[0]
+    listed = cast(list[dict[str, Any]], planned.get("outputs") or [])
+    outputs = [str(item["path"]) for item in listed]
+    removing = outputs if planned.get("remove_outputs") else []
+    keep = [*planned["keep"], *([] if removing else outputs)]
+    cancelled: list[str] = []
+    for operation_id in cast(list[str], planned.get("cancels") or []):
+        record = await service.cancel(operation_id)
+        if record.state.final:
+            cancelled.append(record.operation_id)
+    spare = (
+        frozenset({cleaner.name})
+        if getattr(cleaner, "clean_over_connection", False)
+        else frozenset[str]()
+    )
+    stopped = await shutdown(service, {"site": site_id}, spare=spare)
+    report = await cleaner.clean([*planned["targets"], *removing], keep)
+    if report.get("live"):
+        raise still_running(site_id, [], list(report["live"]), _known_jobs(service, site_id))
+    if spare and isinstance(cleaner, ShutsDown):
+        try:
+            found = await cleaner.shutdown()
+        except Refusal as refusal:
+            stopped["failures"].append(
+                {"site": site_id, "error": refusal.reason.value, "detail": refusal.message}
+            )
+        else:
+            stopped["stopped"].extend({"site": site_id, **item} for item in found)
+    local: list[str] = []
+    for name in planned["adapters"]:
+        directory = service.paths.adapter_dir(site_id, name)
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+            local.append(str(directory))
+    gone = [*planned["targets"], *report.get("removed", []), *report.get("absent", [])]
+    written = site_writes.written(service.paths.state_dir, site_id)
+    dropped = [path for path in written if under(path, gone) and not under(path, keep)]
+    site_writes.forget(service.paths.state_dir, site_id, dropped)
+    return {
+        "schema": SCHEMA,
+        "site": site_id,
+        "adapter": planned["adapter"],
+        "shutdown": stopped,
+        "removed": report.get("removed", []),
+        "kept": report.get("kept", []),
+        "absent": report.get("absent", []),
+        "refused": report.get("refused", []),
+        "local_removed": local,
+        "cancelled": cancelled,
+        "outputs_kept": [path for path in outputs if not removing],
+    }

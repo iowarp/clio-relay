@@ -28,10 +28,10 @@ import os
 
 import pytest
 
+from clio_relay.adapters.worker.frpc_unit import render_frpc_proxy_toml
 from clio_relay.cluster_config import ClusterDefinition, FrpTransportConfig
 from clio_relay.frp_proxy_naming import canonical_proxy_name
 from clio_relay.frp_transport import BrokeredTcpTransport, UdpRendezvousTransport
-from clio_relay.frpc_unit import render_frpc_proxy_toml
 
 
 def _frp_definition(*, cluster: str = "ares", proxy_name: str | None = None) -> ClusterDefinition:
@@ -69,7 +69,6 @@ def _transport_proxy_name(
         remote_api_port=8765,
         api_token="owner-token",
         identity_anchor="preshared_link_secret",
-        frpc_bin="frpc",
     )
     return transport._proxy_name  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 

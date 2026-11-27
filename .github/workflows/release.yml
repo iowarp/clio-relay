@@ -1,17 +1,14 @@
-name: validate release tag asynchronously
+name: release
 
 on:
   push:
     tags: ["v*"]
-  # Re-publication path: the tag-push run polls for the GitHub Release before
-  # a maintainer has published it, so it can legitimately fail first; a
-  # dispatch with the tag re-runs validation+publication against the exact
-  # published assets (learned cutting v1.6.8, where the rerun also hit a
-  # bare-python import break fixed below).
+  # Publishes an earlier tag's GitHub Release assets to PyPI, byte for byte.
+  # Run it from a v* tag ref, the only refs the pypi environment admits.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to validate and publish (e.g. v1.6.8)"
+        description: an existing release tag, such as v2.0.0a36
         required: true
         type: string
 
@@ -20,208 +17,143 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: read
   contents: read
-  pull-requests: read
 
 jobs:
-  bind:
-    name: validate tag identity without blocking publication
+  build:
+    name: build the tagged distributions
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - name: check out the exact tagged commit
+      - name: check out the tagged commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
           persist-credentials: false
-      - name: validate tag, package version, and current main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          TAG_NAME: ${{ github.ref_name }}
-        shell: bash
-        run: |
-          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          source .github/scripts/authenticated-git.sh
-          relay_authenticated_git_fetch --force --no-tags origin \
-            refs/heads/main:refs/remotes/origin/main \
-            "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
-          test "$(git rev-list -n 1 "$TAG_NAME")" = "$GITHUB_SHA"
-          test "$GITHUB_SHA" = "$(git rev-parse refs/remotes/origin/main)"
-          python - "$TAG_NAME" "$REPOSITORY" "$GITHUB_SHA" <<'PY'
-          import json
-          import re
-          import subprocess
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          tag, repository, source_commit = sys.argv[1:]
-          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-          version = project["project"]["version"]
-          init_source = Path("src/clio_relay/__init__.py").read_text(encoding="utf-8")
-          match = re.search(r'^__version__ = "([^"]+)"$', init_source, re.MULTILINE)
-          if match is None or match.group(1) != version or tag != f"v{version}":
-              raise SystemExit("tag and package version identities differ")
-          source_tree = subprocess.check_output(
-              ["git", "rev-parse", "HEAD^{tree}"], text=True
-          ).strip()
-          Path("TAG-BINDING.json").write_text(
-              json.dumps(
-                  {
-                      "schema_version": "clio-relay.tag-binding.v2",
-                      "repository": repository,
-                      "tag": tag,
-                      "version": version,
-                      "source_commit": source_commit,
-                      "source_tree": source_tree,
-                  },
-                  indent=2,
-                  sort_keys=True,
-              )
-              + "\n",
-              encoding="utf-8",
-          )
-          PY
-      - name: upload the asynchronous tag identity receipt
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-binding-${{ github.ref_name }}
-          path: TAG-BINDING.json
-          if-no-files-found: error
-          retention-days: 90
-
-  publish-pypi:
-    name: publish exact GitHub Release distributions to PyPI
-    needs: bind
-    # needs.bind is skipped (not failed) on dispatch, so `!failure()` lets the
-    # dispatch path publish while a push still requires bind to succeed.
-    if: >-
-      !failure() && !cancelled() && github.repository == 'iowarp/clio-relay'
-      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment:
-      name: pypi
-      url: https://pypi.org/project/clio-relay/${{ steps.identity.outputs.version }}/
-    permissions:
-      actions: read
-      contents: read
-      id-token: write
-    steps:
-      - name: check out the exact release tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ inputs.tag || github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - name: install uv for wheel-backed validation
+      - name: install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           version: "0.11.28"
-      - name: verify the published release identity and download exact assets
-        id: identity
+      - name: check the tag matches the package version
+        id: version
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          # Empty on dispatch: the checkout above pinned the tag ref, so HEAD
-          # IS the tag's commit and the script derives it from git directly.
-          SOURCE_COMMIT: ${{ github.event_name == 'push' && github.sha || '' }}
-          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+          TAG_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          if [ -z "${SOURCE_COMMIT:-}" ]; then
-            SOURCE_COMMIT="$(git rev-parse HEAD)"
+          version="$(uv version --short)"
+          test "$TAG_NAME" = "v$version"
+          prerelease="$(uv run --no-project --with packaging==24.2 python -c \
+            'import sys; from packaging.version import Version; print(str(Version(sys.argv[1]).is_prerelease).lower())' \
+            "$version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+      - name: build
+        env:
+          CLIO_RELAY_RELEASE_BUILD: "1"
+        run: uv build
+      - name: record the checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- *.whl *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: upload the distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release:
+    name: attach the distributions to a GitHub Release
+    needs: build
+    if: github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: download the distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then
+            flags=(--prerelease --latest=false)
           fi
-          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          gh release create "$TAG_NAME" dist/* --verify-tag \
+            --title "clio-relay $VERSION" --notes-file - "${flags[@]}" <<EOF
+          clio-relay $VERSION, built from $TAG_NAME ($GITHUB_SHA).
+          Check a download against SHA256SUMS: \`sha256sum --check SHA256SUMS\`.
+          EOF
 
-          for attempt in $(seq 1 20); do
-            if gh api "repos/$REPOSITORY/releases/tags/$TAG_NAME" \
-              > "$RUNNER_TEMP/release.json" 2>/dev/null \
-              && test "$(jq -r .draft "$RUNNER_TEMP/release.json")" = "false" \
-              && test "$(jq -r .prerelease "$RUNNER_TEMP/release.json")" = "false"; then
-              break
-            fi
-            if test "$attempt" -eq 20; then
-              echo "published GitHub Release did not appear for $TAG_NAME" >&2
-              exit 1
-            fi
-            sleep 3
-          done
-          release_id="$(jq -r .id "$RUNNER_TEMP/release.json")"
-          [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
-          test "$(jq -r .tag_name "$RUNNER_TEMP/release.json")" = "$TAG_NAME"
-          test "$(jq -r .draft "$RUNNER_TEMP/release.json")" = "false"
-          test "$(jq -r .prerelease "$RUNNER_TEMP/release.json")" = "false"
-
-          source_commit="$(gh api "repos/$REPOSITORY/commits/$TAG_NAME" --jq .sha)"
-          test "$source_commit" = "$SOURCE_COMMIT"
-          test "$source_commit" = "$(git rev-parse HEAD)"
-          # GitHub may retain the default-branch spelling in target_commitish when a
-          # Release is created for an existing tag. The authoritative source
-          # identity is the tag resolution above, not this display field.
-
-          version="$(python - "$TAG_NAME" <<'PY'
-          import re
-          import sys
-          import tomllib
-          from pathlib import Path
-
-          tag = sys.argv[1]
-          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-          version = project["project"]["version"]
-          init_source = Path("src/clio_relay/__init__.py").read_text(encoding="utf-8")
-          match = re.search(r'^__version__ = "([^"]+)"$', init_source, re.MULTILINE)
-          if match is None or match.group(1) != version or tag != f"v{version}":
-              raise SystemExit("release tag and package version identities differ")
-          print(version)
-          PY
-          )"
-          wheel="clio_relay-${version}-py3-none-any.whl"
-          sdist="clio_relay-${version}.tar.gz"
-
-          gh api "repos/$REPOSITORY/releases/$release_id/assets?per_page=100" \
-            > "$RUNNER_TEMP/assets.json"
-          test "$(jq length "$RUNNER_TEMP/assets.json")" -le 100
-          mkdir -p dist
-          for name in "$wheel" "$sdist" SHA256SUMS; do
-            count="$(jq --arg name "$name" '[.[] | select(.name == $name)] | length' \
-              "$RUNNER_TEMP/assets.json")"
-            test "$count" -eq 1
-            asset_id="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .id' \
-              "$RUNNER_TEMP/assets.json")"
-            asset_size="$(jq -r --arg name "$name" '.[] | select(.name == $name) | .size' \
-              "$RUNNER_TEMP/assets.json")"
-            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
-            [[ "$asset_size" =~ ^[1-9][0-9]*$ ]]
-            gh api -H 'Accept: application/octet-stream' \
-              "repos/$REPOSITORY/releases/assets/$asset_id" > "dist/$name"
-            test "$(stat --format '%s' "dist/$name")" = "$asset_size"
-          done
-          (
-            cd dist
-            sha256sum --check --strict SHA256SUMS
-          )
-          rm dist/SHA256SUMS
-          # ci_validation imports the clio_relay package (post-#231 owner-module
-          # split), so bare system python cannot run it. Installing the JUST-
-          # DOWNLOADED wheel to satisfy the import doubles as an install check
-          # of the exact artifact being published (v1.6.8 publish-break fix).
-          uv run --python 3.12 --no-project --with "dist/$wheel" \
-            python src/clio_relay/ci_validation.py distribution-archives \
-            --wheel "dist/$wheel" \
-            --sdist "dist/$sdist" \
-            --project clio-relay \
-            --version "$version" \
-            --output "$RUNNER_TEMP/DISTRIBUTION-ARCHIVES.json"
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
-      - name: publish the exact attached wheel and source distribution
+  publish:
+    name: publish to PyPI
+    needs: build
+    if: github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/clio-relay/
+    permissions:
+      id-token: write
+    steps:
+      - name: download the distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - name: keep only the distributions
+        run: rm dist/SHA256SUMS
+      - name: publish
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           packages-dir: dist/
-          skip-existing: true
+
+  publish-existing:
+    name: publish an existing release to PyPI
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'iowarp/clio-relay'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/clio-relay/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: download and check the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$TAG_NAME" in v[0-9]*) ;; *) echo "not a release tag: $TAG_NAME" >&2; exit 1 ;; esac
+          version="${TAG_NAME#v}"
+          gh release download "$TAG_NAME" --dir dist
+          cd dist
+          sha256sum --check --strict SHA256SUMS
+          test -f "clio_relay-$version-py3-none-any.whl"
+          test -f "clio_relay-$version.tar.gz"
+          rm SHA256SUMS
+          ls -l
+      - name: publish
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist/

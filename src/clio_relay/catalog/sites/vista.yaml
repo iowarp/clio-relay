@@ -1,0 +1,25 @@
+id: vista
+name: TACC Vista
+summary: TACC, needs an allocation
+featured: 3
+description: >-
+  TACC's Vista, through Tapis. Needs a TACC allocation on Vista. Jobs run reviewed
+  clio-jarvis packages only, and every job asks before it spends.
+source: https://docs.tacc.utexas.edu/hpc/vista/
+address: vista.tacc.utexas.edu
+adapter: tapis
+identity: tacc
+config:
+  base_url: https://tacc.tapis.io
+  tenant_id: tacc
+  authn: tms
+  launcher: guarded
+alternatives:
+  worker:
+    ssh_profile: vista
+policy: guarded
+spend:
+  ask: always
+defaults:
+  account: null
+skill: vista
