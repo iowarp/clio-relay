@@ -80,16 +80,26 @@ def test_every_job_that_reached_the_site_lists_its_outputs_directory() -> None:
         handle=None,
         result={"install": {"stage": "installing", "rounds": 3}},
     )
+    planned = SimpleNamespace(
+        site="ares",
+        kind="run",
+        operation_id="op_planned",
+        outputs=[],
+        handle=None,
+        result={"plan": {"plan_sha256": "5c"}, "partition_facts": {}},
+    )
     install = _record("ares", "install", OutputRef(name="pkg", path="/home/u/spack/opt/x"))
-    service = _service(recorded, failed, unsent, staged, install)
+    service = _service(recorded, failed, unsent, staged, planned, install)
     found = run_outputs(service, "ares", TARGETS, ["clio-relay-runs"])
-    # An install's check and build, a run that ended with nothing recorded, and a run
-    # that failed in its install stage before its job was sent, all left their JARVIS
-    # shared directories; a recorded one is not listed twice.
+    # An install's check and build, a run that ended with nothing recorded, a run
+    # that failed in its install stage before its job was sent, and one cancelled at
+    # the card JARVIS planned, all left their JARVIS shared directories; a recorded
+    # one is not listed twice.
     assert [item["path"] for item in found] == [
         "/home/u/clio-relay-runs/op_run",
         "~/clio-relay-runs/op_failed",
         "~/clio-relay-runs/op_install",
+        "~/clio-relay-runs/op_planned",
         "~/clio-relay-runs/op_staged",
     ]
     assert all(item["size"] is None for item in found)
@@ -97,6 +107,7 @@ def test_every_job_that_reached_the_site_lists_its_outputs_directory() -> None:
         "/home/u/clio-relay-runs/op_run",
         "/scratch/u/op_failed",
         "/scratch/u/op_install",
+        "/scratch/u/op_planned",
         "/scratch/u/op_run",
         "/scratch/u/op_staged",
     ]

@@ -43,7 +43,7 @@ import posixpath
 import shutil
 from typing import TYPE_CHECKING, Any, cast
 
-from clio_relay import site_writes
+from clio_relay import jarvis_plan, site_writes
 from clio_relay.adapters.base import CleansSite, ListsLiveJobs, ShutsDown
 from clio_relay.jobs.records import OperationRecord, OperationState, StateChange
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -284,7 +284,8 @@ def _touched_site(record: Any) -> bool:
     A run or serve does once its job is submitted; an install's first step is
     JARVIS's check on the site, so every install does. So does a run that had an
     install stage, which ran that check in the run's directory, even when it
-    ended before its own job was submitted.
+    ended before its own job was submitted. So does one JARVIS planned for its
+    card, cancelled or declined there, since the plan builds the job's directory.
     """
     result = cast(dict[str, Any], getattr(record, "result", None) or {})
     staged: object = result.get(installing.INSTALL_KEY)
@@ -292,6 +293,7 @@ def _touched_site(record: Any) -> bool:
         record.kind == "install"
         or getattr(record, "handle", None) is not None
         or isinstance(staged, dict)
+        or isinstance(result.get(jarvis_plan.KEY), dict)
     )
 
 
