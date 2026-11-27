@@ -12,6 +12,7 @@ import asyncio
 import json
 import os
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.packages import stage
 from clio_relay.surface.describing import site_report
 from clio_relay.surface.package_progress import JARVIS_SHARED, with_package_progress
+from clio_relay.surface.progress import progress_message
 from clio_relay.surface.results import operation_result
 from clio_relay.surface.server import RelayTasksExtension
 from clio_relay.surface.service import RelayService
@@ -138,7 +140,10 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
     }
     _jsonl(
         execution / "progress" / "pkg-1.jsonl",
-        [{**step, "sequence": 1, "current": 1}, {**step, "sequence": 2, "current": 3}],
+        [
+            {**step, "sequence": 1, "current": 1, "observed_at_epoch": 1_000.0},
+            {**step, "sequence": 2, "current": 3, "observed_at_epoch": 1_600.0},
+        ],
         partial='{"schema_version": "jarvis.prog',
     )
     (execution / "progress" / "pkg-1.jsonl.lock").write_text("")
@@ -154,7 +159,10 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
             "kind": "run",
             "site": "lab",
             "adapter": "local",
-            "spec": {"package": {"name": "demo.hello", "version": "1", "sha256": "a" * 64}},
+            "spec": {
+                "package": {"name": "demo.hello", "version": "1", "sha256": "a" * 64},
+                "attributes": {"duration": 2_400},
+            },
             "spec_digest": "sha256:0",
             "state": "running",
             "handle": JobHandle(adapter="local", data={"job_dir": str(job_dir)}).model_dump(),
@@ -162,12 +170,26 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
     )
     stdout = OutputRef(name="stdout", path=str(job_dir / "stdout"))
     seen = await with_package_progress(
-        adapter, record, JobStatus(state=JobState.RUNNING, outputs=[stdout])
+        adapter,
+        record,
+        JobStatus(
+            state=JobState.RUNNING,
+            outputs=[stdout],
+            started_at=datetime.fromtimestamp(900, UTC),
+        ),
     )
     assert seen.progress is not None
     assert (seen.progress.step, seen.progress.total) == (3, 10)
     assert seen.progress.message == "wrote snapshot 3"
     assert seen.progress.data["execution"].endswith("/executions/new")
+    # 300 s a step from step 1 to 3; 7 more end at 3700, past the limit's end at 3300.
+    pace = seen.progress.data["pace"]
+    assert (pace["seconds_per_step"], pace["remaining_steps"]) == (300.0, 7)
+    assert pace["projected_end_at"] == datetime.fromtimestamp(3_700, UTC).isoformat()
+    assert (pace["time_limit_s"], pace["limit_margin_s"]) == (2_400, -400)
+    record.result = {"progress": seen.progress.model_dump(mode="json")}
+    assert "measured 5 min per step over steps 1 to 3" in str(progress_message(record))
+    assert "6 min after the job's time limit ends it" in str(progress_message(record))
     [snapshot] = seen.progress.outputs
     assert (snapshot.name, snapshot.path, snapshot.metadata) == (
         "snapshots",

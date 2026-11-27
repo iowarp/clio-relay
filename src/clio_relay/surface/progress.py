@@ -4,8 +4,30 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from clio_relay.jarvis_submit import spoken_duration
 from clio_relay.jobs.handles import VIEW_METADATA
 from clio_relay.jobs.records import OperationRecord
+
+
+def pace_note(step: dict[str, Any]) -> str | None:
+    """Say the run's measured pace and where it projects, from ``data["pace"]``."""
+    pace = cast(dict[str, Any], cast(dict[str, Any], step.get("data") or {}).get("pace") or {})
+    per_step = pace.get("seconds_per_step")
+    if not isinstance(per_step, int | float):
+        return None
+    unit = cast(dict[str, Any], step.get("data") or {}).get("unit") or "step"
+    said = (
+        f"measured {spoken_duration(int(per_step))} per {unit} "
+        f"over {unit}s {pace.get('from_step')} to {pace.get('to_step')}"
+    )
+    if pace.get("projected_end_at"):
+        said += f", so the last {unit} lands about {pace['projected_end_at']}"
+    margin = pace.get("limit_margin_s")
+    if isinstance(margin, int) and margin < 0:
+        said += f", {spoken_duration(-margin)} after the job's time limit ends it"
+    elif isinstance(margin, int):
+        said += f", {spoken_duration(margin)} before the job's time limit"
+    return said
 
 
 def progress_message(record: OperationRecord) -> str | None:
@@ -24,6 +46,8 @@ def progress_message(record: OperationRecord) -> str | None:
         parts.append(f"step {step['step']}" + (f" of {total}" if total is not None else ""))
     if step.get("message"):
         parts.append(str(step["message"]))
+    if note := pace_note(step):
+        parts.append(note)
     outputs = cast(list[dict[str, Any]], step.get("outputs") or [])
     viewable = [
         item["name"]
@@ -61,6 +85,8 @@ def observation_line(view: dict[str, Any]) -> str | None:
         shown = cast(dict[str, Any], step)
         total = shown.get("total")
         parts.append(f"step {shown['step']}" + (f" of {total}" if total is not None else ""))
+        if note := pace_note(shown):
+            parts.append(note)
     if result.get("message"):
         parts.append(str(result["message"]))
     return "; ".join(parts) or None

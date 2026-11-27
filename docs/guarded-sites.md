@@ -155,6 +155,11 @@ latest step the package reported (`result.progress`) and its outputs, each
 with its path on the site and, when the package declares one, its view
 descriptor. Relay reads them from the job's JARVIS records with the site's
 `files` verb, so this works the same on every adapter that has `files`.
+Once two steps have been reported, `result.progress.data.pace` is the run's
+measured pace from the times JARVIS recorded them: seconds per step (startup
+left out), when the last step would land if the package gave a total, and how
+that sits against the job's time limit. The task's status says it in words,
+so an agent can see early that a run will not finish in time.
 
 The site script exits with a clear code when something is wrong: 4 when JARVIS
 refused to build outside an allocation, 64 for a package

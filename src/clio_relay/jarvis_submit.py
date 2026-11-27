@@ -1219,7 +1219,8 @@ def record_status(
     )
 
 
-def _duration(seconds: int) -> str:
+def spoken_duration(seconds: int) -> str:
+    """Say a span of seconds as hours and minutes, such as ``1 h 57 min``."""
     hours, rest = divmod(max(seconds, 0), 3600)
     minutes = rest // 60
     if hours:
@@ -1236,7 +1237,7 @@ def queue_message(queue: Mapping[str, Any]) -> str:
     starts = _int(queue.get("starts_in_s"))
     when = ""
     if starts is not None:
-        when = f"; the scheduler expects it to start in about {_duration(starts)}"
+        when = f"; the scheduler expects it to start in about {spoken_duration(starts)}"
     elif isinstance(queue.get("estimated_start"), str):
         when = f"; the scheduler expects it to start at {queue['estimated_start']}"
     fits = [
