@@ -98,9 +98,12 @@ def declined_outcome(
     data: dict[str, Any] = error.get("data") or {}
     message = str(error.get("message") or "")
     question = data.get("question") or message.removeprefix(DECLINED_PREFIX)
-    return {
+    outcome = {
         "operation_id": data.get("operation_id") or operation_id,
         "ask_id": data.get("ask_id"),
         "question": question,
         "not_done": data.get("not_done") or not_done or "Relay did nothing.",
     }
+    if data.get("use_operation_id"):
+        outcome["use_operation_id"] = data["use_operation_id"]
+    return outcome

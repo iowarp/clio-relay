@@ -45,7 +45,7 @@ from clio_relay.jobs.records import OperationKind, OperationRecord, OperationSta
 from clio_relay.jobs.refusals import Refusal, RefusalReason, declined
 from clio_relay.jobs.spec import JobSpec, canonical_digest
 from clio_relay.sites.models import SiteEntry
-from clio_relay.surface import held_services, job_card, plan_card
+from clio_relay.surface import held_services, job_card, plan_card, same_run
 from clio_relay.surface.elicit import (
     answer_response,
     elicit_inline,
@@ -126,6 +126,9 @@ async def operation_asks(
             held_services.fold(service, own[-1], record, held)
         else:
             asks.append(await held_services.ask(service, site, record, held))
+    own = [a for a in asks if a.kind == "approve"]
+    if own and (other := await same_run.twin(service, record)) is not None:
+        same_run.fold(service, own[-1], record, other)
     return asks
 
 
@@ -180,6 +183,8 @@ async def _card(
     )
     if held is not None:
         held_services.fold(service, ask, record, held)
+    if (other := await same_run.twin(service, record)) is not None:
+        same_run.fold(service, ask, record, other)
     _explain(ask, action, site, charge, spends=spends)
     ask.meta = {**(ask.meta or {}), job_card.JOB_META: job_card.snapshot(service, record)}
     service.asks.put(ask.ask_id, ask)
@@ -244,6 +249,21 @@ def used(service: RelayService, ask: Ask) -> None:
         current = service.asks.get(ask.ask_id) or ask
         current.completed_at = utc_now()
         service.asks.put(ask.ask_id, current)
+
+
+def stale(ask: Ask, record: OperationRecord) -> Refusal | None:
+    """The refusal for an answered approval that no longer covers the job."""
+    from clio_relay.surface import installing
+
+    if ask.kind != "approve":
+        return None
+    if ask.binding_digest == canonical_digest(ask.binding) and installing.approval_covers(
+        ask.binding, record
+    ):
+        return None
+    return Refusal(
+        RefusalReason.APPROVAL_MISMATCH, "the approval was for a different job; ask again"
+    )
 
 
 async def exec_confirm(service: RelayService, site: SiteEntry, command: list[str]) -> Ask:

@@ -70,6 +70,7 @@ from clio_relay.surface import (
     installing,
     interrupted,
     queue_switch,
+    same_run,
 )
 from clio_relay.surface import plan_card as job_plan
 from clio_relay.surface.describing import relay_report, site_report
@@ -600,22 +601,14 @@ class RelayService:
                     continue
                 waiting = True
                 continue
-            if ask.kind == "approve" and (
-                ask.binding_digest != canonical_digest(ask.binding)
-                or not installing.approval_covers(ask.binding, record)
-            ):
-                return self.finish(
-                    operation_id,
-                    OperationState.FAILED,
-                    Refusal(
-                        RefusalReason.APPROVAL_MISMATCH,
-                        "the approval was for a different job; ask again",
-                    ),
-                )
+            if (mismatch := confirm_card.stale(ask, record)) is not None:
+                return self.finish(operation_id, OperationState.FAILED, mismatch)
             if ask.kind == "url" and not await self._signed_in(ask, record):
                 waiting = True
         if waiting:
             return record
+        if (reuse := same_run.chosen(self, record)) is not None:
+            return self.finish(operation_id, OperationState.CANCELLED, reuse)
         if installing.pending(record):
             return await self._install(operation_id)
         return await self.submit(operation_id)

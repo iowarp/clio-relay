@@ -133,10 +133,23 @@ error, with `structuredContent.declined`:
 | `ask_id` | The question the person declined |
 | `question` | The question, as one sentence |
 | `not_done` | What relay therefore did not do, such as "Relay submitted nothing, so the job did not run." |
+| `use_operation_id` | Only when the person chose a live operation of the same job instead of starting another (see below): that operation |
 
 An operation the person declined keeps the state `cancelled`, with `error`
 null, and its job card's outcome is `declined`. Its task completes rather than
 being cancelled, and the status message says what was declined.
+
+### the same job already live
+
+Relay does not fold a repeated submit into a live one by itself, and a client
+passes no key for it. When a run or service hashes the same as one of the
+site's that is submitted and not ended, the job's approval (its card, or the
+approval relay asks for it) carries the typed fact
+`io.iowarp.clio-relay/same_run` in `_meta` (`operation_id`, `state`, `job_id`,
+`created_at`, `resource`) and a `same_run` choice: "use the live one"
+(recommended) or "start another". Using it ends the new operation as declined,
+with `use_operation_id` naming the live one; starting another submits it. A job
+that asks the person nothing is submitted as before.
 
 ## the job card
 

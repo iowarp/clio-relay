@@ -62,7 +62,7 @@ RATCHET_BASELINE: dict[str, int] = {
     "src/clio_relay/packages.py": 871,
     "src/clio_relay/serve/runtime.py": 886,
     "src/clio_relay/surface/server.py": 839,
-    "src/clio_relay/surface/service.py": 1104,
+    "src/clio_relay/surface/service.py": 1097,
 }
 
 # Roots of the source tree to scan, relative to the repository root. Tests
@@ -105,12 +105,12 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: dropped the share below the floor, so the check already failed at 21fffaa5.
 #: 88.28 (211/239) recorded at 2.0.0a40: the live-proof fixes of a19 to a39 had
 #: dropped it below 91.70 while CI ran only on release tags.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 88.70
+SRC_DISTRIBUTION_BASELINE_PERCENT = 88.75
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
 #: 93.82 (152/162) recorded at 2.0.0a40, for the same reason as the src floor.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 93.90
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 93.93
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 
