@@ -11,14 +11,21 @@ macOS and Linux. The person's ``ssh`` still says how to reach the site
   that connection. When it drops, calls refuse with ``needs_sign_in`` and
   nothing asks until the person signs in again.
 
+Relay dials the site the way any network client does: through the proxy its
+environment names (``HTTPS_PROXY``, ``ALL_PROXY``; ``NO_PROXY`` exempts hosts),
+unless the person's config gives a ``ProxyCommand`` or jump host. A sandbox that
+lets programs out only through its proxy then reaches the site too.
+
 Failures read as OpenSSH's own messages, so ``errors`` tells the cases apart for
-both transports. Every connection lives on one private loop, so the MCP
-server's loop, the sign-in page's loop and a CLI's ``asyncio.run`` all share it.
+both transports, with a line saying how relay dialed. Every connection lives
+on one private loop, so the MCP server's loop, the sign-in page's loop and a
+CLI's ``asyncio.run`` all share it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import errno
 import logging
@@ -27,10 +34,12 @@ import secrets
 import socket
 import subprocess
 import time
+import urllib.request
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import unquote, urlsplit
 
 import asyncssh
 
@@ -54,6 +63,20 @@ SIGN_IN_ATTEMPTS = 3
 """Passes through a site's prompts before relay gives up, as ssh allows."""
 MAX_HOPS = 8
 BUSY_RETRIES = 20
+PROXY_VARIABLES = (
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+)
+"""Where relay looks for its proxy, in this order; the first one set wins."""
+_MAX_PROXY_HEAD = 64 * 1024
+_bypass = cast(
+    Callable[[str, dict[str, str]], bool],
+    getattr(urllib.request, "proxy_bypass_environment"),  # noqa: B009
+)
 
 Ask = Callable[[str, bool], Awaitable[str | None]]
 """Ask the person one prompt (``echo``: the answer may show); ``None`` if they declined."""
@@ -113,11 +136,16 @@ class _Client(asyncssh.SSHClient):
         self.tries = 0
         self.declined = False
         self.offered: set[str] = set()
+        self.keys_ran_out = False
         self.notes: list[str] = []
         self.lost = asyncio.Event()
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.lost.set()
+
+    def public_key_auth_requested(self) -> None:
+        # asyncssh asks here only once the profile's keys are all refused.
+        self.keys_ran_out = True
 
     def auth_banner_received(self, msg: str, lang: str) -> None:
         if msg.strip():
@@ -202,12 +230,144 @@ def _recorded(profile: Profile, extra: Sequence[str]) -> bool:
 
 async def _fingerprint(profile: Profile, tunnel: Any) -> str | None:
     with contextlib.suppress(Exception):
+        direct = tunnel is None and not profile.proxy_command
+        sock = (await _dial(profile, 15, 15))[0] if direct else None
         key = await asyncio.wait_for(
-            asyncssh.get_server_host_key(profile.host, profile.port, tunnel=tunnel), 15
+            asyncssh.get_server_host_key(
+                profile.host,
+                profile.port,
+                tunnel=tunnel,
+                proxy_command=(
+                    _proxy_argv(profile.proxy_command, profile)
+                    if tunnel is None and profile.proxy_command
+                    else ()
+                ),
+                sock=sock,
+            ),
+            15,
         )
         if key is not None:
             return key.get_fingerprint()
     return None
+
+
+class ProxyRefused(OSError):
+    """The proxy would not open a tunnel to the site."""
+
+
+def proxy_for(host: str, env: Mapping[str, str] | None = None) -> str:
+    """Return the proxy URL the environment names for ``host``, or ``""`` to dial directly."""
+    env = os.environ if env is None else env
+    exempt = env.get("NO_PROXY") or env.get("no_proxy") or ""
+    if exempt and _bypass(host, {"no": exempt}):
+        return ""
+    for key in PROXY_VARIABLES:
+        value = (env.get(key) or "").strip()
+        if value:
+            return value if "://" in value else f"http://{value}"
+    return ""
+
+
+def _shown(proxy: str) -> str:
+    """Return the proxy URL without its credentials."""
+    parts = urlsplit(proxy)
+    return f"{parts.scheme}://{parts.hostname or ''}{f':{parts.port}' if parts.port else ''}"
+
+
+def _authority(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ProxyRefused(errno.ECONNRESET, "the proxy closed the connection")
+        data += chunk
+    return data
+
+
+def _proxy_open(proxy: str, host: str, port: int, dial_s: float, answer_s: float) -> socket.socket:
+    """Return a socket joined to ``host:port`` through ``proxy`` (HTTP ``CONNECT`` or SOCKS5)."""
+    parts = urlsplit(proxy)
+    socks = parts.scheme.lower().startswith("socks")
+    sock = socket.create_connection(
+        (parts.hostname or "127.0.0.1", parts.port or (1080 if socks else 8080)), timeout=dial_s
+    )
+    try:
+        sock.settimeout(answer_s)
+        user, password = unquote(parts.username or ""), unquote(parts.password or "")
+        if socks:
+            methods = b"\x00\x02" if user else b"\x00"
+            sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+            chosen = _recv_exact(sock, 2)[1]
+            if chosen == 0x02:
+                sock.sendall(
+                    b"\x01" + bytes([len(user)]) + user.encode()
+                    + bytes([len(password)]) + password.encode()
+                )  # fmt: skip
+                if _recv_exact(sock, 2)[1] != 0:
+                    raise ProxyRefused(0, "the SOCKS proxy refused the credentials")
+            elif chosen != 0x00:
+                raise ProxyRefused(0, "the SOCKS proxy offered no usable sign-in method")
+            name = host.strip("[]").encode("idna")
+            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + port.to_bytes(2, "big"))
+            head = _recv_exact(sock, 4)
+            if head[1] != 0:
+                raise ProxyRefused(0, f"the SOCKS proxy answered {head[1]}")
+            _recv_exact(sock, ({1: 4, 4: 16}.get(head[3]) or _recv_exact(sock, 1)[0]) + 2)
+        else:
+            target = _authority(host, port)
+            lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+            if parts.username is not None:
+                token = base64.b64encode(f"{user}:{password}".encode()).decode()
+                lines.append(f"Proxy-Authorization: Basic {token}")
+            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+            # One byte at a time: the site's banner may follow the reply head at once.
+            head = b""
+            while not head.endswith(b"\r\n\r\n"):
+                head += _recv_exact(sock, 1)
+                if len(head) > _MAX_PROXY_HEAD:
+                    raise ProxyRefused(0, "the proxy's answer is too large")
+            status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace").strip()
+            fields = status.split()
+            if len(fields) < 2 or fields[1] != "200":
+                raise ProxyRefused(0, f"the proxy answered {status or 'nothing'}")
+        sock.settimeout(None)
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+async def _dial(
+    profile: Profile, dial_s: float, answer_s: float
+) -> tuple[socket.socket | None, list[str]]:
+    """Return a socket through the environment's proxy (``None``: dial directly) and the route.
+
+    When the proxy can't open the tunnel, relay dials directly, as ``ssh`` itself would.
+    """
+    where = _authority(profile.host, profile.port)
+    proxy = proxy_for(profile.host)
+    if not proxy:
+        return None, [f"relay dialed {where} directly (no proxy in its environment)"]
+    try:
+        sock = await asyncio.to_thread(
+            _proxy_open, proxy, profile.host, profile.port, dial_s, answer_s
+        )
+    except OSError as exc:
+        return None, [
+            f"relay's proxy {_shown(proxy)} did not open {where} ({_os_error(exc)}),"
+            " so relay dialed directly"
+        ]
+    return sock, [f"relay dialed {where} through the proxy {_shown(proxy)}"]
+
+
+def _os_error(exc: OSError) -> str:
+    winerror = getattr(exc, "winerror", None)
+    code = f"[WinError {winerror}] " if winerror else f"[Errno {exc.errno}] " if exc.errno else ""
+    return f"{code}{exc.strerror or exc}"
 
 
 _ERRNO_TEXT = {
@@ -217,6 +377,7 @@ _ERRNO_TEXT = {
     errno.ENETUNREACH: "Network is unreachable",
     errno.ECONNRESET: "Connection reset by peer",
     10061: "Connection refused",
+    1225: "Connection refused",
     10060: "Connection timed out",
     10065: "No route to host",
     10051: "Network is unreachable",
@@ -225,10 +386,20 @@ _ERRNO_TEXT = {
 
 
 async def failure_text(
-    exc: BaseException, profile: Profile, client: _Client | None, tunnel: Any, extra: Sequence[str]
+    exc: BaseException,
+    profile: Profile,
+    client: _Client | None,
+    tunnel: Any,
+    extra: Sequence[str],
+    route: Sequence[str] = (),
 ) -> str:
-    """Return what OpenSSH would have said for a connection that did not open."""
+    """Return what OpenSSH would have said for a connection that did not open.
+
+    A connection that failed to open also says how relay dialed (``route``) and the
+    system's own error, since relay, not the person's ``ssh``, made it.
+    """
     notes = "\n".join(client.notes) + "\n" if client is not None and client.notes else ""
+    dialed = "".join(f"\n{line}" for line in route)
     who = f"{profile.user}@{profile.host}"
     if isinstance(exc, asyncssh.HostKeyNotVerifiable):
         name = profile.host_key_alias or profile.host
@@ -248,6 +419,9 @@ async def failure_text(
         interactive = sorted(client.offered - {"publickey"}) if client is not None else []
         if client is not None and client.ask is not None:
             methods = interactive or ["keyboard-interactive"]
+        elif client is not None and interactive and not client.keys_ran_out:
+            # The site took the key and wants a code next, as OpenSSH reports it.
+            methods = interactive
         else:
             methods = ["publickey", *interactive]
         return f"{notes}{who}: Permission denied ({','.join(methods)})."
@@ -260,13 +434,14 @@ async def failure_text(
             if exc.errno in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", -5), 11001)
             else "Temporary failure in name resolution"
         )
-        return f"ssh: Could not resolve hostname {profile.host}: {what}"
+        return f"ssh: Could not resolve hostname {profile.host}: {what}{dialed}"
     if isinstance(exc, TimeoutError):
-        return f"ssh: connect to host {_where(profile)}: Connection timed out"
+        return f"ssh: connect to host {_where(profile)}: Connection timed out{dialed}"
     if isinstance(exc, OSError):
         code = getattr(exc, "winerror", None) or exc.errno
         text = _ERRNO_TEXT.get(code or 0) or exc.strerror or str(exc)
-        return f"ssh: connect to host {_where(profile)}: {text}"
+        detail = f" ({_os_error(exc)})" if route else ""
+        return f"ssh: connect to host {_where(profile)}: {text}{dialed}{detail}"
     if isinstance(exc, (asyncssh.KeyImportError, asyncssh.KeyEncryptionError)):
         return f"ssh: could not load a key for {profile.destination}: {exc}"
     return f"ssh: {type(exc).__name__}: {exc}"
@@ -358,10 +533,13 @@ async def connect(
         options["tunnel"] = tunnel
     elif profile.proxy_command:
         options["proxy_command"] = _proxy_argv(profile.proxy_command, profile)
+    route: list[str] = []
     try:
+        if tunnel is None and not profile.proxy_command:
+            options["sock"], route = await _dial(profile, options["connect_timeout"], timeout_s)
         conn, _ = await asyncssh.create_connection(lambda: client, profile.host, **options)
     except (asyncssh.Error, OSError, ValueError) as exc:
-        text = await failure_text(exc, profile, client, tunnel, extra_known)
+        text = await failure_text(exc, profile, client, tunnel, extra_known, route)
         for done in reversed(hops):
             done.close()
         raise SshFailure(text) from exc

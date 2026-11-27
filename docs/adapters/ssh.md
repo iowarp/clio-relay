@@ -417,6 +417,14 @@ Your ssh still decides where and how to connect: relay reads your
 and keys sign in. When the connection drops, a site that signs in with a key
 connects again by itself on the next call.
 
+Without a `ProxyCommand` or `ProxyJump`, relay dials through the proxy its
+environment names, the way most network clients do: `HTTPS_PROXY`, then
+`ALL_PROXY` and `HTTP_PROXY` (HTTP `CONNECT`, or SOCKS5 for a `socks5://`
+URL), with `NO_PROXY` exempting hosts. That is how relay reaches a site from
+inside a sandbox that lets programs out only through its proxy. When the proxy
+won't open the tunnel, relay dials directly, as `ssh` itself would. A
+connection that fails says which way relay dialed and the system's own error.
+
 A few profiles need the system `ssh` program, and relay runs it, one process
 per call, for those sites only:
 
@@ -441,6 +449,9 @@ Some sites ask for a one-time code or a password on every connection.
 - **With `interactive_sign_in: true`**, relay signs in once. The site shows
   as needing sign-in; you press "Start sign-in" on relay's page and answer
   each prompt there, a password and then a code, or a key and then a code.
+  For a key and then a code, the site's `Host` entry in your ssh config is
+  the same as for a key-only site: relay offers the key first, and you are
+  asked only for the code.
   Every later call rides that signed-in connection, so you are asked once,
   not on every call, and starting several calls at once still asks once.
   Relay's other processes on this computer that share its state (the page

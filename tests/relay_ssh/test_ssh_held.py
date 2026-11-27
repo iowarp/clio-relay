@@ -8,6 +8,8 @@ runs on its own.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
 import io
 import shlex
 import socket
@@ -20,8 +22,9 @@ from typing import Any
 import asyncssh
 import pytest
 import pytest_asyncio
+from asyncssh import auth as ssh_auth
 
-from clio_relay.adapters.ssh import forwarder, held, profile
+from clio_relay.adapters.ssh import errors, forwarder, held, profile
 from clio_relay.adapters.ssh.process import Completed
 from clio_relay.adapters.ssh.profile import Profile
 
@@ -37,6 +40,7 @@ class Site:
     root: Path
     conns: list[asyncssh.SSHServerConnection] = field(default_factory=list[Any])
     codes: list[str] = field(default_factory=lambda: [CODE])
+    key_passed: list[asyncssh.SSHServerConnection] = field(default_factory=list[Any])
 
     def drop(self) -> None:
         for conn in self.conns:
@@ -47,23 +51,29 @@ def _server(site: Site, client_key: asyncssh.SSHKey) -> type[asyncssh.SSHServer]
     class Server(asyncssh.SSHServer):
         def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
             site.conns.append(conn)
+            self.conn = conn
+            self.user = ""
             self.round = 0
 
         def begin_auth(self, username: str) -> bool:
+            self.user = username
             return True
 
         def public_key_auth_supported(self) -> bool:
-            return True
+            return self.conn not in site.key_passed
 
         def validate_public_key(self, username: str, key: asyncssh.SSHKey) -> bool:
-            return username == "keyed" and key.public_data == client_key.public_data
+            return username in ("keyed", "keycode") and key.public_data == client_key.public_data
 
         def kbdint_auth_supported(self) -> bool:
-            return True
+            return self.user != "keycode" or self.conn in site.key_passed
 
         def get_kbdint_challenge(
             self, username: str, lang: str, submethods: str
         ) -> tuple[str, str, str, Sequence[tuple[str, bool]]]:
+            if username == "keycode":
+                self.round = 2
+                return "", "Duo two-factor", "", [("Verification code: ", False)]
             self.round = 1
             return "", "", "", [("Password: ", False)]
 
@@ -146,6 +156,7 @@ async def site(tmp_path: Path) -> AsyncIterator[Site]:
 
 
 def _profile(site: Site, *, user: str, keys: bool) -> Profile:
+    preferred = [] if user == "keycode" else ["publickey"] if keys else ["keyboard-interactive"]
     return Profile(
         destination="loop",
         host="127.0.0.1",
@@ -155,7 +166,7 @@ def _profile(site: Site, *, user: str, keys: bool) -> Profile:
         identities_only=True,
         identity_agent="",
         check_host_keys=False,
-        preferred_auth=["publickey"] if keys else ["keyboard-interactive"],
+        preferred_auth=preferred,
     )
 
 
@@ -166,6 +177,7 @@ def _held(
     signs_in: bool,
     channels: int = 8,
     share: Path | None = None,
+    user: str | None = None,
 ) -> held.Held:
     connection = held.Held(
         base=["ssh"],
@@ -175,7 +187,10 @@ def _held(
         timeout_s=10,
         share=share,
     )
-    profile = _profile(site, user="person" if signs_in else "keyed", keys=not signs_in)
+    if user == "keycode":
+        profile = _profile(site, user=user, keys=True)
+    else:
+        profile = _profile(site, user="person" if signs_in else "keyed", keys=not signs_in)
 
     async def resolve() -> Profile:
         return profile
@@ -264,6 +279,48 @@ async def test_a_wrong_code_is_asked_three_times_then_refused(
     assert "Permission denied" in failed.value.text
     assert person.asked.count("Verification code:") == held.SIGN_IN_ATTEMPTS
     assert not connection.signed_in()
+
+
+async def test_a_key_then_code_site_takes_the_key_and_asks_only_for_the_code(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # asyncssh's server never answers "partial success", so this one does for a
+    # key, as sshd does with AuthenticationMethods publickey,keyboard-interactive.
+    key_auth: Any = ssh_auth._ServerPublicKeyAuth  # pyright: ignore[reportPrivateUsage]
+    succeed = key_auth.send_success
+
+    async def key_then_code(auth: Any) -> None:
+        conn = auth._conn
+        if auth._username == "keycode" and conn not in site.key_passed:
+            site.key_passed.append(conn)
+            auth.send_failure(partial_success=True)
+            return
+        await succeed(auth)
+
+    monkeypatch.setattr(key_auth, "send_success", key_then_code)
+    unset = _held(monkeypatch, site, signs_in=False, user="keycode")
+    try:
+        bare = await _run(unset, "echo bare")
+    finally:
+        await unset.close()
+    assert bare.stderr.endswith(b": Permission denied (keyboard-interactive).")
+    assert errors.cause(bare.stderr.decode(), bare.exit_code) == "sign_in"
+
+    connection = _held(monkeypatch, site, signs_in=True, user="keycode")
+    person = Person(code=[CODE])
+    _asks_through(monkeypatch, person)
+    try:
+        refused = await _run(connection, "echo before")
+        assert b"Permission denied (keyboard-interactive)." in refused.stderr
+
+        await connection.sign_in({})
+        assert person.asked == ["Verification code:"]
+        done = await asyncio.gather(*(_run(connection, f"echo {i}") for i in range(5)))
+        assert [item.stdout for item in done] == [f"ran:echo {i}\n".encode() for i in range(5)]
+        assert site.conns[-1] in site.key_passed
+        assert len(person.asked) == 1
+    finally:
+        await connection.close()
 
 
 async def test_a_key_site_reconnects_by_itself(site: Site, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,3 +489,102 @@ async def test_a_distro_wide_gssapi_default_stays_on_the_held_connection(
     assert "Kerberos" in (profile.from_values("ares", kerberos, "ssh").openssh_only or "")
     monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/krb5cc_1000")
     assert profile.from_values("ares", debian, "ssh").openssh_only is not None
+
+
+@dataclass
+class Proxy:
+    port: int
+    asked: list[str] = field(default_factory=list[str])
+    refuse: bool = False
+
+
+async def _proxy(site: Site) -> tuple[asyncio.Server, Proxy]:
+    """An HTTP ``CONNECT`` proxy: the only way to reach ``site.invalid``."""
+    proxy = Proxy(port=0)
+
+    async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(OSError):
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        writer.close()
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        target = head.split(b"\r\n", 1)[0].split()[1].decode()
+        proxy.asked.append(target)
+        if proxy.refuse or target != f"site.invalid:{site.port}":
+            writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            writer.close()
+            return
+        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", site.port)
+        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await asyncio.gather(pump(reader, up_writer), pump(up_reader, writer))
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    proxy.port = server.sockets[0].getsockname()[1]
+    return server, proxy
+
+
+def _no_proxy_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (*held.PROXY_VARIABLES, "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _at(
+    monkeypatch: pytest.MonkeyPatch, connection: held.Held, site: Site, host: str, port: int
+) -> None:
+    resolved = dataclasses.replace(_profile(site, user="keyed", keys=True), host=host, port=port)
+
+    async def resolve() -> Profile:
+        return resolved
+
+    monkeypatch.setattr(connection, "_resolve", resolve)
+
+
+async def test_relay_reaches_the_site_through_the_proxy_its_environment_names(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, proxy = await _proxy(site)
+    _no_proxy_set(monkeypatch)
+    connection = _held(monkeypatch, site, signs_in=False)
+    _at(monkeypatch, connection, site, "site.invalid", site.port)
+    try:
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}")
+        done = await _run(connection, "echo one")
+        assert done.stdout == b"ran:echo one\n", done.stderr
+        assert proxy.asked == [f"site.invalid:{site.port}"]
+        assert held.proxy_for("site.invalid") == f"http://127.0.0.1:{proxy.port}"
+        monkeypatch.setenv("NO_PROXY", ".invalid")
+        assert held.proxy_for("site.invalid") == ""
+    finally:
+        await connection.close()
+        server.close()
+
+
+async def test_a_failed_dial_says_how_relay_dialed(
+    site: Site, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, proxy = await _proxy(site)
+    _no_proxy_set(monkeypatch)
+    connection = _held(monkeypatch, site, signs_in=False)
+    try:
+        _at(monkeypatch, connection, site, "127.0.0.1", _free_port())
+        closed = await _run(connection, "echo one")
+        text = closed.stderr.decode()
+        assert errors.cause(text, closed.exit_code) == "network", text
+        assert "Connection refused\nrelay dialed 127.0.0.1:" in text
+        assert "directly (no proxy in its environment) ([" in text
+
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}")
+        proxy.refuse = True
+        _at(monkeypatch, connection, site, "site.invalid", site.port)
+        refused = (await _run(connection, "echo one")).stderr.decode()
+        assert refused.startswith("ssh: Could not resolve hostname site.invalid")
+        assert (
+            f"relay's proxy http://127.0.0.1:{proxy.port} did not open site.invalid:{site.port}"
+            " (the proxy answered HTTP/1.1 403 Forbidden), so relay dialed directly"
+        ) in refused
+    finally:
+        await connection.close()
+        server.close()
