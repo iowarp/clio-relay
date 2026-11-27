@@ -1,363 +1,82 @@
-"""The system ``ssh`` and ``scp``, one process per call (RL10).
+"""How relay reaches an ``ssh`` site: its own held connection, or the system ``ssh``.
 
-Relay embeds no SSH library. Each call is its own process with the person's
-profile, so their agent, keys, jump hosts and ``~/.ssh/config`` apply, and
-nothing is held open between calls. A site that asks for a code on every
-connection is the one exception: with ``interactive_sign_in`` the person signs
-in once through an ask, and later calls reuse that connection's master. The
-master ends with the relay process that started it.
+Relay holds the connection itself (``held``), the same way on every OS. The
+person's ``ssh`` still decides where and how to connect: ``ssh -G`` reads their
+``~/.ssh/config`` (``profile``), and their agent and keys sign in. A site with
+``interactive_sign_in`` signs in once through an ask, and later calls reuse that
+connection.
 
-A call ends when its script exits on the site, not when ssh lets go: the script
-reports its exit code on stderr behind a marker (``ends_with_marker``).
+A few profiles need the system ``ssh`` itself (``Profile.openssh_only``: a
+PKCS#11 token, Kerberos, a security key with no agent, or a site's own ssh
+program). Those calls run ``ssh`` and ``scp``, one process per call, and cannot
+sign in with a code.
+
+A call ends when its script exits on the site, not when the connection lets go:
+the script reports its exit code on stderr behind a marker (``ends_with_marker``).
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import hashlib
 import logging
 import os
-import re
-import secrets
 import shlex
-import signal
-import subprocess
-import tempfile
-import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from clio_relay import programs
-from clio_relay.adapters.ssh import errors, overlapped_stdin
+from clio_relay.adapters.ssh import errors, held
 from clio_relay.adapters.ssh.config import SshConfig
+from clio_relay.adapters.ssh.process import (
+    Completed,
+    ends_with_marker,
+    exit_marker,
+    run_process,
+)
+from clio_relay.adapters.ssh.profile import OPENSSH_PROGRAMS
 from clio_relay.asks import askpass
-from clio_relay.jobs.handles import STALL_S, ExecResult, StallReport
+from clio_relay.jobs.handles import StallReport
 from clio_relay.jobs.refusals import Refusal, RefusalReason
+
+__all__ = [
+    "Completed",
+    "SshTransport",
+    "ends_with_marker",
+    "exit_marker",
+    "run_process",
+]
 
 logger = logging.getLogger(__name__)
 
-POSIX = os.name == "posix"
 MAX_RETRY_WAIT_S = 30.0
-EXIT_GRACE_S = 5.0
-"""After the remote command exits, how long ssh gets to end by itself."""
-
-# ``ssh -N -f`` leaves the master in its own session, so it would outlive relay.
-# This watcher, detached too, stops it once the relay process that started it ends.
-_WATCH_MASTER = (
-    'while kill -0 "$1" 2>/dev/null && kill -0 "$2" 2>/dev/null; do sleep 5; done; '
-    'kill "$2" 2>/dev/null'
-)
-
-
-@dataclass
-class Completed:
-    """One finished process, with its output as bytes."""
-
-    argv: list[str]
-    exit_code: int | None
-    stdout: bytes
-    stderr: bytes
-    stdout_truncated: bool = False
-    stderr_truncated: bool = False
-    timed_out: bool = False
-    duration_s: float = 0.0
-    remote_exit: bool = False
-    """The remote command's exit was seen (its marker), so it ran to its end."""
-
-    def text(self) -> str:
-        """Return stdout as text."""
-        return self.stdout.decode("utf-8", errors="replace")
-
-    def error_text(self) -> str:
-        """Return stderr as text."""
-        return self.stderr.decode("utf-8", errors="replace")
-
-    def to_exec_result(self) -> ExecResult:
-        """Return the result in the ``exec`` verb's shape."""
-        return ExecResult(
-            argv=self.argv,
-            exit_code=self.exit_code,
-            stdout=self.text(),
-            stderr=self.error_text(),
-            stdout_truncated=self.stdout_truncated,
-            stderr_truncated=self.stderr_truncated,
-            timed_out=self.timed_out,
-            duration_s=round(self.duration_s, 3),
-        )
-
-
-class _Sink:
-    """One output stream, held to ``limit`` bytes, that may carry relay's exit marker.
-
-    With a ``marker``, the stream's last bytes are held back until it is clear they
-    are not the marker, so the marker never reaches ``data``. Seeing it records the
-    remote exit code and sets ``exited``.
-    """
-
-    def __init__(self, limit: int | None, marker: bytes | None = None) -> None:
-        self.limit = limit
-        self.data = bytearray()
-        self.truncated = False
-        self.last = time.monotonic()
-        self.marker = marker
-        self.exit_code: int | None = None
-        self.exited = asyncio.Event()
-        self._held = b""
-        self._pattern = (
-            re.compile(rb"(?:\r?\n)?" + re.escape(marker) + rb"(\d{1,3})\r?\n") if marker else None
-        )
-
-    async def pump(self, stream: asyncio.StreamReader) -> None:
-        while chunk := await stream.read(65536):
-            self.last = time.monotonic()
-            self._take(chunk)
-        self._keep(self._held)
-        self._held = b""
-
-    def _take(self, chunk: bytes) -> None:
-        if self.marker is None or self._pattern is None or self.exited.is_set():
-            self._keep(chunk)
-            return
-        buffer = self._held + chunk
-        found = self._pattern.search(buffer)
-        if found is not None:
-            self._keep(buffer[: found.start()])
-            self._keep(buffer[found.end() :])
-            self._held = b""
-            self.exit_code = int(found.group(1))
-            self.exited.set()
-            return
-        hold = len(self.marker) + 8
-        self._keep(buffer[:-hold])
-        self._held = buffer[-hold:]
-
-    def _keep(self, chunk: bytes) -> None:
-        if not chunk:
-            return
-        if self.limit is None:
-            self.data += chunk
-            return
-        room = self.limit - len(self.data)
-        if room > 0:
-            self.data += chunk[:room]
-        if len(chunk) > room:
-            self.truncated = True
-
-
-def exit_marker() -> bytes:
-    """Return a marker no command's output holds: a fresh random token per call."""
-    return f"clio-relay-exit:{secrets.token_hex(16)}:".encode()
-
-
-def ends_with_marker(script: str, marker: bytes) -> str:
-    """Return ``script`` run in a subshell, then the marker and its exit code on stderr.
-
-    The marker says the script ended, whatever still holds the session's output or
-    keeps ssh up afterwards: a background child, a jump host's proxy, a wrapper.
-    """
-    return (
-        f"(\n{script.rstrip(chr(10))}\n)\n"
-        "rc=$?\n"
-        f"printf '\\n%s%d\\n' '{marker.decode()}' \"$rc\" >&2\n"
-        'exit "$rc"\n'
-    )
-
-
-def _signed(code: int | None) -> int | None:
-    """Return an exit code as POSIX reads it; Windows reports -1 as 4294967295."""
-    return code - 2**32 if code is not None and code >= 2**31 else code
-
-
-def _kill(process: asyncio.subprocess.Process) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        if POSIX:
-            os.killpg(process.pid, signal.SIGKILL)
-            return
-        # The whole tree: a wrapper's ssh and ssh's ProxyCommand outlive the wrapper.
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=10,
-                check=False,
-            )
-        process.kill()
-
-
-async def run_process(
-    argv: Sequence[str],
-    *,
-    timeout_s: float | None,
-    max_output_bytes: int | None = None,
-    stdin: bytes | None = None,
-    env: Mapping[str, str] | None = None,
-    hold_stdin: bool = False,
-    on_stall: StallReport | None = None,
-    stall_s: float = STALL_S,
-    marker: bytes | None = None,
-) -> Completed:
-    """Run ``argv`` with no shell. ``timeout_s=None`` waits as long as it takes.
-
-    With ``hold_stdin``, standard input stays open until the process ends, so the
-    other end sees it close only then. While the process is quiet for
-    ``stall_s``, ``on_stall`` is called, then again every ``stall_s`` while it
-    stays quiet. Cancelling the caller kills the process group.
-
-    With a ``marker`` (see ``ends_with_marker``), the call ends when the marker
-    shows on stderr: the remote command has exited, with the code it carries.
-    The process gets ``EXIT_GRACE_S`` to end by itself and is then stopped.
-    """
-    command = list(argv)
-    started = time.monotonic()
-    out = _Sink(max_output_bytes)
-    err = _Sink(max_output_bytes, marker)
-    piped = stdin is not None or hold_stdin
-    program = programs.resolved(command, env)
-    if program is None:
-        return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
-    # Win32-OpenSSH gets an overlapped stdin, or a held one can hang it at the end.
-    overlapped = await overlapped_stdin.open_for(program[0], env) if piped else None
-    child_stdin = asyncio.subprocess.PIPE if piped else asyncio.subprocess.DEVNULL
-    if overlapped is not None and overlapped.child is not None:
-        child_stdin = overlapped.child
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *program,
-            stdin=child_stdin,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=overlapped.env if overlapped else dict(env) if env is not None else None,
-            start_new_session=POSIX,
-        )
-    except BaseException as exc:
-        if overlapped is not None:
-            overlapped.close()
-        if isinstance(exc, FileNotFoundError):
-            return Completed(command, 127, b"", f"{command[0]}: command not found".encode())
-        raise
-    if overlapped is not None:
-        overlapped.spawned()
-    sink = overlapped.writer if overlapped is not None else process.stdin
-    assert process.stdout is not None and process.stderr is not None
-
-    async def _feed() -> None:
-        if sink is None:
-            return
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            if stdin:
-                sink.write(stdin)
-                await sink.drain()
-        if hold_stdin:
-            return
-        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-            sink.close()
-
-    work = asyncio.ensure_future(
-        asyncio.gather(out.pump(process.stdout), err.pump(process.stderr), _feed(), process.wait())
-    )
-    exited = asyncio.ensure_future(err.exited.wait())
-    timed_out = False
-    deadline = None if timeout_s is None else started + timeout_s
-    report_at = stall_s
-    try:
-        while True:
-            now = time.monotonic()
-            idle = now - max(out.last, err.last)
-            if idle < stall_s:
-                report_at = stall_s
-            wait: float | None = None if on_stall is None else max(report_at - idle, 0.05)
-            if deadline is not None:
-                left = max(deadline - now, 0.0)
-                wait = left if wait is None else min(wait, left)
-            done, _ = await asyncio.wait(
-                {work, exited}, timeout=wait, return_when=asyncio.FIRST_COMPLETED
-            )
-            if work in done:
-                break
-            if exited in done:
-                # The remote command has exited; whatever holds ssh up now is not it.
-                done, _ = await asyncio.wait({work}, timeout=EXIT_GRACE_S)
-                if not done:
-                    logger.info(
-                        "%s: the remote command exited, but ssh stayed up; stopping it",
-                        command[0],
-                    )
-                    _kill(process)
-                    done, _ = await asyncio.wait({work}, timeout=10)
-                    if not done:
-                        work.cancel()
-                break
-            now = time.monotonic()
-            if deadline is not None and now >= deadline:
-                timed_out = True
-                _kill(process)
-                # The whole process group is gone, so the pipes reach EOF and the pumps end.
-                done, _ = await asyncio.wait({work}, timeout=10)
-                if not done:
-                    work.cancel()
-                break
-            idle = now - max(out.last, err.last)
-            if on_stall is not None and idle >= report_at:
-                report_at += stall_s
-                await on_stall(idle, report_at - idle)
-        with contextlib.suppress(asyncio.CancelledError):
-            await work
-    except asyncio.CancelledError:
-        _kill(process)
-        work.cancel()
-        raise
-    finally:
-        exited.cancel()
-        if sink is not None:
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError, RuntimeError):
-                sink.close()
-        transport = getattr(process, "_transport", None)
-        if transport is not None:
-            transport.close()
-    remote = err.exited.is_set()
-    return Completed(
-        argv=command,
-        exit_code=err.exit_code if remote else None if timed_out else _signed(process.returncode),
-        stdout=bytes(out.data),
-        stderr=bytes(err.data),
-        stdout_truncated=out.truncated,
-        stderr_truncated=err.truncated,
-        timed_out=timed_out and not remote,
-        duration_s=time.monotonic() - started,
-        remote_exit=remote,
-    )
-
-
-def _short_dir(preferred: Path) -> Path:
-    """Return a directory whose socket paths fit the 104-byte Unix limit."""
-    if len(str(preferred)) + 42 < 100:
-        return preferred
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    return Path(tempfile.gettempdir()) / f"clio-relay-ssh-{uid}"
 
 
 class SshTransport:
-    """Builds and runs ``ssh`` and ``scp`` for one site."""
+    """Runs calls and copies on one site, over relay's held connection or the system ``ssh``."""
 
     def __init__(self, config: SshConfig, *, site_id: str, state_dir: Path) -> None:
         self.config = config
         self.site_id = site_id
         self.state_dir = state_dir
-        key = hashlib.sha256(f"{config.ssh_profile}|{state_dir}".encode()).hexdigest()[:16]
-        self.control_path = _short_dir(state_dir / "cm") / f"{key}.sock"
-        self._starting = asyncio.Lock()
+        self.held = held.Held(
+            base=self._base(),
+            destination=config.ssh_profile,
+            signs_in=config.interactive_sign_in,
+            channels=config.channels,
+            timeout_s=config.connect_timeout_s,
+            site=site_id,
+        )
 
     # argv
 
-    def _common_options(self, *, batch: bool, master: bool = False) -> list[str]:
-        options: list[str] = []
+    def _base(self) -> list[str]:
+        """Return the ssh program and relay's options, without the host."""
+        options: list[str] = [self.config.ssh_command]
         if self.config.ssh_config:
             options += ["-F", os.path.expanduser(self.config.ssh_config)]
         options += [
             "-o",
-            f"BatchMode={'yes' if batch else 'no'}",
+            "BatchMode=yes",
             "-o",
             f"ConnectTimeout={self.config.connect_timeout_s}",
             "-o",
@@ -365,36 +84,20 @@ class SshTransport:
             "-o",
             "ServerAliveCountMax=4",
         ]
-        if self.signs_in():
-            options += [
-                "-o",
-                f"ControlPath={self.control_path}",
-                "-o",
-                f"ControlMaster={'yes' if master else 'no'}",
-            ]
         for option in self.config.ssh_options:
             options += ["-o", option]
         return options
 
-    def _use_askpass(self) -> bool:
-        """Return whether ssh's prompts go to relay's askpass (the page, or a program)."""
-        return self.config.interactive_sign_in
-
     def ssh_argv(self) -> list[str]:
-        """Return the base ``ssh`` argv: program, options and host.
+        """Return the system ``ssh`` argv for this site: program, options and host.
 
-        Calls run with ``BatchMode=yes`` and reuse the signed-in master when there
-        is one. ``serve`` adds its own flags (``-N -L``, ``-J``) before the host.
+        ``ssh -G`` with these reads the profile, and a call on the fallback runs them.
         """
-        return [
-            self.config.ssh_command,
-            *self._common_options(batch=True),
-            self.config.ssh_profile,
-        ]
+        return [*self._base(), self.config.ssh_profile]
 
     def environment(self, operation_id: str | None = None) -> dict[str, str] | None:
-        """Return the environment ssh and scp run with, or ``None`` for relay's own."""
-        if not self._use_askpass():
+        """Return the environment signing in asks with, or ``None`` for relay's own."""
+        if not self.config.interactive_sign_in:
             return None
         env = dict(os.environ)
         env.update(
@@ -407,6 +110,32 @@ class SshTransport:
         if self.config.askpass:
             env["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
         return env
+
+    async def holds(self) -> bool:
+        """Return whether calls go over relay's held connection, not the system ``ssh``.
+
+        A site that signs in with a code needs the held connection, so a profile
+        only the system ``ssh`` can serve refuses with its reason.
+        """
+        if Path(self.config.ssh_command).name.lower() not in OPENSSH_PROGRAMS:
+            reason: str | None = f"the site names its own ssh program ({self.config.ssh_command})"
+        else:
+            reason = (await self.held.profile()).openssh_only
+        if reason is None:
+            return True
+        if self.config.interactive_sign_in:
+            raise Refusal(
+                RefusalReason.INTERACTIVE_AUTH_REQUIRED,
+                (
+                    f"interactive_sign_in on {self.config.ssh_profile} needs relay to hold "
+                    f"the signed-in connection, and {reason}, which only the system ssh "
+                    "can use. Sign in with a key relay can read, or use the worker adapter"
+                ),
+                site=self.site_id,
+                adapter="worker",
+                cause="openssh_only",
+            )
+        return False
 
     # ssh
 
@@ -431,26 +160,36 @@ class SshTransport:
         failed or dropped runs again, up to ``retries`` times. Without ``retry``
         the script must not run twice, so it runs again only when the connection
         never opened. The call ends when the script does, even if something
-        keeps ssh up after it (see ``ends_with_marker``).
+        keeps the session up after it (see ``ends_with_marker``).
         """
         marker = exit_marker()
         wrapped = ends_with_marker(script, marker)
         if data is None and not hold_stdin:
-            argv = [*self.ssh_argv(), "sh -s"]
+            command = "sh -s"
             # sh reads a group whole before it runs any of it, so a stream cut
             # short by a dropped connection runs nothing rather than a part.
             stdin = ("{\n" + wrapped.rstrip("\n") + "\n}\n").encode()
         else:
-            argv = [*self.ssh_argv(), f"sh -c {shlex.quote(wrapped)}"]
+            command = f"sh -c {shlex.quote(wrapped)}"
             stdin = data or b""
+        use_held = await self.holds()
 
         async def once() -> Completed:
+            if use_held:
+                return await self.held.run(
+                    command,
+                    stdin=stdin,
+                    hold_stdin=hold_stdin,
+                    timeout_s=timeout_s,
+                    max_output_bytes=max_output_bytes,
+                    marker=marker,
+                    on_stall=on_stall,
+                )
             return await run_process(
-                argv,
+                [*self.ssh_argv(), command],
                 timeout_s=timeout_s,
                 max_output_bytes=max_output_bytes,
                 stdin=stdin,
-                env=self.environment(),
                 hold_stdin=hold_stdin,
                 on_stall=on_stall,
                 marker=marker,
@@ -487,7 +226,7 @@ class SshTransport:
             result = await call()
             code = result.exit_code
             if scp and code:
-                code = 255  # scp exits 1 and passes on ssh's own message
+                code = 255  # scp and sftp exit 1 and pass on the connection's own message
             if (
                 result.remote_exit
                 or attempt >= self.config.retries
@@ -538,30 +277,31 @@ class SshTransport:
             profile=self.config.ssh_profile,
             site=self.site_id,
             what=what,
-            sign_in=self._use_askpass(),
+            sign_in=self.config.interactive_sign_in,
         )
         if refusal is not None:
             raise refusal
 
-    # scp
+    # copies
 
     async def upload(self, sources: Sequence[Path], destination: str) -> None:
         """Copy local files into a directory on the site. A dropped transfer is retried."""
         if not sources:
             return
+        use_held = await self.holds()
         argv = [
             self.config.scp_command,
             "-q",
             "-p",
-            *self._common_options(batch=True),
+            *self._base()[1:],
             *[str(path) for path in sources],
             f"{self.config.ssh_profile}:{destination.rstrip('/')}/",
         ]
 
         async def once() -> Completed:
-            return await run_process(
-                argv, timeout_s=None, max_output_bytes=65536, env=self.environment()
-            )
+            if use_held:
+                return await self.held.upload(sources, destination)
+            return await run_process(argv, timeout_s=None, max_output_bytes=65536)
 
         result = await self.retrying(once, "copying", scp=True)
         if result.exit_code == 0:
@@ -570,141 +310,45 @@ class SshTransport:
         self.raise_for_failure(result, "copying")
         raise Refusal(
             RefusalReason.UNREACHABLE,
-            f"scp to {self.config.ssh_profile} failed: {result.error_text().strip()}",
+            f"copying to {self.config.ssh_profile} failed: {result.error_text().strip()}",
             site=self.site_id,
         )
 
     # interactive sign-in
 
-    def signs_in(self) -> bool:
-        """Return whether this site signs in through a master, refusing where none can run.
+    def signed_in(self) -> bool:
+        """Return whether relay holds a signed-in connection to the site."""
+        return self.held.signed_in()
 
-        Windows' ssh, and Git's, cannot hold a ``ControlMaster``: the master
-        fails only after the person has answered, so refuse before anyone is asked.
+    def forward_connection(self) -> held.Held | None:
+        """Return the connection a served port rides, for a site that signs in with a code.
+
+        Key sites forward from relay's detached forwarder instead, which outlives relay.
         """
-        if not self.config.interactive_sign_in:
-            return False
-        if not POSIX:
-            raise Refusal(
-                RefusalReason.INTERACTIVE_AUTH_REQUIRED,
-                (
-                    f"interactive_sign_in on {self.config.ssh_profile} needs an ssh master "
-                    "connection, and ssh on Windows cannot hold one. Use the worker "
-                    "adapter for this site: it signs in once on relay's page"
-                ),
-                site=self.site_id,
-                adapter="worker",
-                cause="no_ssh_master",
-            )
-        return True
-
-    async def master_up(self) -> bool:
-        """Return whether a signed-in master connection is running."""
-        return await self.master_pid() is not None
-
-    async def master_pid(self) -> int | None:
-        """Return the running master's pid (0 if ssh does not say), or ``None``."""
-        if not self.config.interactive_sign_in or not self.control_path.exists():
-            return None
-        argv = [
-            self.config.ssh_command,
-            *self._common_options(batch=True),
-            "-O",
-            "check",
-            self.config.ssh_profile,
-        ]
-        result = await run_process(argv, timeout_s=30, max_output_bytes=4096)
-        if result.exit_code != 0:
-            return None
-        found = re.search(rb"pid=(\d+)", result.stderr + result.stdout)
-        return int(found.group(1)) if found else 0
+        return self.held if self.config.interactive_sign_in else None
 
     def starter(self) -> Callable[[dict[str, str]], Awaitable[None]]:
-        """Return the coroutine the sign-in page runs to bring the master up."""
+        """Return the coroutine the sign-in page runs to sign in and hold the connection."""
 
         async def _start(env: dict[str, str]) -> None:
-            async with self._starting:
-                # A second master would find the socket taken and stay up as a
-                # plain connection that nothing ever closes.
-                if await self.master_up():
-                    return
-                # A master that was killed can leave its socket behind.
-                with contextlib.suppress(OSError):
-                    self.control_path.unlink()
-                await self._start_master(env)
-                await self._watch_master()
+            await self.holds()
+            merged = dict(os.environ)
+            merged.update(env)
+            if self.config.askpass:
+                merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
+            try:
+                await self.held.sign_in(merged)
+            except held.SshFailure as failure:
+                raise RuntimeError(
+                    f"ssh sign-in to {self.config.ssh_profile} failed: {failure.text}"
+                ) from None
 
         return _start
-
-    async def _start_master(self, env: dict[str, str]) -> None:
-        self.control_path.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            self.control_path.parent.chmod(0o700)
-        argv = [
-            self.config.ssh_command,
-            *self._common_options(batch=False, master=True),
-            "-o",
-            "ControlPersist=no",
-            # ControlMaster=yes makes this the master; adding -M would turn it into "ask".
-            "-N",
-            "-f",
-            self.config.ssh_profile,
-        ]
-        merged = dict(os.environ)
-        merged.update(env)
-        if self.config.askpass:
-            merged["SSH_ASKPASS"] = os.path.expanduser(self.config.askpass)
-        program = programs.resolved(argv, merged)
-        if program is None:
-            raise RuntimeError(programs.missing(argv[0]))
-        # The backgrounded master keeps its stderr, so a pipe would never close.
-        with tempfile.TemporaryFile() as log:
-            process = await asyncio.create_subprocess_exec(
-                *program,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=log,
-                env=merged,
-                start_new_session=POSIX,
-            )
-            code = await process.wait()
-            log.seek(0)
-            detail = log.read(65536).decode("utf-8", errors="replace").strip()
-        if code != 0:
-            raise RuntimeError(f"ssh sign-in to {self.config.ssh_profile} failed: {detail}")
-
-    async def _watch_master(self) -> None:
-        """Stop the master when this relay process ends, however it ends."""
-        pid = await self.master_pid()
-        if not POSIX or not pid:
-            return
-        watcher = await asyncio.create_subprocess_exec(
-            "sh",
-            "-c",
-            f"({_WATCH_MASTER}) &",
-            "sh",
-            str(os.getpid()),
-            str(pid),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        await watcher.wait()
 
     def register_sign_in(self) -> None:
         """Offer the starter to relay's sign-in page."""
         askpass.register_sign_in(self.site_id, self.starter())
 
-    async def stop_master(self) -> None:
-        """Close the signed-in master connection, if one is up."""
-        if not self.config.interactive_sign_in or not self.control_path.exists():
-            return
-        argv = [
-            self.config.ssh_command,
-            *self._common_options(batch=True),
-            "-O",
-            "exit",
-            self.config.ssh_profile,
-        ]
-        await run_process(argv, timeout_s=30, max_output_bytes=4096)
+    async def close(self) -> int:
+        """Close relay's connections to the site; return how many were up."""
+        return await self.held.close()

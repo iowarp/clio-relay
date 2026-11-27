@@ -18,7 +18,8 @@ from typing import Any
 class Runner:
     """Runs coroutines on one background loop, started on first use."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "relay-asks") -> None:
+        self.name = name
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -36,7 +37,7 @@ class Runner:
                     loop.call_soon(ready.set)
                     loop.run_forever()
 
-                self._thread = threading.Thread(target=run, name="relay-asks", daemon=True)
+                self._thread = threading.Thread(target=run, name=self.name, daemon=True)
                 self._thread.start()
                 ready.wait()
                 self._loop = loop

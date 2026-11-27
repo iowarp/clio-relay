@@ -15,6 +15,7 @@ HOST_KEY_FAILED = (
 )
 NODE_REFUSED_JOB_ENDED = ("pam_slurm_adopt", "no active jobs on this node")
 LOGIN_REFUSED = ("permission denied (",)
+NOT_SIGNED_IN = ("relay holds no signed-in connection to",)
 PORT_UNUSABLE = ("cannot listen to port", "could not request local forwarding", "bind [")
 
 
@@ -49,6 +50,14 @@ def classify_exit(lines: list[str], host: str | None) -> Refusal | None:
     text = "\n".join(lines).lower()
     node = host or "the node"
     last = next((line.strip() for line in reversed(lines) if line.strip()), "")
+    if any(mark in text for mark in NOT_SIGNED_IN):
+        return Refusal(
+            RefusalReason.NEEDS_SIGN_IN,
+            "the site signs in with a code, and relay's signed-in connection to it is "
+            "gone (relay restarted, or the connection dropped). Sign in again, then serve again",
+            host=host,
+            detail=last,
+        )
     if any(mark in text for mark in HOST_KEY_FAILED):
         return Refusal(
             RefusalReason.HOST_KEY_UNVERIFIED,

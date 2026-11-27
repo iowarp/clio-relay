@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
+import json
 import socket
 import sys
 from pathlib import Path
@@ -148,15 +148,7 @@ def test_visitor_command_keeps_secrets_in_the_environment(tmp_path: Path) -> Non
     assert "frp-token-value" not in " ".join(argv)
 
 
-def test_ssh_forward_jumps_through_the_login_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    found = str(tmp_path / "shims" / "ssh")
-
-    def find(command: str, env: object = None) -> str | None:
-        return found if command == "ssh" else None
-
-    monkeypatch.setattr("clio_relay.programs.find", find)
+def test_ssh_forward_runs_relays_forwarder_through_the_login_host(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path).model_copy(
         update={
             "mode": "ssh",
@@ -166,18 +158,23 @@ def test_ssh_forward_jumps_through_the_login_host(
         }
     )
     port = plan.ports[0]
-    argv, env = ssh_command(plan, {"SSH_ASKPASS": "/askpass"})
-    assert argv[:5] == ["ssh", "-F", "/cfg", "-o", "BatchMode=yes"]
+    argv, env = ssh_command(plan, {"SSH_ASKPASS": "/askpass"}, tmp_path / "known_hosts")
+    assert argv[:3] == [sys.executable, "-m", "clio_relay.adapters.ssh.forwarder"]
+    assert json.loads(argv[argv.index("--base") + 1]) == [
+        "ssh",
+        "-F",
+        "/cfg",
+        "-o",
+        "BatchMode=yes",
+    ]
+    assert argv[argv.index("--destination") + 1] == "ares"
+    assert argv[argv.index("--node") + 1] == "ares-comp-03"
+    assert argv[argv.index("--known-hosts") + 1] == str(tmp_path / "known_hosts")
+    # The adoption marker relay finds in a running forward's command line.
     assert f"127.0.0.1:{port.local_port}:127.0.0.1:{port.remote_port}" in argv
-    assert "ExitOnForwardFailure=yes" in argv
-    assert argv[-1] == "ares-comp-03"
-    jump = next(item for item in argv if item.startswith("ProxyCommand="))
-    assert shlex.split(jump.split("=", 1)[1])[-3:] == ["-W", "%h:%p", "ares"]
-    # ssh starts the hop itself, so it names the program relay found, not a bare name.
-    assert shlex.split(jump.split("=", 1)[1])[0] == found
     assert env["SSH_ASKPASS"] == "/askpass"
     same = plan.model_copy(update={"host": "ares"})
-    assert ssh_command(same)[0][-1] == "ares"
+    assert "--node" not in ssh_command(same)[0]
 
 
 def test_port_bound_does_not_connect() -> None:

@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.15"
 license = { text = "MIT" }
 dependencies = [
     "aioquic>=1.9.1,<1.10",
+    "asyncssh>=2.24,<3",
     "clio-schemas==0.2.1",
     "cryptography>=50.0.0",
     "fastapi>=0.115",

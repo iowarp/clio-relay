@@ -120,6 +120,10 @@ class ServePlan(BaseModel):
     bound_to: str | None = None
     idle_release_s: float | None = None
     ssh_argv: list[str] = Field(default_factory=list[str])
+    forward_in_relay: bool = Field(
+        default=False,
+        description="The forward rides relay's signed-in connection, so it ends with relay",
+    )
     login_host: str | None = None
     host: str | None = None
     host_keys: list[str] = Field(
@@ -176,9 +180,8 @@ class ServePlan(BaseModel):
                 )
                 for port in self.ports
             ],
-            # A forward outlives relay unless it rides the sign-in master, which does not.
-            durable=self.mode == "frp"
-            or not any(arg.startswith("ControlPath=") for arg in self.ssh_argv),
+            # A forward outlives relay unless it rides relay's signed-in connection.
+            durable=self.mode == "frp" or not self.forward_in_relay,
             connect_command=connect_command,
             note=note,
         )

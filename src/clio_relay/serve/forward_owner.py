@@ -94,5 +94,7 @@ class ForwardOwning:
             environment = getattr(transport, "environment", None)
             if callable(environment):
                 forward.ssh_env = dict(await maybe(environment()) or {})
+            riding = getattr(transport, "forward_connection", None)
+            forward.connection = riding() if callable(riding) else None
         await forward.start()
         return forward

@@ -405,9 +405,7 @@ class ServeRuntime(ForwardCare, ForwardOwning):
             entry=self.sites.get(str(adapter.context.site_id)),
             choices=choices_of(record),
         )
-        if not plan.package:
-            return None
-        return package_service_job(spec, plan, {}), port_choices(plan)
+        return (package_service_job(spec, plan, {}), port_choices(plan)) if plan.package else None
 
     async def start_for(self, adapter: Any, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
         """Plan the service, stage its files and submit the wrapped job."""
@@ -431,6 +429,8 @@ class ServeRuntime(ForwardCare, ForwardOwning):
         plan.secrets = {port.secret_env: new_secret() for port in ports if port.secret_env}
         if mode == "ssh":
             plan.ssh_argv = [str(part) for part in await maybe(adapter.ssh_argv())]
+            riding = getattr(getattr(adapter, "transport", None), "forward_connection", None)
+            plan.forward_in_relay = callable(riding) and riding() is not None
             plan.login_host = (await self._exec(adapter, plan, ["hostname"])).stdout.strip() or None
         if mode == "frp" and plan.site_serve.hop == "login":
             plan.hop = await self._start_hop(adapter, plan)

@@ -391,29 +391,15 @@ def totp_code(fx: dict[str, str]) -> str:
 
 
 async def close_otp(fx: dict[str, str], adapter: SshAdapter) -> None:
-    subprocess.run(
-        [
-            "ssh",
-            "-F",
-            fx["FX_SSH_CONFIG"],
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            f"ControlPath={adapter.transport.control_path}",
-            "fx-otp",
-            f"rm -rf {RUN_DIR}",
-        ],
-        check=False,
-        capture_output=True,
-        timeout=60,
-    )
-    await adapter.transport.stop_master()
-    assert not await adapter.transport.master_up()
+    if adapter.transport.signed_in():
+        await adapter.transport.ssh(f"rm -rf {RUN_DIR}", timeout_s=60, check_timeout=False)
+    await adapter.transport.close()
+    assert not adapter.transport.signed_in()
 
 
 async def signed_in_job(adapter: SshAdapter) -> None:
-    """With the master up, every verb works without another prompt."""
-    assert await adapter.transport.master_up()
+    """With relay's connection up, every verb works without another prompt."""
+    assert adapter.transport.signed_in()
     await adapter.sign_in_done({})
     info = await adapter.describe()
     assert info.facts["host"]

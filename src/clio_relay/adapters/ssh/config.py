@@ -13,10 +13,10 @@ SchedulerChoice = Literal["auto", "none", "slurm", "pbs", "lsf", "cobalt"]
 
 
 class SshConfig(BaseModel):
-    """How relay reaches a site with the system ``ssh`` and ``scp``.
+    """How relay reaches a site over ssh.
 
     The profile is a host from the person's own ssh configuration, so their
-    agent, keys, jump hosts and options apply.
+    agent, keys, jump hosts and options apply. Relay holds the connection itself.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -71,6 +71,15 @@ class SshConfig(BaseModel):
     ssh_command: str = Field(default="ssh", description="The ssh program")
     scp_command: str = Field(default="scp", description="The scp program")
     connect_timeout_s: int = Field(default=30, ge=1, description="ssh ConnectTimeout")
+    channels: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description=(
+            "How many calls share one held connection. Relay uses fewer when the site "
+            "refuses more (its MaxSessions)"
+        ),
+    )
     command_timeout_s: float = Field(
         default=300,
         gt=0,

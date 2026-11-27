@@ -160,19 +160,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # helpers
 
     async def shutdown(self) -> list[dict[str, Any]]:
-        """Close the signed-in ssh control connection, if relay holds one. Jobs keep running."""
-        transport = self.transport
-        if not transport.config.interactive_sign_in or not transport.control_path.exists():
+        """Close relay's held ssh connections to the site. Jobs keep running."""
+        if not await self.transport.close():
             return []
-        pid = await transport.master_pid()
-        await transport.stop_master()
-        stopped: dict[str, Any] = {
-            "kind": "tunnel",
-            "detail": f"ssh control connection to {self.config.ssh_profile}",
-        }
-        if pid:
-            stopped["pid"] = pid
-        return [stopped]
+        return [{"kind": "tunnel", "detail": f"ssh connection to {self.config.ssh_profile}"}]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
         """Relay's directory on the site; Spack, JARVIS's recorded answers and a published
@@ -1118,9 +1109,10 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # sign-in
 
     async def sign_in_needed(self) -> SignInNeed | None:
-        if not self.transport.signs_in():
+        if not self.config.interactive_sign_in:
             return None
-        if await self.transport.master_up():
+        await self.transport.holds()
+        if self.transport.signed_in():
             return None
         failed = ""
         if self.config.askpass:
@@ -1129,7 +1121,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 await self.transport.starter()(self.transport.environment() or {})
             except RuntimeError as exc:
                 failed = f". The askpass program could not sign in: {exc}"
-            if not failed and await self.transport.master_up():
+            if not failed and self.transport.signed_in():
                 return None
         self.transport.register_sign_in()
         return SignInNeed(
@@ -1142,7 +1134,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         )
 
     async def sign_in_done(self, answer: dict[str, Any]) -> None:
-        if self.config.interactive_sign_in and not await self.transport.master_up():
+        if self.config.interactive_sign_in and not self.transport.signed_in():
             raise Refusal(
                 RefusalReason.NEEDS_SIGN_IN,
                 f"the sign-in to {self.config.ssh_profile} did not leave a connection open",

@@ -56,16 +56,15 @@ def test_ssh_argv_uses_the_profile_and_batch_mode(tmp_path: Path) -> None:
     assert not any(item.startswith("ControlPath=") for item in argv)
 
 
-def test_interactive_sign_in_uses_a_control_path(tmp_path: Path) -> None:
+def test_interactive_sign_in_keeps_the_plain_argv(tmp_path: Path) -> None:
     transport = SshTransport(
         SshConfig(ssh_profile="example", interactive_sign_in=True),
         site_id="unit",
         state_dir=tmp_path,
     )
     argv = transport.ssh_argv()
-    assert any(item.startswith("ControlPath=") for item in argv)
-    assert "ControlMaster=no" in argv
-    assert len(str(transport.control_path)) < 104
+    assert not any(item.startswith("Control") for item in argv)
+    assert argv[-1] == "example"
 
 
 def _failed(stderr: str, code: int = 255) -> Completed:
@@ -235,18 +234,14 @@ async def test_no_sign_in_without_interactive_sign_in(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_code_site_without_an_ssh_master_refuses_before_asking(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("clio_relay.adapters.ssh.transport.POSIX", False)
-    adapter = _adapter(tmp_path, interactive_sign_in=True)
+async def test_a_code_site_relay_cannot_hold_refuses_before_asking(tmp_path: Path) -> None:
+    adapter = _adapter(tmp_path, interactive_sign_in=True, ssh_command="/opt/site/bin/gsissh")
     with pytest.raises(Refusal) as refused:
         await adapter.sign_in_needed()
     assert refused.value.reason == RefusalReason.INTERACTIVE_AUTH_REQUIRED
     assert refused.value.data["adapter"] == "worker"
-    assert refused.value.data["cause"] == "no_ssh_master"
-    with pytest.raises(Refusal):
-        adapter.ssh_argv()
+    assert refused.value.data["cause"] == "openssh_only"
+    assert "gsissh" in refused.value.message
 
 
 @pytest.mark.parametrize(

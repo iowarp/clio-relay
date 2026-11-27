@@ -15,11 +15,11 @@ from pathlib import Path
 import pytest
 
 from clio_relay.adapters.ssh import SshConfig, scripts
-from clio_relay.adapters.ssh import transport as ssh_transport
+from clio_relay.adapters.ssh import process as ssh_process
+from clio_relay.adapters.ssh.process import Sink
 from clio_relay.adapters.ssh.transport import (
     Completed,
     SshTransport,
-    _Sink,  # pyright: ignore[reportPrivateUsage]
     ends_with_marker,
     exit_marker,
     run_process,
@@ -28,7 +28,7 @@ from clio_relay.adapters.ssh.transport import (
 DROPPED = "client_loop: send disconnect: Broken pipe\n"
 
 
-async def _pump(sink: _Sink, *chunks: bytes) -> None:
+async def _pump(sink: Sink, *chunks: bytes) -> None:
     stream = asyncio.StreamReader()
     for chunk in chunks:
         stream.feed_data(chunk)
@@ -43,7 +43,7 @@ def test_every_call_gets_its_own_marker() -> None:
 @pytest.mark.asyncio
 async def test_the_marker_is_read_and_left_out_of_stderr() -> None:
     marker = exit_marker()
-    sink = _Sink(None, marker)
+    sink = Sink(None, marker)
     await _pump(sink, b"warning: x\n", b"\n" + marker + b"7\n", b"after\n")
     assert sink.exited.is_set()
     assert sink.exit_code == 7
@@ -54,7 +54,7 @@ async def test_the_marker_is_read_and_left_out_of_stderr() -> None:
 async def test_a_marker_split_across_reads_is_still_found() -> None:
     marker = exit_marker()
     whole = b"no newline at the end" + b"\n" + marker + b"0\n"
-    sink = _Sink(None, marker)
+    sink = Sink(None, marker)
     await _pump(sink, *(whole[i : i + 3] for i in range(0, len(whole), 3)))
     assert sink.exit_code == 0
     assert bytes(sink.data) == b"no newline at the end"
@@ -63,7 +63,7 @@ async def test_a_marker_split_across_reads_is_still_found() -> None:
 @pytest.mark.asyncio
 async def test_a_marker_past_the_output_limit_still_counts() -> None:
     marker = exit_marker()
-    sink = _Sink(8, marker)
+    sink = Sink(8, marker)
     await _pump(sink, b"x" * 100, b"\n" + marker + b"3\n")
     assert sink.exit_code == 3
     assert sink.truncated
@@ -72,7 +72,7 @@ async def test_a_marker_past_the_output_limit_still_counts() -> None:
 
 @pytest.mark.asyncio
 async def test_output_without_a_marker_is_kept_whole() -> None:
-    sink = _Sink(None, exit_marker())
+    sink = Sink(None, exit_marker())
     await _pump(sink, b"short")
     assert not sink.exited.is_set()
     assert bytes(sink.data) == b"short"
@@ -82,7 +82,7 @@ async def test_output_without_a_marker_is_kept_whole() -> None:
 async def test_the_call_ends_on_the_marker_while_ssh_stays_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ssh_transport, "EXIT_GRACE_S", 0.3)
+    monkeypatch.setattr(ssh_process, "EXIT_GRACE_S", 0.3)
     marker = exit_marker()
     # A stand-in for an ssh whose session outlives the command: it reports the
     # exit, then holds both pipes open.
@@ -135,7 +135,7 @@ async def test_a_command_that_ran_is_never_run_again(tmp_path: Path) -> None:
 async def test_a_background_child_holding_the_output_does_not_hold_the_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ssh_transport, "EXIT_GRACE_S", 0.3)
+    monkeypatch.setattr(ssh_process, "EXIT_GRACE_S", 0.3)
     marker = exit_marker()
     script = ends_with_marker("sleep 60 &\necho done\nexit 2", marker)
     started = time.monotonic()

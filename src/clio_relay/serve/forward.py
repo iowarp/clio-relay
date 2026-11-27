@@ -1,7 +1,8 @@
 """The desktop end of a served port: a loopback bind that comes back (RL20, RL22, RL23).
 
-A forward is relay's own frp visitor (``clio_relay.frp_visitor``), or one ``ssh -L``
-held by the system ``ssh``.
+A forward is relay's own frp visitor (``clio_relay.frp_visitor``), or relay's own
+ssh forwarder (``clio_relay.adapters.ssh.forwarder``). A site that signs in with a
+code forwards over the connection relay holds instead, and that forward ends with relay.
 Relay watches its process and starts it again on the same port when it dies,
 counting each restart so the person can see it. Whether the port is bound is
 read by trying to bind it, never by connecting, because some services (a
@@ -18,10 +19,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import shlex
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from clio_relay import frp_visitor, programs
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -76,84 +77,27 @@ def visitor_command(plan: ServePlan, directory: Path) -> tuple[list[str], dict[s
 def ssh_command(
     plan: ServePlan, env: dict[str, str] | None = None, known_hosts: Path | None = None
 ) -> tuple[list[str], dict[str, str]]:
-    """Return the ``ssh -L`` that holds every port of an ``ssh`` site's service.
+    """Return relay's detached forwarder that holds every port of an ``ssh`` site's service.
 
-    ``known_hosts`` holds the compute node's keys read on the login host; ssh checks
-    it after the person's own known_hosts.
+    ``known_hosts`` holds the compute node's keys read on the login host; the
+    forwarder checks it after the person's own known_hosts.
     """
+    from clio_relay.adapters.ssh import forwarder
+
     if not plan.ssh_argv:
         raise Refusal(RefusalReason.INVALID_CONFIG, "the adapter gave no ssh command")
     merged = {**os.environ, **(env or {})}
     base, destination = plan.ssh_argv[:-1], plan.ssh_argv[-1]
-    argv = [
-        *base,
-        "-N",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-o",
-        "ServerAliveInterval=15",
-        "-o",
-        "ServerAliveCountMax=3",
-    ]
-    for port in plan.ports:
-        argv += ["-L", f"127.0.0.1:{port.local_port}:127.0.0.1:{port.remote_port}"]
-    if plan.host and plan.login_host and plan.host != plan.login_host:
-        if known_hosts is not None:
-            argv += ["-o", f'GlobalKnownHostsFile="{known_hosts.as_posix()}"']
-        argv += login_identity(base, destination, merged)
-        argv += ["-o", f"ProxyCommand={_jump_command(base, destination, merged)}", plan.host]
-    else:
-        argv.append(destination)
+    ports = [(port.local_port, port.remote_port) for port in plan.ports]
+    argv = forwarder.command(base, destination, ports, _node(plan), known_hosts)
     return argv, merged
 
 
-IDENTITY_KEYS = ("user", "identityfile", "certificatefile", "identitiesonly", "identityagent")
-"""What the login host's ssh settings say about logging in, carried to the node behind it."""
-
-
-def login_identity(base: list[str], destination: str, env: dict[str, str]) -> list[str]:
-    """Return the login destination's login settings as options for the node behind it.
-
-    A person's ssh config names their user and key for the login host, which says
-    nothing of the compute node relay reaches through it. ``ssh -G`` reads what the
-    login host gets, so the node gets the same; empty when ssh cannot say.
-    """
-    program = programs.find(base[0], env) or base[0]
-    try:
-        done = subprocess.run(
-            [program, *base[1:], "-G", destination],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=env,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if done.returncode != 0:
-        return []
-    options: list[str] = []
-    for line in done.stdout.splitlines():
-        key, _sep, value = line.strip().partition(" ")
-        value = value.strip()
-        if key.lower() in IDENTITY_KEYS and value and value.lower() != "none":
-            options += ["-o", f'{key}="{value.replace(chr(92), "/")}"']
-    return options
-
-
-def _jump_command(base: list[str], destination: str, env: dict[str, str]) -> str:
-    """Return the ``ssh -W`` hop through the login host, as ssh's ``ProxyCommand``.
-
-    ssh starts a ``ProxyCommand`` itself. On Windows that is ``CreateProcess``, which
-    looks in ssh's own directory first, so a bare ``ssh`` there would be System32's
-    rather than the one relay found on the PATH (a host's wrapper, say). The hop
-    therefore names the program relay found, quoted the way the platform reads it.
-    """
-    program = programs.find(base[0], env) or base[0]
-    hop = [program, *base[1:], "-W", "%h:%p", destination]
-    if os.name == "nt":
-        return subprocess.list2cmdline([hop[0].replace("%", "%%"), *hop[1:]])
-    return shlex.join([hop[0].replace("%", "%%"), *hop[1:]])
+def _node(plan: ServePlan) -> str | None:
+    """Return the compute node behind the login host, if the service runs on one."""
+    if plan.host and plan.login_host and plan.host != plan.login_host:
+        return plan.host
+    return None
 
 
 def forward_marker(plan: ServePlan, directory: Path) -> str:
@@ -219,6 +163,8 @@ class Forward:
         self._in_use_polls = 0
         self.closing = False
         self.ssh_env: dict[str, str] = {}
+        self.connection: Any = None
+        """Relay's held ssh connection, for a site that signs in with a code; else None."""
         self.marker = forward_marker(plan, directory)
         self.lock = ForwardLock(directory)
         self.elsewhere = False
@@ -276,21 +222,45 @@ class Forward:
             lines = []
         return frp.direct_note(lines, rendezvous.direct_wait_s)
 
+    def _known_hosts(self) -> Path | None:
+        if not self.plan.host_keys:
+            return None
+        self.directory.mkdir(parents=True, exist_ok=True)
+        known_hosts = self.directory / "known_hosts"
+        known_hosts.write_text("\n".join(self.plan.host_keys) + "\n", encoding="utf-8")
+        return known_hosts
+
     def _command(self) -> tuple[list[str], dict[str, str]]:
         if self.plan.mode == "frp":
             return visitor_command(self.plan, self.directory)
-        known_hosts: Path | None = None
-        if self.plan.host_keys:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            known_hosts = self.directory / "known_hosts"
-            known_hosts.write_text("\n".join(self.plan.host_keys) + "\n", encoding="utf-8")
-        return ssh_command(self.plan, self.ssh_env, known_hosts)
+        return ssh_command(self.plan, self.ssh_env, self._known_hosts())
+
+    def _ride_connection(self) -> None:
+        """Forward over the connection relay holds for a site that signs in with a code."""
+        from clio_relay.adapters.ssh.forwarder import InRelay
+
+        self.directory.mkdir(parents=True, exist_ok=True)
+        try:
+            self._mark = self.log_path.stat().st_size
+        except OSError:
+            self._mark = 0
+        ports = [(port.local_port, port.remote_port) for port in self.plan.ports]
+        self.process = InRelay.start(
+            self.connection,
+            ports,
+            node=_node(self.plan),
+            known_hosts=self._known_hosts(),
+            log=self.log_path,
+        )
 
     async def _spawn(self) -> None:
         if not self.held and any(
             port_state(port.local_port) == "unusable" for port in self.plan.ports
         ):
             self._repick()
+        if self.plan.mode == "ssh" and self.connection is not None:
+            self._ride_connection()
+            return
         argv, env = self._command()
         program = programs.resolved(argv, env)
         if program is None:

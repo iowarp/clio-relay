@@ -45,7 +45,7 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software. Unset, JARVIS sizes it from its estimate of the build, within the partition's limit. Set it only to override JARVIS |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
 | `askpass` | relay's own | The program that answers ssh's prompts |
-| `ssh_command`, `scp_command` | `ssh`, `scp` | The programs to run. A bare name is looked up on the PATH relay hands the child, with PATHEXT on Windows, so an `ssh.cmd` early on the PATH wins. A path is used as given |
+| `ssh_command`, `scp_command` | `ssh`, `scp` | The ssh relay reads your config with (`ssh -G`). A bare name is looked up on the PATH relay hands the child, with PATHEXT on Windows, so an `ssh.cmd` early on the PATH wins. A path is used as given. A program other than OpenSSH's `ssh` makes relay run it, and `scp_command`, for every call instead of holding the connection |
 | `connect_timeout_s` | 30 | ssh's `ConnectTimeout` |
 | `command_timeout_s` | 300 | When a `describe`, `status` or `cancel` call counts as stalled. The next poll tries again |
 | `retries` | 5 | How many times relay repeats a call or copy whose connection failed or dropped, waiting 2, 4, 8, 16, then 30 seconds. exec, and a write that may not overwrite, are repeated only when the connection never opened |
@@ -402,26 +402,50 @@ The local and worker adapters run package jobs the same way, with the same
 refusals: `jarvis ppl submit` when the site's scheduler is Slurm, and
 JARVIS's direct run under the supervisor when it has none.
 
+## How relay connects
+
+Relay holds one ssh connection to each site itself, the same way on Windows,
+macOS and Linux, and runs every call, copy and forward as a channel on it.
+Your ssh still decides where and how to connect: relay reads your
+`~/.ssh/config` through `ssh -G <profile>` (host, user, port, keys,
+`IdentityAgent`, `ProxyJump`, `ProxyCommand`, known hosts), and your agent
+and keys sign in. When the connection drops, a site that signs in with a key
+connects again by itself on the next call.
+
+A few profiles need the system `ssh` program, and relay runs it, one process
+per call, for those sites only:
+
+- `ssh_command` names a program that is not OpenSSH's `ssh`, such as a site's
+  own `gsissh`;
+- the profile signs with a PKCS#11 token (`PKCS11Provider`);
+- the profile signs in with Kerberos: `GSSAPIAuthentication yes` together
+  with a Kerberos method first in `PreferredAuthentications`, or a ticket
+  cache in `KRB5CCNAME` (the `GSSAPIAuthentication yes` Debian and Ubuntu set
+  for every host does not count by itself);
+- the key is a FIDO security key (`sk-...`) that no agent holds.
+
+Those sites cannot sign in with a code.
+
 ## Sites that ask for a code
 
-Some sites ask for a one-time code or a password on every connection. Relay
-never types into ssh itself.
+Some sites ask for a one-time code or a password on every connection.
 
-- **Without `interactive_sign_in`**, relay runs ssh with `BatchMode=yes`. A
-  site that asks is refused with `interactive_auth_required`, and the refusal
-  names the `worker` adapter, which holds one signed-in connection for you.
+- **Without `interactive_sign_in`**, relay never asks. A site that asks is
+  refused with `interactive_auth_required`, and the refusal names the
+  `worker` adapter.
 - **With `interactive_sign_in: true`**, relay signs in once. The site shows
   as needing sign-in; you press "Start sign-in" on relay's page and answer
-  each prompt there. That starts an ssh master connection
-  (`ControlMaster`), and every later call reuses it with `BatchMode=yes`, so
-  you are asked once, not on every call. When the master closes, the site
-  asks you to sign in again. The master closes when relay stops, so none is
-  left running after it, and signing in again while one is up reuses it.
-  ssh on Windows cannot hold a master, so there the site refuses with
-  `interactive_auth_required` before anyone is asked, and names the `worker`
-  adapter.
+  each prompt there, a password and then a code, or a key and then a code.
+  Every later call rides that signed-in connection, so you are asked once,
+  not on every call, and starting several calls at once still asks once.
+  When the connection closes (the site drops it, or relay stops), the site
+  refuses with `needs_sign_in` and asks you to sign in again. A wrong code is
+  asked again, up to the profile's `NumberOfPasswordPrompts`.
+- A site in the list above that needs the system `ssh` refuses with
+  `interactive_auth_required` and `cause: openssh_only` before anyone is
+  asked.
 
-`askpass` replaces the program that shows the prompts, for example with a
+`askpass` replaces the program that answers the prompts, for example with a
 program of your own that reads codes from a token. With such a program, relay
 signs in by itself and only asks you if the program fails.
 
@@ -429,8 +453,9 @@ signs in by itself and only asks you if the program fails.
 
 `files` follows [the files contract](../files.md). A relative path is under
 `remote_dir`, `~/` is your home on the site, and an absolute path is the
-site's own. Each operation is one `ssh` call, and the bytes travel on its
-standard input and output.
+site's own. Each operation is one command on the site, and the bytes travel
+on its standard input and output. Staging a job's inputs copies them over
+sftp on the same connection.
 
 A chunk goes into a temporary file first and joins `<path>.relay-part` only
 once all of it has arrived, so a link that drops partway adds nothing. A chunk
@@ -446,21 +471,26 @@ idle machine; a loaded login node can make that several times longer.
 
 ## Serving a port
 
-`serve` forwards a port from the site with `ssh -L`. When the service runs on a
-compute node, the forward reaches it through the login node with an
-`ssh -W` hop as its `ProxyCommand`. The hop runs the same `ssh` relay found on
-your PATH, and the node gets the user and key your ssh config gives the login
-node (read with `ssh -G`). Relay reads the node's host key from the login
-node's `known_hosts` files, so you don't need the node in your own.
+`serve` forwards a local port to the service on the site. When the service
+runs on a compute node, the forward reaches it through the login node, and
+the node gets the user and key your ssh config gives the login node (read
+with `ssh -G`). Relay reads the node's host key from the login node's
+`known_hosts` files, so you don't need the node in your own.
 
-The forward is its own process, not a child of relay's, so it lives through
-relay restarting, however the host stops relay: a signal to its group, a kill
-of its tree, or on Windows the close of the job object relay runs in (relay
-starts it through the WMI service there, outside every job). A relay that
-starts while the service is live adopts the forward still holding the port, or
-starts it again at once if it has died, before any call. The forward ends when
-the job does, or when you stop the service or clean the site. On a site that
-signs in interactively, the forward rides the sign-in master and ends with it.
+On a site that signs in with a key, the forward is its own process (relay's
+forwarder, which holds its own connection), not a child of relay's, so it
+lives through relay restarting, however the host stops relay: a signal to its
+group, a kill of its tree, or on Windows the close of the job object relay
+runs in (relay starts it through the WMI service there, outside every job). A
+relay that starts while the service is live adopts the forward still holding
+the port, or starts it again at once if it has died, before any call. The
+forward ends when the job does, or when you stop the service or clean the
+site.
+
+On a site that signs in with a code, the forward rides the signed-in
+connection inside relay, so it asks for nothing more, and it ends when that
+connection does or relay stops. The service keeps running; sign in again and
+serve it again to reach it.
 
 ## When a command ends
 
@@ -471,6 +501,7 @@ on the session's error stream, with a token unique to the call, and drops that
 line from what you see. Once it arrives, ssh gets 5 seconds to end by itself,
 then relay stops it and returns the command's own exit code.
 
+For a site that runs the system `ssh` (see [how relay connects](#how-relay-connects)),
 Win32-OpenSSH (the `ssh.exe` Windows ships) can hang for good when a session
 ends while its standard input is a plain pipe that is still open, as relay's
 is for an `exec`: it waits, with no timeout, for a read it failed to cancel,
@@ -483,8 +514,8 @@ keeps the plain pipe.
 
 ## When the connection drops
 
-Every call is its own ssh run, so a dropped link costs only the call it hit.
-Relay repeats that call up to `retries` times, waiting 2, 4, 8, 16 and then
+A dropped link costs only the calls it hit. Relay connects again and repeats
+each of them up to `retries` times, waiting 2, 4, 8, 16 and then
 30 seconds, and logs each attempt as "retry n of N". The repeat is safe
 because each step checks before it acts: a copy skips content already on the
 site, a submit first looks for the job it may already have submitted, and
@@ -498,7 +529,9 @@ caller decides. Chunks of a `files` write are always repeated. A call whose
 command reported its exit is never repeated, whatever ssh said after.
 
 A failed login, an unknown or changed host key and a missing key are not
-repeated: trying again would give the same answer.
+repeated: trying again would give the same answer. On a site that signs in
+with a code, a dropped connection is not opened again by itself: the calls
+refuse with `needs_sign_in` until you sign in again.
 
 ## Troubleshooting
 

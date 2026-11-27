@@ -237,12 +237,12 @@ def test_endpoint_and_service_env_carry_no_secret(tmp_path: Path) -> None:
     assert "shared-key-value" not in dumped
 
 
-def test_an_ssh_forward_is_durable_unless_it_rides_the_sign_in_master(tmp_path: Path) -> None:
+def test_an_ssh_forward_is_durable_unless_it_rides_relays_connection(tmp_path: Path) -> None:
     plan = frp_plan(tmp_path)
     plan.mode = "ssh"
     plan.ssh_argv = ["ssh", "-o", "BatchMode=yes", "ares"]
     assert plan.endpoint(note=None, connect_command=None).durable
-    plan.ssh_argv = ["ssh", "-o", "ControlPath=/s/master", "-o", "ControlMaster=no", "ares"]
+    plan.forward_in_relay = True
     assert not plan.endpoint(note=None, connect_command=None).durable
 
 
