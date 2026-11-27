@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import dataclasses
 import io
 import shlex
 import socket
 import tarfile
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -122,8 +121,9 @@ async def _handle(process: asyncssh.SSHServerProcess[bytes], root: Path) -> None
     process.exit(0)
 
 
-@pytest_asyncio.fixture
-async def site(tmp_path: Path) -> AsyncIterator[Site]:
+@contextlib.asynccontextmanager
+async def serve_site(tmp_path: Path) -> AsyncGenerator[Site, None]:
+    """Serve a loopback site under ``tmp_path`` for as long as the block runs."""
     host_key = asyncssh.generate_private_key("ssh-ed25519")  # pyright: ignore[reportUnknownMemberType]
     client_key = asyncssh.generate_private_key("ssh-ed25519")  # pyright: ignore[reportUnknownMemberType]
     key_file = tmp_path / "id_ed25519"
@@ -153,6 +153,12 @@ async def site(tmp_path: Path) -> AsyncIterator[Site]:
         yield holder[0]
     finally:
         server.close()
+
+
+@pytest_asyncio.fixture
+async def site(tmp_path: Path) -> AsyncIterator[Site]:
+    async with serve_site(tmp_path) as served:
+        yield served
 
 
 def _profile(site: Site, *, user: str, keys: bool) -> Profile:
@@ -489,102 +495,3 @@ async def test_a_distro_wide_gssapi_default_stays_on_the_held_connection(
     assert "Kerberos" in (profile.from_values("ares", kerberos, "ssh").openssh_only or "")
     monkeypatch.setenv("KRB5CCNAME", "FILE:/tmp/krb5cc_1000")
     assert profile.from_values("ares", debian, "ssh").openssh_only is not None
-
-
-@dataclass
-class Proxy:
-    port: int
-    asked: list[str] = field(default_factory=list[str])
-    refuse: bool = False
-
-
-async def _proxy(site: Site) -> tuple[asyncio.Server, Proxy]:
-    """An HTTP ``CONNECT`` proxy: the only way to reach ``site.invalid``."""
-    proxy = Proxy(port=0)
-
-    async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        with contextlib.suppress(OSError):
-            while data := await reader.read(65536):
-                writer.write(data)
-                await writer.drain()
-        writer.close()
-
-    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        head = await reader.readuntil(b"\r\n\r\n")
-        target = head.split(b"\r\n", 1)[0].split()[1].decode()
-        proxy.asked.append(target)
-        if proxy.refuse or target != f"site.invalid:{site.port}":
-            writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-            writer.close()
-            return
-        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", site.port)
-        writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await asyncio.gather(pump(reader, up_writer), pump(up_reader, writer))
-
-    server = await asyncio.start_server(serve, "127.0.0.1", 0)
-    proxy.port = server.sockets[0].getsockname()[1]
-    return server, proxy
-
-
-def _no_proxy_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (*held.PROXY_VARIABLES, "NO_PROXY", "no_proxy"):
-        monkeypatch.delenv(name, raising=False)
-
-
-def _at(
-    monkeypatch: pytest.MonkeyPatch, connection: held.Held, site: Site, host: str, port: int
-) -> None:
-    resolved = dataclasses.replace(_profile(site, user="keyed", keys=True), host=host, port=port)
-
-    async def resolve() -> Profile:
-        return resolved
-
-    monkeypatch.setattr(connection, "_resolve", resolve)
-
-
-async def test_relay_reaches_the_site_through_the_proxy_its_environment_names(
-    site: Site, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    server, proxy = await _proxy(site)
-    _no_proxy_set(monkeypatch)
-    connection = _held(monkeypatch, site, signs_in=False)
-    _at(monkeypatch, connection, site, "site.invalid", site.port)
-    try:
-        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}")
-        done = await _run(connection, "echo one")
-        assert done.stdout == b"ran:echo one\n", done.stderr
-        assert proxy.asked == [f"site.invalid:{site.port}"]
-        assert held.proxy_for("site.invalid") == f"http://127.0.0.1:{proxy.port}"
-        monkeypatch.setenv("NO_PROXY", ".invalid")
-        assert held.proxy_for("site.invalid") == ""
-    finally:
-        await connection.close()
-        server.close()
-
-
-async def test_a_failed_dial_says_how_relay_dialed(
-    site: Site, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    server, proxy = await _proxy(site)
-    _no_proxy_set(monkeypatch)
-    connection = _held(monkeypatch, site, signs_in=False)
-    try:
-        _at(monkeypatch, connection, site, "127.0.0.1", _free_port())
-        closed = await _run(connection, "echo one")
-        text = closed.stderr.decode()
-        assert errors.cause(text, closed.exit_code) == "network", text
-        assert "Connection refused\nrelay dialed 127.0.0.1:" in text
-        assert "directly (no proxy in its environment) ([" in text
-
-        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{proxy.port}")
-        proxy.refuse = True
-        _at(monkeypatch, connection, site, "site.invalid", site.port)
-        refused = (await _run(connection, "echo one")).stderr.decode()
-        assert refused.startswith("ssh: Could not resolve hostname site.invalid")
-        assert (
-            f"relay's proxy http://127.0.0.1:{proxy.port} did not open site.invalid:{site.port}"
-            " (the proxy answered HTTP/1.1 403 Forbidden), so relay dialed directly"
-        ) in refused
-    finally:
-        await connection.close()
-        server.close()

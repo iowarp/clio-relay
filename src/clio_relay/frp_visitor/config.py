@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from clio_relay.frp_visitor import proxy
+from clio_relay.net import proxy
 
 PROTOCOLS = ("tcp", "websocket", "wss")
 DEFAULT_STUN_SERVER = "stun.easyvoip.com:3478"

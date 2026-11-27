@@ -7,7 +7,7 @@
 
 Like frpc, TLS checks the server's certificate only when a CA file is given;
 relay always gives one for ``wss``. Every transport goes through the host's
-proxy when it gives one (see :mod:`clio_relay.frp_visitor.proxy`).
+proxy when it gives one (see :mod:`clio_relay.net.proxy`).
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ from websockets.protocol import State
 from websockets.typing import Origin
 from websockets.uri import parse_uri
 
-from clio_relay.frp_visitor import proxy
 from clio_relay.frp_visitor.config import Server
 from clio_relay.frp_visitor.pipe import CHUNK, NETWORK_ERRORS, Pipe, ProtocolError, TcpPipe
+from clio_relay.net import proxy
 
 WEBSOCKET_PATH = "/~!frp"
 _FRP_TLS_BYTE = b"\x17"

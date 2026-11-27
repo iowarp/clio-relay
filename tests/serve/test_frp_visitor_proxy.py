@@ -10,8 +10,9 @@ import pytest
 
 from clio_relay import frp_transport
 from clio_relay.errors import RelayError
-from clio_relay.frp_visitor import dial, proxy
+from clio_relay.frp_visitor import dial
 from clio_relay.frp_visitor.config import ConfigError, parse
+from clio_relay.net import proxy
 
 FENCED = {
     "HTTPS_PROXY": "http://127.0.0.1:3128",

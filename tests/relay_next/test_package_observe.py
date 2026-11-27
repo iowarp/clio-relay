@@ -136,13 +136,19 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
         "unit": "step",
         "total": 10,
         "message": "wrote snapshot 3",
-        "metadata": {"clio": {"step": 3, "output": "snapshots", "view": VIEW}},
+        "metadata": {"clio": {"output": "snapshots", "view": VIEW}},
     }
     _jsonl(
         execution / "progress" / "pkg-1.jsonl",
         [
             {**step, "sequence": 1, "current": 1, "observed_at_epoch": 1_000.0},
-            {**step, "sequence": 2, "current": 3, "observed_at_epoch": 1_600.0},
+            {
+                **step,
+                "sequence": 2,
+                "current": 3,
+                "observed_at_epoch": 1_600.0,
+                "metadata": {"clio": {"step": 3, "output": "snapshots", "view": VIEW}},
+            },
         ],
         partial='{"schema_version": "jarvis.prog',
     )

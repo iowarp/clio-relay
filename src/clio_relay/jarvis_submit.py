@@ -1221,8 +1221,7 @@ def record_status(
 
 def spoken_duration(seconds: int) -> str:
     """Say a span of seconds as hours and minutes, such as ``1 h 57 min``."""
-    hours, rest = divmod(max(seconds, 0), 3600)
-    minutes = rest // 60
+    hours, minutes = divmod(max(seconds, 0) // 60, 60)
     if hours:
         return f"{hours} h {minutes} min" if minutes else f"{hours} h"
     return f"{minutes} min" if minutes else "under a minute"

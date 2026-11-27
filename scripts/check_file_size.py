@@ -105,12 +105,12 @@ DISTRIBUTION_TARGET_PERCENT = 90.0
 #: dropped the share below the floor, so the check already failed at 21fffaa5.
 #: 88.28 (211/239) recorded at 2.0.0a40: the live-proof fixes of a19 to a39 had
 #: dropped it below 91.70 while CI ran only on release tags.
-SRC_DISTRIBUTION_BASELINE_PERCENT = 88.75
+SRC_DISTRIBUTION_BASELINE_PERCENT = 88.84
 
 #: Same guard for tests/. May only RISE.
 #: 95.45 (105/110) after the old queue, storage and models tests were deleted.
 #: 93.82 (152/162) recorded at 2.0.0a40, for the same reason as the src floor.
-TESTS_DISTRIBUTION_BASELINE_PERCENT = 93.93
+TESTS_DISTRIBUTION_BASELINE_PERCENT = 93.97
 
 TESTS_ROOTS: tuple[str, ...] = ("tests",)
 

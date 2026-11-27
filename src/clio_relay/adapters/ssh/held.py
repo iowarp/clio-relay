@@ -11,10 +11,10 @@ macOS and Linux. The person's ``ssh`` still says how to reach the site
   that connection. When it drops, calls refuse with ``needs_sign_in`` and
   nothing asks until the person signs in again.
 
-Relay dials the site the way any network client does: through the proxy its
-environment names (``HTTPS_PROXY``, ``ALL_PROXY``; ``NO_PROXY`` exempts hosts),
-unless the person's config gives a ``ProxyCommand`` or jump host. A sandbox that
-lets programs out only through its proxy then reaches the site too.
+Relay dials the site through the proxy its environment names
+(:mod:`clio_relay.net.proxy`), unless the person's config gives a
+``ProxyCommand`` or jump host, so a sandbox that lets programs out only through
+its proxy reaches the site too.
 
 Failures read as OpenSSH's own messages, so ``errors`` tells the cases apart for
 both transports, with a line saying how relay dialed. Every connection lives
@@ -25,26 +25,21 @@ CLI's ``asyncio.run`` all share it.
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
-import errno
 import logging
-import os
 import secrets
 import socket
 import subprocess
 import time
-import urllib.request
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
-from urllib.parse import unquote, urlsplit
+from typing import Any
 
 import asyncssh
 
 from clio_relay import programs
-from clio_relay.adapters.ssh import mux
+from clio_relay.adapters.ssh import dialer, mux
 from clio_relay.adapters.ssh import profile as profiles
 from clio_relay.adapters.ssh.process import Completed, Sink, supervise
 from clio_relay.adapters.ssh.profile import Profile
@@ -63,21 +58,6 @@ SIGN_IN_ATTEMPTS = 3
 """Passes through a site's prompts before relay gives up, as ssh allows."""
 MAX_HOPS = 8
 BUSY_RETRIES = 20
-PROXY_VARIABLES = (
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-)
-"""Where relay looks for its proxy, in this order; the first one set wins."""
-_MAX_PROXY_HEAD = 64 * 1024
-_bypass = cast(
-    Callable[[str, dict[str, str]], bool],
-    getattr(urllib.request, "proxy_bypass_environment"),  # noqa: B009
-)
-
 Ask = Callable[[str, bool], Awaitable[str | None]]
 """Ask the person one prompt (``echo``: the answer may show); ``None`` if they declined."""
 
@@ -207,10 +187,6 @@ class Conn:
             hop.close()
 
 
-def _where(profile: Profile) -> str:
-    return f"{profile.host} port {profile.port}"
-
-
 def _known_hosts(files: Sequence[str]) -> asyncssh.SSHKnownHosts:
     """Return the host keys on record. None on record means none is trusted."""
     if not files:
@@ -231,14 +207,14 @@ def _recorded(profile: Profile, extra: Sequence[str]) -> bool:
 async def _fingerprint(profile: Profile, tunnel: Any) -> str | None:
     with contextlib.suppress(Exception):
         direct = tunnel is None and not profile.proxy_command
-        sock = (await _dial(profile, 15, 15))[0] if direct else None
+        sock = (await dialer.dial(profile, 15, 15))[0] if direct else None
         key = await asyncio.wait_for(
             asyncssh.get_server_host_key(
                 profile.host,
                 profile.port,
                 tunnel=tunnel,
                 proxy_command=(
-                    _proxy_argv(profile.proxy_command, profile)
+                    dialer.proxy_argv(profile.proxy_command, profile)
                     if tunnel is None and profile.proxy_command
                     else ()
                 ),
@@ -249,140 +225,6 @@ async def _fingerprint(profile: Profile, tunnel: Any) -> str | None:
         if key is not None:
             return key.get_fingerprint()
     return None
-
-
-class ProxyRefused(OSError):
-    """The proxy would not open a tunnel to the site."""
-
-
-def proxy_for(host: str, env: Mapping[str, str] | None = None) -> str:
-    """Return the proxy URL the environment names for ``host``, or ``""`` to dial directly."""
-    env = os.environ if env is None else env
-    exempt = env.get("NO_PROXY") or env.get("no_proxy") or ""
-    if exempt and _bypass(host, {"no": exempt}):
-        return ""
-    for key in PROXY_VARIABLES:
-        value = (env.get(key) or "").strip()
-        if value:
-            return value if "://" in value else f"http://{value}"
-    return ""
-
-
-def _shown(proxy: str) -> str:
-    """Return the proxy URL without its credentials."""
-    parts = urlsplit(proxy)
-    return f"{parts.scheme}://{parts.hostname or ''}{f':{parts.port}' if parts.port else ''}"
-
-
-def _authority(host: str, port: int) -> str:
-    return f"[{host}]:{port}" if ":" in host and not host.startswith("[") else f"{host}:{port}"
-
-
-def _recv_exact(sock: socket.socket, size: int) -> bytes:
-    data = b""
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
-        if not chunk:
-            raise ProxyRefused(errno.ECONNRESET, "the proxy closed the connection")
-        data += chunk
-    return data
-
-
-def _proxy_open(proxy: str, host: str, port: int, dial_s: float, answer_s: float) -> socket.socket:
-    """Return a socket joined to ``host:port`` through ``proxy`` (HTTP ``CONNECT`` or SOCKS5)."""
-    parts = urlsplit(proxy)
-    socks = parts.scheme.lower().startswith("socks")
-    sock = socket.create_connection(
-        (parts.hostname or "127.0.0.1", parts.port or (1080 if socks else 8080)), timeout=dial_s
-    )
-    try:
-        sock.settimeout(answer_s)
-        user, password = unquote(parts.username or ""), unquote(parts.password or "")
-        if socks:
-            methods = b"\x00\x02" if user else b"\x00"
-            sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
-            chosen = _recv_exact(sock, 2)[1]
-            if chosen == 0x02:
-                sock.sendall(
-                    b"\x01" + bytes([len(user)]) + user.encode()
-                    + bytes([len(password)]) + password.encode()
-                )  # fmt: skip
-                if _recv_exact(sock, 2)[1] != 0:
-                    raise ProxyRefused(0, "the SOCKS proxy refused the credentials")
-            elif chosen != 0x00:
-                raise ProxyRefused(0, "the SOCKS proxy offered no usable sign-in method")
-            name = host.strip("[]").encode("idna")
-            sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + port.to_bytes(2, "big"))
-            head = _recv_exact(sock, 4)
-            if head[1] != 0:
-                raise ProxyRefused(0, f"the SOCKS proxy answered {head[1]}")
-            _recv_exact(sock, ({1: 4, 4: 16}.get(head[3]) or _recv_exact(sock, 1)[0]) + 2)
-        else:
-            target = _authority(host, port)
-            lines = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
-            if parts.username is not None:
-                token = base64.b64encode(f"{user}:{password}".encode()).decode()
-                lines.append(f"Proxy-Authorization: Basic {token}")
-            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
-            # One byte at a time: the site's banner may follow the reply head at once.
-            head = b""
-            while not head.endswith(b"\r\n\r\n"):
-                head += _recv_exact(sock, 1)
-                if len(head) > _MAX_PROXY_HEAD:
-                    raise ProxyRefused(0, "the proxy's answer is too large")
-            status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace").strip()
-            fields = status.split()
-            if len(fields) < 2 or fields[1] != "200":
-                raise ProxyRefused(0, f"the proxy answered {status or 'nothing'}")
-        sock.settimeout(None)
-        return sock
-    except BaseException:
-        sock.close()
-        raise
-
-
-async def _dial(
-    profile: Profile, dial_s: float, answer_s: float
-) -> tuple[socket.socket | None, list[str]]:
-    """Return a socket through the environment's proxy (``None``: dial directly) and the route.
-
-    When the proxy can't open the tunnel, relay dials directly, as ``ssh`` itself would.
-    """
-    where = _authority(profile.host, profile.port)
-    proxy = proxy_for(profile.host)
-    if not proxy:
-        return None, [f"relay dialed {where} directly (no proxy in its environment)"]
-    try:
-        sock = await asyncio.to_thread(
-            _proxy_open, proxy, profile.host, profile.port, dial_s, answer_s
-        )
-    except OSError as exc:
-        return None, [
-            f"relay's proxy {_shown(proxy)} did not open {where} ({_os_error(exc)}),"
-            " so relay dialed directly"
-        ]
-    return sock, [f"relay dialed {where} through the proxy {_shown(proxy)}"]
-
-
-def _os_error(exc: OSError) -> str:
-    winerror = getattr(exc, "winerror", None)
-    code = f"[WinError {winerror}] " if winerror else f"[Errno {exc.errno}] " if exc.errno else ""
-    return f"{code}{exc.strerror or exc}"
-
-
-_ERRNO_TEXT = {
-    errno.ECONNREFUSED: "Connection refused",
-    errno.ETIMEDOUT: "Connection timed out",
-    errno.EHOSTUNREACH: "No route to host",
-    errno.ENETUNREACH: "Network is unreachable",
-    errno.ECONNRESET: "Connection reset by peer",
-    10061: "Connection refused",
-    1225: "Connection refused",
-    10060: "Connection timed out",
-    10065: "No route to host",
-    10051: "Network is unreachable",
-    10054: "Connection reset by peer",
-}
 
 
 async def failure_text(
@@ -427,7 +269,8 @@ async def failure_text(
         return f"{notes}{who}: Permission denied ({','.join(methods)})."
     if isinstance(exc, asyncssh.DisconnectError):
         reason = exc.reason.strip()
-        return f"{notes}{reason + chr(10) if reason else ''}Connection closed by {_where(profile)}"
+        said = f"{reason}\n" if reason else ""
+        return f"{notes}{said}Connection closed by {dialer.where(profile)}"
     if isinstance(exc, socket.gaierror):
         what = (
             "Name or service not known"
@@ -436,32 +279,15 @@ async def failure_text(
         )
         return f"ssh: Could not resolve hostname {profile.host}: {what}{dialed}"
     if isinstance(exc, TimeoutError):
-        return f"ssh: connect to host {_where(profile)}: Connection timed out{dialed}"
+        return f"ssh: connect to host {dialer.where(profile)}: Connection timed out{dialed}"
     if isinstance(exc, OSError):
         code = getattr(exc, "winerror", None) or exc.errno
-        text = _ERRNO_TEXT.get(code or 0) or exc.strerror or str(exc)
-        detail = f" ({_os_error(exc)})" if route else ""
-        return f"ssh: connect to host {_where(profile)}: {text}{dialed}{detail}"
+        text = dialer.ERRNO_TEXT.get(code or 0) or exc.strerror or str(exc)
+        detail = f" ({dialer.os_error(exc)})" if route else ""
+        return f"ssh: connect to host {dialer.where(profile)}: {text}{dialed}{detail}"
     if isinstance(exc, (asyncssh.KeyImportError, asyncssh.KeyEncryptionError)):
         return f"ssh: could not load a key for {profile.destination}: {exc}"
     return f"ssh: {type(exc).__name__}: {exc}"
-
-
-def _proxy_argv(command: str, profile: Profile) -> list[str]:
-    """Return ssh's ``ProxyCommand`` with its tokens, run by the shell as ssh runs it."""
-    tokens = {"%h": profile.host, "%p": str(profile.port), "%r": profile.user, "%%": "%"}
-    out, index = "", 0
-    while index < len(command):
-        pair = command[index : index + 2]
-        if pair in tokens:
-            out += tokens[pair]
-            index += 2
-            continue
-        out += command[index]
-        index += 1
-    if os.name == "nt":
-        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", out]
-    return [os.environ.get("SHELL") or "/bin/sh", "-c", f"exec {out}"]
 
 
 async def connect(
@@ -532,11 +358,13 @@ async def connect(
     if tunnel is not None:
         options["tunnel"] = tunnel
     elif profile.proxy_command:
-        options["proxy_command"] = _proxy_argv(profile.proxy_command, profile)
+        options["proxy_command"] = dialer.proxy_argv(profile.proxy_command, profile)
     route: list[str] = []
     try:
         if tunnel is None and not profile.proxy_command:
-            options["sock"], route = await _dial(profile, options["connect_timeout"], timeout_s)
+            options["sock"], route = await dialer.dial(
+                profile, options["connect_timeout"], timeout_s
+            )
         conn, _ = await asyncssh.create_connection(lambda: client, profile.host, **options)
     except (asyncssh.Error, OSError, ValueError) as exc:
         text = await failure_text(exc, profile, client, tunnel, extra_known, route)
@@ -788,7 +616,7 @@ class Held:
     def _closed(self, slot: Conn) -> Completed:
         """A channel could not open because the connection went: nothing ran, so it may retry."""
         profile = slot.client.profile
-        return self._failed(f"Connection closed by {_where(profile)}")
+        return self._failed(f"Connection closed by {dialer.where(profile)}")
 
     async def _exec(
         self,

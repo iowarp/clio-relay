@@ -419,8 +419,10 @@ connects again by itself on the next call.
 
 Without a `ProxyCommand` or `ProxyJump`, relay dials through the proxy its
 environment names, the way most network clients do: `HTTPS_PROXY`, then
-`ALL_PROXY` and `HTTP_PROXY` (HTTP `CONNECT`, or SOCKS5 for a `socks5://`
-URL), with `NO_PROXY` exempting hosts. That is how relay reaches a site from
+`ALL_PROXY` and `HTTP_PROXY` (HTTP `CONNECT`, or SOCKS5: a `socks5h://` proxy
+resolves the site's name, a `socks5://` one is given the address), with
+`NO_PROXY` exempting hosts. relay's frp visitor dials through the same code.
+That is how relay reaches a site from
 inside a sandbox that lets programs out only through its proxy. When the proxy
 won't open the tunnel, relay dials directly, as `ssh` itself would. A
 connection that fails says which way relay dialed and the system's own error.
