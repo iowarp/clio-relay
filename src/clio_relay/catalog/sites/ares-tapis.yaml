@@ -4,7 +4,9 @@ site: ares
 description: >-
   IIT's Ares cluster, reached through TACC's Tapis. Relay registers Ares as the
   person's own Tapis system with one logical queue per Slurm partition and runs jobs as
-  Tapis BATCH jobs, the path Vista uses.
+  Tapis BATCH jobs, the path Vista uses. Ares takes SSH only from inside IIT's
+  network or its VPN, so Tapis at TACC cannot reach it, and this site cannot
+  register until IIT opens SSH to TACC.
 source: https://tapis.readthedocs.io/en/latest/technical/systems.html
 address: ares.cs.iit.edu
 adapter: tapis

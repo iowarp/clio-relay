@@ -17,8 +17,9 @@
 # ppl append <name> pkg key=value..., then ppl run. A package-service job runs
 # ppl start instead, holds until the job is cancelled, then runs ppl stop.
 #
-# The launcher writes the job's exit code to relay.exitcode in the job's
-# directory and exits with it.
+# The launcher writes the job's exit code to tapisjob.exitcode (which Tapis
+# reads for a FORK job) and relay.exitcode in the job's directory, and exits
+# with it.
 
 set -u
 
@@ -26,6 +27,8 @@ job_dir="${_tapisExecSystemOutputDir:-$PWD}"
 mkdir -p "$job_dir"
 
 finish() {
+    # Tapis reads tapisjob.exitcode for a FORK job and takes a missing one as 0.
+    printf '%s\n' "$1" > "$job_dir/tapisjob.exitcode"
     printf '%s\n' "$1" > "$job_dir/relay.exitcode"
     exit "$1"
 }

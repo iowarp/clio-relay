@@ -19,6 +19,9 @@ The catalog has four Tapis sites:
 | `vista` | TACC Vista | TACC's trust manager | `BATCH`, guarded |
 | `stampede3` | TACC Stampede3 | TACC's trust manager | `BATCH`, guarded |
 
+Ares takes SSH only from inside IIT's network or its VPN, so Tapis at TACC
+cannot reach it. `ares-tapis` cannot register until IIT opens SSH to TACC.
+
 ## Signing in to TACC
 
 Tapis needs you signed in to TACC. Relay uses the OAuth device code sign-in, so
@@ -153,7 +156,8 @@ For a host you already reach over SSH, such as a Chameleon node or Ares:
    back out and reports what Tapis said.
 
 The host must accept SSH logins from TACC with a key. A host that asks for a
-second factor on every login cannot be registered this way.
+second factor on every login, or that takes SSH only from a campus network or
+VPN (Ares), cannot be registered this way.
 
 `unregister-host` removes the credential, the system relay made, and the key
 line with relay's comment. It never removes a system relay did not make.
