@@ -1,6 +1,6 @@
 [project]
 name = "clio-relay"
-version = "2.0.0a60"
+version = "2.0.0a61"
 description = "An MCP server and command line that runs jobs, commands, files and services on your compute sites."
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
