@@ -10,9 +10,10 @@ add <path>`` (:data:`PACKAGES_SCRIPT`'s ``add``).
 
 A package's review identity is its digest (:data:`DIGEST_FUNCTIONS`), computed
 on the site from the package as it sits in the root, however it got there.
-:data:`PACKAGES_SCRIPT` lists every package of the root with its digest, files,
-``pkg.py`` and ``contract.yaml``; the site script recomputes the digest of each
-step before JARVIS runs it and refuses one that changed since its review.
+:data:`PACKAGES_SCRIPT` lists every package of the root with its digest and files,
+and with its menu and contract from ``jarvis repo list +json``; the site script
+recomputes the digest of each step before JARVIS runs it and refuses one that
+changed since its review.
 """
 
 from __future__ import annotations

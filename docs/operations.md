@@ -196,8 +196,9 @@ is reused. `site clean` removes the root with the rest of relay's deployment.
 
 The packages `run` takes are the ones the root holds, named
 `<repository>.<package>`. Relay lists them on the site, through the adapter's
-`exec`, with each package's review digest (below), its files and the text of
-its `pkg.py` and `contract.yaml`, and keeps the listing per site.
+`exec`, with each package's review digest (below) and files, and with its menu
+and contract as `jarvis repo list +json` reads them, and keeps the listing per
+site.
 `packages_read(site=...)` and `describe(site=...)` list them; neither changes
 anything.
 
