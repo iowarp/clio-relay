@@ -66,6 +66,8 @@ from clio_relay.jarvis_site import (
     PACKAGES_SCRIPT,
     SETUP_SCRIPT,
     SITE_ROOT_DIR,
+    Unset,
+    root_sentence,
     site_pin,
 )
 from clio_relay.jarvis_site import JARVIS_PIN as JARVIS_PIN
@@ -1272,11 +1274,11 @@ def jarvis_refused(text: str, *, site: str, what: str = "the pipeline") -> Refus
 
 
 SETUP_STEP = (
-    "To set it up, call install(site=..., package={name: ...}) with the package you mean "
-    "to run: it asks the person, sets up the site's JARVIS root and ends; then call run "
-    "or install again"
+    "For that, call install(site=..., package={name: ...}) with the package you mean "
+    "to run: it asks the person, brings the site's JARVIS root to relay's pin and ends; "
+    "then call run or install again"
 )
-"""The setup step a run, serve, install or describe names when the site is not set up."""
+"""The setup step a run, serve, install or describe names when the root is not at the pin."""
 
 
 def missing_jarvis(text: str, *, site: str) -> Refusal:
@@ -1306,16 +1308,21 @@ def missing_jarvis(text: str, *, site: str) -> Refusal:
             tried=tried,
             explicit=True,
         )
-    pin = written.get("pin")
+    unset = Unset(want=str(written.get("want") or site_pin()), at=str(written.get("pin") or ""))
+    return not_at_pin(site, unset, tried=tried)
+
+
+def not_at_pin(site: str, unset: Unset, *, tried: str | None = None) -> Refusal:
+    """The refusal for a root not at relay's pin: where it is, and what setup makes it."""
     return Refusal(
         RefusalReason.ADAPTER_UNAVAILABLE,
-        f"{site}'s JARVIS root is not set up at jarvis-cd {JARVIS_PIN[:8]} with clio-jarvis "
-        f"{CLIO_JARVIS_REF[:12]} ({tried}). {SETUP_STEP}",
+        f"{root_sentence(site, unset)}. {SETUP_STEP}",
         missing="jarvis",
         next_step="install",
-        tried=tried,
         installable=JARVIS_PIN,
-        **({"pin": pin} if isinstance(pin, str) else {}),
+        want=unset.want,
+        **({"tried": tried} if tried else {}),
+        **({"pin": unset.at} if unset.at else {}),
     )
 
 

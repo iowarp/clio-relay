@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, Field
 
-from clio_relay.jarvis_site import parse_packages, refuse_builtin
+from clio_relay.jarvis_site import Unset, parse_packages, refuse_builtin
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import COUPLING_KINDS, Coupling, JobSpec, PackageRef, step_ids
 
@@ -395,10 +395,10 @@ class PackageCatalog:
 
     async def refresh(
         self, site: str, adapter: BaseAdapter[Any], *, add: str = "", force: bool = False
-    ) -> list[PackageEntry] | None:
-        """List the site's root again through the adapter; ``None`` when it is not set up."""
+    ) -> list[PackageEntry] | Unset:
+        """List the site's root again through the adapter; :class:`Unset` when not at the pin."""
         listed = parse_packages(await adapter.site_packages(add, force=force))
-        return None if listed is None else self.store(site, listed)
+        return listed if isinstance(listed, Unset) else self.store(site, listed)
 
     def resolve(self, site: str, package: PackageRef) -> PackageRef:
         """Fill ``package``'s version and digest from the site's catalog.

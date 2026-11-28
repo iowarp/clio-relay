@@ -48,7 +48,7 @@ UNCHECKED: dict[str, Any] = {
     "scope": "site",
     "subject": "install_check",
     "answerable": False,
-    "packages": ["pkg"],
+    "packages": ["xcompact3d"],
     "reason": "no_record",
     "hint": "check inside an allocation: `jarvis ppl install yaml FILE +check +submit`",
 }
@@ -59,7 +59,7 @@ def _report(status: str, issues: list[dict[str, Any]]) -> dict[str, Any]:
         "status": status,
         "missing": ["fftw"] if status == "missing" else None,
     }
-    installers = {} if status == "unchecked" else {"spack": {"packages": {"pkg": package}}}
+    installers = {} if status == "unchecked" else {"spack": {"packages": {"xcompact3d": package}}}
     return {
         "schema_version": jarvis_submit.INSTALL_REPORT_SCHEMA,
         "satisfied": status in ("satisfied", "installed"),
@@ -232,10 +232,10 @@ def test_install_unchecked_is_neither_blocking_nor_a_question() -> None:
 
 def test_the_summary_keeps_undecided_packages_out_of_the_build() -> None:
     summary = jarvis_report.install_summary(_report("needs_decision", [ISSUE]))
-    assert summary["build"] == [] and summary["undecided"] == ["pkg"]
+    assert summary["build"] == [] and summary["undecided"] == ["xcompact3d"]
     assert not jarvis_report.software_missing(_report("needs_decision", [ISSUE]))
     assert jarvis_report.software_missing(_report("missing", []))
-    assert jarvis_report.install_summary(_report("installed", []))["reuse"] == ["pkg"]
+    assert jarvis_report.install_summary(_report("installed", []))["reuse"] == ["xcompact3d"]
 
 
 def test_a_recheck_command_is_a_check_job_with_the_answers() -> None:

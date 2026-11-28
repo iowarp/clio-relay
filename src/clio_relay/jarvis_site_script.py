@@ -126,9 +126,9 @@ if [ -n "$install_env" ]; then
   mkdir -p "$install_env"
   export JARVIS_INSTALL_ENV_DIR="$install_env"
 fi
+esc() { printf '%s' "$1" | sed 's/[\\"]/\\&/g'; }
 refuse() {
-  tried=$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')
-  printf '{"missing":"jarvis","reason":"adapter_unavailable","tried":"%s"%s}\n' "$tried" "$2" \
+  printf '{"missing":"jarvis","reason":"adapter_unavailable","tried":"%s"%s}\n' "$(esc "$1")" "$2" \
     > "$job/relay.refusal.json"
   cat "$job/relay.refusal.json" >&2
   fail 69 "$3"
@@ -145,9 +145,10 @@ else
   found="$site/bin/jarvis"
   [ -f "$found" ] && [ -x "$found" ] || refuse "$found" '' "relay has not set up jarvis-cd at $site"
 fi
-got=$(cat "$root/relay.pin" 2>/dev/null) || got=
-[ -z "$pin" ] || [ "$got" = "$pin" ] \
-  || refuse "$found" ",\"pin\":\"$got\"" "the site's JARVIS root is at ${got:-no setup}, not $pin"
+got=$(head -n 1 "$root/relay.pin" 2>/dev/null) || got=
+[ -z "$pin" ] || [ "$got" = "$pin" ] || refuse "$found" \
+  ",\"pin\":\"$(esc "$got")\",\"want\":\"$(esc "$pin")\"" \
+  "the site's JARVIS root is at ${got:-no setup}, not $pin"
 # Only relay's pinned JARVIS is known to plan. An older one ignores an unknown +plan and
 # would submit, so any other JARVIS makes no plan and submits unbound.
 plans=; [ -n "$jarvis" ] || [ -z "$pin" ] || plans=1

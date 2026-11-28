@@ -83,6 +83,7 @@ from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import Ask, explain_approval
 from clio_relay.asks.core import approval_covers as approval_covers
 from clio_relay.jarvis_exits import build_refused, built_here, ran_here
+from clio_relay.jarvis_site import Unset, root_sentence
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -282,17 +283,31 @@ async def ask_install(
                 state[OFFERS_KEY][ask.ask_id] = offer_map(issue)
                 asks.append(ask)
     else:
+        unset = Unset(
+            want=str(refusal.data.get("want") or jarvis_submit.site_pin()),
+            at=str(refusal.data.get("pin") or ""),
+        )
+        if unset.at:
+            how = (
+                f"Relay reinstalls jarvis-cd {jarvis_submit.JARVIS_PIN[:8]} with uv's own "
+                "Python under the CLIO home on the site and moves the root's clio-jarvis "
+                f"clone to {jarvis_submit.CLIO_JARVIS_REF[:12]}"
+            )
+        else:
+            how = (
+                "Relay installs uv under the CLIO home on the site, "
+                f"installs jarvis-cd {jarvis_submit.JARVIS_PIN[:8]} with uv's own Python, "
+                "sets up the site's JARVIS root there and clones clio-jarvis "
+                f"{jarvis_submit.CLIO_JARVIS_REF[:12]} into it"
+            )
+        verb = "Update" if unset.at else "Set up"
         with service.asks.locked(site_lock_id(site.id)):
             ask = shared_jarvis_ask(service, site.id, operation_id) or await provider.approve(
                 site=site,
                 operation_id=operation_id,
                 message=(
-                    f"{site.title}'s JARVIS root is not set up. Relay installs uv under the "
-                    "CLIO home on the site, "
-                    f"installs jarvis-cd {jarvis_submit.JARVIS_PIN[:8]} with uv's own Python, "
-                    "sets up the site's JARVIS root there and clones clio-jarvis "
-                    f"{jarvis_submit.CLIO_JARVIS_REF[:12]} into it. This needs the site to "
-                    f"reach github.com. Set up JARVIS on {site.title}?"
+                    f"{root_sentence(site.title, unset)}. {how}. This needs the site to "
+                    f"reach github.com. {verb} JARVIS on {site.title}?"
                 ),
                 binding={
                     "site": site.id,
@@ -588,11 +603,8 @@ async def _ended(
     output = tail if isinstance(tail, str) else ""
     if status.exit_code == install_failures.EXIT_INSTALL_FAILED:
         # Something JARVIS ran failed: its records and words go to the agent whole.
-        return service.finish(
-            operation_id,
-            OperationState.FAILED,
-            install_failures.failed(issues, site=site, output=output, **where),
-        )
+        message, data = install_failures.outcome(issues, output=output)
+        return _job_failed(service, operation_id, status, message, **data, **where)
     if status.exit_code == jarvis_submit.EXIT_DECISION:
         blocking = jarvis_report.blocking_issues({"issues": issues})
         if blocking:
@@ -613,16 +625,22 @@ async def _ended(
         or status.message
         or f"the install job ended {status.native_state or status.state.value}"
     )
+    return _job_failed(service, operation_id, status, message, issues=issues, **where)
+
+
+def _job_failed(
+    service: RelayService, operation_id: str, status: JobStatus, message: str, **data: Any
+) -> OperationRecord:
+    """End an operation whose install job failed as a failed run job ends.
+
+    It is FAILED with the job's exit code and JARVIS's words, and JARVIS's records
+    and the install log (``data``) are in its result.
+    """
     return service.finish(
         operation_id,
         OperationState.FAILED,
-        Refusal(
-            RefusalReason.SUBMIT_FAILED,
-            message,
-            site=site,
-            needs=jarvis_submit.NEEDS_INSTALL,
-            exit_code=status.exit_code,
-            issues=issues,
-            **where,
-        ),
+        None,
+        message=message,
+        exit_code=status.exit_code,
+        result=data,
     )

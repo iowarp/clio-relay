@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 from clio_relay import jarvis_submit
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
-from clio_relay.jarvis_site import JARVIS_PIN
+from clio_relay.jarvis_site import JARVIS_PIN, Unset, pin_parts, root_sentence
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.sites.models import SiteEntry
@@ -63,8 +63,10 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
 async def package_listing(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     """List the packages the site's JARVIS root holds now, and whether this site reviewed each.
 
-    ``jarvis`` says whether the root is set up: its path and the jarvis-cd pin,
-    or ``set_up: false`` with the setup step (:data:`~clio_relay.jarvis_submit.SETUP_STEP`).
+    ``jarvis`` says whether the root is at relay's pin: its path and the jarvis-cd pin,
+    or ``set_up: false`` with ``at`` (the pin the root holds, or None when it has none),
+    ``state`` (the sentence saying so) and the setup step
+    (:data:`~clio_relay.jarvis_submit.SETUP_STEP`).
 
     The listing runs on the site (:meth:`~clio_relay.packages.PackageCatalog.refresh`);
     when it cannot, the last one relay read is shown with the reason.
@@ -76,9 +78,16 @@ async def package_listing(service: RelayService, site: SiteEntry) -> dict[str, A
             return {"packages": [], "packages_note": f"the {adapter.name} adapter runs no packages"}
         home = await adapter.jarvis_home()
         root = None if home is None else jarvis_submit.site_root(home)
-        if await service.packages.refresh(site.id, adapter) is None:
-            # A root that is not set up holds nothing, whatever relay listed before.
-            setup = {"root": root, "set_up": False, "setup": jarvis_submit.SETUP_STEP}
+        found = await service.packages.refresh(site.id, adapter)
+        if isinstance(found, Unset):
+            # A root that is not at the pin holds nothing, whatever relay listed before.
+            setup = {
+                "root": root,
+                "set_up": False,
+                "at": pin_parts(found.at) if found.at else None,
+                "state": root_sentence(site.title, found),
+                "setup": jarvis_submit.SETUP_STEP,
+            }
             return {"packages": [], "jarvis": setup}
         note["jarvis"] = {"root": root, "set_up": True, "jarvis_cd": JARVIS_PIN}
     except Refusal as refusal:

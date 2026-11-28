@@ -189,9 +189,11 @@ relay runs as one script after you approve them:
    or `jarvis repo update` when the clone is at another commit).
 
 The setup is the `install` tool's: a `run`, `serve` or `install` on a site that
-is not set up refuses and names that step, and `describe(site=...)` reports
-`jarvis.set_up` with the root and the jarvis-cd pin, or `set_up: false` with
-the same step. Two setups at once share a lock, and a root already at the pins
+is not set up, or is at other pins, refuses and names that step, and
+`describe(site=...)` reports `jarvis.set_up` with the root and the jarvis-cd
+pin, or `set_up: false` with the same step, the pins the root holds in `at`
+(null when there is no root) and the true sentence in `state`. Two setups at
+once share a lock, and a root already at the pins
 is reused. `site clean` removes the root with the rest of relay's deployment.
 
 The packages `run` takes are the ones the root holds, named

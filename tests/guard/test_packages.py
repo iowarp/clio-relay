@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from clio_relay.jarvis_site import parse_packages
+from clio_relay.jarvis_site import Unset, parse_packages
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import PackageRef
 from clio_relay.packages import ADD_COMMAND, PackageCatalog, describe_package
@@ -129,7 +129,9 @@ def test_the_listing_reads_back_what_the_site_printed() -> None:
             f"@@package demo.broken {'e' * 64}",
         ]
     )
-    hello, broken = parse_packages(text) or []
+    found = parse_packages(text)
+    assert not isinstance(found, Unset)
+    hello, broken = found
     assert (hello["name"], hello["digest"]) == ("demo.hello", "a" * 64)
     assert hello["repo_dir"] == "/home/u/.clio-relay/jarvis/repos/demo"
     assert hello["git"] == {"commit": "c" * 40, "url": "https://example.org/demo.git"}
@@ -142,7 +144,8 @@ def test_the_listing_reads_back_what_the_site_printed() -> None:
         {"version": "1"},
     )
     assert (broken["menu"], broken["contract"], broken["contract_error"]) == (None, None, "bad")
-    assert parse_packages("@@unset\n") is None
+    assert parse_packages("@@unset\n@@want j r\n@@at \n") == Unset(want="j r", at="")
+    assert parse_packages("@@unset\n@@want j r\n@@at k s\n") == Unset(want="j r", at="k s")
     with pytest.raises(Refusal, match="printed no document .* set the site up again"):
         parse_packages("")
     with pytest.raises(Refusal, match="is other, not jarvis.repos.v1; set the site up again"):

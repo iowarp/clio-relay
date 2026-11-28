@@ -271,11 +271,9 @@ class Coupling(_Spec):
 def step_ids(steps: list[PackageRef]) -> list[str]:
     """Return each step's ``pkg_name`` in the pipeline.
 
-    One step is ``pkg``. Several are named by their package, with ``_2``, ``_3``
-    for a package that appears again.
+    Each is named by its package, with ``_2``, ``_3`` for a package that appears
+    again.
     """
-    if len(steps) == 1:
-        return ["pkg"]
     names: list[str] = []
     for step in steps:
         base = step.name.partition(".")[2] or step.name

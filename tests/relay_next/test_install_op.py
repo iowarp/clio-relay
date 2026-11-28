@@ -42,7 +42,7 @@ def _report(satisfied: bool) -> dict[str, Any]:
     return {
         "schema_version": jarvis_submit.INSTALL_REPORT_SCHEMA,
         "satisfied": satisfied,
-        "installers": {"spack": {"packages": {"pkg": package}}},
+        "installers": {"spack": {"packages": {"hello": package}}},
         "issues": [],
     }
 
@@ -270,7 +270,7 @@ def test_install_is_a_task_tool_that_changes_the_site(relay_paths: RelayPaths) -
 
 def test_the_install_ask_says_no_run_follows() -> None:
     report = _report(False)
-    names = {"pkg": "demo.hello"}
+    names = {"hello": "demo.hello"}
     alone = install_wording.install_message(
         report, site="Ares", package="demo.hello", names=names, walltime=None, run=False
     )
@@ -623,7 +623,7 @@ def test_the_install_ask_names_the_install_settings_given() -> None:
         report,
         site="Ares",
         package="demo.hello",
-        names={"pkg": "demo.hello"},
+        names={"hello": "demo.hello"},
         settings=[(question, "/mnt/scratch/u/tmp")],
     )
     assert f"{question} /mnt/scratch/u/tmp" in said

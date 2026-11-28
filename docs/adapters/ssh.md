@@ -237,16 +237,21 @@ own, a site copy that does not load), JARVIS exits 6 with one failure record
 per failure (in its install report, and in `install/issues.jsonl` for an
 install job): the stage, host, command and exit code, a preview of the output,
 `output_path` (the whole output on the site, for `files`) and the logs
-involved. Relay asks nothing about it and adds no words: the run fails
-`submit_failed` with JARVIS's own line for each failure as the message and the
-records whole in `failures`, with `install_log` and `install_job` (the
-scheduler's job id) for a job. The agent reads the output, decides what to
+involved. Relay asks nothing about it and adds no words. When the login-host
+check or submit exits 6, the run fails `submit_failed` with JARVIS's own line for
+each failure as the message and the records whole in `failures`. When an install
+job exits 6, the operation ends `failed` as a failed run job does: the same
+message, the job's `exit_code`, and in its `result` the records whole in
+`failures`, every issue in `issues`, `install_log` and `install_job` (the
+scheduler's job id). An install job that ends any other way fails the same way,
+with the end of what it printed. The agent reads the output, decides what to
 change (for example the install's `scheduler.install.exclude`), and the person
 confirms the consequential steps. A record can also offer the site's install
 settings (jarvis-cd 1.9.14: `install_tmpdir`, the install job's temp dir and
 Spack build stage) under `settings`, each with its `issue_id`, JARVIS's question
-and what an answer does. Relay passes them whole as the refusal's `settings`
-and adds JARVIS's question and answer text to the message. To give one, the
+and what an answer does. Relay passes them whole as `settings` (in the refusal,
+or in a failed job's result) and adds JARVIS's question and answer text to the
+message. To give one, the
 agent runs the same job again with `spec.install_settings`, or installs it again
 with `install_settings`, each `{issue_id, value, basis}`; relay takes only an issue_id a failure on the same
 site offered, names the value in the install approval, and sends it with every
@@ -378,7 +383,12 @@ with `JARVIS_ROOT=<home>/jarvis`. It never runs a `jarvis` found on the site's
 `PATH`: an older one rejects the service reports and builds on the login node.
 When the root is not set up, or not at relay's pins, a `run`, `serve` or
 `install` refuses and names the setup step: `install(site=..., package={name: ...})`,
-which asks you before it sets up the site and ends. The setup installs uv (the
+which asks you before it sets up the site and ends. The refusal says which it
+is: a root at other pins reads "JARVIS is on <site> at jarvis-cd X with
+clio-jarvis Y; relay updates it to ...", with the pins it holds in `pin` and
+relay's in `want`, and the ask is "Update JARVIS on <site>?"; a site with no
+root reads "<site> has no JARVIS root that relay set up", and the ask is "Set
+up JARVIS on <site>?". The setup installs uv (the
 one on `PATH`, else `<home>/bin/uv`, else uv's installer puts it there), then
 jarvis-cd at its pinned commit with `uv tool install`, which brings its own
 Python, then makes the root without jarvis-cd's builtin repository and clones

@@ -118,6 +118,33 @@ def _offer_line(setting: Mapping[str, Any]) -> str:
     return f"{question} ({answer})" if question and answer else question
 
 
+def outcome(
+    issues: list[dict[str, Any]],
+    *,
+    output: str = "",
+    named: Iterable[object] = (),
+    exit_code: object = EXIT_INSTALL_FAILED,
+) -> tuple[str, dict[str, Any]]:
+    """JARVIS's words for an install it reports failed, and its records, whole.
+
+    The message is each record's own line (:func:`clio_relay.jarvis_report.words`);
+    with no record it is the end of what JARVIS printed (``output``). The install
+    settings the records offer (:func:`offered`) follow in JARVIS's words, and
+    travel whole as ``settings``. The data is ``failures`` and ``issues``, with
+    ``settings`` and ``settings_how`` when there are settings.
+    """
+    found = records(issues, named)
+    said = [line for line in map(jarvis_report.words, found) if line]
+    message = "\n".join(said) or _tail(output) or f"JARVIS exited {exit_code} with no output"
+    data: dict[str, Any] = {"failures": found, "issues": issues}
+    settings = offered(found)
+    if settings:
+        lines = [line for line in map(_offer_line, settings) if line]
+        message = "\n".join([message, *lines])
+        data.update({SETTINGS_KEY: settings, "settings_how": SETTINGS_HOW})
+    return message, data
+
+
 def failed(
     issues: list[dict[str, Any]],
     *,
@@ -127,29 +154,15 @@ def failed(
     exit_code: object = EXIT_INSTALL_FAILED,
     **extra: Any,
 ) -> Refusal:
-    """The refusal for an install JARVIS reports failed: its records and words, whole.
-
-    The message is each record's own line (:func:`clio_relay.jarvis_report.words`);
-    with no record it is the end of what JARVIS printed (``output``). The install
-    settings the records offer (:func:`offered`) follow in JARVIS's words, and
-    travel whole as ``settings``.
-    """
-    found = records(issues, named)
-    said = [line for line in map(jarvis_report.words, found) if line]
-    message = "\n".join(said) or _tail(output) or f"JARVIS exited {exit_code} with no output"
-    settings = offered(found)
-    if settings:
-        lines = [line for line in map(_offer_line, settings) if line]
-        message = "\n".join([message, *lines])
-        extra = {**extra, SETTINGS_KEY: settings, "settings_how": SETTINGS_HOW}
+    """The refusal for a submit whose ``ppl install`` JARVIS reports failed (:func:`outcome`)."""
+    message, data = outcome(issues, output=output, named=named, exit_code=exit_code)
     return Refusal(
         RefusalReason.SUBMIT_FAILED,
         message,
         site=site,
-        failures=found,
-        issues=issues,
         exit_code=exit_code,
         retry=False,
+        **data,
         **extra,
     )
 
@@ -185,16 +198,19 @@ def raise_for(exit_code: object, text: str, *, site: str) -> None:
 def site_offers(operations: Iterable[OperationRecord], site_id: str) -> dict[str, dict[str, Any]]:
     """Return the install settings failures on the site offered, by ``issue_id``.
 
-    They are what relay already holds: each failed operation's refusal keeps its
-    records' settings (:func:`failed`). The newest offer of an issue wins.
+    They are what relay already holds: a submit's refusal keeps its records'
+    settings (:func:`failed`), and a failed install job's result keeps them
+    (:func:`outcome`). The newest offer of an issue wins.
     """
     found: dict[str, dict[str, Any]] = {}
     for record in sorted(operations, key=lambda item: item.updated_at):
-        data = (record.error or {}).get("data") if record.site == site_id else None
-        if isinstance(data, dict):
-            for setting in _dicts(cast(dict[str, Any], data).get(SETTINGS_KEY)):
-                if isinstance(setting.get("issue_id"), str):
-                    found[str(setting["issue_id"])] = setting
+        if record.site != site_id:
+            continue
+        for data in ((record.error or {}).get("data"), record.result):
+            if isinstance(data, dict):
+                for setting in _dicts(cast(dict[str, Any], data).get(SETTINGS_KEY)):
+                    if isinstance(setting.get("issue_id"), str):
+                        found[str(setting["issue_id"])] = setting
     return found
 
 

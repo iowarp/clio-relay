@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
-JARVIS_PIN = "dae7f4d87a49d99c0dd54e12c9d399320856537c"
+JARVIS_PIN = "25a19fb32cc31564e951e622ed80d442cf2553d9"
 """The jarvis-cd commit relay installs on a site (branch ``relay_ready``)."""
 JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
 CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
@@ -81,6 +81,45 @@ def refuse_builtin(name: str) -> None:
 def site_pin(jarvis: str = "") -> str:
     """What the root's :data:`PIN_FILE` holds once set up, for the site's ``jarvis`` setting."""
     return f"{jarvis or JARVIS_PIN} {CLIO_JARVIS_REF}"
+
+
+class Unset(NamedTuple):
+    """A root not at relay's pin: ``want`` is relay's, ``at`` what its :data:`PIN_FILE` holds.
+
+    ``at`` is empty when the root has no finished setup.
+    """
+
+    want: str
+    at: str
+
+
+def pin_parts(pin: str) -> dict[str, str]:
+    """A :data:`PIN_FILE` pin as ``{"jarvis_cd": ..., "clio_jarvis": ...}``."""
+    jarvis, _space, ref = pin.strip().partition(" ")
+    return {"jarvis_cd": jarvis, "clio_jarvis": ref}
+
+
+def pin_words(pin: str) -> str:
+    """Say a pin: jarvis-cd, or the program the site's setting names, and clio-jarvis."""
+    parts = pin_parts(pin)
+    jarvis, ref = parts["jarvis_cd"], parts["clio_jarvis"]
+    said = (
+        f"jarvis-cd {jarvis[:8]}"
+        if re.fullmatch(r"[0-9a-f]{40}", jarvis)
+        else f"the jarvis program {jarvis}"
+    )
+    return f"{said} with clio-jarvis {ref[:12]}" if ref else said
+
+
+def root_sentence(site: str, unset: Unset) -> str:
+    """The true sentence about ``site``'s JARVIS root: where it is, and what setup makes it."""
+    if unset.at:
+        return (
+            f"JARVIS is on {site} at {pin_words(unset.at)}; relay updates it to "
+            f"{pin_words(unset.want)}"
+        )
+    want = pin_words(unset.want)
+    return f"{site} has no JARVIS root that relay set up; relay sets one up at {want}"
 
 
 HOME_LINES = r"""case $home in
@@ -252,7 +291,8 @@ mode=$1 home=$2 want=$3 jarvis=${4:-} path=${5:-} force=${6:-}
 """
     + HOME_LINES
     + DIGEST_FUNCTIONS
-    + r"""if [ "$(cat "$root/relay.pin" 2>/dev/null)" != "$want" ]; then echo "@@unset"; exit 0; fi
+    + r"""got=$(head -n 1 "$root/relay.pin" 2>/dev/null) || got=
+if [ "$got" != "$want" ]; then printf '%s\n' "@@unset" "@@want $want" "@@at $got"; exit 0; fi
 case $jarvis in "") jarvis="$home/bin/jarvis" ;; "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
 if [ "$mode" = add ]; then
   case $path in "~/"*) path="$HOME/${path#??}" ;; /*) ;; *) path="$HOME/$path" ;; esac
@@ -282,27 +322,30 @@ done
 
 ``sh -c PACKAGES_SCRIPT <$0> list|add <home> <pin> [jarvis] [path] [+force]``
 (:func:`clio_relay.jarvis_submit.packages_command`). ``add`` runs ``jarvis repo add
-<path>`` in the root. It prints ``@@unset`` when the root is not set up at the
-pin. Else it prints ``@@repos`` and JARVIS's ``jarvis repo list +json`` document
+<path>`` in the root. When the root is not at the pin it prints ``@@unset``, then
+``@@want`` with the pin and ``@@at`` with what the root's pin file holds. Else it
+prints ``@@repos`` and JARVIS's ``jarvis repo list +json`` document
 (each package's menu, contract and git source, as JARVIS reads them), then each
 package's review digest as ``@@package <name> <digest>`` and an ``@@file`` line
 per reviewed file (:func:`parse_packages`).
 """
 
 
-def parse_packages(text: str) -> list[dict[str, Any]] | None:
-    """Return the packages :data:`PACKAGES_SCRIPT` printed, or ``None`` for ``@@unset``.
+def parse_packages(text: str) -> list[dict[str, Any]] | Unset:
+    """Return the packages :data:`PACKAGES_SCRIPT` printed, or :class:`Unset` for ``@@unset``.
 
     Each is its digest and files, with ``repo_dir``, ``git``, ``menu`` and
     ``contract`` from JARVIS's ``jarvis.repos.v1`` document.
     """
+    lines = text.splitlines()
+    if "@@unset" in lines:
+        said = {tag: rest for tag, _space, rest in (line.partition(" ") for line in lines)}
+        return Unset(want=said.get("@@want", "").strip(), at=said.get("@@at", "").strip())
     found: list[dict[str, Any]] = []
     listing: str | None = None
     item: dict[str, Any] | None = None
-    for line in text.splitlines():
+    for line in lines:
         tag, _space, rest = line.partition(" ")
-        if tag == "@@unset":
-            return None
         if tag == "@@repos":
             listing = rest
         elif tag == "@@package":

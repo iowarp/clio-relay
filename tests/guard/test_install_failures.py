@@ -161,7 +161,7 @@ class _Record:
 
 class _Service:
     def __init__(self) -> None:
-        self.finished: list[tuple[OperationState, Refusal | None]] = []
+        self.finished: list[tuple[OperationState, Refusal | None, dict[str, Any]]] = []
 
     def operation(self, operation_id: str) -> _Record:
         return _Record()
@@ -169,8 +169,10 @@ class _Service:
     def site(self, site_id: str) -> _Site:
         return _Site()
 
-    def finish(self, operation_id: str, state: OperationState, refusal: Refusal | None) -> str:
-        self.finished.append((state, refusal))
+    def finish(
+        self, operation_id: str, state: OperationState, refusal: Refusal | None, **ended: Any
+    ) -> str:
+        self.finished.append((state, refusal, ended))
         return "record"
 
 
@@ -211,13 +213,12 @@ async def test_an_install_job_that_exits_6_fails_with_its_records_whole(
     adapter, service, result = await _end(monkeypatch, json.dumps(BUILD) + "\n", 6, "raw tail")
     assert result == "record"
     assert adapter._files.paths == ["/home/u/jobs/op/executions/e1/install/issues.jsonl"]  # pyright: ignore[reportPrivateUsage]
-    state, refusal = service.finished[0]
-    assert state == OperationState.FAILED
-    assert refusal is not None
-    assert refusal.message == BUILD["message"]
-    assert refusal.data["failures"] == [BUILD]
-    assert refusal.data["install_job"] == "27990"
-    assert installing.install_kind(refusal) is None
+    state, refusal, ended = service.finished[0]
+    # Like a failed run job: no refusal, the job's exit code, and JARVIS's records whole.
+    assert (state, refusal) == (OperationState.FAILED, None)
+    assert (ended["message"], ended["exit_code"]) == (BUILD["message"], 6)
+    assert ended["result"]["failures"] == [BUILD]
+    assert ended["result"]["install_job"] == "27990"
 
 
 @pytest.mark.asyncio
@@ -225,9 +226,8 @@ async def test_an_install_job_that_exits_6_with_no_record_passes_its_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _adapter, service, _result = await _end(monkeypatch, "", 6, "==> Error: out of space\n")
-    _state, refusal = service.finished[0]
-    assert refusal is not None
-    assert refusal.message == "==> Error: out of space"
+    _state, _refusal, ended = service.finished[0]
+    assert ended["message"] == "==> Error: out of space"
 
 
 @pytest.mark.asyncio
@@ -235,11 +235,10 @@ async def test_an_install_job_that_ends_otherwise_passes_its_output_as_printed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _adapter, service, _result = await _end(monkeypatch, "", 1, "slurmstepd: CANCELLED\n")
-    _state, refusal = service.finished[0]
-    assert refusal is not None
-    assert refusal.message == "slurmstepd: CANCELLED"
-    assert refusal.data["exit_code"] == 1
-    assert "JARVIS could not" not in refusal.message
+    _state, refusal, ended = service.finished[0]
+    assert refusal is None
+    assert (ended["message"], ended["exit_code"]) == ("slurmstepd: CANCELLED", 1)
+    assert "JARVIS could not" not in ended["message"]
 
 
 @pytest.mark.asyncio
@@ -255,7 +254,7 @@ async def test_an_install_job_with_an_issue_no_answer_settles_fails_in_jarvis_s_
         "hint": "Load an MPI module first.",
     }
     _adapter, service, _result = await _end(monkeypatch, json.dumps(stuck) + "\n", 3, None)
-    state, refusal = service.finished[0]
+    state, refusal, _ended = service.finished[0]
     assert state == OperationState.FAILED
     assert refusal is not None
     assert refusal.message == "no MPI on the compute nodes. Load an MPI module first."
@@ -333,10 +332,15 @@ def test_a_failure_without_settings_offers_none() -> None:
     assert "settings_how" not in refusal.data
 
 
-def _failed_op(site: str, settings: list[dict[str, Any]]) -> Any:
+def _failed_op(site: str, settings: list[dict[str, Any]], *, job: bool = False) -> Any:
     from clio_relay.jobs.records import OperationRecord
 
-    refusal = install_failures.failed([{**BUILD, "settings": settings}], site=site)
+    found = [{**BUILD, "settings": settings}]
+    if job:
+        # A failed install job keeps JARVIS's records in its result, as a run job does.
+        error, result = None, install_failures.outcome(found)[1]
+    else:
+        error, result = install_failures.failed(found, site=site).to_dict(), None
     return OperationRecord(
         operation_id="op-f",
         kind="install",
@@ -345,7 +349,8 @@ def _failed_op(site: str, settings: list[dict[str, Any]]) -> Any:
         spec={},
         spec_digest="d",
         state=OperationState.FAILED,
-        error=refusal.to_dict(),
+        error=error,
+        result=result,
     )
 
 
@@ -360,6 +365,8 @@ def _job(*settings: dict[str, Any]) -> Any:
 def test_install_settings_take_only_what_a_failure_on_the_site_offered() -> None:
     offers = install_failures.site_offers([_failed_op("ares", [TMPDIR_SETTING])], "ares")
     assert offers == {TMPDIR_ID: TMPDIR_SETTING}
+    ended = install_failures.site_offers([_failed_op("ares", [TMPDIR_SETTING], job=True)], "ares")
+    assert ended == offers
     job = _job({"issue_id": TMPDIR_ID, "value": "/mnt/scratch/u/tmp", "basis": "the person"})
     install_failures.check_settings(job, offers, site="ares")
     assert install_failures.setting_answers(job) == {

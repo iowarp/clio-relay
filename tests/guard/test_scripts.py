@@ -10,10 +10,11 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from clio_relay.jarvis_site import PACKAGES_SCRIPT, parse_packages, site_pin
+from clio_relay.jarvis_site import PACKAGES_SCRIPT, Unset, parse_packages, site_pin
 from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
     EXIT_MISSING,
@@ -404,6 +405,12 @@ def _packages(tmp_path: Path, mode: str, *rest: str) -> subprocess.CompletedProc
     )
 
 
+def _listing(text: str) -> list[dict[str, Any]]:
+    found = parse_packages(text)
+    assert not isinstance(found, Unset), found
+    return found
+
+
 def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path: Path) -> None:
     root = _root(tmp_path)
     repo = tmp_path / "src" / "demo"
@@ -412,7 +419,7 @@ def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path:
     (repo / "demo" / "hello" / "contract.yaml").write_text("version: 0.3.0\n")
     done = _packages(tmp_path, "list")
     assert done.returncode == 0, done.stderr
-    found = {item["name"]: item for item in parse_packages(done.stdout) or []}
+    found = {item["name"]: item for item in _listing(done.stdout)}
     assert sorted(found) == ["demo.hello", "demo.other"]
     for name, item in found.items():
         expected = listed(repo, name)
@@ -428,13 +435,17 @@ def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path:
     mine = make_repo(tmp_path / "user", repo="mine", packages=("solver",))
     added = _packages(tmp_path, "add", str(mine))
     assert added.returncode == 0, added.stderr
-    assert "mine.solver" in {item["name"] for item in parse_packages(added.stdout) or []}
+    assert "mine.solver" in {item["name"] for item in _listing(added.stdout)}
     assert f"JARVIS_ROOT={root} repo add {mine.resolve()}" in (tmp_path / "jarvis.log").read_text()
     assert f"JARVIS_ROOT={root} repo list +json" in (tmp_path / "jarvis.log").read_text()
     assert _packages(tmp_path, "add", str(tmp_path / "nowhere")).returncode == EXIT_MISSING
 
     (root / "relay.pin").write_text("an older setup\n")
-    assert parse_packages(_packages(tmp_path, "list").stdout) is None
+    assert parse_packages(_packages(tmp_path, "list").stdout) == Unset(
+        want=site_pin(), at="an older setup"
+    )
+    (root / "relay.pin").unlink()
+    assert parse_packages(_packages(tmp_path, "list").stdout) == Unset(want=site_pin(), at="")
 
 
 def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> None:
@@ -474,6 +485,23 @@ def test_the_site_script_says_when_jarvis_is_missing(tmp_path: Path) -> None:
     refusal = missing_jarvis(done.stderr, site="lab")
     assert refusal.reason == RefusalReason.ADAPTER_UNAVAILABLE
     assert refusal.data == {"missing": "jarvis", "tried": tried, "explicit": True}
+
+
+def test_the_site_script_says_which_pin_an_outdated_root_holds(tmp_path: Path) -> None:
+    job, digest = _job_dir(tmp_path)
+    jarvis = _jarvis(tmp_path)
+    (tmp_path / "site" / "jarvis" / "relay.pin").write_text('old "x"\n')
+    env = _env(tmp_path, tmp_path / "bin", CLIO_RELAY_JARVIS_PIN="new y")
+    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", PIPELINE)
+    assert done.returncode == EXIT_NO_JARVIS
+    assert 'the site\'s JARVIS root is at old "x", not new y' in done.stderr
+    written = json.loads((job / REFUSAL_FILE).read_text())
+    assert (written["pin"], written["want"], written["tried"]) == ('old "x"', "new y", str(jarvis))
+    refusal = missing_jarvis(done.stderr, site="lab")
+    assert (refusal.data["pin"], refusal.data["want"]) == ('old "x"', "new y")
+    assert refusal.message.startswith(
+        'JARVIS is on lab at the jarvis program old with clio-jarvis "x"'
+    )
 
 
 def test_the_site_script_expands_a_home_jarvis_path(tmp_path: Path) -> None:

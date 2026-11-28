@@ -68,7 +68,7 @@ def test_a_placeholder_around_an_input_name_is_refused(value: str) -> None:
         update={"package": spec.package.model_copy(update={"parameters": {"stl": "./body.stl"}})}
     )
     assert pipeline_document(dotted, pipeline="p", job_dir="/scratch/job")["pkgs"] == [
-        {"pkg_type": "demo.hello", "pkg_name": "pkg", "stl": "/scratch/job/body.stl"}
+        {"pkg_type": "demo.hello", "pkg_name": "hello", "stl": "/scratch/job/body.stl"}
     ]
 
 
@@ -95,7 +95,7 @@ def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
     assert entry == [
         {
             "pkg_type": "demo.hello",
-            "pkg_name": "pkg",
+            "pkg_name": "hello",
             "count": 2,
             "label": "body",
             "stl": "/scratch/job/body.stl",
@@ -126,12 +126,22 @@ def test_a_missing_jarvis_says_whose_it_is() -> None:
     explicit = missing_jarvis('{"missing":"jarvis","tried":"/opt/j","explicit":true}', site="lab")
     assert explicit.data.get("explicit") is True
     assert "installable" not in explicit.data
-    stale = missing_jarvis('{"missing":"jarvis","tried":"/h/j","pin":"abc"}', site="lab")
-    assert stale.data["pin"] == "abc"
+    stale = missing_jarvis(
+        '{"missing":"jarvis","tried":"/h/j","pin":"' + "a" * 40 + ' f38ecb74abcd",'
+        '"want":"' + "b" * 40 + ' dae7f4d8abcd"}',
+        site="lab",
+    )
+    assert stale.data["pin"] == "a" * 40 + " f38ecb74abcd"
     assert stale.data["installable"] == JARVIS_PIN
+    assert stale.message.startswith(
+        "JARVIS is on lab at jarvis-cd aaaaaaaa with clio-jarvis f38ecb74abcd; relay "
+        "updates it to jarvis-cd bbbbbbbb with clio-jarvis dae7f4d8abcd. "
+    )
     absent = missing_jarvis('{"missing":"jarvis","tried":"/h/j"}', site="lab")
     assert absent.reason == RefusalReason.ADAPTER_UNAVAILABLE
     assert absent.data["installable"] == JARVIS_PIN
+    assert "pin" not in absent.data
+    assert absent.message.startswith("lab has no JARVIS root that relay set up; ")
 
 
 def test_a_refusal_keeps_jarvis_typed_issues_even_pretty_printed() -> None:

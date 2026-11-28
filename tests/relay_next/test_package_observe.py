@@ -20,6 +20,7 @@ import pytest
 
 from clio_relay.adapters.hooks import set_hook
 from clio_relay.guard import create_guard
+from clio_relay.jarvis_site import Unset, site_pin
 from clio_relay.jobs.handles import VIEW_METADATA, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -78,13 +79,19 @@ async def test_describe_lists_packages_and_run_pins_one_named_alone(
     assert shown["reviewed"] is False
     assert report["jarvis"]["set_up"] is True
 
-    # A root that is no longer set up lists nothing, though relay listed it before.
+    # A root that is not at the pin lists nothing, though relay listed it before.
+    old = "a" * 40 + " f38ecb74abcd"
+
     async def unset(site: str, adapter: Any, **_: Any) -> Any:
-        return None
+        return Unset(want=site_pin(), at=old)
 
     setattr(service.packages, "refresh", unset)  # noqa: B010
     report = await site_report(service, service.site("fx"))
     assert report["packages"] == [] and report["jarvis"]["set_up"] is False
+    assert report["jarvis"]["at"] == {"jarvis_cd": "a" * 40, "clio_jarvis": "f38ecb74abcd"}
+    assert report["jarvis"]["state"].startswith(
+        "JARVIS is on fx at jarvis-cd aaaaaaaa with clio-jarvis f38ecb74abcd; relay updates it"
+    )
     setattr(service.packages, "refresh", refresh)  # noqa: B010
 
     record = await service.start_run(
