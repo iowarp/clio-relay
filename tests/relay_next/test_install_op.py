@@ -303,6 +303,10 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     assert "JARVIS's Spack check finds no installed lammps@2Aug2023 on Ares" in message
     assert "JARVIS finds no rich-cli pyyaml on Ares and installs it with pip." in message
     assert "JARVIS finds no alpine:3.20 on Ares and installs it with container." in message
+    assert "not installed" not in message
+    refusal = jarvis_report.install_needed(report, site="Ares")
+    assert "JARVIS installs 3 package(s)" in refusal.message
+    assert "relay asks them" in refusal.message
 
 
 def test_the_install_ask_names_the_provider_spack_picked_for_each_virtual() -> None:
@@ -330,10 +334,6 @@ def test_the_install_ask_names_the_provider_spack_picked_for_each_virtual() -> N
         report, site="Ares", package="demo.mpb", names={}, walltime=None
     )
     assert "It builds against openmpi 5.0.5. Spack picks fftw 2.1.5 for fftw-api." in message
-    assert "not installed" not in message
-    refusal = jarvis_report.install_needed(report, site="Ares")
-    assert "JARVIS installs 3 package(s)" in refusal.message
-    assert "relay asks them" in refusal.message
 
 
 def test_the_install_ask_states_jarvis_s_no_site_copy_fact() -> None:
