@@ -16,11 +16,14 @@ def pace_note(step: dict[str, Any]) -> str | None:
     per_step = pace.get("seconds_per_step")
     if not isinstance(per_step, int | float):
         return None
-    unit = cast(dict[str, Any], step.get("data") or {}).get("unit") or "step"
+    data = cast(dict[str, Any], step.get("data") or {})
+    unit = pace.get("unit") or data.get("unit") or "step"
     said = (
         f"measured {_spoken_rate(per_step)} per {unit} "
         f"over {unit}s {pace.get('from_step')} to {pace.get('to_step')}"
     )
+    if pace.get("total") is not None:
+        said += f" of {pace['total']}"
     if pace.get("projected_end_at"):
         said += f", so the last {unit} lands about {pace['projected_end_at']}"
     margin = pace.get("limit_margin_s")

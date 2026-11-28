@@ -161,26 +161,37 @@ def _at(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).isoformat()
 
 
-def step_pace(lines: list[dict[str, Any]], total: int | None) -> dict[str, Any] | None:
+def step_pace(lines: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the run's own measured pace from the times its steps were reported.
 
-    Each step counts at the first time a record named it. The pace runs from the
-    earliest step the records still hold to the latest, so it leaves out the
-    startup before the first step; ``latest_seconds_per_step`` is the last
-    interval alone. With ``total`` known, ``projected_end_at`` is when the last
-    step would be reported at the measured pace.
+    Steps are counted within one series, a package's lines in one ``unit``, so a
+    package's other records (an output it publishes as step 1 of 1, say) never mix
+    with its timesteps; the pace is the newest series' that holds two steps or more,
+    and its ``unit`` and ``total`` name it. Each step counts at the first time a
+    record named it. The pace runs from the earliest step the records still hold to
+    the latest, so it leaves out the startup before the first step;
+    ``latest_seconds_per_step`` is the last interval alone. With the series' total
+    known, ``projected_end_at`` is when its last step would be reported at that pace.
     """
-    first: dict[int, float] = {}
+    series: dict[tuple[object, object], dict[int, float]] = {}
+    totals: dict[tuple[object, object], tuple[float, int | None]] = {}
     for line in lines:
         if line.get("schema_version") != PROGRESS_SCHEMA:
             continue
         step, epoch = _step_of(line), line.get("observed_at_epoch")
         if step is None or isinstance(epoch, bool) or not isinstance(epoch, int | float):
             continue
+        key = (line.get("package_name"), line.get("unit"))
+        first = series.setdefault(key, {})
         first[step] = min(first.get(step, float(epoch)), float(epoch))
-    ordered = sorted(first.items())
-    if len(ordered) < 2:
+        if key not in totals or float(epoch) >= totals[key][0]:
+            totals[key] = (float(epoch), _int(line.get("total")))
+    measured = [(max(first.values()), key) for key, first in series.items() if len(first) >= 2]
+    if not measured:
         return None
+    key = max(measured, key=lambda item: item[0])[1]
+    total = totals[key][1]
+    ordered = sorted(series[key].items())
     (from_step, from_at), (before_step, before_at), (to_step, to_at) = (
         ordered[0],
         ordered[-2],
@@ -190,6 +201,7 @@ def step_pace(lines: list[dict[str, Any]], total: int | None) -> dict[str, Any] 
         return None
     per_step = (to_at - from_at) / (to_step - from_step)
     pace: dict[str, Any] = {
+        "unit": key[1],
         "from_step": from_step,
         "from_at": _at(from_at),
         "to_step": to_step,
@@ -197,6 +209,8 @@ def step_pace(lines: list[dict[str, Any]], total: int | None) -> dict[str, Any] 
         "seconds_per_step": round(per_step, 3),
         "latest_seconds_per_step": round((to_at - before_at) / (to_step - before_step), 3),
     }
+    if total is not None:
+        pace["total"] = total
     if total is not None and total > to_step:
         pace["remaining_steps"] = total - to_step
         pace["projected_end_at"] = _at(to_at + (total - to_step) * per_step)
@@ -249,7 +263,7 @@ def latest_step(lines: list[dict[str, Any]], execution: str) -> JobProgress | No
     if clio.get("visible_steps") is not None:
         data["visible_steps"] = clio["visible_steps"]
     total = _int(latest.get("total"))
-    pace = step_pace(steps, total)
+    pace = step_pace(steps)
     if pace is not None:
         data[PACE] = pace
     message = latest.get("message")
