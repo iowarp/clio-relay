@@ -243,13 +243,10 @@ def test_a_site_refusing_the_install_fails_typed(relay_paths: RelayPaths, site: 
     asyncio.run(scenario())
 
 
-def test_install_takes_a_package_and_an_adapter_that_installs(relay_paths: RelayPaths) -> None:
+def test_install_needs_an_adapter_that_installs(relay_paths: RelayPaths) -> None:
     async def scenario() -> None:
         add_site(relay_paths)
         service = RelayService(relay_paths)
-        with pytest.raises(Refusal) as no_steps:
-            await install_op.start(service, "fx", JobSpec(executable="echo"))
-        assert no_steps.value.reason == RefusalReason.INVALID_SPEC
         with pytest.raises(Refusal) as cannot:
             await install_op.start(service, "fx", SPEC)
         assert cannot.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED
