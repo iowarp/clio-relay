@@ -633,14 +633,13 @@ def _job_failed(
 ) -> OperationRecord:
     """End an operation whose install job failed as a failed run job ends.
 
-    It is FAILED with the job's exit code and JARVIS's words, and JARVIS's records
-    and the install log (``data``) are in its result.
+    It is FAILED with the job's exit code, and its result has JARVIS's words as
+    the ``message``, with JARVIS's records and the install log (``data``).
     """
-    return service.finish(
-        operation_id,
-        OperationState.FAILED,
-        None,
-        message=message,
-        exit_code=status.exit_code,
-        result=data,
-    )
+    with service.operations.locked(operation_id):
+        record = service.operation(operation_id)
+        if not record.state.final:
+            record.exit_code = status.exit_code
+            record.result = {**(record.result or {}), "message": message, **data}
+            service.operations.put(operation_id, record)
+    return service.finish(operation_id, OperationState.FAILED, None)

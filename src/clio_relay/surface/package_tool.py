@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from clio_relay import jarvis_submit
-from clio_relay.jarvis_site import Unset
 from clio_relay.jarvis_submit import not_run_here
 
 if TYPE_CHECKING:
@@ -38,9 +36,7 @@ async def packages(
     adapter = service.adapter_for(site, "run")
     if not adapter.runs_packages:
         raise not_run_here(adapter.name)
-    entries = await service.packages.refresh(site.id, adapter, add=add, force=force)
-    if isinstance(entries, Unset):
-        raise jarvis_submit.not_at_pin(site.title, entries)
+    entries = await service.packages.at_pin(site, adapter, add=add, force=force)
     words = (match or "").lower().split()
     listed = [
         entry.model_dump(mode="json", include=_FIELDS)

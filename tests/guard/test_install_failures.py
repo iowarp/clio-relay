@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -157,22 +158,31 @@ class _Site:
 
 class _Record:
     site = "ares"
+    state = OperationState.RUNNING
+    exit_code: int | None = None
+    result: dict[str, Any] | None = None
 
 
 class _Service:
     def __init__(self) -> None:
-        self.finished: list[tuple[OperationState, Refusal | None, dict[str, Any]]] = []
+        self.finished: list[tuple[OperationState, Refusal | None]] = []
+        self.record = _Record()
+        self.operations = self
+
+    def locked(self, operation_id: str) -> contextlib.nullcontext[None]:
+        return contextlib.nullcontext()
+
+    def put(self, operation_id: str, record: _Record) -> None:
+        assert record is self.record
 
     def operation(self, operation_id: str) -> _Record:
-        return _Record()
+        return self.record
 
     def site(self, site_id: str) -> _Site:
         return _Site()
 
-    def finish(
-        self, operation_id: str, state: OperationState, refusal: Refusal | None, **ended: Any
-    ) -> str:
-        self.finished.append((state, refusal, ended))
+    def finish(self, operation_id: str, state: OperationState, refusal: Refusal | None) -> str:
+        self.finished.append((state, refusal))
         return "record"
 
 
@@ -213,12 +223,12 @@ async def test_an_install_job_that_exits_6_fails_with_its_records_whole(
     adapter, service, result = await _end(monkeypatch, json.dumps(BUILD) + "\n", 6, "raw tail")
     assert result == "record"
     assert adapter._files.paths == ["/home/u/jobs/op/executions/e1/install/issues.jsonl"]  # pyright: ignore[reportPrivateUsage]
-    state, refusal, ended = service.finished[0]
     # Like a failed run job: no refusal, the job's exit code, and JARVIS's records whole.
-    assert (state, refusal) == (OperationState.FAILED, None)
-    assert (ended["message"], ended["exit_code"]) == (BUILD["message"], 6)
-    assert ended["result"]["failures"] == [BUILD]
-    assert ended["result"]["install_job"] == "27990"
+    assert service.finished == [(OperationState.FAILED, None)]
+    ended = service.record.result or {}
+    assert (ended["message"], service.record.exit_code) == (BUILD["message"], 6)
+    assert ended["failures"] == [BUILD]
+    assert ended["install_job"] == "27990"
 
 
 @pytest.mark.asyncio
@@ -226,8 +236,7 @@ async def test_an_install_job_that_exits_6_with_no_record_passes_its_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _adapter, service, _result = await _end(monkeypatch, "", 6, "==> Error: out of space\n")
-    _state, _refusal, ended = service.finished[0]
-    assert ended["message"] == "==> Error: out of space"
+    assert (service.record.result or {})["message"] == "==> Error: out of space"
 
 
 @pytest.mark.asyncio
@@ -235,10 +244,10 @@ async def test_an_install_job_that_ends_otherwise_passes_its_output_as_printed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _adapter, service, _result = await _end(monkeypatch, "", 1, "slurmstepd: CANCELLED\n")
-    _state, refusal, ended = service.finished[0]
-    assert refusal is None
-    assert (ended["message"], ended["exit_code"]) == ("slurmstepd: CANCELLED", 1)
-    assert "JARVIS could not" not in ended["message"]
+    assert service.finished == [(OperationState.FAILED, None)]
+    message = (service.record.result or {})["message"]
+    assert (message, service.record.exit_code) == ("slurmstepd: CANCELLED", 1)
+    assert "JARVIS could not" not in message
 
 
 @pytest.mark.asyncio
@@ -254,7 +263,7 @@ async def test_an_install_job_with_an_issue_no_answer_settles_fails_in_jarvis_s_
         "hint": "Load an MPI module first.",
     }
     _adapter, service, _result = await _end(monkeypatch, json.dumps(stuck) + "\n", 3, None)
-    state, refusal, _ended = service.finished[0]
+    state, refusal = service.finished[0]
     assert state == OperationState.FAILED
     assert refusal is not None
     assert refusal.message == "no MPI on the compute nodes. Load an MPI module first."

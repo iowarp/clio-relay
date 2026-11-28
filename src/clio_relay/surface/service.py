@@ -28,7 +28,6 @@ from clio_relay.adapters.hooks import (
     said_yes,
     split_question,
 )
-from clio_relay.jarvis_site import Unset
 from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs import declines
 from clio_relay.jobs.content import ContentStore
@@ -351,9 +350,7 @@ class RelayService:
             return
         adapter = self.adapter_for(site, verb)
         if adapter.runs_packages:
-            listed = await self.packages.refresh(site.id, adapter)
-            if isinstance(listed, Unset):
-                raise jarvis_submit.not_at_pin(site.title, listed)
+            await self.packages.at_pin(site, adapter)
 
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
         """Return the run's job as relay records and digests it."""
@@ -643,26 +640,14 @@ class RelayService:
         return self.lease.acts_on(self.operations, record)
 
     def finish(
-        self,
-        operation_id: str,
-        state: OperationState,
-        refusal: Refusal | None,
-        *,
-        message: str | None = None,
-        exit_code: int | None = None,
-        result: dict[str, Any] | None = None,
+        self, operation_id: str, state: OperationState, refusal: Refusal | None
     ) -> OperationRecord:
-        """End an operation: with a refusal, or as a job ends, its message, exit code and result."""
         with self.operations.locked(operation_id):
             record = self.operation(operation_id)
             if not record.state.final:
                 if refusal is not None:
                     record.error = refusal.to_dict()
-                if exit_code is not None:
-                    record.exit_code = exit_code
-                if result:
-                    record.result = {**(record.result or {}), **result}
-                record.move(state, message if refusal is None else refusal.message)
+                record.move(state, None if refusal is None else refusal.message)
                 self.operations.put(operation_id, record)
                 drop_transient(self.content, self.operations, record)
         return record

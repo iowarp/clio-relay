@@ -30,12 +30,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, Field
 
+from clio_relay import jarvis_submit
 from clio_relay.jarvis_site import Unset, parse_packages, refuse_builtin
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import COUPLING_KINDS, Coupling, JobSpec, PackageRef, step_ids
 
 if TYPE_CHECKING:
     from clio_relay.adapters.base import BaseAdapter
+    from clio_relay.sites.models import SiteEntry
 
 ADD_COMMAND = (
     "the files tool, to copy a repository laid out <name>/<name>/<package>/pkg.py to the "
@@ -399,6 +401,15 @@ class PackageCatalog:
         """List the site's root again through the adapter; :class:`Unset` when not at the pin."""
         listed = parse_packages(await adapter.site_packages(add, force=force))
         return listed if isinstance(listed, Unset) else self.store(site, listed)
+
+    async def at_pin(
+        self, site: SiteEntry, adapter: BaseAdapter[Any], *, add: str = "", force: bool = False
+    ) -> list[PackageEntry]:
+        """:meth:`refresh`, refusing with the root's pins when it is not at relay's."""
+        listed = await self.refresh(site.id, adapter, add=add, force=force)
+        if isinstance(listed, Unset):
+            raise jarvis_submit.not_at_pin(site.title, listed)
+        return listed
 
     def resolve(self, site: str, package: PackageRef) -> PackageRef:
         """Fill ``package``'s version and digest from the site's catalog.
