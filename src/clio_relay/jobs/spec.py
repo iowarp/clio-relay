@@ -440,7 +440,7 @@ class JobSpec(_Spec):
         if self.package is not None and self.packages:
             raise ValueError("give package or packages, not both")
         if (self.executable is None) == (not self.steps()):
-            raise ValueError("give exactly one of executable or package(s)")
+            raise ValueError("set package: {name: ...} or executable")
         if self.couplings:
             steps = self.steps()
             if len(steps) < 2:

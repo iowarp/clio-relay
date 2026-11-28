@@ -1285,8 +1285,9 @@ def jarvis_refused(text: str, *, site: str, what: str = "the pipeline") -> Refus
 
 
 SETUP_STEP = (
-    "To set it up, call install with this site and job: that install operation asks the "
-    "person, sets up the site's JARVIS root and ends; then run the job again"
+    "To set it up, call install(site=..., package={name: ...}) with the package you mean "
+    "to run: it asks the person, sets up the site's JARVIS root and ends; then call run "
+    "or install again"
 )
 """The setup step a run, serve, install or describe names when the site is not set up."""
 

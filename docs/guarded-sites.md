@@ -130,7 +130,7 @@ its `host_slice` parameter.
 When the site lacks software the packages need, relay asks you before it
 installs anything, and the install runs as its own job before the run. When
 the site's JARVIS root is not set up, `run` refuses and names the setup step:
-an `install` with the site and job, which asks you, sets the root up and ends;
+`install(site=..., package={name: ...})`, which asks you, sets the root up and ends;
 the agent then runs again. Nothing is submitted until you say yes. Nothing
 is built on a site's login node: JARVIS refuses a build outside an allocation
 (exit 4), and relay reports that as a refusal and never retries it.

@@ -93,8 +93,8 @@ SETTINGS_KEY = "settings"
 """A failure record's install settings (jarvis-cd 1.9.14): what the person may set."""
 
 SETTINGS_HOW = (
-    "To give a setting, run or install the same job again with spec.install_settings "
-    "[{issue_id, value, basis}]"
+    "To give a setting, run the same job again with spec.install_settings, or call install "
+    "again with install_settings, as [{issue_id, value, basis}]"
 )
 
 

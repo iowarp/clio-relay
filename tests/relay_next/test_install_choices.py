@@ -234,8 +234,9 @@ def test_a_declined_question_cancels_every_holder(relay_paths: RelayPaths, site:
     asyncio.run(scenario())
 
 
-def _spec(job: JobSpec) -> dict[str, Any]:
-    return job.model_dump(mode="json", exclude_none=True)
+def _package(job: JobSpec) -> dict[str, Any]:
+    assert job.package is not None
+    return job.package.model_dump(mode="json", exclude_none=True)
 
 
 def test_an_answer_through_one_task_moves_every_task_holding_the_question(
@@ -250,9 +251,11 @@ def test_an_answer_through_one_task_moves_every_task_holding_the_question(
 
     async def scenario() -> None:
         async with Client(create_server(relay_paths), mode="auto") as client:
-            first = await call_tool_task(client, "install", {"site": "fx", "spec": _spec(XCOMPACT)})
+            first = await call_tool_task(
+                client, "install", {"site": "fx", "package": _package(XCOMPACT)}
+            )
             second = await call_tool_task(
-                client, "install", {"site": "fx", "spec": _spec(PVSERVER)}
+                client, "install", {"site": "fx", "package": _package(PVSERVER)}
             )
             side = RelayService(relay_paths)
             (choice,) = _choices(side)

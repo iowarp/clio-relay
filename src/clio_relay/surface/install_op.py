@@ -53,12 +53,6 @@ async def start(
 ) -> OperationRecord:
     """Record an install operation, ask what must be asked, and check if nothing must."""
     site = service.site(site_id)
-    if not spec.steps():
-        raise Refusal(
-            RefusalReason.INVALID_SPEC,
-            "install takes a package job: name the package (or pipeline) to install",
-            site=site.id,
-        )
     adapter_name, _, _ = service.route(site, "run")
     if not can_install(service.adapter_named(site, adapter_name)):
         raise Refusal(

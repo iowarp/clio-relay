@@ -193,7 +193,8 @@ digest it finds there. Do not look for relay's files or build an archive.
 
 - **clio-jarvis** is in every site's root once the site is set up. When
   `describe(site=...)` shows `jarvis.set_up: false`, or a `run` refuses
-  because the site is not set up, call `install` with the site and the job:
+  because the site is not set up, call
+  `install(site=..., package={name: ...})` with the package you mean to run:
   it asks the person, sets the root up and ends. Then run again. Do not look
   for another way to place JARVIS.
 - **A repository the person wrote**, such as one just written with the JARVIS
@@ -214,8 +215,9 @@ the current one: leave the pin out to take it.
 ## Install ahead of a run
 
 When the person wants a package's software on a site before running it ("install
-xcompact3d on ares, don't run anything yet"), call `install` with the site and
-the same `spec` a run would take, `package: {name, parameters}`. It is `run`'s install step on its own, and nothing
+xcompact3d on ares, don't run anything yet"), call
+`install(site=..., package={name, parameters})`, the same `package` a run
+takes. It is `run`'s install step on its own, and nothing
 launches:
 
 - On a site whose JARVIS root is not set up, `install` sets it up (uv,
@@ -241,7 +243,7 @@ launches:
 
 Like `run` it is a task: follow it with the task, or with `describe(job=...)`,
 and cancel it with `install(cancel=...)`. To install several packages, such
-as everything a plan runs, make one `install` call whose `spec` lists them all
+as everything a plan runs, make one `install` call that lists them all
 in `packages`, the same steps the later `run` or `serve` takes. The person
 then gets one review of the packages, one set of JARVIS questions and one
 build, instead of one of each per package. A later `run` of the same

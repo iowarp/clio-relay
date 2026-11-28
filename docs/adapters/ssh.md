@@ -248,8 +248,8 @@ settings (jarvis-cd 1.9.14: `install_tmpdir`, the install job's temp dir and
 Spack build stage) under `settings`, each with its `issue_id`, JARVIS's question
 and what an answer does. Relay passes them whole as the refusal's `settings`
 and adds JARVIS's question and answer text to the message. To give one, the
-agent runs or installs the same job again with `spec.install_settings`
-`[{issue_id, value, basis}]`; relay takes only an issue_id a failure on the same
+agent runs the same job again with `spec.install_settings`, or installs it again
+with `install_settings`, each `{issue_id, value, basis}`; relay takes only an issue_id a failure on the same
 site offered, names the value in the install approval, and sends it with every
 round's answers (`answered_by: agent`). JARVIS records it for the site
 (`decisions.yaml` `site.install_tmpdir`; `ppl install --forget install_tmpdir`
@@ -378,7 +378,7 @@ home, by absolute path for submit, install, check, execution and stop, always
 with `JARVIS_ROOT=<home>/jarvis`. It never runs a `jarvis` found on the site's
 `PATH`: an older one rejects the service reports and builds on the login node.
 When the root is not set up, or not at relay's pins, a `run`, `serve` or
-`install` refuses and names the setup step: an `install` with the site and job,
+`install` refuses and names the setup step: `install(site=..., package={name: ...})`,
 which asks you before it sets up the site and ends. The setup installs uv (the
 one on `PATH`, else `<home>/bin/uv`, else uv's installer puts it there), then
 jarvis-cd at its pinned commit with `uv tool install`, which brings its own

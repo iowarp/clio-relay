@@ -406,9 +406,10 @@ class RelayServer:
                 record = await self.service.advance(resume)
                 return await self._observed(ctx, record, wait_s, flagged=flagged)
             if site is None or spec is None:
+                needs = "site and package (or packages)" if kind == "install" else "site and spec"
                 raise Refusal(
                     RefusalReason.INVALID_ARGUMENTS,
-                    f"{kind} needs site and spec, or cancel, or resume",
+                    f"{kind} needs {needs}, or cancel, or resume",
                 )
             task = tasks_opted_in(ctx)
             if kind == "install":
