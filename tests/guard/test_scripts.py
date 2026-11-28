@@ -239,8 +239,8 @@ def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> Non
     assert done.returncode == 3
     assert "sbatch said no" in done.stderr
     assert not (job / SUBMISSION_FILE).exists()
-    # JARVIS stopped before sbatch: its stdout is the install report, kept as such.
-    report = json.loads((job / "relay.install-report.json").read_text())
+    # JARVIS stopped before sbatch: its stdout is the install report, printed as such.
+    report = json.loads(done.stdout.strip().splitlines()[-1])
     assert report["submitted"] is False
 
 
@@ -254,7 +254,6 @@ def test_submit_asks_the_light_check_first_and_stops_on_its_exit_3(tmp_path: Pat
     log = (tmp_path / "jarvis.log").read_text()
     assert f"ppl install yaml {job}/{PIPELINE_FILE} +check +json" in log
     assert "ppl check" not in log and "ppl submit" not in log
-    assert json.loads((job / "relay.install-report.json").read_text())["satisfied"] is False
     assert json.loads(done.stdout.strip().splitlines()[-1])["satisfied"] is False
     assert not (job / SUBMISSION_FILE).exists()
 
@@ -294,7 +293,7 @@ def test_check_asks_jarvis_what_is_installed_and_submits_nothing(tmp_path: Path,
     env = _env(tmp_path, tmp_path / "bin", JARVIS_INSTALL_RC=str(rc), JARVIS_SATISFIED=satisfied)
     done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="check")
     assert done.returncode == rc, done.stderr
-    report = json.loads((job / "relay.install-report.json").read_text())
+    report = json.loads(done.stdout.strip().splitlines()[-1])
     assert report["satisfied"] is (rc == 0)
     last = (tmp_path / "jarvis.log").read_text().splitlines()[-1]
     assert last.endswith(f"ppl install yaml {job}/{PIPELINE_FILE} +check +json")
@@ -356,7 +355,6 @@ def test_a_recheck_jarvis_checks_here_submits_no_job(tmp_path: Path, rc: int, is
     assert not (job / "relay.install.json").exists()
     report = json.loads(done.stdout.strip().splitlines()[-1])
     assert report["issues"] == json.loads(issues)
-    assert json.loads((job / "relay.install-report.json").read_text()) == report
 
 
 def test_relay_sets_no_placement_and_no_limits_of_its_own() -> None:

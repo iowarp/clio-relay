@@ -26,9 +26,7 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
     async def files(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         site: Annotated[str, Field(description="The site id")],
-        op: Literal[
-            "list", "stat", "read", "write", "delete", "stage", "has", "upload", "download"
-        ],
+        op: Literal["list", "stat", "read", "write", "delete", "stage", "upload", "download"],
         path: Annotated[
             str | None,
             Field(description="Absolute, ~/ for home, or relative to relay's work directory"),
@@ -44,7 +42,6 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         overwrite: bool = False,
         final: Annotated[bool, Field(description="False while more chunks follow")] = True,
         recursive: Annotated[bool, Field(description="Delete a non-empty directory")] = False,
-        digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
         local_path: Annotated[
             str | None,
             Field(
@@ -61,7 +58,7 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         for bytes that exist only in the conversation. stage puts bytes in the
         site's content store and returns the SHA-256 a JobSpec input names. On a
         guarded site, delete and an upload or write that replaces a file wait for
-        the person's yes. list, stat, read and has only read: files_read does them
+        the person's yes. list, stat and read only read: files_read does them
         and never asks."""
         return await relay.files(
             ctx,
@@ -76,7 +73,6 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
                 overwrite=overwrite,
                 final=final,
                 recursive=recursive,
-                digest=digest,
                 local_path=local_path,
             ),
         )

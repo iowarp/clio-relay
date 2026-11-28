@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +44,7 @@ def test_exec_and_files(relay_paths: RelayPaths) -> None:
             staged = _structured(
                 await client.call_tool("files", {"site": "fx", "op": "stage", "content": "x"})
             )
-            has = await client.call_tool(
-                "files", {"site": "fx", "op": "has", "digest": staged["sha256"]}
-            )
-            assert _structured(has)["present"] is True
+            assert staged["sha256"] == hashlib.sha256(b"x").hexdigest()
             again = await client.call_tool(
                 "files",
                 {"site": "fx", "op": "write", "path": "a/b.txt", "content": "x"},

@@ -248,17 +248,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
     # run
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
-        return cast(JobHandle, await self._submit(spec, operation_id, check_only=False))
+        return cast(JobHandle, await self._submit(spec, operation_id, mode="submit"))
 
     async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._submit(spec, operation_id, check_only=True))
+        return cast(dict[str, Any], await self._submit(spec, operation_id, mode="check"))
 
     async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
-        found = await self._submit(spec, operation_id, check_only=False, plan=True)
+        found = await self._submit(spec, operation_id, mode="plan")
         return cast(dict[str, Any] | None, found)
 
     async def _submit(
-        self, spec: JobSpec, operation_id: str, *, check_only: bool, plan: bool = False
+        self, spec: JobSpec, operation_id: str, *, mode: jarvis_submit.SiteMode
     ) -> JobHandle | dict[str, Any] | None:
         if not spec.steps() and spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
@@ -279,7 +279,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{self.context.title} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
-        existing = None if check_only or plan else self._existing(check, root, job_dir, name)
+        existing = None if mode != "submit" else self._existing(check, root, job_dir, name)
         if existing is not None:
             return existing
         if "ready" not in check:
@@ -304,8 +304,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if scheduler is None and hints:
             raise direct_refused(hints, site=self.context.title)
         jarvis_mode = bool(spec.steps())
-        mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
-        if plan and not jarvis_mode:
+        if mode == "plan" and not jarvis_mode:
             return None
         have = set(check.get("have", []))
         missing = sorted(digests - have)
@@ -355,6 +354,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 launcher_dir=rendered.launcher_dir,
                 launcher_files=[path.name for path in rendered.launcher_files],
                 submit_command=rendered.submit_command,
+                mode=mode if jarvis_mode else "submit",
             )
             result = await self.transport.ssh(script, timeout_s=None, what="submitting")
         finally:
@@ -795,7 +795,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
     ) -> JobHandle:
-        """Submit ``ppl install +submit`` from the job directory the refused submit left."""
+        """Submit ``ppl install +submit`` from the job directory, which it makes."""
         sections = parse_sections(
             await self._ssh(
                 scripts.find_script(self.config.remote_dir, operation_id, self.config.scheduler),
@@ -830,7 +830,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             graph=self.config.jarvis_graph,
         )
         result = await self.transport.ssh(
-            jarvis_remote.install_script(str(job_dir), command),
+            jarvis_remote.install_script(str(job_dir), command, site_script=True),
             timeout_s=None,
             what="submitting the install",
         )

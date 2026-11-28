@@ -52,7 +52,7 @@ GENERAL = (
     "Reads never change anything and never ask: describe (a site, an operation or a "
     "service with job=...), exec_read (a command "
     "on relay's read-only list, such as squeue or jarvis sched info +json), files_read "
-    "(list, stat, read, has) and packages_read (the packages a site's JARVIS root holds). "
+    "(list, stat, read) and packages_read (the packages a site's JARVIS root holds). "
     "cancel cancels a job or stops a service; site_clean removes relay's deployment from "
     "a site after the person's yes, keeping the Spack store. "
     "Refusals carry a typed reason in structuredContent.refusal. "

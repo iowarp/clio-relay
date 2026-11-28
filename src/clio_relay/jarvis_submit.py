@@ -20,8 +20,8 @@ The login host runs no Spack: for a pipeline with a ``scheduler:`` block,
 JARVIS's ``ppl install +check`` there reads the ``install-check.json`` record
 a job's check wrote. A submit asks that light check first. When software is
 missing, needs a decision, or has no matching record (``install_unchecked``),
-the script writes JARVIS's ``jarvis.install-report.v1`` to
-``relay.install-report.json`` and exits 3, before any ``sbatch``. Relay asks
+the script prints JARVIS's ``jarvis.install-report.v1`` and exits 3, before
+any ``sbatch``. Relay asks
 the person to approve the install and answer each question
 (:func:`install_needed`), or asks nothing and runs ``recheck`` for
 ``install_unchecked``, follows that job, and then submits the run again.
@@ -85,8 +85,6 @@ REFUSAL_FILE = "relay.refusal.json"
 """Written when the site has no JARVIS, or no Spack for it: ``{"reason", "missing", "tried"}``."""
 JARVIS_FILE = "relay.jarvis"
 """The JARVIS program the site script found, for the ``execution`` commands later."""
-INSTALL_REPORT_FILE = "relay.install-report.json"
-"""The ``jarvis.install-report.v1`` of a submit that exited 3."""
 ANSWERS_FILE = "relay.answers.json"
 """The person's answers to JARVIS's install questions, ``{issue_id: {constraint, ...}}``."""
 INSTALL_FILE = "relay.install.json"
@@ -102,7 +100,6 @@ SITE_FILES = (
     SUBMISSION_FILE,
     REFUSAL_FILE,
     JARVIS_FILE,
-    INSTALL_REPORT_FILE,
     ANSWERS_FILE,
     INSTALL_FILE,
     SHARED_FILE,

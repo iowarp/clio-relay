@@ -3,7 +3,7 @@
 A host that runs only reads, or runs them without a question, can honour that
 per tool: ``describe`` (relay, a site, an operation or a service),
 ``exec_read`` (a command on the guard's read-only list, on every site),
-``files_read`` (list, stat, read, has) and ``packages_read`` (the packages a
+``files_read`` (list, stat, read) and ``packages_read`` (the packages a
 site's JARVIS root holds).
 """
 
@@ -113,19 +113,17 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
     async def files_read(  # pyright: ignore[reportUnusedFunction]
         ctx: Context,
         site: Annotated[str, Field(description="The site id")],
-        op: Literal["list", "stat", "read", "has"],
+        op: Literal["list", "stat", "read"],
         path: Annotated[
             str | None,
             Field(description="Absolute, ~/ for home, or relative to relay's work directory"),
         ] = None,
         offset: Annotated[int, Field(ge=0, description="Where a read starts")] = 0,
         limit: Annotated[int | None, Field(ge=1)] = None,
-        digest: Annotated[str | None, Field(description="A SHA-256, for has")] = None,
     ) -> ToolResult | InputRequiredToolResult:
         """The reads of files, on any site, with no question: list a directory, stat
-        a path, read a file (up to 4 MiB a call, for content you need to see) and
-        has, whether the site's content store holds a SHA-256. To copy a file to
-        this machine, use files op download with local_path. Writes, deletes,
-        stage, upload and download are in files."""
-        arguments = FilesArgs(op=op, path=path, offset=offset, limit=limit, digest=digest)
+        a path, and read a file (up to 4 MiB a call, for content you need to see).
+        To copy a file to this machine, use files op download with local_path.
+        Writes, deletes, stage, upload and download are in files."""
+        arguments = FilesArgs(op=op, path=path, offset=offset, limit=limit)
         return await relay.files(ctx, site, arguments)

@@ -189,14 +189,9 @@ printf '%s\n' "$shared" > "$job/relay.shared"
 printf '{"schema_version":"clio-relay.shared.v1","path":"%s"}\n' \
   "$(printf '%s' "$shared" | sed 's/[\\"]/\\&/g')"
 [ -f "$answers" ] && export JARVIS_INSTALL_ANSWERS="$answers"
-keep_report() {
-  printf '%s\n' "$1" | tail -n 1 > "$job/relay.install-report.json.tmp"
-  mv -f "$job/relay.install-report.json.tmp" "$job/relay.install-report.json"
-}
 light() {
   rc=0
   out=$("$found" ppl install yaml "$pipeline" +check +json) || rc=$?
-  keep_report "$out"
   [ "$mode" = check ] || [ "$rc" -ne 0 ] || return 0
   printf '%s\n' "$out"
   exit "$rc"
@@ -303,7 +298,6 @@ if [ "$mode" = recheck ] || [ "$mode" = install ]; then
   where=$(route "$out" "$rc")
   [ "$where" != login ] || login_build "$out"
   if [ "$where" != job ]; then
-    [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] && keep_report "$out"
     rm -f "$job/relay.install.json"
     printf '%s\n' "$out"
     exit "$rc"
@@ -385,7 +379,7 @@ print(f if isinstance(f, int) and not isinstance(f, bool) else 0)' \
 fi
 printf '%s\n' "$out"
 # Exit 3 stopped JARVIS before sbatch: its stdout is the jarvis.install report.
-if [ "$rc" -eq 3 ]; then keep_report "$out"; exit 3; fi
+if [ "$rc" -eq 3 ]; then exit 3; fi
 [ "$rc" -eq 0 ] || exit "$rc"
 printf '%s\n' "$out" | tail -n 1 > "$job/$saved.tmp"
 mv -f "$job/$saved.tmp" "$job/$saved"
@@ -471,14 +465,16 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   builds here;
 - ``check`` runs only the light ``ppl install +check``, for an install ahead of
   any run: it exits 0 with the report when the software is all there, else 3.
+  Adapters run it in a scratch directory, never the job's: a check leaves no
+  record of the job.
 
 The light check runs no Spack: JARVIS answers from the ``install-check.json``
 record a job's check wrote, while its inputs match, else ``install_unchecked``.
 When it exits 3 (software to install, a question, or no record), the script
-writes its report to ``relay.install-report.json``, prints it and exits 3; a
+prints its report and exits 3; a
 site where JARVIS finds no Spack is one of those questions (``spack_missing``,
 whose candidates are the site's Spacks JARVIS found). ``ppl submit``'s own
-exit 3 prints the same report, kept the same way.
+exit 3 prints the same report.
 Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build where it was asked,
 outside an allocation or on a login host too busy for its limits) passes through

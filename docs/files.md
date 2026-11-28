@@ -27,7 +27,6 @@ A job's `OutputRef` paths are absolute, so they can be read back as they are.
 | `write` (chunk) | as above, plus `offset` and `final` | Adds one chunk of a larger upload (see below) | `invalid_arguments` with `resume_at` on a wrong offset |
 | `delete` | `path`, `recursive` | Deletes a file, a symlink or a directory | `path_not_found`; `invalid_arguments` for a directory that is not empty without `recursive`, and for the work directory, the home directory or `/` |
 | `stage` | `content` or `content_base64` | Puts bytes in the site's content store and returns their SHA-256, which a job input names | |
-| `has` | `digest` | Says whether the content store holds a SHA-256 | |
 | `upload` | `local_path`, `path`, `overwrite` | Copies a file on the relay host to the site and checks its SHA-256 there (see below) | `path_not_found` for a missing local file; `path_exists` without `overwrite` |
 | `download` | `path`, `local_path`, `overwrite` | Copies a site file to the relay host and checks it against the site's SHA-256 | `path_not_found`; `path_exists` for a local file without `overwrite` |
 

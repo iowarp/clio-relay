@@ -146,8 +146,12 @@ def submit_script(
     launcher_dir: str | None,
     launcher_files: Sequence[str],
     submit_command: str,
+    mode: str = "submit",
 ) -> str:
-    """Move the uploads into place, link the inputs and submit, once (RL16, RL17)."""
+    """Move the uploads into place, link the inputs and submit, once (RL16, RL17).
+
+    A plan keeps no ``states`` and no ``submit.*``; a check runs in the uploads.
+    """
     move_blobs = "\n".join(
         f"""f="$I"/{q(d)}
 if [ -f "$f" ]; then
@@ -174,13 +178,29 @@ fi
   else mkdir -p "$(dirname "$t")"; rm -f "$t"; ln "$c" "$t" 2>/dev/null || cp "$c" "$t"; fi"""
         for name, digest in inputs
     )
+    where = "$I" if mode == "check" else "$J"
+    head = (
+        _head(remote_dir, operation_id)
+        + f'umask 077\nmkdir -p "{where}" "$R/content/cas/sha256" "$R/psij"\n'
+        + f"{move_blobs}\n{launcher}"
+    )
+    answer = "$J/submit" if mode == "submit" else "$I/submit"
+    run = f'(cd "{where}" && {submit_command}) </dev/null >"{answer}.out" 2>"{answer}.err"'
+    tail = (
+        f'echo "@@out"; cat "{answer}.out" 2>/dev/null; echo\n'
+        f'echo "@@err"; cat "{answer}.err" 2>/dev/null; echo\n'
+        'rm -rf "$I"\n'
+    )
+    if mode != "submit":
+        stage = "" if mode == "check" else f"{moves}\n{links}\n"
+        return (
+            head + f'ok=1\n{stage}[ "$ok" = 1 ] && {{ {run}; printf "%s\\n" "@@rc $?"; }}\n' + tail
+        )
     return (
         # A dropped connection must not stop a submit between the scheduler's answer
         # and the record of it.
         "trap '' HUP PIPE\n"
-        + _head(remote_dir, operation_id)
-        + 'umask 077\nmkdir -p "$J" "$R/content/cas/sha256" "$R/psij"\n'
-        + f"{move_blobs}\n{launcher}"
+        + head
         + 'if [ -f "$J/submit.rc" ] && [ "$(cat "$J/submit.rc")" != 0 ]; then\n'
         + '  rm -f "$J/submit.rc"; rmdir "$J/.submit.lock" 2>/dev/null\nfi\n'
         + 'if mkdir "$J/.submit.lock" 2>/dev/null; then\n'
@@ -188,7 +208,7 @@ fi
         + f"{moves}\n{links}\n"
         + '  if [ "$ok" = 1 ]; then\n'
         + '    printf "%s\\n" "$(ts) submitted" >> "$J/states"\n'
-        + f'    (cd "$J" && {submit_command}) </dev/null >"$J/submit.out" 2>"$J/submit.err"\n'
+        + f"    {run}\n"
         + '    printf "%s\\n" "$?" > "$J/submit.rc.tmp"\n'
         + '    mv -f "$J/submit.rc.tmp" "$J/submit.rc"\n'
         + '  else rmdir "$J/.submit.lock"; fi\n'
@@ -197,10 +217,8 @@ fi
         + '  while [ ! -f "$J/submit.rc" ] && [ $n -lt 600 ]; do\n'
         + '    sleep 1; fresh "$J"; n=$((n+1))\n  done\n'
         + "fi\n"
-        + 'rm -rf "$I"\n'
         + 'if [ -f "$J/submit.rc" ]; then printf "%s\\n" "@@rc $(cat "$J/submit.rc")"; fi\n'
-        + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo\n'
-        + 'echo "@@err"; cat "$J/submit.err" 2>/dev/null; echo\n'
+        + tail
     )
 
 

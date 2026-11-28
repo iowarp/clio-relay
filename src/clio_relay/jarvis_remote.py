@@ -100,22 +100,25 @@ def document(
 
 
 def submit_script(
-    job_dir: str, command: str, links: Sequence[tuple[str, str]], *, keep: bool
+    job_dir: str, command: str, links: Sequence[tuple[str, str]], *, mode: jarvis_submit.SiteMode
 ) -> str:
     """Run the site script's ``command`` in the job directory, the inputs linked first.
 
     ``links`` are ``(name, path)``: each input's path on the site, linked (else
-    copied) into the job directory as its name. With ``keep`` (a submit) the answer
-    is kept as ``submit.out`` and ``submit.rc``, and a submit that already exited 0
-    prints that answer again rather than submitting twice. Prints ``@@rc``, the
-    output under ``@@out`` and stderr under ``@@err``.
+    copied) into the job directory as its name. A submit keeps its answer as
+    ``submit.out`` and ``submit.rc``, and a submit that already exited 0 prints that
+    answer again rather than submitting twice; a plan keeps none, and a check's
+    directory is removed. Prints ``@@rc``, the output under ``@@out`` and stderr
+    under ``@@err``.
     """
+    keep = mode == "submit"
     linked = "".join(
         f't={q(name)}; mkdir -p "$(dirname "$t")"; rm -f "$t"; '
         f'ln {q(path)} "$t" 2>/dev/null || cp {q(path)} "$t" || exit 66\n'
         for name, path in links
     )
-    run = f"( {linked}{command} ) </dev/null >submit.out.$$ 2>submit.err\nrc=$?\n"
+    out, err = ("submit.out", "submit.err") if keep else (".relay.out", ".relay.err")
+    run = f"( {linked}{command} ) </dev/null >{out}.$$ 2>{err}\nrc=$?\n"
     if keep:
         run = (
             'if [ "$(cat submit.rc 2>/dev/null)" = 0 ]; then rc=0; : > submit.err\nelse\n'
@@ -123,13 +126,15 @@ def submit_script(
             + "mv -f submit.out.$$ submit.out; printf '%s\\n' \"$rc\" > submit.rc\nfi\n"
         )
     else:
-        run += "mv -f submit.out.$$ submit.out\n"
+        run += f"mv -f {out}.$$ {out}\n"
+    drop = {"plan": f"rm -f {out} {err}\n", "check": 'cd / && rm -rf "$J"\n'}.get(mode, "")
     return (
         f"J={q(job_dir)}\n"
         + 'mkdir -p "$J" && cd "$J" || { echo "@@nodir"; exit 0; }\n'
         + run
-        + 'printf "%s\\n" "@@rc $rc"; echo "@@out"; cat submit.out; echo\n'
-        + 'echo "@@err"; cat submit.err\n'
+        + f'printf "%s\\n" "@@rc $rc"; echo "@@out"; cat {out}; echo\n'
+        + f'echo "@@err"; cat {err}\n'
+        + drop
         + "exit 0\n"
     )
 
@@ -260,15 +265,23 @@ def execution_script(
     )
 
 
-def install_script(job_dir: str, install_command: str) -> str:
+def install_script(job_dir: str, install_command: str, *, site_script: bool = False) -> str:
     """Submit the install job from the job directory: the site script's ``install`` mode.
 
-    Prints ``@@rc`` and the output under ``@@out``; the handle line JARVIS printed
-    is kept as ``relay.install.json`` and printed under ``@@handle``.
+    The job directory is made here, private, as a check runs elsewhere; with
+    ``site_script`` the site script is written into it first. Prints ``@@rc`` and the
+    output under ``@@out``; the handle line JARVIS printed is kept as
+    ``relay.install.json`` and printed under ``@@handle``.
     """
+    script = jarvis_submit.SCRIPT_FILE
+    write = (
+        f"cat > {script}.tmp <<'CLIO_RELAY_SITE_SCRIPT'\n{jarvis_submit.SITE_SCRIPT}"
+        f"CLIO_RELAY_SITE_SCRIPT\nmv -f {script}.tmp {script}\n"
+    )
     return (
         f"J={q(job_dir)}\n"
-        + ENTER_JOB
+        + 'umask 077; mkdir -p "$J" && cd "$J" || { echo "@@nodir"; exit 0; }\n'
+        + (write if site_script else "")
         + f"out=$({install_command} 2>&1 </dev/null); rc=$?\n"
         + 'printf "%s\\n" "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
         + f'echo "@@handle"; cat {jarvis_submit.INSTALL_FILE} 2>/dev/null; echo\n'
@@ -295,8 +308,8 @@ def installed(
     job_dir = str(data["job_dir"])
     if "nodir" in found:
         raise Refusal(
-            RefusalReason.INPUT_MISSING,
-            f"the job directory {job_dir} is gone from {site}; run the job again",
+            RefusalReason.UNREACHABLE,
+            f"cannot create the job directory {job_dir} on {site}",
         )
     output, rc = "\n".join(found.get("out", [])).strip(), one(found, "rc")
     jarvis_exits.refuse(

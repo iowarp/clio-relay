@@ -35,7 +35,7 @@ flowchart LR
    install answers as `clio-relay site clean` does (`forget_decisions` drops
    the answers). The tools that only read, `describe`, `exec_read`
    (the read-only command list of [guarded sites](guarded-sites.md#read-only-exec))
-   and `files_read` (list, stat, read and has), live in `surface/read_tools.py`;
+   and `files_read` (list, stat and read), live in `surface/read_tools.py`;
    the result rendering and the annotations are in `surface/results.py`.
    `describe(site=...)` also lists the site's packages and says whether its
    JARVIS root is set up, and gives a service's endpoint and readiness (`job=<service>`). `run` and `serve`

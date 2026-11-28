@@ -471,21 +471,21 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     async def _jarvis(
         self, spec: JobSpec, operation_id: str, mode: jarvis_submit.SiteMode
     ) -> JobHandle | dict[str, Any] | None:
-        """Run the site script's ``mode`` in the job directory through :meth:`exec`."""
+        """Run the site script's ``mode`` through :meth:`exec`, a check in ``checks/<op>``."""
         _system, document, data = await self._jarvis_job(spec, operation_id)
         files = await self._files()
         await self._stage_inputs(files, [item.sha256 for item in spec.inputs])
-        job_dir = f"{files.root}/jobs/{operation_id}"
+        run_dir = f"{files.root}/checks/{operation_id}" if mode == "check" else data["job_dir"]
         for name, text in (
             (jarvis_submit.PIPELINE_FILE, jarvis_submit.render_pipeline(document)),
             (jarvis_submit.SCRIPT_FILE, jarvis_submit.SITE_SCRIPT),
         ):
-            await files.write(f"{job_dir}/{name}", text.encode(), overwrite=True)
+            await files.write(f"{run_dir}/{name}", text.encode(), overwrite=True)
         command = jarvis_submit.submit_command(
             spec, operation_id=operation_id, jarvis="", home=data["root"], mode=mode, graph=""
         )
         links = [(item.name, files.content_path(item.sha256)) for item in spec.inputs]
-        script = jarvis_remote.submit_script(data["job_dir"], command, links, keep=mode == "submit")
+        script = jarvis_remote.submit_script(run_dir, command, links, mode=mode)
         return jarvis_remote.submitted(
             self.name,
             jarvis_remote.parse_sections(await self._sh(script, f"the {mode}")),
@@ -499,8 +499,14 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
     ) -> JobHandle:
-        """Submit ``ppl install +submit`` from the job directory the refused submit left."""
+        """Submit ``ppl install +submit`` from the job directory, the site script written first."""
         _, document, data = await self._jarvis_job(spec, operation_id)
+        files = await self._files()
+        await files.write(
+            f"{data['job_dir']}/{jarvis_submit.SCRIPT_FILE}",
+            jarvis_submit.SITE_SCRIPT.encode(),
+            overwrite=True,
+        )
         command = jarvis_submit.install_command(
             spec,
             operation_id=operation_id,

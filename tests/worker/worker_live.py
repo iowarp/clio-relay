@@ -184,7 +184,6 @@ async def files_round_trip(client: Client, site: str, tag: str) -> dict[str, Any
         )
     )
     out["stage"] = {"expected": digest, "answer": staged, "matches": digest in json.dumps(staged)}
-    out["has"] = brief(await tool(client, "files", {"site": site, "op": "has", "digest": digest}))
     out["path"] = path
     return out
 

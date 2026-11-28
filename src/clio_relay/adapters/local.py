@@ -292,17 +292,17 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         return f"relay-{operation_id}"
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
-        return cast(JobHandle, await self._start(spec, operation_id, check_only=False))
+        return cast(JobHandle, await self._start(spec, operation_id, mode="submit"))
 
     async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
-        return cast(dict[str, Any], await self._start(spec, operation_id, check_only=True))
+        return cast(dict[str, Any], await self._start(spec, operation_id, mode="check"))
 
     async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
-        found = await self._start(spec, operation_id, check_only=False, plan=True)
+        found = await self._start(spec, operation_id, mode="plan")
         return cast(dict[str, Any] | None, found)
 
     async def _start(
-        self, spec: JobSpec, operation_id: str, *, check_only: bool, plan: bool = False
+        self, spec: JobSpec, operation_id: str, *, mode: jarvis_submit.SiteMode
     ) -> JobHandle | dict[str, Any] | None:
         job_dir = self._job_dir(operation_id)
         scheduler = self.scheduler()
@@ -313,12 +313,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         jarvis_mode = bool(spec.steps())
         if not jarvis_mode and spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
-        if plan and not jarvis_mode:
+        if mode == "plan" and not jarvis_mode:
             return None
-        if jarvis_mode and not check_only and not plan:
+        if jarvis_mode and mode == "submit":
             existing = await asyncio.to_thread(self._jarvis_found, job_dir)
             if existing is not None:
                 return existing
+        if mode == "check" and jarvis_mode:
+            result = await self._site_script(spec, job_dir, operation_id, mode)
+            return jarvis_exits.checked(result.stdout)
         await asyncio.to_thread(job_dir.mkdir, parents=True, exist_ok=True)
         for item in spec.inputs:
             await asyncio.to_thread(
@@ -328,12 +331,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             (job_dir / "spec.json").write_text, spec.model_dump_json(indent=2), "utf-8"
         )
         if jarvis_mode:
-            mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
             result = await self._site_script(spec, job_dir, operation_id, mode)
-            if plan:
+            if mode == "plan":
                 return jarvis_plan.planned(str(result.exit_code), result.stdout)
-            if check_only:
-                return jarvis_exits.checked(result.stdout)
             found = jarvis_submit.parse_handle(result.stdout)
             if found is None:
                 raise Refusal(
@@ -364,12 +364,15 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def _site_script(
         self, spec: JobSpec, job_dir: Path, operation_id: str, mode: jarvis_submit.SiteMode
     ) -> ExecResult:
+        """Run the site script's ``mode`` in the job directory, a check in ``checks/<op>``."""
         document = self._jarvis_document(spec, job_dir, operation_id)
+        run_dir = self.work_dir / "checks" / operation_id if mode == "check" else job_dir
 
         def _write() -> None:
+            run_dir.mkdir(parents=True, exist_ok=True)
             pipeline = jarvis_submit.render_pipeline(document)
-            (job_dir / jarvis_submit.PIPELINE_FILE).write_text(pipeline, "utf-8")
-            (job_dir / jarvis_submit.SCRIPT_FILE).write_text(jarvis_submit.SITE_SCRIPT, "utf-8")
+            (run_dir / jarvis_submit.PIPELINE_FILE).write_text(pipeline, "utf-8")
+            (run_dir / jarvis_submit.SCRIPT_FILE).write_text(jarvis_submit.SITE_SCRIPT, "utf-8")
 
         await asyncio.to_thread(_write)
         out = site_outputs.with_outputs(spec, self.config.outputs_dir)
@@ -381,12 +384,16 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             mode=mode,
             graph=self.config.jarvis_graph,
         )
-        result = await run_bounded(
-            shlex.split(command),
-            timeout_s=self.config.submit_timeout_s,
-            max_output_bytes=1 << 20,
-            cwd=job_dir,
-        )
+        try:
+            result = await run_bounded(
+                shlex.split(command),
+                timeout_s=self.config.submit_timeout_s,
+                max_output_bytes=1 << 20,
+                cwd=run_dir,
+            )
+        finally:
+            if mode == "check":
+                await asyncio.to_thread(shutil.rmtree, run_dir, True)
         if mode == "plan":
             # No plan (JARVIS refused, or cannot plan) is not a refusal: the submit says why.
             return result
@@ -412,13 +419,14 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     async def install(
         self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
     ) -> JobHandle:
-        """Submit ``ppl install +submit`` from the job directory the refused submit left."""
+        """Submit ``ppl install +submit`` from the job directory, which it makes."""
         job_dir = self._job_dir(operation_id)
-        if not await asyncio.to_thread((job_dir / jarvis_submit.PIPELINE_FILE).is_file):
-            raise Refusal(
-                RefusalReason.INPUT_MISSING,
-                f"the job directory {job_dir} has no pipeline; run the job again",
-            )
+
+        def _ready() -> None:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / jarvis_submit.SCRIPT_FILE).write_text(jarvis_submit.SITE_SCRIPT, "utf-8")
+
+        await asyncio.to_thread(_ready)
         document = self._jarvis_document(spec, job_dir, operation_id)
         argv = shlex.split(
             jarvis_submit.install_command(

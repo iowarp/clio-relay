@@ -86,7 +86,6 @@ class FilesArgs:
     overwrite: bool = False
     final: bool = True
     recursive: bool = False
-    digest: str | None = None
     local_path: str | None = None
 
 
@@ -247,10 +246,6 @@ async def _dispatch(access: FileAccess, args: FilesArgs) -> tuple[dict[str, Any]
         text = f"staged {len(data)} bytes as {staged}"
     elif op in {"upload", "download"}:
         return await _transfer(access, args)
-    elif op == "has":
-        present = await access.has(_need(args.digest, "digest"))
-        structured = {"sha256": args.digest, "present": present}
-        text = "present" if present else "absent"
     elif op == "delete":
         target = _need(path, "path")
         await access.delete(target, recursive=args.recursive)
