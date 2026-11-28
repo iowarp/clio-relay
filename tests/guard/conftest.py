@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from clio_relay.adapters.hooks import Ask, HookContext
 from clio_relay.guard import Guard, create_guard
@@ -79,7 +80,16 @@ def _reviewed(inner: Path, name: str) -> list[Path]:
     ]
 
 
-def listed(repo_dir: Path, name: str, git: dict[str, str] | None = None) -> dict[str, Any]:
+MENU = [{"name": "out", "msg": "where", "type": "str", "default": "out.txt"}]
+"""``PKG``'s menu, as ``jarvis repo list +json`` reads it."""
+
+
+def listed(
+    repo_dir: Path,
+    name: str,
+    git: dict[str, str] | None = None,
+    menu: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Return what the site listing prints of package ``name`` of ``repo_dir``, digest included."""
     inner = repo_dir / repo_dir.name
     package = name.split(".", 1)[1]
@@ -101,8 +111,8 @@ def listed(repo_dir: Path, name: str, git: dict[str, str] | None = None) -> dict
         "name": name,
         "digest": hashlib.sha256(b"".join(lines)).hexdigest(),
         "files": sorted(files, key=lambda item: item["path"]),
-        "pkg": (inner / package / "pkg.py").read_text(),
-        "contract": contract.read_text() if contract.is_file() else "",
+        "menu": MENU if menu is None else menu,
+        "contract": yaml.safe_load(contract.read_text()) if contract.is_file() else None,
         "repo_dir": str(repo_dir),
         "git": git,
     }

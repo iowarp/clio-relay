@@ -424,6 +424,15 @@ class JobSpec(_Spec):
         ),
     )
 
+    @field_validator("environment")
+    @classmethod
+    def _environment_names(cls, value: dict[str, str]) -> dict[str, str]:
+        # The site command passes each entry to env as NAME=VALUE; a name is never an option.
+        bad = [key for key in value if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)]
+        if bad:
+            raise ValueError(f"environment names must be shell variable names: {bad}")
+        return value
+
     @model_validator(mode="after")
     def _one_entry_point(self) -> Self:
         if self.install_settings and not self.steps():

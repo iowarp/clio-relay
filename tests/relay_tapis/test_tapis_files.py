@@ -20,7 +20,14 @@ from clio_relay.jobs.file_rules import part_path
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.testing.conformance import ConformanceTarget
 from tests.fixtures.tapis_stub import TapisStub
-from tests.fixtures.tapis_stub.support import seed_host, sign_in, tapis_config, use_memory_keyring
+from tests.fixtures.tapis_stub.support import (
+    USERNAME,
+    seed_host,
+    sign_in,
+    system_id,
+    tapis_config,
+    use_memory_keyring,
+)
 
 pytestmark = pytest.mark.release_platform("posix")
 
@@ -180,3 +187,26 @@ def test_home_is_known_only_on_a_host_relay_registered() -> None:
     assert home_for("/home/me/.clio-relay/tapis") == "/home/me"
     assert home_for("/scratch/me/relay") == "/scratch/me/relay"
     assert home_for("/.clio-relay/tapis") == "/.clio-relay/tapis"
+
+
+@pytest.mark.asyncio
+async def test_paths_translate_through_the_system_root_dir(
+    stub: TapisStub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_memory_keyring(monkeypatch)
+    await sign_in(stub)
+    found = system_id("rooted")
+    (tmp_path / "root" / "work").mkdir(parents=True)
+    stub.seed_system(found, jobWorkingDir="/work", rootDir=str(tmp_path / "root"))
+    stub.seed_credential(found, USERNAME)
+    target = ConformanceTarget(
+        adapter="tapis", config=tapis_config(stub), state_dir=tmp_path / "relay", site_id="rooted"
+    )
+    files = await open_files(target)
+    host = str(tmp_path / "root" / "work")
+    assert files.root == host
+    assert files.tapis_path(host + "/a.txt") == "/work/a.txt"
+    await files.write("a.txt", b"rooted")
+    assert (tmp_path / "root" / "work" / "a.txt").read_bytes() == b"rooted"
+    assert [entry.path for entry in await files.list("")] == [host + "/a.txt"]
+    await refused(RefusalReason.PATH_NOT_FOUND, files.read(str(tmp_path / "elsewhere")))

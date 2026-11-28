@@ -89,7 +89,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
         return JobStatus(state=JobState.COMPLETED, exit_code=0)
 
     async def site_packages(self: FixtureAdapter, add: str = "", *, force: bool = False) -> str:
-        return ""
+        return '@@repos {"schema_version": "jarvis.repos.v1", "repos": []}'
 
     for name, value in {
         "install_check": install_check,

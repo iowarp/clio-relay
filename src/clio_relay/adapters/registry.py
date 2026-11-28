@@ -115,11 +115,16 @@ def validate_config(name: str, config: dict[str, Any]) -> BaseModel:
     try:
         return cls.Config.model_validate(config)
     except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_context=False)
+        said = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or 'config'}: {error['msg']}"
+            for error in errors
+        )
         raise Refusal(
             RefusalReason.INVALID_CONFIG,
-            f"the {name} adapter's config is not valid: {exc.error_count()} error(s)",
+            f"the {name} adapter's config is not valid: {said}",
             adapter=name,
-            errors=exc.errors(include_url=False, include_context=False),
+            errors=errors,
         ) from exc
 
 

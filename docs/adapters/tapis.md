@@ -6,9 +6,15 @@ tenant over HTTPS, and Tapis logs in to the host and runs the job. Your
 machine needs no SSH access to the host while a job runs.
 
 It serves `describe`, `run` (with `status`, `cancel` and `find` on the jobs it
-starts), `exec` and `files`. `serve` is not a Tapis operation. A site that
-needs it names an `ssh` or `worker` alternative, and `describe` shows which
-adapter serves each verb.
+starts), `exec` and `files`. It does not serve `serve`: a Tapis job's port is
+reachable only on the system's network, and Tapis offers no tunnel to a job's
+node. A site that needs `serve` names an `ssh` or `worker` alternative.
+`describe` shows which adapter serves each verb; with no alternative, the
+`serve` route has no adapter and `not_offered` gives that reason, and so does
+the refusal.
+
+The host needs bash 4.4 or later, which `exec` uses to bound its output.
+`describe` says so in `info.facts.needs`.
 
 The catalog has four Tapis sites:
 
@@ -116,6 +122,9 @@ Always allow (`spend: {ask: never}`) on the Compute page.
 | `system_id` | `clio-relay.<username>.<site id>` | The Tapis system. Set it to use a system someone else registered |
 | `work_dir` | the system's job working directory | Relay's directory on the system, as a Tapis path |
 | `client_id` | the environment | Relay's OAuth client, when not the shipped one |
+
+An old `launcher` setting is refused with `invalid_config` naming the field;
+remove it from the site's config.
 
 ## Registering a host
 
@@ -240,7 +249,10 @@ the operation id, so a retried `run` never submits a second copy.
 
 The `files` tool works through Tapis Files and follows relay's
 [files contract](../files.md). Relative paths are under the site's work
-directory; absolute paths are under the system's root directory. Tapis does
+directory. Absolute paths are the host's own paths: relay maps them to Tapis
+paths through the system's `rootDir`, and refuses one outside it with
+`path_not_found`. A `rootDir` that is not a plain path (one Tapis works out on
+the host) refuses with `invalid_config`. Tapis does
 not report a home directory, so `~` is your home only on a host relay
 registered, where the work directory is `~/.clio-relay/tapis`. On any other
 system, `~` is the work directory.
@@ -274,7 +286,7 @@ Both are Slurm systems, where JARVIS submits the package job to Slurm.
 | `invalid_config` | The site has no Tapis system yet, and registering it on first use failed or the site names a `system_id`. Add or switch to the site again, or run `register-host`. On a TACC host, set `system_id` to one of the `candidates` it lists |
 | `policy_refused` | A free-form executable on a guarded site |
 | `submit_failed` | Tapis refused the job or the credential. The message carries Tapis's own words |
-| `verb_not_implemented` | A free-form `run` on a system whose scheduler is not Slurm, which relay does not run its own jobs on yet |
+| `verb_not_implemented` | A free-form `run` on a system whose scheduler is not Slurm, which relay does not run its own jobs on yet, or `serve` on a site with no `ssh` or `worker` alternative |
 
 ## Testing without TACC
 

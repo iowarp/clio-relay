@@ -95,7 +95,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
         raise AssertionError("an install launches no app")
 
     async def site_packages(self: FixtureAdapter, add: str = "", *, force: bool = False) -> str:
-        return ""
+        return '@@repos {"schema_version": "jarvis.repos.v1", "repos": []}'
 
     for name, value in {
         "install_check": install_check,

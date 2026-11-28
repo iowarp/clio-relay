@@ -17,17 +17,17 @@ step before JARVIS runs it and refuses one that changed since its review.
 
 from __future__ import annotations
 
-import base64
+import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
-JARVIS_PIN = "539027f430a8ed2a5ac22bdc9c2d12d03abb8f30"
+JARVIS_PIN = "0c0fe0830b1948acf5ee335eabb1f9b5198f51db"
 """The jarvis-cd commit relay installs on a site (branch ``relay_ready``)."""
 JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
 CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
-CLIO_JARVIS_REF = "a3b73614f0901b4df516808b1795031d83046b06"
+CLIO_JARVIS_REF = "2fbfac499649883c847ab57aa8f8d3d532eee064"
 """The clio-jarvis ref relay registers in a site's root."""
 CLIO_JARVIS = "clio_jarvis"
 SITE_ROOT_DIR = "jarvis"
@@ -259,25 +259,18 @@ if [ "$mode" = add ]; then
   JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1 "$jarvis" repo add "$path" $force </dev/null >&2
   repo_paths | grep -qxF -- "$path" || { echo "jarvis did not register $path" >&2; exit 65; }
 fi
+listed=$(JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1 "$jarvis" repo list +json </dev/null) \
+  || { echo "jarvis repo list +json failed" >&2; exit 1; }
+echo "@@repos $(printf '%s\n' "$listed" | tail -n 1)"
 repo_paths | while IFS= read -r dir; do
   name=${dir##*/}
   case $name in builtin|clio_relay_site) continue ;; esac
-  url= commit=
-  if [ -e "$dir/.git" ]; then
-    url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null) || url=
-    commit=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || commit=
-  fi
   for p in "$dir/$name"/*/pkg.py; do
     [ -f "$p" ] || continue
     pkg=${p%/pkg.py}; pkg=${pkg##*/}
     files=$(relay_files "$dir/$name" "$pkg") || { echo "@@refused $name.$pkg"; continue; }
     echo "@@package $name.$pkg $(relay_digest "$files")"
-    echo "@@repo $dir"
-    [ -z "$commit" ] || echo "@@git $commit $url"
     printf '%s\n' "$files" | sed 's/^/@@file /'
-    echo "@@pkg $(base64 < "$p" | tr -d '\n')"
-    c="$dir/$name/$pkg/contract.yaml"
-    [ ! -f "$c" ] || echo "@@contract $(base64 < "$c" | tr -d '\n')"
   done
 done
 """
@@ -287,35 +280,38 @@ done
 ``sh -c PACKAGES_SCRIPT <$0> list|add <home> <pin> [jarvis] [path] [+force]``
 (:func:`clio_relay.jarvis_submit.packages_command`). ``add`` runs ``jarvis repo add
 <path>`` in the root. It prints ``@@unset`` when the root is not set up at the
-pin, else each package as ``@@package <name> <digest>``, ``@@repo``, ``@@git
-<commit> <url>`` for a git clone, an ``@@file`` line per reviewed file, and
-``pkg.py`` and ``contract.yaml`` in base64 (:func:`parse_packages`).
+pin. Else it prints ``@@repos`` and JARVIS's ``jarvis repo list +json`` document
+(each package's menu, contract and git source, as JARVIS reads them), then each
+package's review digest as ``@@package <name> <digest>`` and an ``@@file`` line
+per reviewed file (:func:`parse_packages`).
 """
 
 
 def parse_packages(text: str) -> list[dict[str, Any]] | None:
-    """Return the packages :data:`PACKAGES_SCRIPT` printed, or ``None`` for ``@@unset``."""
+    """Return the packages :data:`PACKAGES_SCRIPT` printed, or ``None`` for ``@@unset``.
+
+    Each is its digest and files, with ``repo_dir``, ``git``, ``menu`` and
+    ``contract`` from JARVIS's ``jarvis.repos.v1`` document.
+    """
     found: list[dict[str, Any]] = []
+    described: dict[str, dict[str, Any]] | None = None
     item: dict[str, Any] | None = None
     for line in text.splitlines():
         tag, _space, rest = line.partition(" ")
         if tag == "@@unset":
             return None
-        if tag == "@@package":
+        if tag == "@@repos":
+            described = _described(rest)
+        elif tag == "@@package":
             name, _space, digest = rest.partition(" ")
             item = None
             if re.fullmatch(r"[0-9a-f]{64}", digest) and _NAME_PART.fullmatch(
                 name.partition(".")[2] or "-"
             ):
-                item = {"name": name, "digest": digest, "files": [], "pkg": "", "contract": ""}
+                item = {"name": name, "digest": digest, "files": []}
                 found.append(item)
         elif item is None:
             continue
-        elif tag == "@@repo":
-            item["repo_dir"] = rest
-        elif tag == "@@git":
-            commit, _space, url = rest.partition(" ")
-            item["git"] = {"commit": commit, "url": url}
         elif tag == "@@file":
             parts = rest.split(" ", 3)
             if len(parts) == 4 and parts[2].isdigit():
@@ -327,9 +323,41 @@ def parse_packages(text: str) -> list[dict[str, Any]] | None:
                         "executable": parts[1] == "x",
                     }
                 )
-        elif tag in ("@@pkg", "@@contract"):
-            try:
-                item[tag[2:]] = base64.b64decode(rest).decode("utf-8", errors="replace")
-            except ValueError:
+    if described is None:
+        raise Refusal(
+            RefusalReason.UNREACHABLE,
+            "the site's jarvis printed no jarvis.repos.v1 document for `jarvis repo list +json`; "
+            "set the site up again so its jarvis-cd is at relay's pin",
+        )
+    for each in found:
+        each.update(described.get(each["name"], {}))
+    return found
+
+
+def _described(text: str) -> dict[str, dict[str, Any]] | None:
+    """Each package of a ``jarvis.repos.v1`` document, by ``repo.package``; None if invalid."""
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(document, dict) or document.get("schema_version") != "jarvis.repos.v1":
+        return None
+    found: dict[str, dict[str, Any]] = {}
+    for repo in cast(list[Any], document.get("repos") or []):
+        if not isinstance(repo, dict):
+            continue
+        repo = cast(dict[str, Any], repo)
+        for package in cast(list[Any], repo.get("packages") or []):
+            if not isinstance(package, dict):
                 continue
+            package = cast(dict[str, Any], package)
+            found[f"{repo.get('name')}.{package.get('name')}"] = {
+                "repo_dir": str(repo.get("path") or ""),
+                "git": repo.get("git") if isinstance(repo.get("git"), dict) else None,
+                "menu": package.get("menu") if isinstance(package.get("menu"), list) else None,
+                "contract": package.get("contract")
+                if isinstance(package.get("contract"), dict)
+                else None,
+                "contract_error": str(package.get("contract_error") or ""),
+            }
     return found

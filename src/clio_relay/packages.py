@@ -4,11 +4,12 @@ Every package relay runs on a site is in that site's JARVIS root
 (:data:`clio_relay.jarvis_site.SITE_ROOT_DIR`): clio-jarvis, which the site's
 setup clones, and any repository the person's agent copied to the site and
 registered with ``packages(op="add")``. :data:`~clio_relay.jarvis_site.PACKAGES_SCRIPT`
-lists them through the adapter's exec, each with its review digest, its files,
-its git source and the text of ``pkg.py`` and ``contract.yaml``. Relay reads
-those texts here, never by running them: the parameters of ``_configure_menu``,
-and the title, summary, version, outputs, progress and resources of the
-contract. The catalog keeps one file per site at ``<state>/packages/<site>.json``.
+lists them through the adapter's exec: JARVIS's ``jarvis repo list +json``
+(each package's ``_configure_menu`` and ``contract.yaml``, which JARVIS reads
+without running the package) and each package's review digest and files.
+Relay turns those into the parameters, and the title, summary, version,
+outputs, progress and resources of the contract. The catalog keeps one file
+per site at ``<state>/packages/<site>.json``.
 
 ``describe(site=...)`` lists the catalog, so an agent finds a package by name.
 ``run`` takes ``package: {name, parameters}``, and :meth:`PackageCatalog.resolve`
@@ -20,7 +21,6 @@ leaves unset.
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -28,7 +28,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import yaml
 from pydantic import BaseModel, Field
 
 from clio_relay.jarvis_site import parse_packages, refuse_builtin
@@ -78,43 +77,6 @@ def _json(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
-def _menu(source: str) -> list[dict[str, Any]] | None:
-    """Return the literal list ``_configure_menu`` returns, without running pkg.py."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name != "_configure_menu":
-            continue
-        returns = [item for item in ast.walk(node) if isinstance(item, ast.Return)]
-        if len(returns) != 1 or not isinstance(returns[0].value, ast.List):
-            return None
-        entries: list[dict[str, Any]] = []
-        for element in returns[0].value.elts:
-            if not isinstance(element, ast.Dict):
-                return None
-            entry: dict[str, Any] = {}
-            for key_node, value_node in zip(element.keys, element.values, strict=True):
-                if key_node is None:
-                    return None
-                try:
-                    key = ast.literal_eval(key_node)
-                    entry[str(key)] = (
-                        getattr(value_node, "id", None)
-                        if key == "type"
-                        else ast.literal_eval(value_node)
-                    )
-                except (ValueError, TypeError, SyntaxError):
-                    # A value built by a call (an input binding) is not needed for the
-                    # schema; the entry keeps the keys that are literals.
-                    continue
-            if isinstance(entry.get("name"), str):
-                entries.append(entry)
-        return entries
-    return None
-
-
 def _parameters(menu: list[dict[str, Any]] | None, contract: dict[str, Any]) -> dict[str, Any]:
     """Return a JSON Schema of the parameters: the menu, refined by the contract."""
     refinement = cast(dict[str, Any], contract.get("parameters") or {})
@@ -147,10 +109,7 @@ def describe_package(listed: dict[str, Any]) -> PackageEntry:
     The version is the contract's, else the git commit's first 12 characters,
     else the digest's.
     """
-    try:
-        loaded = yaml.safe_load(listed.get("contract") or "")
-    except yaml.YAMLError:
-        loaded = None
+    loaded = listed.get("contract")
     contract = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
     git = cast(dict[str, str], listed.get("git") or {})
     source = {"repository": git.get("url", ""), "commit": git["commit"]} if git else None
@@ -172,7 +131,7 @@ def describe_package(listed: dict[str, Any]) -> PackageEntry:
         kind=str(contract["kind"]) if contract.get("kind") else None,
         title=" ".join(str(contract["title"]).split()) if contract.get("title") else None,
         summary=" ".join(str(contract["summary"]).split()) if contract.get("summary") else None,
-        parameters=_parameters(_menu(str(listed.get("pkg") or "")), contract),
+        parameters=_parameters(cast(list[dict[str, Any]] | None, listed.get("menu")), contract),
         outputs=outputs,
         progress={
             key: _json(value)

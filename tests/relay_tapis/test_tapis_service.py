@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.tapis import TapisAdapter, TapisConfig, register
 from clio_relay.adapters.tapis.mapping import NO_WALLTIME_MINUTES, TAPISLOCAL, max_minutes
@@ -165,6 +166,27 @@ async def test_describe_routes_serve_to_ssh(
     assert info["adapter"] == "tapis"
     assert info["facts"]["credential"] == "ok"
     assert info["facts"]["job_type"] == info["facts"]["exec_job_type"] == "FORK"
+    assert "bash 4.4" in info["facts"]["needs"]
+    await service.close()
+
+
+async def test_serve_without_an_alternative_refuses_with_the_tapis_reason(
+    stub: TapisStub, relay_paths: RelayPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    use_memory_keyring(monkeypatch)
+    await sign_in(stub)
+    seed_host(stub, SITE, tmp_path / "site")
+    add_site(relay_paths, _site(stub))
+    service = RelayService(relay_paths)
+    described = await service.describe(SITE)
+    serve = next(item for item in described["routes"] if item["verb"] == "serve")
+    assert serve["adapter"] is None
+    assert "no tunnel" in serve["not_offered"]["tapis"]
+    assert "serve" not in described["info"]["verbs"]
+    with pytest.raises(Refusal) as caught:
+        service.route(service.site(SITE), "serve")
+    assert caught.value.reason == RefusalReason.VERB_NOT_IMPLEMENTED
+    assert "no tunnel" in caught.value.message
     await service.close()
 
 
@@ -314,3 +336,10 @@ async def test_max_minutes_never_falls_to_the_tapis_default() -> None:
 )
 async def test_slurm_time_limits_become_minutes(limit: str, minutes: int | None) -> None:
     assert register.slurm_minutes(limit) == minutes
+
+
+def test_an_old_launcher_setting_is_refused_by_name(stub: TapisStub) -> None:
+    with pytest.raises(Refusal) as caught:
+        registry.validate_config("tapis", tapis_config(stub) | {"launcher": "guarded"})
+    assert caught.value.reason == RefusalReason.INVALID_CONFIG
+    assert "launcher is no longer a Tapis setting" in caught.value.message

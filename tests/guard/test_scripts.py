@@ -43,6 +43,24 @@ echo "JARVIS_ROOT=${JARVIS_ROOT:-} $*" >> "$JARVIS_LOG"
 [ -z "${JARVIS_INSTALL_ANSWERS:-}" ] || echo "answers $JARVIS_INSTALL_ANSWERS" >> "$JARVIS_LOG"
 case "$1 $2" in
   "repo add") echo "- $3" >> "$JARVIS_ROOT/repos.yaml" ;;
+  "repo list")
+    [ "$3" = +json ] || exit 2
+    printf '{"schema_version":"jarvis.repos.v1","builtin":false,"repos":['
+    sed -n 's/^ *- *//p' "$JARVIS_ROOT/repos.yaml" | {
+      sep=
+      while IFS= read -r dir; do
+        printf '%s{"name":"%s","path":"%s","git":null,"packages":[' "$sep" "${dir##*/}" "$dir"
+        sep=, inner=
+        for p in "$dir/${dir##*/}"/*/pkg.py; do
+          [ -f "$p" ] || continue
+          p=${p%/pkg.py}
+          printf '%s{"name":"%s","menu":[{"name":"listed"}],"contract":null}' "$inner" "${p##*/}"
+          inner=,
+        done
+        printf ']}'
+      done
+    }
+    printf ']}\\n' ;;
   "ppl install")
     case " $* " in
       *" +submit "*)
@@ -401,8 +419,8 @@ def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path:
         expected = listed(repo, name)
         assert item["digest"] == expected["digest"], name
         assert sorted(item["files"], key=lambda f: f["path"]) == expected["files"]
-        assert (item["pkg"], item["contract"]) == (expected["pkg"], expected["contract"])
-        assert item["repo_dir"] == str(repo) and "git" not in item
+        assert (item["menu"], item["contract"]) == ([{"name": "listed"}], None)
+        assert item["repo_dir"] == str(repo) and item["git"] is None
     [run] = [f for f in found["demo.hello"]["files"] if f["path"] == "hello/run.sh"]
     assert run["executable"] is True
 
@@ -411,6 +429,7 @@ def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path:
     assert added.returncode == 0, added.stderr
     assert "mine.solver" in {item["name"] for item in parse_packages(added.stdout) or []}
     assert f"JARVIS_ROOT={root} repo add {mine.resolve()}" in (tmp_path / "jarvis.log").read_text()
+    assert f"JARVIS_ROOT={root} repo list +json" in (tmp_path / "jarvis.log").read_text()
     assert _packages(tmp_path, "add", str(tmp_path / "nowhere")).returncode == EXIT_MISSING
 
     (root / "relay.pin").write_text("an older setup\n")

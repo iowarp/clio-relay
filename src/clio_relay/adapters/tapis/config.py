@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TapisConfig(BaseModel):
     """One Tapis system, reached through one tenant."""
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_launcher(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "launcher" in data:
+            raise ValueError(
+                "launcher is no longer a Tapis setting: every job runs a reviewed JARVIS "
+                "package from the site's JARVIS root. Remove launcher from the site's config"
+            )
+        return data
 
     base_url: str = Field(
         default="https://tacc.tapis.io", description="The Tapis tenant's base address"

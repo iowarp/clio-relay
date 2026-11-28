@@ -86,6 +86,12 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     name: ClassVar[str] = "tapis"
     Config: ClassVar[type[BaseModel]] = TapisConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
+    not_offered: ClassVar[dict[str, str]] = {
+        "serve": (
+            "a Tapis job's port is reachable only on the system's network, and Tapis "
+            "offers no tunnel to a job's node; add an ssh alternative to this site for serve"
+        )
+    }
     runs_packages: ClassVar[bool] = True
 
     @classmethod
@@ -225,11 +231,18 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             job_working_dir=found or None,
         )
 
-    @staticmethod
-    def host_path(system: dict[str, Any], path: str) -> str:
-        """Return the host's path for a Tapis path on ``system``."""
-        root = str(system.get("rootDir") or "/").rstrip("/")
-        return f"{root}/{path.lstrip('/')}"
+    def root_dir(self, system: dict[str, Any]) -> str:
+        """The system's ``rootDir`` on the host; Tapis paths are relative to it."""
+        found = str(system.get("rootDir") or "/")
+        if found.startswith("/") and "HOST_EVAL" not in found and "$" not in found:
+            return found.rstrip("/") or "/"
+        raise Refusal(
+            RefusalReason.INVALID_CONFIG,
+            f"the Tapis system's rootDir {found} is not a plain host path, so relay cannot "
+            "map its Tapis paths to the host's; use a system whose rootDir is one",
+            site=self.context.site_id,
+            root_dir=found,
+        )
 
     async def _files(self) -> TapisFiles:
         system = await self.system()
@@ -238,14 +251,14 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             str(system["id"]),
             self.work_dir(system),
             staging=self.context.state_dir / "parts",
+            root_dir=self.root_dir(system),
         )
 
     async def files(self) -> FileAccess:
         return await self._files()
 
     async def jarvis_home(self) -> str | None:
-        system = await self.system()
-        return self.host_path(system, self.work_dir(system))
+        return (await self._files()).root
 
     # setting the site up
 
@@ -312,6 +325,8 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             "tenant": self.config.tenant_id,
             "base_url": self.config.base_url,
             "authn": self.config.authn,
+            "not_offered": dict(self.not_offered),
+            "needs": "bash 4.4 or later on the system's host, for exec's bounded output",
         }
         status = await self.identity.status()
         facts["signed_in"] = status.state == "signed_in"
@@ -394,7 +409,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             app_id=app_id,
             app_version=app_version,
             system_id=str(system["id"]),
-            container_image=path,
+            container_image=files.tapis_path(path),
         )
         try:
             await self.tapis_call("apps", "createAppVersion", **body)
@@ -449,7 +464,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         system, files = await self.system(), await self._files()
         name = str(system.get("batchScheduler") or "").lower()
         scheduler = name if system.get("canRunBatch") and name not in ("", "none") else "local"
-        root = self.host_path(system, files.root)
+        root = files.root
         job_dir = f"{root}/jobs/{operation_id}"
         document = jarvis_remote.document(
             spec, operation_id, job_dir, scheduler=scheduler, job_name=f"relay-{operation_id}"
@@ -473,10 +488,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         command = jarvis_submit.submit_command(
             spec, operation_id=operation_id, jarvis="", home=data["root"], mode=mode, graph=""
         )
-        links = [
-            (item.name, self.host_path(system, files.content_path(item.sha256)))
-            for item in spec.inputs
-        ]
+        links = [(item.name, files.content_path(item.sha256)) for item in spec.inputs]
         script = jarvis_remote.submit_script(data["job_dir"], command, links, keep=mode == "submit")
         return jarvis_remote.submitted(
             self.name,
@@ -536,7 +548,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         await self._stage_inputs(files, [item.sha256 for item in spec.inputs])
         app_id, app_version = await self.ensure_app()
         job_dir = f"{files.root}/jobs/{operation_id}"
-        content_host = self.host_path(system, posixpath.dirname(files.content_path("x")))
+        content_host = posixpath.dirname(files.content_path("x"))
         fields = launcher.record(spec, content_dir=content_host)
         record = f"{job_dir}/{RECORD_FILE}"
         await files.write(record, launcher.encode(fields).encode("ascii"), overwrite=True)
@@ -547,9 +559,9 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             app_version=app_version,
             system_id=str(system["id"]),
             system_type=kind,
-            job_dir=job_dir,
+            job_dir=files.tapis_path(job_dir),
             content_dir_host=content_host,
-            launcher_arg="@" + self.host_path(system, record),
+            launcher_arg="@" + record,
             max_minutes=mapping.max_minutes(spec, system, kind),
             exec_prefix=bool(system.get("enableCmdPrefix")),
         )
@@ -587,7 +599,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             {
                 "executable": "bash",
                 "arguments": ["-c", BOUNDED, "relay-exec", keep, *command],
-                "directory": self.host_path(system, files.root),
+                "directory": files.root,
                 "attributes": {
                     "duration": None if timeout_s is None else max(60, int(timeout_s) + 60)
                 },
@@ -752,10 +764,11 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         if not jobs:
             return None
         latest = max(jobs, key=lambda job: str(job.get("created") or ""))
+        tapis_dir = str(latest.get("execSystemExecDir") or "")
         handle = self._handle(
             str(latest["uuid"]),
             str(latest.get("execSystemId") or await self.system_id()),
-            str(latest.get("execSystemExecDir") or ""),
+            (await self._files()).host_path(tapis_dir) if tapis_dir else "",
         )
         self._remember(operation_id, handle)
         return handle

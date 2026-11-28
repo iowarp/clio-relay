@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
+from pydantic import ValidationError
 
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
@@ -239,6 +240,12 @@ async def test_package_jobs_take_settings_only_as_parameters(guard: Guard, tmp_p
     decision = await guard.check_run(site(), package_spec(digest, environment={"LD_PRELOAD": "x"}))
     assert not decision.allowed
     assert decision.reason == RefusalReason.POLICY_REFUSED
+
+
+def test_an_environment_name_is_never_an_env_option() -> None:
+    with pytest.raises(ValidationError, match="shell variable names"):
+        JobSpec(executable="x", environment={"-S": "rm -rf ~"})
+    assert JobSpec(executable="x", environment={"_A1": "a b"}).environment == {"_A1": "a b"}
 
 
 @pytest.mark.asyncio

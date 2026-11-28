@@ -39,6 +39,7 @@ class Route(BaseModel):
     adapter: str | None
     via: str | None = None
     unavailable: dict[str, str] = {}
+    not_offered: dict[str, str] = {}
     skipped: list[Skipped] = []
 
 
@@ -60,8 +61,9 @@ def _validate(name: str, config: dict[str, Any]) -> object:
 
 def _walk(
     entry: SiteEntry, verb: Verb, check: Check, *, strict: bool = True
-) -> tuple[tuple[str, dict[str, Any]] | None, dict[str, str], list[Skipped]]:
+) -> tuple[tuple[str, dict[str, Any]] | None, dict[str, str], dict[str, str], list[Skipped]]:
     unavailable: dict[str, str] = {}
+    not_offered: dict[str, str] = {}
     skipped: list[Skipped] = []
     for name, config in _candidates(entry):
         try:
@@ -70,6 +72,8 @@ def _walk(
             unavailable[name] = refusal.reason.value
             continue
         if verb not in cls.implements:
+            if verb in cls.not_offered:
+                not_offered[name] = cls.not_offered[verb]
             continue
         try:
             check(name, config)
@@ -78,7 +82,7 @@ def _walk(
                 if strict:
                     raise
                 # describe still names it; the call itself returns the refusal.
-                return (name, config), unavailable, skipped
+                return (name, config), unavailable, not_offered, skipped
             skipped.append(
                 Skipped(
                     site=entry.id,
@@ -88,8 +92,8 @@ def _walk(
                 )
             )
             continue
-        return (name, config), unavailable, skipped
-    return None, unavailable, skipped
+        return (name, config), unavailable, not_offered, skipped
+    return None, unavailable, not_offered, skipped
 
 
 def route(entry: SiteEntry, verb: Verb, check: Check = _validate) -> Routed:
@@ -98,13 +102,14 @@ def route(entry: SiteEntry, verb: Verb, check: Check = _validate) -> Routed:
     ``check`` builds or validates each candidate; the default validates its
     settings. When every candidate is skipped, the refusal carries each reason.
     """
-    chosen, unavailable, skipped = _walk(entry, verb, check)
+    chosen, unavailable, not_offered, skipped = _walk(entry, verb, check)
     if chosen is not None:
         return Routed(chosen[0], chosen[1], skipped)
     details: dict[str, Any] = {
         "site": entry.id,
         "verb": verb,
         "unavailable": unavailable,
+        "not_offered": not_offered,
         "skipped": [item.model_dump() for item in skipped],
     }
     if unavailable and entry.adapter in unavailable:
@@ -120,9 +125,10 @@ def route(entry: SiteEntry, verb: Verb, check: Check = _validate) -> Routed:
             f"every adapter on {entry.id!r} that serves {verb} has unusable settings: {reasons}",
             **details,
         )
+    why = "".join(f"; {name}: {text}" for name, text in not_offered.items())
     raise Refusal(
         RefusalReason.VERB_NOT_IMPLEMENTED,
-        f"no adapter on {entry.id!r} implements {verb}",
+        f"no adapter on {entry.id!r} implements {verb}{why}",
         **details,
     )
 
@@ -131,10 +137,17 @@ def routes(entry: SiteEntry, check: Check = _validate) -> list[Route]:
     """Return the route for every verb, for ``describe``."""
     found: list[Route] = []
     for verb in VERBS:
-        chosen, unavailable, skipped = _walk(entry, verb, check, strict=False)
+        chosen, unavailable, not_offered, skipped = _walk(entry, verb, check, strict=False)
         name = chosen[0] if chosen is not None else None
         via = "alternative" if name is not None and name != entry.adapter else None
         found.append(
-            Route(verb=verb, adapter=name, via=via, unavailable=unavailable, skipped=skipped)
+            Route(
+                verb=verb,
+                adapter=name,
+                via=via,
+                unavailable=unavailable,
+                not_offered={} if name is not None else not_offered,
+                skipped=skipped,
+            )
         )
     return found

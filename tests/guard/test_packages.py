@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -65,23 +65,6 @@ def test_a_version_comes_from_the_contract_the_commit_or_the_digest(tmp_path: Pa
     assert describe_package(listed(_with_contract(tmp_path / "c"), "demo.hello")).version == "0.3.0"
 
 
-def test_a_menu_entry_built_by_a_call_keeps_its_literal_keys(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    (repo / "demo" / "hello" / "pkg.py").write_text(
-        "from jarvis_cd.core.pkg import Application\n\n\n"
-        "class Hello(Application):\n"
-        "    def _configure_menu(self):\n"
-        "        return [\n"
-        '            {"name": "inputs", "msg": "native input", "type": str, "default": "",\n'
-        '             "input_binding": Binding(kind="local_file").to_dict()},\n'
-        '            {"name": "steps", "msg": "how many", "type": int, "default": 10},\n'
-        "        ]\n"
-    )
-    properties = describe_package(listed(repo, "demo.hello")).parameters["properties"]
-    assert set(properties) == {"inputs", "steps"}
-    assert properties["steps"]["type"] == "integer"
-
-
 def test_the_catalog_pins_what_the_site_holds_now(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     catalog = PackageCatalog(tmp_path / "packages")
@@ -112,33 +95,57 @@ def test_the_catalog_pins_what_the_site_holds_now(tmp_path: Path) -> None:
 
 
 def test_the_listing_reads_back_what_the_site_printed() -> None:
-    pkg = base64.b64encode(b"class Hello: pass\n").decode()
+    document = {
+        "schema_version": "jarvis.repos.v1",
+        "builtin": False,
+        "repos": [
+            {
+                "name": "demo",
+                "path": "/home/u/.clio-relay/jarvis/repos/demo",
+                "exists": True,
+                "git": {"commit": "c" * 40, "url": "https://example.org/demo.git"},
+                "packages": [
+                    {
+                        "name": "hello",
+                        "dir": "/home/u/.clio-relay/jarvis/repos/demo/demo/hello",
+                        "menu": [{"name": "out", "type": "str"}],
+                        "contract": {"version": "1"},
+                    },
+                    {"name": "broken", "menu": None, "contract": None, "contract_error": "bad"},
+                ],
+            }
+        ],
+    }
     text = "\n".join(
         [
             "noise before",
+            f"@@repos {json.dumps(document)}",
             f"@@package demo.hello {'a' * 64}",
-            "@@repo /home/u/.clio-relay/jarvis/repos/demo",
-            f"@@git {'c' * 40} https://example.org/demo.git",
             f"@@file {'b' * 64} x 12 hello/run.sh",
             f"@@file {'d' * 64} - 5 _contract/spec.py",
             "@@file broken",
-            f"@@pkg {pkg}",
             "@@refused demo.linked",
             "@@package demo.bad-name " + "a" * 64,
-            "@@repo /ignored",
+            f"@@package demo.broken {'e' * 64}",
         ]
     )
-    [item] = parse_packages(text) or []
-    assert (item["name"], item["digest"]) == ("demo.hello", "a" * 64)
-    assert item["repo_dir"] == "/home/u/.clio-relay/jarvis/repos/demo"
-    assert item["git"] == {"commit": "c" * 40, "url": "https://example.org/demo.git"}
-    assert item["files"] == [
+    hello, broken = parse_packages(text) or []
+    assert (hello["name"], hello["digest"]) == ("demo.hello", "a" * 64)
+    assert hello["repo_dir"] == "/home/u/.clio-relay/jarvis/repos/demo"
+    assert hello["git"] == {"commit": "c" * 40, "url": "https://example.org/demo.git"}
+    assert hello["files"] == [
         {"path": "hello/run.sh", "sha256": "b" * 64, "size": 12, "executable": True},
         {"path": "_contract/spec.py", "sha256": "d" * 64, "size": 5, "executable": False},
     ]
-    assert (item["pkg"], item["contract"]) == ("class Hello: pass\n", "")
+    assert (hello["menu"], hello["contract"]) == (
+        [{"name": "out", "type": "str"}],
+        {"version": "1"},
+    )
+    assert (broken["menu"], broken["contract"], broken["contract_error"]) == (None, None, "bad")
     assert parse_packages("@@unset\n") is None
-    assert parse_packages("") == []
+    for missing in ("", "@@repos not json", '@@repos {"schema_version": "other"}'):
+        with pytest.raises(Refusal, match="jarvis.repos.v1"):
+            parse_packages(missing)
 
 
 def test_jarvis_builtin_packages_are_never_run(tmp_path: Path) -> None:

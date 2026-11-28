@@ -374,11 +374,11 @@ class ListsLiveJobs(Protocol):
         ...
 
 
-def not_implemented(adapter: str, verb: str) -> Refusal:
+def not_implemented(adapter: str, verb: str, why: str | None = None) -> Refusal:
     """Return the refusal for a verb an adapter does not implement."""
     return Refusal(
         RefusalReason.VERB_NOT_IMPLEMENTED,
-        f"the {adapter} adapter does not implement {verb}",
+        f"the {adapter} adapter does not implement {verb}" + (f": {why}" if why else ""),
         adapter=adapter,
         verb=verb,
     )
@@ -416,6 +416,8 @@ class BaseAdapter[ConfigT: BaseModel]:
     name: ClassVar[str] = "base"
     Config: ClassVar[type[BaseModel]] = EmptyConfig
     implements: ClassVar[frozenset[Verb]] = frozenset({"describe"})
+    # Why the adapter cannot serve a verb it leaves out, for describe and the refusal.
+    not_offered: ClassVar[dict[str, str]] = {}
     # True when the site runs a reviewed package from the package store, not the agent's command.
     runs_packages: ClassVar[bool] = False
     # True when service_runtimes reads JARVIS's record, so a package service picks its own port.
@@ -465,7 +467,7 @@ class BaseAdapter[ConfigT: BaseModel]:
         raise not_implemented(self.name, "files")
 
     async def serve(self, spec: ServiceSpec, *, operation_id: str) -> Endpoint:
-        raise not_implemented(self.name, "serve")
+        raise not_implemented(self.name, "serve", self.not_offered.get("serve"))
 
     async def stop(self, handle: JobHandle) -> JobStatus:
         """Ask a running job to end cleanly (``jarvis execution stop``), and return its status."""
