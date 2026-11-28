@@ -67,7 +67,7 @@ def test_each_failure_has_a_cause(stderr: str, expected: str | None) -> None:
 
 def test_a_remote_exit_other_than_255_is_never_an_ssh_failure() -> None:
     assert errors.cause(REFUSED, 1) is None
-    assert errors.refusal(REFUSED, 7, profile="p", site="s", what="x", sign_in=False) is None
+    assert errors.refusal(REFUSED, 7, profile="p", who="p", what="x", sign_in=False) is None
 
 
 def test_only_network_failures_are_retried() -> None:
@@ -97,7 +97,7 @@ def test_a_call_that_must_run_once_is_retried_only_before_a_session(
 
 
 def _refuse(stderr: str, *, sign_in: bool = False) -> Refusal:
-    refused = errors.refusal(stderr, 255, profile="fx", site="s", what="describe", sign_in=sign_in)
+    refused = errors.refusal(stderr, 255, profile="fx", who="fx", what="describe", sign_in=sign_in)
     assert refused is not None
     return refused
 
@@ -206,6 +206,16 @@ async def test_scp_failures_are_read_as_ssh_failures(tmp_path: Path, no_sleep: l
     result = await _transport(tmp_path, 1).retrying(call, "copying", scp=True)
     assert result.exit_code == 0
     assert no_sleep == [2.0]
+
+
+def test_a_refusal_names_the_site_by_its_title(tmp_path: Path) -> None:
+    transport = SshTransport(
+        SshConfig(ssh_profile="fx"), site_id="s", title="Ares", state_dir=tmp_path
+    )
+    with pytest.raises(Refusal) as refused:
+        transport.raise_for_failure(_completed(REFUSED, 255), "describe")
+    assert "Ares (ssh fx)" in refused.value.message
+    assert "site" not in refused.value.data
 
 
 def test_the_old_setting_name_is_refused() -> None:

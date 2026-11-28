@@ -389,7 +389,6 @@ class Held:
         signs_in: bool,
         channels: int,
         timeout_s: float,
-        site: str = "",
         share: Path | None = None,
     ) -> None:
         self.base = list(base)
@@ -400,7 +399,6 @@ class Held:
         self.signs_in = signs_in
         self.channels = channels
         self.timeout_s = timeout_s
-        self.site = site
         self._conns: list[Conn] = []
         self._cond: asyncio.Condition | None = None
         self._signing: asyncio.Lock | None = None
@@ -481,7 +479,7 @@ class Held:
         if self._profile is None or now - self._profile[0] > 60:
             self._profile = (
                 now,
-                await profiles.resolve(self.base, self.destination, site=self.site),
+                await profiles.resolve(self.base, self.destination),
             )
         return self._profile[1]
 

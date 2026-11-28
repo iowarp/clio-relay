@@ -725,7 +725,6 @@ def install_blocked(issues: list[dict[str, Any]], *, site: str) -> Refusal:
     return Refusal(
         RefusalReason.SUBMIT_FAILED,
         message or f"JARVIS raised {len(issues)} issue(s) on {site} that no answer settles",
-        site=site,
         issues=issues,
         needs=NEEDS_INSTALL,
     )

@@ -16,13 +16,11 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 CLEAN_TIMEOUT_S = 60.0
 
 
-async def batch_ssh(argv: list[str], script: str, what: str, site_id: str) -> str:
+async def batch_ssh(argv: list[str], script: str, what: str) -> str:
     """Run ``script`` on ``argv``'s host and return its output; ``what`` names it in refusals."""
     program = programs.resolved(argv)
     if program is None:
-        raise Refusal(
-            RefusalReason.UNREACHABLE, programs.missing(argv[0]), site=site_id, command=argv[0]
-        )
+        raise Refusal(RefusalReason.UNREACHABLE, programs.missing(argv[0]), command=argv[0])
     try:
         process = await asyncio.create_subprocess_exec(
             *program,
@@ -32,7 +30,7 @@ async def batch_ssh(argv: list[str], script: str, what: str, site_id: str) -> st
             start_new_session=os.name == "posix",
         )
     except OSError as exc:
-        raise Refusal(RefusalReason.UNREACHABLE, f"ssh did not start: {exc}", site=site_id) from exc
+        raise Refusal(RefusalReason.UNREACHABLE, f"ssh did not start: {exc}") from exc
     try:
         out, err = await asyncio.wait_for(
             process.communicate(script.encode("utf-8")), CLEAN_TIMEOUT_S
@@ -40,14 +38,11 @@ async def batch_ssh(argv: list[str], script: str, what: str, site_id: str) -> st
     except TimeoutError as exc:
         with contextlib.suppress(ProcessLookupError):
             process.kill()
-        raise Refusal(
-            RefusalReason.TIMEOUT, f"{what} took over {CLEAN_TIMEOUT_S:g} s", site=site_id
-        ) from exc
+        raise Refusal(RefusalReason.TIMEOUT, f"{what} took over {CLEAN_TIMEOUT_S:g} s") from exc
     if process.returncode != 0:
         raise Refusal(
             RefusalReason.NEEDS_SIGN_IN,
             f"{what} needs an ssh that signs in without a prompt (exit {process.returncode}): "
             f"{err.decode('utf-8', 'replace')[-1000:]}",
-            site=site_id,
         )
     return out.decode("utf-8", "replace")

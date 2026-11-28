@@ -150,7 +150,9 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
     def __init__(self, config: SshConfig, context: AdapterContext) -> None:
         super().__init__(config, context)
-        self.transport = SshTransport(config, site_id=context.site_id, state_dir=context.state_dir)
+        self.transport = SshTransport(
+            config, site_id=context.site_id, title=context.title, state_dir=context.state_dir
+        )
         self.render_dir = context.state_dir / "ssh-psij"
         self.outbox = context.state_dir / "ssh-outbox"
         # The compute cores the last describe read from JARVIS, for the submits after it.
@@ -162,7 +164,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         """Close relay's held ssh connections to the site. Jobs keep running."""
         if not await self.transport.close():
             return []
-        return [{"kind": "tunnel", "detail": f"ssh connection to {self.config.ssh_profile}"}]
+        return [{"kind": "tunnel", "detail": f"ssh connection to {self.transport.who}"}]
 
     def clean_targets(self) -> tuple[list[str], list[str]]:
         """Relay's directory on the site; Spack, JARVIS's recorded answers and a published
@@ -181,9 +183,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.ADAPTER_UNAVAILABLE,
-                f"cleaning {self.config.ssh_profile} failed (exit {result.exit_code}): "
+                f"cleaning {self.context.title} failed (exit {result.exit_code}): "
                 f"{result.error_text()[-1000:] or 'no output'}",
-                site=self.context.site_id,
                 exit_code=result.exit_code,
             )
         return parse_report(result.text())
@@ -198,9 +199,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if result.exit_code != 0:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"listing relay's jobs on {self.config.ssh_profile} failed "
+                f"listing relay's jobs on {self.context.title} failed "
                 f"(exit {result.exit_code}): {result.error_text()[-500:] or 'no output'}",
-                site=self.context.site_id,
             )
         return parse_live(result.text())
 
@@ -276,7 +276,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if not root.is_absolute():
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"{self.config.ssh_profile} did not report relay's directory",
+                f"{self.context.title} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
         existing = None if check_only or plan else self._existing(check, root, job_dir, name)
@@ -285,27 +285,24 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if "ready" not in check:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"cannot create {root}/incoming on {self.config.ssh_profile}",
+                f"cannot create {root}/incoming on {self.context.title}",
             )
         detected = _one(check, "scheduler")
         if detected is None:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"{self.config.ssh_profile} did not say which scheduler it has, so relay will "
+                f"{self.context.title} did not say which scheduler it has, so relay will "
                 "not run the job there",
-                site=self.config.ssh_profile,
             )
         scheduler = cast(SchedulerName, detected) if detected in _SCHEDULERS else None
         if scheduler is None and detected != "none":
             raise Refusal(
                 RefusalReason.INVALID_CONFIG,
-                f"{self.config.ssh_profile} reported scheduler {detected!r}, which relay "
-                "does not know",
-                site=self.config.ssh_profile,
+                f"{self.context.title} reported scheduler {detected!r}, which relay does not know",
             )
         hints = (_one(check, "batch_hint") or "").split()
         if scheduler is None and hints:
-            raise direct_refused(hints, site=self.config.ssh_profile)
+            raise direct_refused(hints, site=self.context.title)
         jarvis_mode = bool(spec.steps())
         mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
         if plan and not jarvis_mode:
@@ -317,7 +314,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             if not self.context.content.has(digest):
                 raise Refusal(
                     RefusalReason.INPUT_MISSING,
-                    f"content {digest} is staged neither here nor on {self.config.ssh_profile}",
+                    f"content {digest} is staged neither here nor on {self.context.title}",
                     digest=digest,
                 )
             blobs.append(self.context.content.path_for(digest))
@@ -367,7 +364,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             bad = (sections.get("corrupt") or sections.get("missing") or ["?"])[0]
             raise Refusal(
                 RefusalReason.INPUT_MISSING,
-                f"content {bad} did not arrive intact on {self.config.ssh_profile}",
+                f"content {bad} did not arrive intact on {self.context.title}",
                 digest=bad,
             )
         if jarvis_mode:
@@ -376,7 +373,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 sections,
                 mode=mode,
                 spec=spec,
-                site=self.config.ssh_profile,
+                site=self.context.title,
                 install_walltime_s=self.config.install_walltime_s,
                 data={"root": str(root), "job_dir": str(job_dir), "job_name": name},
             )
@@ -386,7 +383,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             error = "\n".join(sections.get("err", [])).strip() or output
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
-                f"{self.config.ssh_profile} refused the job: {error or 'no output'}",
+                f"{self.context.title} refused the job: {error or 'no output'}",
                 scheduler=used,
                 exit_code=int(rc) if rc and rc.lstrip("-").isdigit() else None,
             )
@@ -422,7 +419,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             if not native.startswith("pid:"):
                 raise Refusal(
                     RefusalReason.SUBMIT_FAILED,
-                    f"the job did not start on {self.config.ssh_profile}",
+                    f"the job did not start on {self.context.title}",
                 )
             data["mode"] = "detached"
             return JobHandle(adapter=self.name, native_id=native, data=data)
@@ -573,7 +570,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         mode = str(handle.data.get("mode", "scheduler"))
         if mode == "jarvis":
             status, sections = await jarvis_remote.status(
-                self._ssh, handle, site=self.config.ssh_profile
+                self._ssh, handle, site=self.context.title
             )
             inputs = store.input_entries(sections.get("inputs", []))
             if status.state.final and inputs and "dropped" not in sections:
@@ -610,7 +607,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             return JobStatus(
                 state=JobState.FAILED,
                 native_state="lost",
-                message=f"the job directory {job_dir} is gone from {self.config.ssh_profile}",
+                message=f"the job directory {job_dir} is gone from {self.context.title}",
             )
         if "final" in sections:
             status = stored_final(sections["final"])
@@ -787,7 +784,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         """Move a pending JARVIS job to ``queue_name`` (:func:`jarvis_remote.move`)."""
         if handle.data.get("mode") != "jarvis":
             raise not_implemented(self.name, "move_queue")
-        await jarvis_remote.move(self._ssh, handle, queue_name, site=self.config.ssh_profile)
+        await jarvis_remote.move(self._ssh, handle, queue_name, site=self.context.title)
 
     async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
         """``jarvis execution service-runtimes +json`` for a JARVIS job, read on the site."""
@@ -809,7 +806,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if not root.is_absolute():
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"{self.config.ssh_profile} did not report relay's directory",
+                f"{self.context.title} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
         detected = _one(sections, "scheduler") or "none"
@@ -841,7 +838,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             self.name,
             result.text(),
             spec=spec,
-            site=self.config.ssh_profile,
+            site=self.context.title,
             install_walltime_s=self.config.install_walltime_s,
             login_mode="detached",
             data={"root": str(root), "job_dir": str(job_dir), "job_name": job_name(operation_id)},
@@ -923,7 +920,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         return SignInNeed(
             provider="ssh",
             message=(
-                f"Sign in to {self.config.ssh_profile}. Relay keeps that connection "
+                f"Sign in to {self.transport.who}. Relay keeps that connection "
                 f"and reuses it, so you sign in once{failed}"
             ),
             url=None,
@@ -933,8 +930,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
         if self.config.interactive_sign_in and not self.transport.signed_in():
             raise Refusal(
                 RefusalReason.NEEDS_SIGN_IN,
-                f"the sign-in to {self.config.ssh_profile} did not leave a connection open",
-                site=self.context.site_id,
+                f"the sign-in to {self.transport.who} did not leave a connection open",
             )
 
 

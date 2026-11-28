@@ -298,10 +298,12 @@ how long the build may take only when relay, not JARVIS, sets it), with
 (JARVIS will not build outside an allocation; never retry it), and with
 `jarvis_submit.missing_jarvis` when the site script exits 69: JARVIS is
 missing or at another pin. Before those, it calls
-`install_failures.raise_for(exit_code, output, site=...)`, which raises
+`install_failures.raise_for(exit_code, output, site=self.context.title)`, which raises
 JARVIS's failure records (exit 6, passed whole and never asked) and a
 blocking `site_fact_uncertain`
-question (exit 3), both with JARVIS's issues untouched. Relay turns the rest into the install question and
+question (exit 3), both with JARVIS's issues untouched. A refusal names the
+site by `self.context.title`, the name the person gave it, as describe does;
+it carries no `site` field. Relay turns the rest into the install question and
 calls `install` or `install_jarvis` itself. A missing Spack is JARVIS's own
 `spack_missing` question (exit 3), asked like any other choice. The `install`
 tool's check takes the same path: exit 0 means the software is all there, and

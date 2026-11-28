@@ -55,6 +55,7 @@ def _adapter(site_id: str) -> tuple[TapisAdapter, SshHost | None, str | None]:
         site_id=entry.id,
         state_dir=paths.adapter_dir(entry.id, "tapis"),
         content=ContentStore(paths.content_dir),
+        title=entry.title,
     )
     adapter = TapisAdapter(TapisConfig.model_validate(config), context)
     return adapter, ssh_for_site(entry), entry.address

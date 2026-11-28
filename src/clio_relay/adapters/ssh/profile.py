@@ -175,18 +175,14 @@ def _command(base: list[str], destination: str) -> list[str]:
     return [*base, "-G", destination]
 
 
-async def resolve(
-    base: list[str], destination: str, env: dict[str, str] | None = None, *, site: str = ""
-) -> Profile:
+async def resolve(base: list[str], destination: str, env: dict[str, str] | None = None) -> Profile:
     """Return what the person's ``ssh`` makes of ``destination`` with relay's options.
 
     ``base`` is the ssh program and the options relay passes (``-F``, ``-o``).
     """
     resolved = programs.resolved(_command(base, destination), env)
     if resolved is None:
-        raise Refusal(
-            RefusalReason.ADAPTER_UNAVAILABLE, programs.missing(base[0]), site=site, command=base[0]
-        )
+        raise Refusal(RefusalReason.ADAPTER_UNAVAILABLE, programs.missing(base[0]), command=base[0])
     try:
         done = await asyncio.to_thread(
             subprocess.run,
@@ -201,14 +197,12 @@ async def resolve(
         raise Refusal(
             RefusalReason.ADAPTER_UNAVAILABLE,
             programs.start_failed(base[0], exc),
-            site=site,
             command=base[0],
         ) from exc
     except subprocess.SubprocessError as exc:
         raise Refusal(
             RefusalReason.ADAPTER_UNAVAILABLE,
             f"{base[0]} -G {destination} did not finish: {exc}",
-            site=site,
             command=base[0],
         ) from exc
     if done.returncode != 0:
@@ -217,6 +211,5 @@ async def resolve(
             RefusalReason.INVALID_CONFIG,
             f"ssh could not read the profile {destination}: "
             f"{detail[-1] if detail else 'no detail'}",
-            site=site,
         )
     return from_values(destination, parse(done.stdout), resolved[0])

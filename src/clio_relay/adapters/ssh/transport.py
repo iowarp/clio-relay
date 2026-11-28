@@ -54,9 +54,15 @@ MAX_RETRY_WAIT_S = 30.0
 class SshTransport:
     """Runs calls and copies on one site, over relay's held connection or the system ``ssh``."""
 
-    def __init__(self, config: SshConfig, *, site_id: str, state_dir: Path) -> None:
+    def __init__(
+        self, config: SshConfig, *, site_id: str, state_dir: Path, title: str = ""
+    ) -> None:
         self.config = config
         self.site_id = site_id
+        self.title = title or site_id
+        # The site as a sentence about its ssh destination names it.
+        profile = config.ssh_profile
+        self.who = errors.who(self.title, profile)
         self.state_dir = state_dir
         self.held = held.Held(
             base=self._base(),
@@ -64,7 +70,6 @@ class SshTransport:
             signs_in=config.interactive_sign_in,
             channels=config.channels,
             timeout_s=config.connect_timeout_s,
-            site=site_id,
             share=mux.path_for(state_dir, site_id) if config.interactive_sign_in else None,
         )
 
@@ -105,7 +110,7 @@ class SshTransport:
             askpass.environment(
                 site=self.site_id,
                 operation_id=operation_id,
-                title=f"Sign in to {self.site_id}",
+                title=f"Sign in to {self.title}",
             )
         )
         if self.config.askpass:
@@ -128,11 +133,10 @@ class SshTransport:
             raise Refusal(
                 RefusalReason.INTERACTIVE_AUTH_REQUIRED,
                 (
-                    f"interactive_sign_in on {self.config.ssh_profile} needs relay to hold "
+                    f"interactive_sign_in on {self.who} needs relay to hold "
                     f"the signed-in connection, and {reason}, which only the system ssh "
                     "can use. Sign in with a key relay can read, or use the worker adapter"
                 ),
-                site=self.site_id,
                 adapter="worker",
                 cause="openssh_only",
             )
@@ -201,13 +205,7 @@ class SshTransport:
             return result
         self.raise_for_failure(result, what)
         if not result.remote_exit and not result.timed_out:
-            raise errors.lost(
-                result.error_text(),
-                result.exit_code,
-                profile=self.config.ssh_profile,
-                site=self.site_id,
-                what=what,
-            )
+            raise errors.lost(result.error_text(), result.exit_code, who=self.who, what=what)
         return result
 
     async def retrying(
@@ -253,8 +251,7 @@ class SshTransport:
         if result.timed_out:
             raise Refusal(
                 RefusalReason.TIMEOUT,
-                f"{what} on {self.config.ssh_profile} did not answer; relay will try again",
-                site=self.site_id,
+                f"{what} on {self.who} did not answer; relay will try again",
             )
         local_programs = (self.config.ssh_command, self.config.scp_command)
         # Only the spawn failure in ``run_process`` writes exactly this; a remote
@@ -269,14 +266,13 @@ class SshTransport:
             raise Refusal(
                 RefusalReason.ADAPTER_UNAVAILABLE,
                 programs.missing(result.argv[0]),
-                site=self.site_id,
                 command=result.argv[0],
             )
         refusal = errors.refusal(
             result.error_text(),
             result.exit_code,
             profile=self.config.ssh_profile,
-            site=self.site_id,
+            who=self.who,
             what=what,
             sign_in=self.config.interactive_sign_in,
         )
@@ -311,8 +307,7 @@ class SshTransport:
         self.raise_for_failure(result, "copying")
         raise Refusal(
             RefusalReason.UNREACHABLE,
-            f"copying to {self.config.ssh_profile} failed: {result.error_text().strip()}",
-            site=self.site_id,
+            f"copying to {self.who} failed: {result.error_text().strip()}",
         )
 
     # interactive sign-in
@@ -340,9 +335,7 @@ class SshTransport:
             try:
                 await self.held.sign_in(merged)
             except held.SshFailure as failure:
-                raise RuntimeError(
-                    f"ssh sign-in to {self.config.ssh_profile} failed: {failure.text}"
-                ) from None
+                raise RuntimeError(f"ssh sign-in to {self.who} failed: {failure.text}") from None
 
         return _start
 

@@ -211,7 +211,7 @@ class RelayService:
         self.ask_provider = cast(AskProvider, hook_factory("asks", StubAskProvider)(context))
         self.guard = cast(GuardHook, hook_factory("guard", DefaultGuard)(context))
         self.serve_hook = cast(ServeHook, hook_factory("serve", StubServe)(context))
-        self._adapters: dict[tuple[str, str, str], BaseAdapter[Any]] = {}
+        self._adapters: dict[tuple[str, str, str, str], BaseAdapter[Any]] = {}
         self.offered_plans: dict[tuple[str, str], dict[str, Any]] = {}
         """Commands relay offered in ``describe``, by site and argv digest (:mod:`exec_plan`)."""
 
@@ -228,13 +228,11 @@ class RelayService:
         return self.sites.get(site_id)
 
     def _build(self, site: SiteEntry, name: str, config: dict[str, Any]) -> BaseAdapter[Any]:
-        key = (site.id, name, canonical_digest(config))
+        key = (site.id, site.title, name, canonical_digest(config))
         adapter = self._adapters.get(key)
         if adapter is None:
             context = AdapterContext(
-                site_id=site.id,
-                state_dir=self.paths.adapter_dir(site.id, name),
-                content=self.content,
+                site.id, self.paths.adapter_dir(site.id, name), self.content, site.title
             )
             adapter = registry.build(name, config, context)
             self._adapters[key] = adapter

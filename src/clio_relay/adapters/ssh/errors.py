@@ -60,6 +60,11 @@ _UNREADABLE_KEY = re.compile(
 )
 
 
+def who(title: str, profile: str) -> str:
+    """Name an ssh destination: the site's title, with the profile when the two differ."""
+    return profile if title == profile else f"{title} (ssh {profile})"
+
+
 def cause(stderr: str, exit_code: int | None) -> str | None:
     """Return why ``ssh`` itself failed, or ``None`` when the remote command did."""
     if exit_code not in SSH_FAILED:
@@ -101,7 +106,7 @@ def retryable(stderr: str, exit_code: int | None, *, once: bool = False) -> bool
     return not once or _BEFORE_SESSION.search(stderr.lower()) is not None
 
 
-def lost(stderr: str, exit_code: int | None, *, profile: str, site: str, what: str) -> Refusal:
+def lost(stderr: str, exit_code: int | None, *, who: str, what: str) -> Refusal:
     """Return the refusal for a session that ended before the remote command reported its end.
 
     The script always reports its end through relay's marker, so its absence
@@ -112,11 +117,10 @@ def lost(stderr: str, exit_code: int | None, *, profile: str, site: str, what: s
     return Refusal(
         RefusalReason.UNREACHABLE,
         (
-            f"the ssh connection to {profile} was lost during {what}, before the command "
+            f"the ssh connection to {who} was lost during {what}, before the command "
             f"reported its end (ssh exited {exit_code}).{said} The command may have run in "
             "part, so check before running one that changes things again."
         ),
-        site=site,
         cause="connection_lost",
     )
 
@@ -126,11 +130,14 @@ def refusal(
     exit_code: int | None,
     *,
     profile: str,
-    site: str,
+    who: str,
     what: str,
     sign_in: bool,
 ) -> Refusal | None:
-    """Return the refusal for an ``ssh`` failure, or ``None`` if ssh did not fail."""
+    """Return the refusal for an ``ssh`` failure, or ``None`` if ssh did not fail.
+
+    ``who`` names the site as the person knows it, with its ssh ``profile``.
+    """
     found = cause(stderr, exit_code)
     if found is None:
         return None
@@ -140,25 +147,23 @@ def refusal(
         if sign_in:
             return Refusal(
                 RefusalReason.NEEDS_SIGN_IN,
-                f"{profile} needs you to sign in again: {last}",
-                site=site,
+                f"{who} needs you to sign in again: {last}",
                 cause=found,
             )
         return Refusal(
             RefusalReason.INTERACTIVE_AUTH_REQUIRED,
             (
-                f"{profile} asks for a code or password on every connection, so the ssh "
+                f"{who} asks for a code or password on every connection, so the ssh "
                 "adapter cannot use it unattended. Set interactive_sign_in on the site to "
                 "sign in once through relay, or use the worker adapter. "
                 f"ssh said: {last}"
             ),
-            site=site,
             adapter="worker",
             cause=found,
         )
     if found == "key_refused":
         unreadable = sorted(set(_UNREADABLE_KEY.findall(stderr)))
-        message = f"{profile} accepted none of your keys"
+        message = f"{who} accepted none of your keys"
         if unreadable:
             message += f" (ssh could not read {', '.join(unreadable)})"
         message += (
@@ -174,9 +179,7 @@ def refusal(
                 " The site also takes a password or code: set interactive_sign_in on the "
                 "site to sign in that way."
             )
-        return Refusal(
-            RefusalReason.UNREACHABLE, f"{message} ssh said: {last}", site=site, cause=found
-        )
+        return Refusal(RefusalReason.UNREACHABLE, f"{message} ssh said: {last}", cause=found)
     if found == "host_key_changed":
         fingerprint = _FINGERPRINT.search(stderr)
         remove = next(
@@ -185,7 +188,7 @@ def refusal(
         return Refusal(
             RefusalReason.UNREACHABLE,
             (
-                f"{profile}'s host key is not the one on record"
+                f"{who}'s host key is not the one on record"
                 + (f" (it now sends {fingerprint.group(1)})" if fingerprint else "")
                 + ". The machine may have been reinstalled, or someone may be in the middle. "
                 "Check the new fingerprint with the site's administrators. If it is right, "
@@ -193,7 +196,6 @@ def refusal(
                 f"once with `ssh {profile}` to record the new one. Relay will not connect "
                 "until then."
             ),
-            site=site,
             cause=found,
         )
     if found == "host_key_unknown":
@@ -204,7 +206,6 @@ def refusal(
                 f"it cannot check. Connect once yourself with `ssh {profile}`, check the "
                 "fingerprint and accept it, then try again."
             ),
-            site=site,
             cause=found,
         )
     if found == "unknown_host":
@@ -214,16 +215,12 @@ def refusal(
                 f"ssh does not know the host {profile}: it is neither a Host in your ssh "
                 f"config nor a name DNS can find. ssh said: {last}"
             ),
-            site=site,
             cause=found,
         )
     if found == "network":
         return Refusal(
             RefusalReason.UNREACHABLE,
-            f"the connection to {profile} failed during {what}: {last}",
-            site=site,
+            f"the connection to {who} failed during {what}: {last}",
             cause=found,
         )
-    return Refusal(
-        RefusalReason.UNREACHABLE, f"ssh could not reach {profile}: {last}", site=site, cause=found
-    )
+    return Refusal(RefusalReason.UNREACHABLE, f"ssh could not reach {who}: {last}", cause=found)

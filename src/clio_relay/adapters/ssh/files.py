@@ -149,7 +149,7 @@ class SshFileAccess:
     def _missing(self, path: str) -> Refusal:
         return Refusal(
             RefusalReason.PATH_NOT_FOUND,
-            f"{path} does not exist on {self.transport.config.ssh_profile}",
+            f"{path} does not exist on {self.transport.title}",
             path=path,
         )
 

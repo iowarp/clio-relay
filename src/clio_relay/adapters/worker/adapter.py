@@ -44,6 +44,7 @@ from pydantic import BaseModel, ValidationError
 
 from clio_relay import jarvis_site, jarvis_submit, programs
 from clio_relay.adapters.base import BaseAdapter, Reach, SignInNeed, SiteInfo, Verb
+from clio_relay.adapters.ssh import errors as ssh_errors
 from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.worker.batch_ssh import batch_ssh
 from clio_relay.adapters.worker.config import Rendezvous, WorkerConfig, WorkerLink
@@ -93,19 +94,6 @@ def _askpass() -> Any | None:
         if exc.name not in ("clio_relay.asks", "clio_relay.asks.askpass"):
             raise
         return None
-
-
-def ssh_sign_in_environment(
-    site_id: str, *, operation_id: str | None, title: str
-) -> dict[str, str]:
-    """Return the askpass environment for the sign-in ssh, or nothing without asks."""
-    module = _askpass()
-    if module is None:
-        return {}
-    env: Mapping[str, str] = module.environment(
-        site=site_id, operation_id=operation_id, title=title
-    )
-    return dict(env)
 
 
 def register_ssh_sign_in(
@@ -217,6 +205,10 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
 
     def _site_key(self) -> str:
         return _env_key(self.context.site_id).lower()
+
+    @property
+    def _who(self) -> str:
+        return ssh_errors.who(self.context.title, self.config.ssh_profile)
 
     def _remote_dir(self) -> str:
         return self.config.remote_dir or f"~/.local/share/clio-relay/worker/{self._site_key()}"
@@ -496,7 +488,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             raise Refusal(
                 RefusalReason.UNREACHABLE,
                 programs.missing("ssh"),
-                site=self.context.site_id,
                 command="ssh",
             )
         # No time limit: the person may be typing a code on the sign-in page.
@@ -514,9 +505,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if process.returncode != 0 or ready is None:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"placing the worker on {self.config.ssh_profile} failed "
+                f"placing the worker on {self.context.title} failed "
                 f"(exit {process.returncode}): {err.decode('utf-8', 'replace')[-2000:]}",
-                site=self.context.site_id,
             )
         remote_dir, _, document = ready[len(READY_MARKER) :].partition(" ")
         report = json.loads(document)
@@ -548,8 +538,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if link is None:
             raise Refusal(
                 RefusalReason.NEEDS_SIGN_IN,
-                f"sign in to {self.config.ssh_profile} so relay can place its worker",
-                site=self.context.site_id,
+                f"sign in to {self._who} so relay can place its worker",
                 provider="ssh",
             )
         if link.session_owner_token is None:
@@ -557,10 +546,9 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if link.link_mode != self.config.link_mode:
             raise Refusal(
                 RefusalReason.NEEDS_SIGN_IN,
-                f"the worker on {self.config.ssh_profile} was placed for {link.link_mode}, and "
+                f"the worker on {self.context.title} was placed for {link.link_mode}, and "
                 f"the site now asks for {self.config.link_mode}; sign in again so relay can "
                 "place it for the new link",
-                site=self.context.site_id,
                 provider="ssh",
             )
         key = self._connection_key(link)
@@ -592,10 +580,9 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         if isinstance(last, TransportPunchFailed):
             raise Refusal(
                 RefusalReason.PUNCH_FAILED,
-                f"relay could not hole punch to the worker on {self.config.ssh_profile} "
+                f"relay could not hole punch to the worker on {self.context.title} "
                 f"({last}). Relay does not fall back to the rendezvous on its own; set the "
                 "site's link_mode to brokered_tcp to carry calls through it",
-                site=self.context.site_id,
                 link_mode=link.link_mode,
             )
         idle = (
@@ -605,18 +592,16 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         )
         raise Refusal(
             RefusalReason.NEEDS_SIGN_IN,
-            f"the worker on {self.config.ssh_profile} did not answer over the rendezvous "
+            f"the worker on {self.context.title} did not answer over the rendezvous "
             f"({last}).{idle} Sign in again so relay can place it",
-            site=self.context.site_id,
             provider="ssh",
         )
 
     def _outdated(self, why: str) -> Refusal:
         return Refusal(
             RefusalReason.NEEDS_SIGN_IN,
-            f"the worker on {self.config.ssh_profile} is from an older relay ({why}); sign in "
+            f"the worker on {self.context.title} is from an older relay ({why}); sign in "
             "again so relay can replace it",
-            site=self.context.site_id,
             provider="ssh",
         )
 
@@ -661,9 +646,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
                 connection.close()
                 raise Refusal(
                     RefusalReason.UNREACHABLE,
-                    f"the worker on {self.config.ssh_profile} did not answer ({exc}). It may "
+                    f"the worker on {self.context.title} did not answer ({exc}). It may "
                     "have exited idle already",
-                    site=self.context.site_id,
                 ) from exc
         try:
             answer = await _in_daemon_thread(
@@ -674,8 +658,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         except Exception as exc:
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"the worker on {self.config.ssh_profile} did not take the shutdown ({exc})",
-                site=self.context.site_id,
+                f"the worker on {self.context.title} did not take the shutdown ({exc})",
             ) from exc
         finally:
             connection.close()
@@ -722,9 +705,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         """Run ``script`` over a plain ``ssh`` that signs in without a prompt."""
         argv = self.sign_in_argv()
         argv[argv.index("BatchMode=no")] = "BatchMode=yes"
-        return await batch_ssh(
-            argv, script, f"{what} {self.config.ssh_profile}", self.context.site_id
-        )
+        return await batch_ssh(argv, script, f"{what} {self._who}")
 
     def _site_config(self) -> dict[str, Any]:
         config: dict[str, Any] = {
@@ -990,7 +971,7 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         register_ssh_sign_in(self.context.site_id, starter)
         return SignInNeed(
             provider="ssh",
-            message=f"Sign in to {self.config.ssh_profile} so relay can place its worker there",
+            message=f"Sign in to {self._who} so relay can place its worker there",
             url=None,
         )
 

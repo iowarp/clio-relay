@@ -222,12 +222,19 @@ class AdapterContext:
     """What relay gives an adapter when it builds one.
 
     ``state_dir`` is the adapter's own directory for this site; ``content`` is
-    relay's content store, where inputs named by digest are.
+    relay's content store, where inputs named by digest are. ``title`` is the
+    site's name as the person sees it (:attr:`SiteEntry.title`); an adapter's
+    sentences name the site by it. It is the site id when not given.
     """
 
     site_id: str
     state_dir: Path
     content: ContentStore
+    title: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.title:
+            object.__setattr__(self, "title", self.site_id)
 
     def secret(self, name: str) -> str | None:
         """Return a secret the person typed on relay's page, such as an API key.
@@ -529,7 +536,7 @@ class BaseAdapter[ConfigT: BaseModel]:
         argv = jarvis_submit.setup_command(home, jarvis, outputs)
         result = await self.exec(argv, timeout_s=None, max_output_bytes=1 << 20)
         return jarvis_submit.setup_result(
-            result.exit_code, result.stdout + "\n" + result.stderr, site=self.context.site_id
+            result.exit_code, result.stdout + "\n" + result.stderr, site=self.context.title
         )
 
     async def site_packages(self, add: str = "", *, force: bool = False) -> str:
@@ -551,7 +558,7 @@ class BaseAdapter[ConfigT: BaseModel]:
         tail = "\n".join(result.stderr.strip().splitlines()[-10:]) or "no output"
         raise Refusal(
             RefusalReason.INVALID_ARGUMENTS if add else RefusalReason.UNREACHABLE,
-            f"{'adding ' + add if add else 'listing the packages'} on {self.context.site_id} "
+            f"{'adding ' + add if add else 'listing the packages'} on {self.context.title} "
             f"failed: {tail}",
             exit_code=result.exit_code,
         )

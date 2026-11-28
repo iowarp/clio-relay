@@ -161,7 +161,6 @@ def direct_refused(hints: Sequence[str], *, site: str) -> Refusal:
         "to, so it will not run the job on this host, which may be a login node. Set the "
         "site's scheduler (such as scheduler: slurm), or scheduler: none to run jobs on "
         "this host on purpose",
-        site=site,
         batch_hints=list(hints),
         next_step="set_scheduler",
     )

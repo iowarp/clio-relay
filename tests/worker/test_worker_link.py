@@ -255,7 +255,7 @@ def test_no_stored_link_asks_for_sign_in(tmp_path: Path) -> None:
         asyncio.run(adapter._connection())  # pyright: ignore[reportPrivateUsage]
 
     assert refusal.value.reason is RefusalReason.NEEDS_SIGN_IN
-    assert "sign in to site-login" in refusal.value.message
+    assert "sign in to site (ssh site-login)" in refusal.value.message
 
 
 def test_a_link_stored_by_an_older_relay_asks_for_sign_in_to_replace_the_worker(

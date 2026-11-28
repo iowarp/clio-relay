@@ -70,7 +70,7 @@ def _report(*issues: dict[str, Any], failures: list[str] | None = None) -> str:
 
 
 def test_a_failure_is_passed_whole_in_jarvis_s_words() -> None:
-    refusal = install_failures.refusal(_report(BUILD), site="Ares")
+    refusal = install_failures.refusal(_report(BUILD))
     assert refusal.reason == RefusalReason.SUBMIT_FAILED
     assert refusal.message == BUILD["message"]
     assert refusal.data["failures"] == [BUILD]
@@ -90,7 +90,7 @@ def test_a_failure_is_never_an_ask_even_with_candidates_beside_it() -> None:
         "question": "Which MPI?",
         "candidates": [{"id": "openmpi", "constraint": "^openmpi"}],
     }
-    refusal = install_failures.refusal(_report(PROBE, question, failures=["sha256:p1"]), site="A")
+    refusal = install_failures.refusal(_report(PROBE, question, failures=["sha256:p1"]))
     assert installing.install_kind(refusal) is None
     assert refusal.message == PROBE["message"]
     assert refusal.data["failures"] == [PROBE]
@@ -98,13 +98,13 @@ def test_a_failure_is_never_an_ask_even_with_candidates_beside_it() -> None:
 
 
 def test_every_failure_is_listed_one_line_each() -> None:
-    refusal = install_failures.refusal(_report(BUILD, PROBE), site="Ares")
+    refusal = install_failures.refusal(_report(BUILD, PROBE))
     assert refusal.message.splitlines() == [BUILD["message"], PROBE["message"]]
     assert [item["issue_id"] for item in refusal.data["failures"]] == ["sha256:f1", "sha256:p1"]
 
 
 def test_exit_6_with_no_record_passes_what_jarvis_printed() -> None:
-    refusal = install_failures.refusal("Error: something\n", site="Ares")
+    refusal = install_failures.refusal("Error: something\n")
     assert refusal.reason == RefusalReason.SUBMIT_FAILED
     assert refusal.message == "Error: something"
     assert refusal.data["failures"] == []
@@ -326,7 +326,7 @@ TMPDIR_SETTING: dict[str, Any] = {
 def test_a_failure_s_install_settings_are_offered_whole_in_jarvis_s_words() -> None:
     build = {**BUILD, "settings": [TMPDIR_SETTING]}
     probe = {**PROBE, "settings": [TMPDIR_SETTING]}
-    refusal = install_failures.refusal(_report(build, probe), site="Ares")
+    refusal = install_failures.refusal(_report(build, probe))
     assert refusal.data["settings"] == [TMPDIR_SETTING]
     assert refusal.data["failures"] == [build, probe]
     lines = refusal.message.splitlines()
@@ -336,7 +336,7 @@ def test_a_failure_s_install_settings_are_offered_whole_in_jarvis_s_words() -> N
 
 
 def test_a_failure_without_settings_offers_none() -> None:
-    refusal = install_failures.refusal(_report(BUILD), site="Ares")
+    refusal = install_failures.refusal(_report(BUILD))
     assert "settings" not in refusal.data
     assert "settings_how" not in refusal.data
 
@@ -349,7 +349,7 @@ def _failed_op(site: str, settings: list[dict[str, Any]], *, job: bool = False) 
         # A failed install job keeps JARVIS's records in its result, as a run job does.
         error, result = None, install_failures.outcome(found)[1]
     else:
-        error, result = install_failures.failed(found, site=site).to_dict(), None
+        error, result = install_failures.failed(found).to_dict(), None
     return OperationRecord(
         operation_id="op-f",
         kind="install",

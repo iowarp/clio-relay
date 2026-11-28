@@ -309,7 +309,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         if scheduler is None and self.config.scheduler == "auto":
             hints = await asyncio.to_thread(batch_hints)
             if hints:
-                raise direct_refused(hints, site=self.context.site_id)
+                raise direct_refused(hints, site=self.context.title)
         jarvis_mode = bool(spec.steps())
         if not jarvis_mode and spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
@@ -404,7 +404,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
 
     def _refuse_jarvis_exit(self, result: ExecResult, spec: JobSpec) -> None:
         """Raise the refusal for the site script's typed exits (69, 3, 4, 5 and 6)."""
-        r, site, w = result, self.context.site_id, self.config.install_walltime_s
+        r, site, w = result, self.context.title, self.config.install_walltime_s
         jarvis_exits.refuse(
             r.exit_code, r.stdout, r.stderr, spec=spec, site=site, install_walltime_s=w
         )

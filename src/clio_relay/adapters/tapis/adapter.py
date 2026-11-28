@@ -149,7 +149,6 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             need.message,
             provider=PROVIDER,
             url=need.url,
-            site=self.context.site_id,
         )
 
     async def client(self) -> Any:
@@ -211,7 +210,6 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
                         f"Tapis has no system {system_id} for this person. Add or switch to "
                         "the site again to register the host, or run "
                         "python -m clio_relay.adapters.tapis register-host",
-                        site=self.context.site_id,
                         system=system_id,
                     ) from None
                 raise exc.refusal(system=system_id) from None
@@ -227,7 +225,6 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         raise Refusal(
             RefusalReason.INVALID_CONFIG,
             "the system's job working directory is not a plain path; set work_dir",
-            site=self.context.site_id,
             job_working_dir=found or None,
         )
 
@@ -240,7 +237,6 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             RefusalReason.INVALID_CONFIG,
             f"the Tapis system's rootDir {found} is not a plain host path, so relay cannot "
             "map its Tapis paths to the host's; use a system whose rootDir is one",
-            site=self.context.site_id,
             root_dir=found,
         )
 
@@ -495,7 +491,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             jarvis_remote.parse_sections(await self._sh(script, f"the {mode}")),
             mode=mode,
             spec=spec,
-            site=self.context.site_id,
+            site=self.context.title,
             install_walltime_s=None,
             data=data,
         )
@@ -519,7 +515,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             self.name,
             text,
             spec=spec,
-            site=self.context.site_id,
+            site=self.context.title,
             install_walltime_s=None,
             login_mode="detached",
             data=data,
@@ -532,7 +528,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             error = result.stderr.strip() or result.stdout.strip()
             raise Refusal(
                 RefusalReason.UNREACHABLE,
-                f"{what} did not finish on {self.context.site_id}: {error[-500:] or 'no output'}",
+                f"{what} did not finish on {self.context.title}: {error[-500:] or 'no output'}",
             )
         return result.stdout
 
@@ -568,7 +564,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         try:
             submitted = cast(dict[str, Any], await self.tapis_call("jobs", "submitJob", **request))
         except TapisCallError as exc:
-            raise exc.refusal(RefusalReason.SUBMIT_FAILED, site=self.context.site_id) from None
+            raise exc.refusal(RefusalReason.SUBMIT_FAILED) from None
         return self._handle(str(submitted["uuid"]), str(system["id"]), job_dir)
 
     # exec
@@ -663,7 +659,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
 
     async def status(self, handle: JobHandle) -> JobStatus:
         if handle.data.get("mode") == "jarvis":
-            found, _ = await jarvis_remote.status(self._sh, handle, site=self.context.site_id)
+            found, _ = await jarvis_remote.status(self._sh, handle, site=self.context.title)
             return found
         uuid = self._uuid(handle)
         try:
@@ -743,7 +739,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
         if handle.data.get("mode") != "jarvis":
             raise not_implemented(self.name, "move_queue")
-        await jarvis_remote.move(self._sh, handle, queue_name, site=self.context.site_id)
+        await jarvis_remote.move(self._sh, handle, queue_name, site=self.context.title)
 
     async def find(self, operation_id: str) -> JobHandle | None:
         path = self.records_dir / f"{operation_id}.json"

@@ -148,7 +148,6 @@ def outcome(
 def failed(
     issues: list[dict[str, Any]],
     *,
-    site: str,
     output: str = "",
     named: Iterable[object] = (),
     exit_code: object = EXIT_INSTALL_FAILED,
@@ -159,7 +158,6 @@ def failed(
     return Refusal(
         RefusalReason.SUBMIT_FAILED,
         message,
-        site=site,
         exit_code=exit_code,
         retry=False,
         **data,
@@ -167,7 +165,7 @@ def failed(
     )
 
 
-def refusal(text: str, *, site: str) -> Refusal:
+def refusal(text: str) -> Refusal:
     """The refusal for a ``ppl install`` or ``ppl submit`` that exited 6."""
     report = jarvis_report.parse_install_report(text) or {}
     extra = {key: report[key] for key in ("issues_path", "record_path") if report.get(key)}
@@ -175,7 +173,6 @@ def refusal(text: str, *, site: str) -> Refusal:
         extra["report"] = report
     return failed(
         _dicts(report.get("issues")),
-        site=site,
         output=text,
         named=cast(list[object], report.get("failures") or []),
         **extra,
@@ -192,7 +189,7 @@ def raise_for(exit_code: object, text: str, *, site: str) -> None:
     if str(exit_code) == str(jarvis_submit.EXIT_DECISION):
         site_facts.raise_for(text, site=site)
     if str(exit_code) == str(EXIT_INSTALL_FAILED):
-        raise refusal(text, site=site)
+        raise refusal(text)
 
 
 def site_offers(operations: Iterable[OperationRecord], site_id: str) -> dict[str, dict[str, Any]]:
@@ -228,7 +225,6 @@ def check_settings(spec: JobSpec, offers: Mapping[str, Mapping[str, Any]], *, si
         RefusalReason.INVALID_SPEC,
         f"no install failure on {site} offered the setting(s) {', '.join(unknown)}; "
         "install_settings take only the issue_ids of a failure record's settings",
-        site=site,
         unknown=unknown,
         settings=list(offers.values()),
     )
