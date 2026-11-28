@@ -23,7 +23,7 @@ _relay_live() {{
   case "$(ps -o stat= -p "$1" 2>/dev/null)" in ''|Z*) return 1;; esac
 }}
 _relay_pass() {{
-  case $1 in TERM|INT) echo "$1" > {marker}; _relay_stop=1;; esac
+  case $1 in TERM|INT) printf '%s\\n' "$1" > {marker}; _relay_stop=1;; esac
   if [ -z "$_relay_job" ]; then _relay_held=$1; return; fi
   sleep 1
   _relay_live "$_relay_job" && kill -s "$1" -- "-$_relay_job" 2>/dev/null

@@ -110,11 +110,11 @@ def _head(remote_dir: str, operation_id: str | None = None) -> str:
 
 def _detect(choice: str) -> str:
     if choice != "auto":
-        return f'S={q(choice)}\necho "@@scheduler $S"\n'
+        return f'S={q(choice)}\nprintf "%s\\n" "@@scheduler $S"\n'
     lines = ["S=none"]
     for name, command in reversed(SCHEDULER_COMMANDS):
         lines.append(f"command -v {command} >/dev/null 2>&1 && S={name}")
-    lines.append('echo "@@scheduler $S"')
+    lines.append('printf "%s\\n" "@@scheduler $S"')
     return "\n".join(lines) + "\n" + BATCH_HINT_SH
 
 
@@ -126,12 +126,12 @@ def check_script(remote_dir: str, operation_id: str, scheduler: str, digests: It
     )
     return (
         _head(remote_dir, operation_id)
-        + 'echo "@@root $R"\n'
+        + 'printf "%s\\n" "@@root $R"\n'
         + _detect(scheduler)
         + f"{have}\n"
-        + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; '
+        + 'if [ -f "$J/submit.rc" ]; then printf "%s\\n" "@@rc $(cat "$J/submit.rc")"; '
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo; '
-        + 'echo "@@used $(cat "$J/scheduler" 2>/dev/null)"; fi\n'
+        + 'printf "%s\\n" "@@used $(cat "$J/scheduler" 2>/dev/null)"; fi\n'
         + 'mkdir -p "$I" && echo "@@ready"\n'
     )
 
@@ -187,9 +187,10 @@ fi
         + "  ok=1\n"
         + f"{moves}\n{links}\n"
         + '  if [ "$ok" = 1 ]; then\n'
-        + '    echo "$(ts) submitted" >> "$J/states"\n'
+        + '    printf "%s\\n" "$(ts) submitted" >> "$J/states"\n'
         + f'    (cd "$J" && {submit_command}) </dev/null >"$J/submit.out" 2>"$J/submit.err"\n'
-        + '    echo $? > "$J/submit.rc.tmp" && mv -f "$J/submit.rc.tmp" "$J/submit.rc"\n'
+        + '    printf "%s\\n" "$?" > "$J/submit.rc.tmp"\n'
+        + '    mv -f "$J/submit.rc.tmp" "$J/submit.rc"\n'
         + '  else rmdir "$J/.submit.lock"; fi\n'
         + "else\n"
         + "  n=0\n"
@@ -197,7 +198,7 @@ fi
         + '    sleep 1; fresh "$J"; n=$((n+1))\n  done\n'
         + "fi\n"
         + 'rm -rf "$I"\n'
-        + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; fi\n'
+        + 'if [ -f "$J/submit.rc" ]; then printf "%s\\n" "@@rc $(cat "$J/submit.rc")"; fi\n'
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo\n'
         + 'echo "@@err"; cat "$J/submit.err" 2>/dev/null; echo\n'
     )
@@ -209,7 +210,7 @@ DETACHED_SUBMIT = (
     'else (nohup sh "$J/supervise.sh" </dev/null >"$J/supervisor.log" 2>&1 &); fi; '
     'n=0; while [ ! -s "$J/pid" ] && [ $n -lt 300 ]; do '
     "sleep 0.1 2>/dev/null || sleep 1; n=$((n+1)); done; "
-    '[ -s "$J/pid" ] && echo "pid:$(cat "$J/pid")"'
+    '[ -s "$J/pid" ] && printf "%s\\n" "pid:$(cat "$J/pid")"'
 )
 
 
@@ -219,18 +220,18 @@ def supervise_script(job_dir: PurePosixPath) -> str:
 J={q(str(job_dir))}
 cd "$J" || exit 1
 ts() {{ date -u +%Y-%m-%dT%H:%M:%SZ; }}
-echo $$ > pid.tmp && mv -f pid.tmp pid
+printf '%s\\n' "$$" > pid.tmp && mv -f pid.tmp pid
 if [ -e cancel ]; then
   echo 143 > exit_code.tmp && mv -f exit_code.tmp exit_code
   exit 0
 fi
 if command -v setsid >/dev/null 2>&1; then setsid sh "$J/child.sh" & else sh "$J/child.sh" & fi
 child=$!
-echo $child > child_pid
-echo "$(ts) running pid $child" >> states
+printf '%s\\n' "$child" > child_pid
+printf '%s\\n' "$(ts) running pid $child" >> states
 wait $child
 ec=$?
-echo $ec > exit_code.tmp && mv -f exit_code.tmp exit_code
+printf '%s\\n' "$ec" > exit_code.tmp && mv -f exit_code.tmp exit_code
 """
 
 
@@ -287,9 +288,9 @@ def status_script(
         ec = q(native_id + ".ec")
         body += (
             f"out=$({status_command} 2>&1 </dev/null); rc=$?\n"
-            'echo "@@schedrc $rc"; echo "@@sched"; printf "%s\\n" "$out"\n'
+            'printf "%s\\n" "@@schedrc $rc"; echo "@@sched"; printf "%s\\n" "$out"\n'
             f'echo "@@ec"; cat {ec} 2>/dev/null; echo\n'
-            '[ -s signalled ] && echo "@@signalled $(cat signalled)"\n'
+            '[ -s signalled ] && printf "%s\\n" "@@signalled $(cat signalled)"\n'
         )
         if accounting_command is not None:
             body += (
@@ -355,7 +356,10 @@ def cancel_script(job_dir: str, *, cancel_command: str | None) -> str:
         + "printf '%s cancel requested\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> states\n"
     )
     if cancel_command is not None:
-        body += f'out=$({cancel_command} 2>&1 </dev/null); echo "@@rc $?"; printf "%s\\n" "$out"\n'
+        body += (
+            f'out=$({cancel_command} 2>&1 </dev/null); printf "%s\\n" "@@rc $?"\n'
+            'printf "%s\\n" "$out"\n'
+        )
     else:
         body += (
             "c=$(cat child_pid 2>/dev/null)\n"
@@ -374,10 +378,10 @@ def find_script(remote_dir: str, operation_id: str, scheduler: str | None = None
     """
     return (
         _head(remote_dir, operation_id)
-        + 'echo "@@root $R"\n'
+        + 'printf "%s\\n" "@@root $R"\n'
         + (_detect(scheduler) if scheduler else "")
-        + 'if [ -f "$J/submit.rc" ]; then echo "@@rc $(cat "$J/submit.rc")"; '
-        + 'echo "@@used $(cat "$J/scheduler" 2>/dev/null)"; '
+        + 'if [ -f "$J/submit.rc" ]; then printf "%s\\n" "@@rc $(cat "$J/submit.rc")"; '
+        + 'printf "%s\\n" "@@used $(cat "$J/scheduler" 2>/dev/null)"; '
         + 'echo "@@out"; cat "$J/submit.out" 2>/dev/null; echo; fi\n'
     )
 
@@ -399,8 +403,8 @@ def graph_script(remote_dir: str, jarvis: str = "", graph: str = "") -> str:
         + f"D={root_expression(jarvis_submit.site_decisions(home))}\n"
         f"R={root_expression(jarvis_submit.site_root(home))}\n"
         f"JB={program}\n"
-        'echo "@@graph_path $G"; echo "@@graph_source $GS"; echo "@@site_home $SH"; '
-        'echo "@@decisions_path $D"\n'
+        'printf "%s\\n" "@@graph_path $G" "@@graph_source $GS" "@@site_home $SH" '
+        'printf "%s\\n" "@@decisions_path $D"\n'
         'if [ -x "$JB" ] && [ -f "$R/jarvis_config.yaml" ]; then\n'
         + jarvis_graph.NO_BUILTIN
         + 'T=; command -v timeout >/dev/null 2>&1 && T="timeout 60"\n'
@@ -433,7 +437,7 @@ def graph_collect_command(
     queue = (
         'case "${1:-}" in\n'
         '  "") ;;\n'
-        '  *[!A-Za-z0-9_.-]*) echo "not a queue name: $1" >&2; exit 64 ;;\n'
+        '  *[!A-Za-z0-9_.-]*) printf "%s\\n" "not a queue name: $1" >&2; exit 64 ;;\n'
         '  *) printf \'  partition: %s\\n\' "$1" >> "$S/site_net.yaml" ;;\n'
         "esac\n"
         if scheduler not in ("", "none")
@@ -446,7 +450,7 @@ def graph_collect_command(
         f"JB={root_expression(jarvis or jarvis_submit.jarvis_program(home))}\n"
         + _SET_UP
         + jarvis_submit.graph_lines(home, graph, root_expression)
-        + '[ "$GS" != site ] || { echo "the site publishes its resource graph at $G '
+        + '[ "$GS" != site ] || { printf "%s\\n" "the site publishes its resource graph at $G '
         '($JARVIS_RESOURCE_GRAPH); relay generates one only for a site that publishes none" '
         ">&2; exit 64; }\n"
         + jarvis_graph.write_lines('"$S"')
@@ -551,11 +555,11 @@ def describe_script(
             remote_dir, jarvis, graph
         )
     return (
-        jarvis_part + 'echo "@@host $(hostname 2>/dev/null)"\n'
-        'echo "@@os $(uname -s 2>/dev/null)"\n'
-        'echo "@@machine $(uname -m 2>/dev/null)"\n'
-        'echo "@@cpus $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"\n'
-        'echo "@@home $HOME"\n' + _detect(scheduler) + queues
+        jarvis_part + 'printf "%s\\n" "@@host $(hostname 2>/dev/null)"\n'
+        'printf "%s\\n" "@@os $(uname -s 2>/dev/null)"\n'
+        'printf "%s\\n" "@@machine $(uname -m 2>/dev/null)"\n'
+        'printf "%s\\n" "@@cpus $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"\n'
+        'printf "%s\\n" "@@home $HOME"\n' + _detect(scheduler) + queues
     )
 
 

@@ -602,7 +602,7 @@ def is_service(spec: JobSpec) -> bool:
 _SLICE_HOST = (
     'h=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | awk -v s="$s" '
     "'{ h[NR - 1] = $0 } END { if (s < 0) s += NR; if (s >= 0 && s < NR) print h[s] }'); "
-    'if [ -z "$h" ]; then echo "no host $s in the allocation $SLURM_JOB_NODELIST"; '
+    'if [ -z "$h" ]; then printf "%s\\n" "no host $s in the allocation $SLURM_JOB_NODELIST"; '
     "exit 1; fi; "
 )
 

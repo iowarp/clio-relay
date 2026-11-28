@@ -28,7 +28,7 @@ POLL_S = 30
 HOLDER = r"""limit=$1 step=$2
 marker="$PWD/.relay-warm-active"
 job=${SLURM_JOB_ID:-${PBS_JOBID:-}}
-echo "relay warm allocation $job: held; released after $limit s with nothing running"
+printf '%s\n' "relay warm allocation $job: held; released after $limit s with nothing running"
 slurm() { [ -n "${SLURM_JOB_ID:-}" ] && command -v squeue >/dev/null 2>&1; }
 busy() {
   slurm || return 1
@@ -54,7 +54,8 @@ while :; do
   if busy; then last=$now; fi
   for t in $(used); do [ "$t" -gt "$last" ] && last=$t; done
   if [ $((now - last)) -ge "$limit" ] && ! busy; then
-    echo "relay warm allocation $job: idle for $((now - last)) s; released at $(date -u +%FT%TZ)"
+    printf 'relay warm allocation %s: idle for %s s; released at %s\n' \
+      "$job" "$((now - last))" "$(date -u +%FT%TZ)"
     exit 0
   fi
   sleep "$step"

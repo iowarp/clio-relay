@@ -122,7 +122,7 @@ BATCH_HINT_SH = (
     f"  for f in {' '.join(BATCH_FILES)} ${{SLURM_CONF:-}}; do\n"
     '    [ -e "$f" ] && h="$h $f"\n'
     "  done\n"
-    '  [ -z "$h" ] || echo "@@batch_hint$h"\n'
+    '  [ -z "$h" ] || printf "%s\\n" "@@batch_hint$h"\n'
     "fi\n"
 )
 """Shell text for after ``S`` holds the detected scheduler: prints ``@@batch_hint ...``

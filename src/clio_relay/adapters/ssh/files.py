@@ -66,7 +66,7 @@ else
   elif [ "$fin" = 1 ] && [ ! -e "$part" ] && [ "$(size "$p")" = $((off + n)) ] \\
       && [ "$(tailsum "$p")" = "$h" ]; then
     rm -f "$t"; echo "@@entry"; st "$p"; exit 0
-  else rm -f "$t"; echo "@@resume $held"; exit 0
+  else rm -f "$t"; printf '%s\\n' "@@resume $held"; exit 0
   fi
   rm -f "$t"
 fi
@@ -291,7 +291,7 @@ class SshFileAccess:
             + 'if command -v sha256sum >/dev/null 2>&1; then s=$(sha256sum < "$p")\n'
             + 'elif command -v shasum >/dev/null 2>&1; then s=$(shasum -a 256 < "$p")\n'
             + 'else echo "@@none"; exit 0; fi\n'
-            + 'echo "@@sum"; echo "${s%% *}"\n'
+            + 'echo "@@sum"; printf "%s\\n" "${s%% *}"\n'
         )
         result = await self.transport.ssh(script, timeout_s=None, what="hashing")
         sections = parse_sections(result.text())

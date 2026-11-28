@@ -56,7 +56,7 @@ def fetch_script(target: str, *, url: str | None = None, sha256: str | None = No
             pattern = "|".join(f'"{system} {m}"' for m in machines.split("|"))
             lines.append(f'  {pattern}) FRPC_URL="{_RELEASE}/{archive}"; FRPC_SHA={digest} ;;')
         lines += [
-            f'  *) echo "{NO_PIN} ($(uname -s) $(uname -m))" >&2; exit 5 ;;',
+            f'  *) printf "%s\\n" "{NO_PIN} ($(uname -s) $(uname -m))" >&2; exit 5 ;;',
             "esac",
         ]
     t = '"$FRPC_TMP"'
@@ -65,20 +65,22 @@ def fetch_script(target: str, *, url: str | None = None, sha256: str | None = No
         f'  || [ "$(cat "{target}.sha256" 2>/dev/null)" != "$FRPC_SHA" ]; then',
         '  FRPC_TMP="$(mktemp -d "$D/dist/frpc.XXXXXX")"',
         f'  if ! curl -fLsS --retry 3 -o {t}/download "$FRPC_URL" >&2; then',
-        f'    rm -rf {t}; echo "could not fetch frpc from $FRPC_URL" >&2; exit 5',
+        f'    rm -rf {t}; printf "%s\\n" "could not fetch frpc from $FRPC_URL" >&2; exit 5',
         "  fi",
         f'  got="$( (sha256sum {t}/download 2>/dev/null || shasum -a 256 {t}/download) '
         "| cut -d' ' -f1)\"",
         '  if [ "$got" != "$FRPC_SHA" ]; then',
         f"    rm -rf {t}",
-        '    echo "frpc from $FRPC_URL has sha256 $got, not the pinned $FRPC_SHA" >&2; exit 5',
+        '    printf "%s\\n" "frpc from $FRPC_URL has sha256 $got, not the pinned $FRPC_SHA" >&2',
+        "    exit 5",
         "  fi",
         '  case "$FRPC_URL" in',
         "    *.tar.gz|*.tgz)",
         f"      tar -xzf {t}/download -C {t}",
         '      f=""',
         f'      for c in {t}/frpc {t}/*/frpc; do [ -f "$c" ] && {{ f="$c"; break; }}; done',
-        f'      [ -n "$f" ] || {{ rm -rf {t}; echo "no frpc in $FRPC_URL" >&2; exit 5; }} ;;',
+        f'      [ -n "$f" ] || {{ rm -rf {t}; printf "%s\\n" "no frpc in $FRPC_URL" >&2; '
+        "exit 5; }} ;;",
         f"    *) f={t}/download ;;",
         "  esac",
         '  chmod 700 "$f"',

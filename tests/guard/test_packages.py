@@ -143,9 +143,20 @@ def test_the_listing_reads_back_what_the_site_printed() -> None:
     )
     assert (broken["menu"], broken["contract"], broken["contract_error"]) == (None, None, "bad")
     assert parse_packages("@@unset\n") is None
-    for missing in ("", "@@repos not json", '@@repos {"schema_version": "other"}'):
-        with pytest.raises(Refusal, match="jarvis.repos.v1"):
-            parse_packages(missing)
+    with pytest.raises(Refusal, match="printed no document .* set the site up again"):
+        parse_packages("")
+    with pytest.raises(Refusal, match="is other, not jarvis.repos.v1; set the site up again"):
+        parse_packages('@@repos {"schema_version": "other"}')
+    # What a shell's echo makes of JARVIS's "\\d": the site is set up, the text is not JSON.
+    mangled = '@@repos {"schema_version": "jarvis.repos.v1", "x": "ET \\d+"}'
+    with pytest.raises(Refusal) as bad:
+        parse_packages(mangled)
+    assert bad.value.message.startswith(
+        "the site's `jarvis repo list +json` document did not parse: Invalid \\escape at "
+        "character 47 of 52, near"
+    )
+    assert "set the site up" not in bad.value.message
+    assert bad.value.data == {"parse_error": "Invalid \\escape", "position": 47, "length": 52}
 
 
 def test_jarvis_builtin_packages_are_never_run(tmp_path: Path) -> None:

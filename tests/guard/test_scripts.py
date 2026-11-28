@@ -54,7 +54,8 @@ case "$1 $2" in
         for p in "$dir/${dir##*/}"/*/pkg.py; do
           [ -f "$p" ] || continue
           p=${p%/pkg.py}
-          printf '%s{"name":"%s","menu":[{"name":"listed"}],"contract":null}' "$inner" "${p##*/}"
+          printf '%s{"name":"%s","menu":[{"name":"listed","match":"%s"}],"contract":null}' \\
+            "$inner" "${p##*/}" '^Rank 0 - ET \\\\d+'
           inner=,
         done
         printf ']}'
@@ -419,7 +420,9 @@ def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path:
         expected = listed(repo, name)
         assert item["digest"] == expected["digest"], name
         assert sorted(item["files"], key=lambda f: f["path"]) == expected["files"]
-        assert (item["menu"], item["contract"]) == ([{"name": "listed"}], None)
+        # A backslash in JARVIS's document reaches relay as JARVIS printed it.
+        menu = [{"name": "listed", "match": r"^Rank 0 - ET \d+"}]
+        assert (item["menu"], item["contract"]) == (menu, None)
         assert item["repo_dir"] == str(repo) and item["git"] is None
     [run] = [f for f in found["demo.hello"]["files"] if f["path"] == "hello/run.sh"]
     assert run["executable"] is True

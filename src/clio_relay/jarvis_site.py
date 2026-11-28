@@ -104,7 +104,7 @@ relay_files() (
   set -- "$pkg"
   for f in _*; do if [ -e "$f" ] || [ -L "$f" ]; then set -- "$@" "$f"; fi; done
   links=$(find "$@" \( -name __pycache__ -o -name .git \) -prune -o -type l -print)
-  [ -z "$links" ] || { echo "$pkg has symbolic links: $links" >&2; exit 65; }
+  [ -z "$links" ] || { printf '%s\n' "$pkg has symbolic links: $links" >&2; exit 65; }
   find "$@" \( -name __pycache__ -o -name .git \) -prune -o -type f \
     ! -name '*.pyc' ! -name '*.pyo' -print | while IFS= read -r f; do
     case $(ls -ld -- "$f" | cut -c4) in x|s) m=x ;; *) m=- ;; esac
@@ -166,7 +166,7 @@ else
   until mkdir "$lock.d" 2>/dev/null; do
     waited=$((waited + 2))
     [ "$waited" -lt 3600 ] || {
-      echo "another setup holds $lock.d; remove it if none is running" >&2
+      printf '%s\n' "another setup holds $lock.d; remove it if none is running" >&2
       exit 1
     }
     sleep 2
@@ -185,14 +185,14 @@ if [ "$(cat "$root/relay.pin" 2>/dev/null)" = "$want" ] && [ -x "$program" ] \
   exit 0
 fi
 : > "$log"
-fail() { tail -n 40 "$log" >&2; echo "clio-relay setup: $1" >&2; exit 1; }
-step() { echo "+ $*" >>"$log"; "$@" >>"$log" 2>&1 </dev/null || fail "$* failed"; }
+fail() { tail -n 40 "$log" >&2; printf '%s\n' "clio-relay setup: $1" >&2; exit 1; }
+step() { printf '%s\n' "+ $*" >>"$log"; "$@" >>"$log" 2>&1 </dev/null || fail "$* failed"; }
 rm -f "$root/relay.pin"
 # 1. jarvis-cd at the pin, as a uv tool with uv's own Python.
 if [ -z "$jarvis" ]; then
   uv=$(command -v uv 2>/dev/null) || uv="$home/bin/uv"
   if [ ! -x "$uv" ]; then
-    echo "+ install uv into $home/bin" >>"$log"
+    printf '%s\n' "+ install uv into $home/bin" >>"$log"
     curl -LsSf https://astral.sh/uv/install.sh 2>>"$log" \
       | env UV_INSTALL_DIR="$home/bin" UV_NO_MODIFY_PATH=1 sh >>"$log" 2>&1 \
       || fail "installing uv failed"
@@ -256,21 +256,23 @@ mode=$1 home=$2 want=$3 jarvis=${4:-} path=${5:-} force=${6:-}
 case $jarvis in "") jarvis="$home/bin/jarvis" ;; "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
 if [ "$mode" = add ]; then
   case $path in "~/"*) path="$HOME/${path#??}" ;; /*) ;; *) path="$HOME/$path" ;; esac
-  path=$(cd "$path" 2>/dev/null && pwd -P) || { echo "no directory $5 on the site" >&2; exit 66; }
+  path=$(cd "$path" 2>/dev/null && pwd -P) \
+    || { printf '%s\n' "no directory $5 on the site" >&2; exit 66; }
   JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1 "$jarvis" repo add "$path" $force </dev/null >&2
-  repo_paths | grep -qxF -- "$path" || { echo "jarvis did not register $path" >&2; exit 65; }
+  repo_paths | grep -qxF -- "$path" \
+    || { printf '%s\n' "jarvis did not register $path" >&2; exit 65; }
 fi
 listed=$(JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1 "$jarvis" repo list +json </dev/null) \
   || { echo "jarvis repo list +json failed" >&2; exit 1; }
-echo "@@repos $(printf '%s\n' "$listed" | tail -n 1)"
+printf '%s\n' "@@repos $(printf '%s\n' "$listed" | tail -n 1)"
 repo_paths | while IFS= read -r dir; do
   name=${dir##*/}
   case $name in builtin|clio_relay_site) continue ;; esac
   for p in "$dir/$name"/*/pkg.py; do
     [ -f "$p" ] || continue
     pkg=${p%/pkg.py}; pkg=${pkg##*/}
-    files=$(relay_files "$dir/$name" "$pkg") || { echo "@@refused $name.$pkg"; continue; }
-    echo "@@package $name.$pkg $(relay_digest "$files")"
+    files=$(relay_files "$dir/$name" "$pkg") || { printf '%s\n' "@@refused $name.$pkg"; continue; }
+    printf '%s\n' "@@package $name.$pkg $(relay_digest "$files")"
     printf '%s\n' "$files" | sed 's/^/@@file /'
   done
 done
@@ -295,14 +297,14 @@ def parse_packages(text: str) -> list[dict[str, Any]] | None:
     ``contract`` from JARVIS's ``jarvis.repos.v1`` document.
     """
     found: list[dict[str, Any]] = []
-    described: dict[str, dict[str, Any]] | None = None
+    listing: str | None = None
     item: dict[str, Any] | None = None
     for line in text.splitlines():
         tag, _space, rest = line.partition(" ")
         if tag == "@@unset":
             return None
         if tag == "@@repos":
-            described = _described(rest)
+            listing = rest
         elif tag == "@@package":
             name, _space, digest = rest.partition(" ")
             item = None
@@ -324,25 +326,44 @@ def parse_packages(text: str) -> list[dict[str, Any]] | None:
                         "executable": parts[1] == "x",
                     }
                 )
-    if described is None:
+    if listing is None:
         raise Refusal(
             RefusalReason.UNREACHABLE,
-            "the site's jarvis printed no jarvis.repos.v1 document for `jarvis repo list +json`; "
+            "the site's jarvis printed no document for `jarvis repo list +json`; "
             "set the site up again so its jarvis-cd is at relay's pin",
         )
+    described = _described(listing)
     for each in found:
         each.update(described.get(each["name"], {}))
     return found
 
 
-def _described(text: str) -> dict[str, dict[str, Any]] | None:
-    """Each package of a ``jarvis.repos.v1`` document, by ``repo.package``; None if invalid."""
+def _described(text: str) -> dict[str, dict[str, Any]]:
+    """Each package of a ``jarvis.repos.v1`` document, by ``repo.package``.
+
+    A document that does not parse is refused with the parse error and where it
+    occurred; one of another schema is refused as a jarvis-cd at another pin.
+    """
     try:
         document = json.loads(text)
-    except ValueError:
-        return None
-    if not isinstance(document, dict) or document.get("schema_version") != "jarvis.repos.v1":
-        return None
+    except json.JSONDecodeError as exc:
+        near = text[max(exc.pos - 40, 0) : exc.pos + 40]
+        raise Refusal(
+            RefusalReason.UNREACHABLE,
+            f"the site's `jarvis repo list +json` document did not parse: {exc.msg} at "
+            f"character {exc.pos} of {len(text)}, near {near!r}",
+            parse_error=exc.msg,
+            position=exc.pos,
+            length=len(text),
+        ) from exc
+    schema = document.get("schema_version") if isinstance(document, dict) else None
+    if schema != "jarvis.repos.v1":
+        raise Refusal(
+            RefusalReason.UNREACHABLE,
+            f"the site's `jarvis repo list +json` document is {schema or 'not an object'!s}, "
+            "not jarvis.repos.v1; set the site up again so its jarvis-cd is at relay's pin",
+        )
+    document = cast(dict[str, Any], document)
     found: dict[str, dict[str, Any]] = {}
     for repo in cast(list[Any], document.get("repos") or []):
         if not isinstance(repo, dict):

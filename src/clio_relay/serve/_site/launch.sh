@@ -106,7 +106,7 @@ connections() {
         [ -n "$name" ] || continue
         total=$((total + $(established "$port")))
     done < "$S/ports"
-    echo "$total"
+    printf '%s\n' "$total"
 }
 
 write_json() {
@@ -214,7 +214,7 @@ while :; do
     beat=$((beat - 1))
     if [ -n "$frpc_pid" ] && ! alive "$frpc_pid"; then
         restarts=$((restarts + 1))
-        echo "$restarts" > "$S/frpc-restarts"
+        printf '%s\n' "$restarts" > "$S/frpc-restarts"
         note "frpc exited, starting it again (restart $restarts)"
         start_frpc
     fi

@@ -120,7 +120,7 @@ def submit_script(
         run = (
             'if [ "$(cat submit.rc 2>/dev/null)" = 0 ]; then rc=0; : > submit.err\nelse\n'
             + run
-            + "mv -f submit.out.$$ submit.out; echo $rc > submit.rc\nfi\n"
+            + "mv -f submit.out.$$ submit.out; printf '%s\\n' \"$rc\" > submit.rc\nfi\n"
         )
     else:
         run += "mv -f submit.out.$$ submit.out\n"
@@ -128,7 +128,8 @@ def submit_script(
         f"J={q(job_dir)}\n"
         + 'mkdir -p "$J" && cd "$J" || { echo "@@nodir"; exit 0; }\n'
         + run
-        + 'echo "@@rc $rc"; echo "@@out"; cat submit.out; echo; echo "@@err"; cat submit.err\n'
+        + 'printf "%s\\n" "@@rc $rc"; echo "@@out"; cat submit.out; echo\n'
+        + 'echo "@@err"; cat submit.err\n'
         + "exit 0\n"
     )
 
@@ -221,7 +222,7 @@ def status_script(
         + f"fresh {execution}; jarvis=$(cat {jarvis_submit.JARVIS_FILE} 2>/dev/null)\n"
         + '[ -n "$jarvis" ] || { echo "@@nojarvis"; exit 0; }\n'
         + f"out=$({get} 2>&1 </dev/null); rc=$?\n"
-        + 'echo "@@getrc $rc"; echo "@@get"; printf "%s\\n" "$out"\n'
+        + 'printf "%s\\n" "@@getrc $rc"; echo "@@get"; printf "%s\\n" "$out"\n'
         + (f'echo "@@components"; cat {q(states)} 2>/dev/null; echo\n' if states else "")
         + 'if [ "$rc" -eq 0 ] && printf \'%s\\n\' "$out" | tail -n 1 | grep -qF '
         + "'\"terminal\":true'; then\n"
@@ -254,7 +255,7 @@ def execution_script(
         + f"jarvis=$(cat {jarvis_submit.JARVIS_FILE} 2>/dev/null)\n"
         + '[ -n "$jarvis" ] || { echo "@@nojarvis"; exit 0; }\n'
         + f"out=$({command} 2>&1 </dev/null); rc=$?\n"
-        + 'echo "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
+        + 'printf "%s\\n" "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
         + "exit 0\n"
     )
 
@@ -269,7 +270,7 @@ def install_script(job_dir: str, install_command: str) -> str:
         f"J={q(job_dir)}\n"
         + ENTER_JOB
         + f"out=$({install_command} 2>&1 </dev/null); rc=$?\n"
-        + 'echo "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
+        + 'printf "%s\\n" "@@rc $rc"; echo "@@out"; printf "%s\\n" "$out"\n'
         + f'echo "@@handle"; cat {jarvis_submit.INSTALL_FILE} 2>/dev/null; echo\n'
         + "exit 0\n"
     )

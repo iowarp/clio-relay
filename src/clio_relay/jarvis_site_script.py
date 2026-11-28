@@ -52,7 +52,7 @@ mode=$1 jarvis=$2 execution=$3 steps=$4
 shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
-fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
+fail() { printf '%s\n' "clio-relay jarvis: $2" >&2; exit "$1"; }
 case $mode in submit|plan|install|check|recheck) ;;
   *) fail 64 "mode $mode is not submit, plan, install, check or recheck" ;;
 esac
@@ -244,7 +244,7 @@ st() {
     "$1" "$2" "$$" "${c:-null}" > state.json.tmp && mv -f state.json.tmp state.json
 }
 c=
-echo $$ > pid.tmp && mv -f pid.tmp pid
+printf '%s\n' "$$" > pid.tmp && mv -f pid.tmp pid
 st queued null
 if [ -e cancel ]; then
   echo 143 > exit_code.tmp && mv -f exit_code.tmp exit_code
@@ -257,15 +257,15 @@ else
   "$@" </dev/null >report.json 2>progress.log &
 fi
 c=$!
-echo "$c" > child_pid
-echo "$(ts) running pid $c" >> states
+printf '%s\n' "$c" > child_pid
+printf '%s\n' "$(ts) running pid $c" >> states
 st running null
 ec=0
 wait "$c" || ec=$?
 if [ -e cancel ] && [ "$ec" -ne 0 ]; then s=cancelled
 elif [ "$ec" -eq 0 ]; then s=completed
 else s=failed; fi
-echo "$ec" > exit_code.tmp && mv -f exit_code.tmp exit_code
+printf '%s\n' "$ec" > exit_code.tmp && mv -f exit_code.tmp exit_code
 st "$s" "$ec"
 SUPERVISE
     set -- sh "$lb/supervise.sh" "$lb" "$found" ppl install yaml "$pipeline" \
