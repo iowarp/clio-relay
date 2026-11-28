@@ -2,9 +2,9 @@
 
 The stub runs each job on this machine the way Tapis's ``ZIP`` runtime does:
 it unpacks relay's launcher archive and runs ``tapisjob_app.sh`` with the
-app arguments relay wrote. ``exec`` and ``serve`` are not Tapis verbs, so the
-kit checks that each exec and serve test gets the ``verb_not_implemented``
-refusal instead.
+app arguments relay wrote. ``exec`` is one such job (FORK on the stub's
+system). ``serve`` is not a Tapis verb, so the kit checks that each serve test
+gets the ``verb_not_implemented`` refusal instead.
 """
 
 from __future__ import annotations

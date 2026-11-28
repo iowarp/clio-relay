@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, cast
 
-from clio_relay import jarvis_submit, site_outputs
+from clio_relay import jarvis_remote, jarvis_submit, site_outputs
 from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import PartitionInfo, SiteInfo, Verb
 from clio_relay.adapters.ssh import scripts
@@ -41,7 +41,7 @@ def site_info(
     outputs_dir: str | None,
 ) -> Described:
     """Return the site's facts from the describe script's ``text``."""
-    sections = scripts.parse_sections(text)
+    sections = jarvis_remote.parse_sections(text)
 
     def first(key: str) -> str | None:
         values = [value for value in sections.get(key, []) if value.strip()]
@@ -61,7 +61,7 @@ def site_info(
     scheduler = first("scheduler") or "none"
     graph_text = "\n".join(sections.get("graph", []))
     pipeline = jarvis_submit.graph_pipeline(scheduler)
-    job: dict[str, Any] | None = pipeline.get("scheduler")
+    job: dict[str, Any] | None = pipeline["scheduler"] if scheduler != "none" else None
     where = f"on {job['nodes']} compute nodes for up to {job['time']}" if job else "here"
     summary = (
         f"Relay's network collection job runs {where} with JARVIS and collects the "
@@ -89,7 +89,7 @@ def site_info(
         if "graph" not in sections:
             graph["note"] += (
                 ". Its net section is read with relay's JARVIS, so net shows once "
-                "relay has placed JARVIS on the site; null until then is not empty"
+                "relay has set up JARVIS on the site; null until then is not empty"
             )
     else:
         unset = (
@@ -152,12 +152,12 @@ def _sched_facts(
                 "source": "sinfo",
                 "observed_at": utc_now().isoformat(),
                 "note": (
-                    "relay has not placed JARVIS on this site yet, so the partitions are "
+                    "relay has not set up JARVIS on this site yet, so the partitions are "
                     "the sinfo query JARVIS's sched info reads, as of observed_at; "
-                    "JARVIS's report replaces them once JARVIS is placed"
+                    "JARVIS's report replaces them once it is set up"
                 ),
             }
-        return {"note": "relay has not placed JARVIS on this site yet; its first run does"}
+        return {"note": "relay has not set up JARVIS on this site yet; a package job asks to"}
     return {"note": "jarvis sched info gave no report", "detail": text.strip()[-500:] or None}
 
 
@@ -166,6 +166,7 @@ def _jarvis_facts(remote_dir: str, jarvis: str, graph_setting: str) -> dict[str,
     return {
         "exec": scripts.jarvis_command(remote_dir, jarvis, graph_setting),
         "read": ["jarvis"],
+        "root": jarvis_submit.site_root(home),
         "spack_root": posixpath.join(home, jarvis_submit.SPACK_DIR),
         "note": (
             "exec_read + sched info|rg facts show|rg skill list|show NAME +json: no plan. "

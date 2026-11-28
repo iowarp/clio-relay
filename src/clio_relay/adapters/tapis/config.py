@@ -37,10 +37,6 @@ class TapisConfig(BaseModel):
             "job working directory"
         ),
     )
-    launcher: Literal["open", "guarded"] = Field(
-        default="open",
-        description="open runs the job spec's executable; guarded runs reviewed packages only",
-    )
     client_id: str | None = Field(
         default=None, description="Relay's OAuth client in the tenant, when not the shipped one"
     )

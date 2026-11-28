@@ -13,13 +13,15 @@ from pathlib import Path
 import pytest
 
 from clio_relay.jarvis_plan import BIND_ENV, EXIT_PLANNED, PLAN_FILE, planned
-from clio_relay.jarvis_submit import FALLBACK_ENV, PIN_ENV, PIPELINE_FILE, SUBMISSION_FILE
+from clio_relay.jarvis_submit import PIN_ENV, PIPELINE_FILE, SUBMISSION_FILE
 
 from .test_scripts import (
+    FAKE_JARVIS,
     PIPELINE,
     _env,  # pyright: ignore[reportPrivateUsage]
-    _jarvis,  # pyright: ignore[reportPrivateUsage]
     _job_dir,  # pyright: ignore[reportPrivateUsage]
+    _program,  # pyright: ignore[reportPrivateUsage]
+    _root,  # pyright: ignore[reportPrivateUsage]
     _site,  # pyright: ignore[reportPrivateUsage]
 )
 
@@ -29,10 +31,10 @@ PIN = "ab12cd"
 
 
 def _pinned(tmp_path: Path, **extra: str) -> dict[str, str]:
-    """The stand-in as relay's own JARVIS, at the pin relay asks for."""
-    jarvis = _jarvis(tmp_path)
-    (jarvis.parent / "pin").write_text(PIN + "\n")
-    return _env(tmp_path, tmp_path / "bin", **{FALLBACK_ENV: str(jarvis), PIN_ENV: PIN}, **extra)
+    """The stand-in as relay's own JARVIS, its root set up at the pin relay asks for."""
+    _program(tmp_path / "site" / "bin", "jarvis", FAKE_JARVIS)
+    (_root(tmp_path) / "relay.pin").write_text(PIN + "\n")
+    return _env(tmp_path, tmp_path / "bin", **{PIN_ENV: PIN}, **extra)
 
 
 def test_plan_makes_jarvis_plan_and_submits_nothing(tmp_path: Path) -> None:

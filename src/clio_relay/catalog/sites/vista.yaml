@@ -13,7 +13,6 @@ config:
   base_url: https://tacc.tapis.io
   tenant_id: tacc
   authn: tms
-  launcher: guarded
 alternatives:
   worker:
     ssh_profile: vista

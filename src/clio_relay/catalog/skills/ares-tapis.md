@@ -19,5 +19,7 @@ Tapis runs it on Ares through Slurm as a Tapis `BATCH` job.
 - The Tapis job UUID is in the task's result. Quote it when you report the run.
 - Outputs stay in the job's directory on Ares. Read them with `files`, which goes
   through Tapis Files.
-- `exec` and `serve` are not Tapis verbs. Relay routes them to the site's `ssh`
-  alternative, and `describe` shows that route.
+- `exec` runs as a Tapis job on the login host (`FORK`) when the system allows
+  it, else as a batch job, and `describe` says which. `serve` is not a Tapis
+  verb: relay routes it to the site's `ssh` alternative, and `describe` shows
+  that route.

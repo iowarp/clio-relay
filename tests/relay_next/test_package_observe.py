@@ -1,7 +1,7 @@
 """An agent finds a package by name and sees a running package job's step and outputs.
 
-R1: ``describe(site=)`` lists the staged packages and ``run`` pins one named
-alone. R2: a package job's JARVIS records give its step and outputs on any
+R1: ``describe(site=)`` lists the packages the site's JARVIS root holds and
+``run`` pins one named alone. R2: a package job's JARVIS records give its step and outputs on any
 adapter with ``files``. R3: each look at a job says when it was and what the
 site said, and a look that fails says so instead of leaving the old answer.
 """
@@ -20,21 +20,19 @@ import pytest
 
 from clio_relay.adapters.hooks import set_hook
 from clio_relay.guard import create_guard
-from clio_relay.jarvis_site import archive_package
 from clio_relay.jobs.handles import VIEW_METADATA, JobHandle, JobState, JobStatus, OutputRef
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
-from clio_relay.packages import stage
 from clio_relay.surface.describing import site_report
-from clio_relay.surface.package_progress import JARVIS_SHARED, with_package_progress
+from clio_relay.surface.package_progress import with_package_progress
 from clio_relay.surface.progress import progress_message
 from clio_relay.surface.results import operation_result
 from clio_relay.surface.server import RelayTasksExtension
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
-from ..guard.conftest import make_repo
+from ..guard.conftest import listed, make_repo
 from .conftest import add_site
 
 pytestmark = [pytest.mark.release_platform("posix"), pytest.mark.asyncio]
@@ -61,30 +59,44 @@ async def test_describe_lists_packages_and_run_pins_one_named_alone(
     relay_paths: RelayPaths, tmp_path: Path, guarded: None
 ) -> None:
     add_site(relay_paths, policy="guarded")
-    repo = make_repo(tmp_path / "src")
-    entry = stage(
-        relay_paths.state_dir, archive_package(repo, "demo.hello"), "demo.hello", version="0.1.0"
-    )
+    repo = make_repo(tmp_path / "src", packages=("hello",))
     service = RelayService(relay_paths)
-    [listed] = (await site_report(service, service.site("fx")))["packages"]
-    assert (listed["name"], listed["version"], listed["sha256"]) == (
+    [entry] = service.packages.store("fx", [listed(repo, "demo.hello")])
+
+    async def refresh(site: str, adapter: Any, **_: Any) -> Any:
+        return service.packages.all(site)
+
+    setattr(service.packages, "refresh", refresh)  # noqa: B010
+    report = await site_report(service, service.site("fx"))
+    [shown] = report["packages"]
+    assert (shown["name"], shown["version"], shown["digest"]) == (
         "demo.hello",
-        "0.1.0",
-        entry.sha256,
+        entry.version,
+        entry.digest,
     )
-    assert listed["parameters"]["properties"]["out"]["default"] == "out.txt"
-    assert listed["reviewed"] is False
+    assert shown["parameters"]["properties"]["out"]["default"] == "out.txt"
+    assert shown["reviewed"] is False
+    assert report["jarvis"]["set_up"] is True
+
+    # A root that is no longer set up lists nothing, though relay listed it before.
+    async def unset(site: str, adapter: Any, **_: Any) -> Any:
+        return None
+
+    setattr(service.packages, "refresh", unset)  # noqa: B010
+    report = await site_report(service, service.site("fx"))
+    assert report["packages"] == [] and report["jarvis"]["set_up"] is False
+    setattr(service.packages, "refresh", refresh)  # noqa: B010
 
     record = await service.start_run(
         "fx", JobSpec(package=PackageRef(name="demo.hello", parameters={"out": "x.txt"}))
     )
-    assert record.spec["package"]["version"] == "0.1.0"
-    assert record.spec["package"]["sha256"] == entry.sha256
+    assert record.spec["package"]["version"] == entry.version
+    assert record.spec["package"]["sha256"] == entry.digest
     assert record.state == OperationState.AWAITING_INPUT
     reviews = [
         ask for ask in service.outstanding(record) if ask.binding.get("kind") == "package_review"
     ]
-    assert [ask.binding["package_hash"] for ask in reviews] == [entry.sha256]
+    assert [ask.binding["package_hash"] for ask in reviews] == [entry.digest]
 
     with pytest.raises(Refusal) as raised:
         await service.start_run("fx", JobSpec(package=PackageRef(name="demo.missing")))
@@ -99,7 +111,9 @@ def _jsonl(path: Path, lines: list[dict[str, Any]], *, partial: str = "") -> Non
 
 
 def _execution(job_dir: Path, name: str) -> Path:
-    execution = job_dir / JARVIS_SHARED / "relay_abc" / "executions" / name
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "relay.shared").write_text(f"{job_dir / 'shared' / 'relay_abc'}\n")
+    execution = job_dir / "shared" / "relay_abc" / "executions" / name
     execution.mkdir(parents=True)
     return execution
 

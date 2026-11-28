@@ -403,15 +403,9 @@ def _started(record: OperationRecord) -> datetime | None:
     return running
 
 
-def _titles(service: RelayService, job: JobSpec | None) -> dict[str, str]:
+def _titles(service: RelayService, site: str, job: JobSpec | None) -> dict[str, str]:
     """The job's packages' contract titles, by package name, for the components' labels."""
-    if job is None:
-        return {}
-    try:
-        return service.step_titles(job)
-    except (OSError, ValueError):
-        # A card is drawn on every status; an unreadable archive leaves short names.
-        return {}
+    return service.packages.titles(site) if job is not None and job.steps() else {}
 
 
 _SPACK_SPEC_END = re.compile(r"[\s+~^%]")
@@ -442,7 +436,7 @@ def _label(service: RelayService, record: OperationRecord) -> str | None:
         job: JobSpec | None = JobSpec.model_validate(record.spec)
     except ValueError:
         job = None
-    titles = _titles(service, job)
+    titles = _titles(service, record.site, job)
     if built:
         names = [_installed_what(item, titles) for item in built]
     else:
@@ -470,7 +464,7 @@ def snapshot(service: RelayService, record: OperationRecord) -> dict[str, Any] |
     walltime = plan.get("time_limit_s") or walltime
     facts = cast(dict[str, Any] | None, (record.result or {}).get("site_facts"))
     couplings = _couplings(plan, job)
-    titles = _titles(service, job)
+    titles = _titles(service, record.site, job)
     components = (
         _planned(record, plan, state, titles)
         if plan
@@ -551,7 +545,7 @@ def command_snapshot(
     nodes = directives.get("nodes")
     nodes = nodes if isinstance(nodes, int) else None
     components: list[dict[str, Any]] = []
-    titles = service.packages.titles() if pkgs else {}
+    titles = service.packages.titles(site_id) if pkgs else {}
     for pkg in pkgs:
         pkg_type = str(pkg.get("pkg_type") or "")
         id_ = str(pkg.get("pkg_name") or pkg_type.rpartition(".")[2] or pkg_type)

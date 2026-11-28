@@ -26,8 +26,8 @@ flowchart LR
 
 1. **Surface.** `surface/server.py` serves the verbs `describe`, `run`,
    `exec`, `files` and `serve` over stdio or Streamable HTTP, with `packages`
-   (stage and remove the packages `run` takes, `surface/staging.py`; the read
-   tool `packages_read` lists them) and
+   (add a repository to a site's JARVIS root, `surface/package_tool.py`; the
+   read tool `packages_read` lists the packages the root holds) and
    `shutdown` beside them. Two changes have tools of their own, so a host's
    question names what they do (`surface/site_tools.py`): `cancel` cancels a
    job or stops a service, and `site_clean` removes relay's deployment from a
@@ -37,8 +37,8 @@ flowchart LR
    (the read-only command list of [guarded sites](guarded-sites.md#read-only-exec))
    and `files_read` (list, stat, read and has), live in `surface/read_tools.py`;
    the result rendering and the annotations are in `surface/results.py`.
-   `describe` also lists the staged packages (`packages=true`) and gives a
-   service's endpoint and readiness (`job=<service>`). `run` and `serve`
+   `describe(site=...)` also lists the site's packages and says whether its
+   JARVIS root is set up, and gives a service's endpoint and readiness (`job=<service>`). `run` and `serve`
    are MCP tasks when the client supports them (see [MCP tasks](mcp-tasks.md)).
    `install` (`surface/install_tool.py`, `surface/install_op.py`) is a run's
    install task on its own, and a task too: it asks JARVIS's light
@@ -59,19 +59,19 @@ flowchart LR
    with the answers, so nothing is asked or built when everything is
    installed. It
    takes the run's install path when software is missing (the same asks, then
-   `ppl install +submit` as a job on the compute nodes), installs relay's
-   jarvis-cd first when the site lacks it, and launches nothing. A run's
+   `ppl install +submit` as a job on the compute nodes), sets up the site's
+   JARVIS root when the site lacks it, and launches nothing. A run's
    submit asks the same light check before `ppl submit`, so the person is
    still asked before any job of the run is submitted. Operations
-   that find a site without jarvis-cd at once share one site-scoped ask
-   (`surface/install_share.py`), and the bootstrap's lock in the site home
+   that find a site without its JARVIS root at once share one site-scoped ask
+   (`surface/install_share.py`), and the setup's lock in the site home
    makes a second install wait for the first and reuse it. A JARVIS question
    scoped to the site (which MPI) is shared the same way: operations that get
    the same `issue_id` with the same candidates hold one ask, and its answer
    reaches each install.
    The tools only translate arguments; all behaviour is in the service. The
    server's `instructions`, which a client reads when it connects, name the
-   configured sites and the staged packages (`surface/instructions.py`), so an
+   configured sites and the packages relay listed on them (`surface/instructions.py`), so an
    agent knows what relay can run before it calls a tool. The tool annotations
    say the three read tools only read and never destroy (`readOnlyHint` true,
    `destructiveHint` false) and the rest change things, all in a closed world:
@@ -105,7 +105,7 @@ and both plain files:
 | Directory | Holds |
 | --- | --- |
 | Config (`CLIO_RELAY_CONFIG_DIR`) | `sites.yaml`, `guard.yaml`, your own skills |
-| State (`CLIO_RELAY_STATE_DIR`) | Operation records, asks, the content store, the staged package catalog, each adapter's own files, reviewed packages, the rendezvous settings |
+| State (`CLIO_RELAY_STATE_DIR`) | Operation records, asks, the content store, each site's package listing, each adapter's own files, reviewed packages, the rendezvous settings |
 
 An operation record holds the spec, its digest, the site, the adapter's job
 handle and the states seen. Any relay process can observe, answer or cancel

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -7,8 +8,6 @@ import pytest
 
 from clio_relay.adapters.hooks import Ask, HookContext
 from clio_relay.guard import Guard, create_guard
-from clio_relay.jarvis_site import archive_package
-from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationRecord, OperationState, RecordStore
 from clio_relay.sites.models import SiteEntry
 
@@ -68,9 +67,59 @@ def guard(tmp_path: Path) -> Guard:
     return create_guard(context_for(tmp_path))
 
 
-def stage(guard: Guard, repo_dir: Path, name: str, source: dict[str, Any] | None = None) -> str:
-    data = archive_package(repo_dir, name, source=source)
-    return ContentStore(guard.context.state_dir / "content").put(data)
+def _reviewed(inner: Path, name: str) -> list[Path]:
+    tops = [inner / name, *(path for path in inner.iterdir() if path.name.startswith("_"))]
+    found = [top for top in tops if top.is_file()]
+    found += [path for top in tops if top.is_dir() for path in top.rglob("*") if path.is_file()]
+    return [
+        path
+        for path in found
+        if not {"__pycache__", ".git"} & set(path.relative_to(inner).parts)
+        and path.suffix not in (".pyc", ".pyo")
+    ]
+
+
+def listed(repo_dir: Path, name: str, git: dict[str, str] | None = None) -> dict[str, Any]:
+    """Return what the site listing prints of package ``name`` of ``repo_dir``, digest included."""
+    inner = repo_dir / repo_dir.name
+    package = name.split(".", 1)[1]
+    files = [
+        {
+            "path": path.relative_to(inner).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size": path.stat().st_size,
+            "executable": bool(path.stat().st_mode & 0o100),
+        }
+        for path in _reviewed(inner, package)
+    ]
+    lines = sorted(
+        f"{item['sha256']} {'x' if item['executable'] else '-'} {item['path']}\n".encode()
+        for item in files
+    )
+    contract = inner / package / "contract.yaml"
+    return {
+        "name": name,
+        "digest": hashlib.sha256(b"".join(lines)).hexdigest(),
+        "files": sorted(files, key=lambda item: item["path"]),
+        "pkg": (inner / package / "pkg.py").read_text(),
+        "contract": contract.read_text() if contract.is_file() else "",
+        "repo_dir": str(repo_dir),
+        "git": git,
+    }
+
+
+def stage(
+    guard: Guard,
+    repo_dir: Path,
+    name: str,
+    git: dict[str, str] | None = None,
+    site_id: str = "hpc",
+) -> str:
+    """List package ``name`` into the site's catalog, beside what it held, and return its digest."""
+    item = listed(repo_dir, name, git)
+    kept = [{"name": e.name, "digest": e.digest} for e in guard.packages.all(site_id)]
+    guard.packages.store(site_id, [item, *kept])
+    return item["digest"]
 
 
 def answer(

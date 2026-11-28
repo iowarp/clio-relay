@@ -18,6 +18,7 @@ from fastmcp import Client
 
 from clio_relay import install_wording, jarvis_exits, jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import ask_text
+from clio_relay.jarvis_site import site_pin
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -93,10 +94,14 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
     async def run(self: FixtureAdapter, spec: JobSpec, *, operation_id: str) -> JobHandle:
         raise AssertionError("an install launches no app")
 
+    async def site_packages(self: FixtureAdapter, add: str = "", *, force: bool = False) -> str:
+        return ""
+
     for name, value in {
         "install_check": install_check,
         "install": install,
         "install_jarvis": install_jarvis,
+        "site_packages": site_packages,
         "status": status,
         "run": run,
     }.items():
@@ -213,8 +218,8 @@ def test_a_site_without_jarvis_gets_it_first(relay_paths: RelayPaths, site: _Sit
         service = RelayService(relay_paths)
         record = await install_op.start(service, "fx", SPEC)
         (ask,) = service.outstanding(service.operation(record.operation_id))
-        assert ask.binding["jarvis"] == jarvis_submit.JARVIS_PIN
-        assert ask.message == "Install jarvis-cd on fx?"
+        assert ask.binding["jarvis"] == site_pin()
+        assert ask.message == "Set up JARVIS on fx?"
         await _approve(service, record.operation_id)
         done = service.operation(record.operation_id)
         assert done.state == OperationState.COMPLETED, done
@@ -224,9 +229,9 @@ def test_a_site_without_jarvis_gets_it_first(relay_paths: RelayPaths, site: _Sit
     asyncio.run(scenario())
 
 
-def test_a_site_jarvis_cannot_submit_to_fails_typed(relay_paths: RelayPaths, site: _Site) -> None:
+def test_a_site_refusing_the_install_fails_typed(relay_paths: RelayPaths, site: _Site) -> None:
     async def scenario() -> None:
-        site.refuse = jarvis_exits.install_only_refused("local", site="fx")
+        site.refuse = Refusal(RefusalReason.ADAPTER_UNAVAILABLE, "fx cannot install")
         add_site(relay_paths)
         service = RelayService(relay_paths)
         record = await install_op.start(service, "fx", SPEC)
@@ -491,8 +496,6 @@ def test_the_check_exit_is_the_install_report_or_a_typed_refusal() -> None:
         jarvis_exits.refuse(3, missing, "", spec=SPEC, site="fx", install_walltime_s=3600)
     assert needed.value.data["needs"] == jarvis_submit.NEEDS_INSTALL
     jarvis_exits.refuse(0, line, "", spec=SPEC, site="fx", install_walltime_s=3600)
-    refused = jarvis_exits.install_only_refused("local", site="fx")
-    assert refused.data["needs"] == "a Slurm site"
 
 
 def test_a_failed_jarvis_command_says_jarvis_error_not_its_notices() -> None:

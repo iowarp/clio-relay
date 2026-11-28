@@ -6,12 +6,12 @@ the submit script here with PSI/J, copies it and any missing inputs with one
 are PSI/J's too, run on the site. With no scheduler, a small ``sh`` supervisor
 runs the job detached and writes its exit code to the job directory.
 
-A JARVIS package job is JARVIS's (RL40, RL45). On Slurm relay writes the
-pipeline with the run's resources in its ``scheduler:`` block and runs
-``jarvis ppl submit`` on the login host; status and outputs come from
-``jarvis execution get`` and ``jarvis execution artifacts``, and relay never
-calls ``sbatch`` or ``scancel`` for it. With no scheduler the job runs with
-JARVIS's direct run under the supervisor. See :mod:`clio_relay.jarvis_submit`.
+A JARVIS package job is JARVIS's (RL40, RL45) on every scheduler. Relay writes
+the pipeline with the run's resources in its ``scheduler:`` block (the site's
+scheduler, or ``local`` with none) and runs ``jarvis ppl submit`` on the login
+host; status and outputs come from ``jarvis execution get`` and ``jarvis
+execution artifacts``, and relay never calls ``sbatch`` or ``scancel`` for it.
+See :mod:`clio_relay.jarvis_submit` and :mod:`clio_relay.jarvis_remote`.
 
 The job record lives in the job directory on the site (RL17), so a poll from
 any relay process, after any restart, reads it. No ``ssh`` process is kept
@@ -26,7 +26,6 @@ import importlib
 import io
 import json
 import logging
-import re
 import shlex
 import shutil
 from datetime import timedelta
@@ -35,7 +34,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
-from clio_relay import jarvis_exits, jarvis_plan, jarvis_submit, site_outputs
+from clio_relay import jarvis_remote, jarvis_submit, site_outputs
 from clio_relay.adapters import sched_info
 from clio_relay.adapters.base import (
     AdapterContext,
@@ -52,9 +51,9 @@ from clio_relay.adapters.ssh import describing, pricing, scripts, signals, slurm
 from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.ssh.config import SchedulerName, SshConfig
 from clio_relay.adapters.ssh.files import SshFileAccess
-from clio_relay.adapters.ssh.scripts import parse_sections
 from clio_relay.adapters.ssh.statuses import accounted_status, detached_status, stored_final
 from clio_relay.adapters.ssh.transport import SshTransport
+from clio_relay.jarvis_remote import parse_sections
 from clio_relay.jobs.handles import (
     Endpoint,
     ExecResult,
@@ -261,9 +260,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
     async def _submit(
         self, spec: JobSpec, operation_id: str, *, check_only: bool, plan: bool = False
     ) -> JobHandle | dict[str, Any] | None:
-        if spec.steps():
-            spec = jarvis_submit.with_archive(spec)
-        elif spec.executable is None:
+        if not spec.steps() and spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
         name = job_name(operation_id)
         digests = {item.sha256 for item in spec.inputs}
@@ -309,23 +306,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         hints = (_one(check, "batch_hint") or "").split()
         if scheduler is None and hints:
             raise direct_refused(hints, site=self.config.ssh_profile)
-        jarvis_mode = False
-        if spec.steps():
-            if scheduler is None:
-                spec = jarvis_submit.direct_job(
-                    site_outputs.with_outputs(spec, self.config.outputs_dir),
-                    jarvis=self.config.jarvis,
-                    job_dir=str(job_dir),
-                    home=self.config.remote_dir,
-                    site=self.config.ssh_profile,
-                    graph=self.config.jarvis_graph,
-                )
-            elif scheduler == "slurm":
-                jarvis_mode = True
-            else:
-                raise jarvis_submit.scheduler_refusal(scheduler, site=self.config.ssh_profile)
-        if check_only and not jarvis_mode:
-            raise jarvis_exits.install_only_refused(scheduler, site=self.config.ssh_profile)
+        jarvis_mode = bool(spec.steps())
+        mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
         if plan and not jarvis_mode:
             return None
         have = set(check.get("have", []))
@@ -341,13 +323,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
             blobs.append(self.context.content.path_for(digest))
 
         if jarvis_mode:
-            mode: jarvis_submit.SiteMode = "check" if check_only else "plan" if plan else "submit"
             rendered = self._render_jarvis(
                 spec,
                 operation_id,
                 job_dir,
                 name,
                 mode,
+                scheduler=scheduler or "local",
                 threads_per_core=await self._threads_per_core(spec),
             )
         else:
@@ -388,31 +370,26 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"content {bad} did not arrive intact on {self.config.ssh_profile}",
                 digest=bad,
             )
+        if jarvis_mode:
+            return jarvis_remote.submitted(
+                self.name,
+                sections,
+                mode=mode,
+                spec=spec,
+                site=self.config.ssh_profile,
+                install_walltime_s=self.config.install_walltime_s,
+                data={"root": str(root), "job_dir": str(job_dir), "job_name": name},
+            )
         rc = _one(sections, "rc")
         output = "\n".join(sections.get("out", [])).strip()
-        if plan:
-            # No plan (JARVIS refused, or cannot plan) is not a refusal: the submit says why.
-            return jarvis_plan.planned(rc, output)
         if rc != "0":
             error = "\n".join(sections.get("err", [])).strip() or output
-            if jarvis_mode:
-                jarvis_exits.refuse(
-                    rc,
-                    output,
-                    error,
-                    spec=spec,
-                    site=self.config.ssh_profile,
-                    install_walltime_s=self.config.install_walltime_s,
-                )
-                error = jarvis_exits.failure_text(output, error)
             raise Refusal(
                 RefusalReason.SUBMIT_FAILED,
                 f"{self.config.ssh_profile} refused the job: {error or 'no output'}",
                 scheduler=used,
                 exit_code=int(rc) if rc and rc.lstrip("-").isdigit() else None,
             )
-        if check_only:
-            return jarvis_exits.checked(output)
         return self._handle(used, output, root, job_dir, name)
 
     def _existing(
@@ -438,7 +415,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
             "job_name": name,
         }
         if used == "jarvis":
-            return self._jarvis_handle(submit_output, data)
+            return jarvis_remote.handle(self.name, submit_output, data)
         scheduler = cast(SchedulerName, used) if used in _SCHEDULERS else None
         if scheduler is None:
             native = submit_output.strip().splitlines()[-1] if submit_output.strip() else ""
@@ -462,22 +439,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
         data["scheduler"] = scheduler
         return JobHandle(adapter=self.name, native_id=native, data=data)
 
-    def _jarvis_handle(self, submit_output: str, data: dict[str, Any]) -> JobHandle:
-        found = jarvis_submit.parse_handle(submit_output)
-        if found is None:
-            raise Refusal(
-                RefusalReason.SUBMIT_FAILED,
-                "jarvis ppl submit printed no execution handle: "
-                f"{submit_output.strip()[-500:] or 'no output'}",
-                scheduler="jarvis",
-            )
-        native, jarvis_data = jarvis_submit.handle_data(
-            found, job_dir=str(data["job_dir"]), shared=jarvis_submit.shared_dir(submit_output)
-        )
-        if (plan := jarvis_plan.parse(submit_output)) is not None:
-            jarvis_data[jarvis_plan.KEY] = plan
-        return JobHandle(adapter=self.name, native_id=native, data={**data, **jarvis_data})
-
     async def _threads_per_core(self, spec: JobSpec) -> int | None:
         """Return the hardware threads per core of the job's partition, when it asks for
         more than one core per rank; JARVIS's facts from the last describe, else a new one."""
@@ -493,32 +454,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
         assert self._cores is not None
         return sched_info.threads_per_core(*self._cores, spec.attributes.queue_name)
 
-    def _jarvis_document(
-        self,
-        spec: JobSpec,
-        operation_id: str,
-        job_dir: PurePosixPath,
-        name: str,
-        *,
-        threads_per_core: int | None = None,
-    ) -> dict[str, object]:
-        stdout = _remote_path(job_dir, spec.stdout_path)
-        stderr = _remote_path(job_dir, spec.stderr_path)
-        block = jarvis_submit.scheduler_block(
-            spec,
-            job_name=name,
-            stdout=str(stdout) if stdout is not None else None,
-            stderr=str(stderr) if stderr is not None else None,
-            job_dir=str(job_dir),
-            threads_per_core=threads_per_core,
-        )
-        return jarvis_submit.pipeline_document(
-            spec,
-            pipeline=jarvis_submit.pipeline_id(operation_id),
-            scheduler=block,
-            job_dir=str(job_dir),
-        )
-
     def _render_jarvis(
         self,
         spec: JobSpec,
@@ -527,10 +462,16 @@ class SshAdapter(BaseAdapter[SshConfig]):
         name: str,
         mode: jarvis_submit.SiteMode,
         *,
+        scheduler: str,
         threads_per_core: int | None = None,
     ) -> _Rendered:
-        document = self._jarvis_document(
-            spec, operation_id, job_dir, name, threads_per_core=threads_per_core
+        document = jarvis_remote.document(
+            spec,
+            operation_id,
+            str(job_dir),
+            scheduler=scheduler,
+            job_name=name,
+            threads_per_core=threads_per_core,
         )
         rendered = _Rendered()
         rendered.files[jarvis_submit.PIPELINE_FILE] = jarvis_submit.render_pipeline(document)
@@ -631,7 +572,17 @@ class SshAdapter(BaseAdapter[SshConfig]):
         job_dir = str(handle.data["job_dir"])
         mode = str(handle.data.get("mode", "scheduler"))
         if mode == "jarvis":
-            return await self._jarvis_status(handle)
+            status, sections = await jarvis_remote.status(
+                self._ssh, handle, site=self.config.ssh_profile
+            )
+            inputs = store.input_entries(sections.get("inputs", []))
+            if status.state.final and inputs and "dropped" not in sections:
+                with contextlib.suppress(Refusal):
+                    await self._ssh(
+                        scripts.drop_inputs_script(job_dir, str(handle.data["root"]), inputs),
+                        "dropping spent inputs",
+                    )
+            return status
         executor: BatchSchedulerExecutor | None = None
         status_command: str | None = None
         accounting_command: str | None = None
@@ -696,59 +647,6 @@ class SshAdapter(BaseAdapter[SshConfig]):
                     scripts.record_script(job_dir, line, final=False),
                     timeout_s=self.config.command_timeout_s,
                     what="recording the job's state",
-                )
-        return status
-
-    async def _jarvis_status(self, handle: JobHandle) -> JobStatus:
-        """Read the job from JARVIS's execution record; relay keeps no state of its own."""
-        job_dir = str(handle.data["job_dir"])
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-        execution = str(handle.data.get("execution_dir") or "") or jarvis_submit.execution_dir(
-            job_dir, execution_id, pipeline=pipeline
-        )
-        states = None if handle.data.get("install") else f"{execution}/{jarvis_plan.STATES_FILE}"
-        sections = parse_sections(
-            await self._ssh(
-                scripts.jarvis_status_script(job_dir, execution_id, pipeline, states=states),
-                "status",
-            )
-        )
-        if "nodir" in sections:
-            return JobStatus(
-                state=JobState.FAILED,
-                native_state="lost",
-                message=f"the job directory {job_dir} is gone from {self.config.ssh_profile}",
-            )
-        if "nojarvis" in sections:
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                f"the job directory {job_dir} on {self.config.ssh_profile} does not say "
-                "which JARVIS submitted the job",
-            )
-        answer = "\n".join(sections.get("get", []))
-        record = jarvis_submit.parse_document(answer, jarvis_submit.RECORD_SCHEMA)
-        if _one(sections, "getrc") != "0" or record is None:
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                f"jarvis execution get did not answer on {self.config.ssh_profile}: "
-                f"{answer.strip()[-500:] or 'no output'}",
-            )
-        status = jarvis_submit.record_status(record, job_id=handle.native_id)
-        status.components = jarvis_plan.component_states("\n".join(sections.get("components", [])))
-        if not status.state.final or handle.data.get("install"):
-            return status
-        snapshot = jarvis_submit.parse_document(
-            "\n".join(sections.get("artifacts", [])), jarvis_submit.ARTIFACTS_SCHEMA
-        )
-        if snapshot is not None:
-            status.outputs = jarvis_submit.artifact_outputs(snapshot, execution=execution)
-        inputs = store.input_entries(sections.get("inputs", []))
-        if inputs and "dropped" not in sections:
-            with contextlib.suppress(Refusal):
-                await self.transport.ssh(
-                    scripts.drop_inputs_script(job_dir, str(handle.data["root"]), inputs),
-                    timeout_s=self.config.command_timeout_s,
-                    what="dropping spent inputs",
                 )
         return status
 
@@ -848,7 +746,7 @@ class SshAdapter(BaseAdapter[SshConfig]):
 
     async def cancel(self, handle: JobHandle) -> JobStatus:
         if handle.data.get("mode") == "jarvis":
-            return await self._jarvis_control(handle, "cancel")
+            return await jarvis_remote.control(self._ssh, handle, "cancel", self.status)
         job_dir = str(handle.data["job_dir"])
         cancel_command: str | None = None
         if handle.data.get("mode", "scheduler") == "scheduler":
@@ -882,95 +780,18 @@ class SshAdapter(BaseAdapter[SshConfig]):
     async def stop(self, handle: JobHandle) -> JobStatus:
         """``jarvis execution stop`` for a JARVIS job; any other job is cancelled."""
         if handle.data.get("mode") == "jarvis":
-            return await self._jarvis_control(handle, "stop")
+            return await jarvis_remote.control(self._ssh, handle, "stop", self.status)
         return await self.cancel(handle)
 
     async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
-        """Move a pending JARVIS job to ``queue_name`` with ``jarvis execution move``.
-
-        JARVIS checks that the job still waits, that the queue exists and that
-        the job fits there, and refuses with typed issues (exit 5) otherwise;
-        relay passes those on (:func:`jarvis_submit.jarvis_refused`).
-        """
+        """Move a pending JARVIS job to ``queue_name`` (:func:`jarvis_remote.move`)."""
         if handle.data.get("mode") != "jarvis":
             raise not_implemented(self.name, "move_queue")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", queue_name):
-            raise Refusal(RefusalReason.INVALID_ARGUMENTS, f"{queue_name!r} is not a queue name")
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-        sections = parse_sections(
-            await self._ssh(
-                scripts.jarvis_execution_script(
-                    str(handle.data["job_dir"]),
-                    "move",
-                    execution_id,
-                    pipeline,
-                    extra=["--queue", queue_name],
-                ),
-                "moving the job",
-            )
-        )
-        rc = _one(sections, "rc")
-        output = "\n".join(sections.get("out", [])).strip()
-        if "nojarvis" in sections:
-            raise Refusal(
-                RefusalReason.UNREACHABLE,
-                f"the job directory on {self.config.ssh_profile} does not say which JARVIS "
-                "submitted the job",
-            )
-        if rc == str(jarvis_submit.EXIT_REFUSED):
-            raise jarvis_submit.jarvis_refused(
-                output, site=self.config.ssh_profile, what=f"moving the job to {queue_name}"
-            )
-        if rc != "0":
-            raise Refusal(
-                RefusalReason.SUBMIT_FAILED,
-                f"jarvis execution move did not move the job to {queue_name}: "
-                f"{output[-500:] or 'no output'}",
-                queue=queue_name,
-            )
-
-    async def _jarvis_control(
-        self, handle: JobHandle, verb: jarvis_submit.ExecutionVerb
-    ) -> JobStatus:
-        current = await self.status(handle)
-        if current.state.final:
-            return current
-        job_dir = str(handle.data["job_dir"])
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-        sections = parse_sections(
-            await self._ssh(
-                scripts.jarvis_execution_script(job_dir, verb, execution_id, pipeline), verb
-            )
-        )
-        if "nodir" in sections or "nojarvis" in sections:
-            return await self.status(handle)
-        output = "\n".join(sections.get("out", []))
-        if _one(sections, "rc") != "0":
-            current = await self.status(handle)
-            if current.state.final:
-                return current
-            raise jarvis_submit.execution_failed(verb, output)
-        return await self.status(handle)
+        await jarvis_remote.move(self._ssh, handle, queue_name, site=self.config.ssh_profile)
 
     async def service_runtimes(self, handle: JobHandle) -> dict[str, Any] | None:
         """``jarvis execution service-runtimes +json`` for a JARVIS job, read on the site."""
-        if handle.data.get("mode") != "jarvis" or not handle.data.get("job_dir"):
-            return None
-        job_dir = str(handle.data["job_dir"])
-        execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
-        sections = parse_sections(
-            await self._ssh(
-                scripts.jarvis_execution_script(
-                    job_dir, "service-runtimes", execution_id, pipeline
-                ),
-                "reading the service runtimes",
-            )
-        )
-        if _one(sections, "rc") != "0":
-            return None
-        return jarvis_submit.parse_document(
-            "\n".join(sections.get("out", [])), jarvis_submit.SERVICE_RUNTIMES_SCHEMA
-        )
+        return await jarvis_remote.service_runtimes(self._ssh, handle)
 
     # install
 
@@ -980,7 +801,8 @@ class SshAdapter(BaseAdapter[SshConfig]):
         """Submit ``ppl install +submit`` from the job directory the refused submit left."""
         sections = parse_sections(
             await self._ssh(
-                scripts.find_script(self.config.remote_dir, operation_id), "finding the job"
+                scripts.find_script(self.config.remote_dir, operation_id, self.config.scheduler),
+                "finding the job",
             )
         )
         root = PurePosixPath(_one(sections, "root") or "")
@@ -990,12 +812,13 @@ class SshAdapter(BaseAdapter[SshConfig]):
                 f"{self.config.ssh_profile} did not report relay's directory",
             )
         job_dir = root / "jobs" / operation_id
-        spec = jarvis_submit.with_archive(spec)
-        document = self._jarvis_document(
+        detected = _one(sections, "scheduler") or "none"
+        document = jarvis_remote.document(
             spec,
             operation_id,
-            job_dir,
-            job_name(operation_id),
+            str(job_dir),
+            job_name=job_name(operation_id),
+            scheduler=detected if detected in _SCHEDULERS else "local",
             threads_per_core=await self._threads_per_core(spec),
         )
         command = jarvis_submit.install_command(
@@ -1009,50 +832,23 @@ class SshAdapter(BaseAdapter[SshConfig]):
             home=self.config.remote_dir,
             graph=self.config.jarvis_graph,
         )
-        script = scripts.jarvis_install_script(str(job_dir), command)
-        result = await self.transport.ssh(script, timeout_s=None, what="submitting the install")
-        found = parse_sections(result.text())
-        if "nodir" in found:
-            raise Refusal(
-                RefusalReason.INPUT_MISSING,
-                f"the job directory {job_dir} is gone from {self.config.ssh_profile}; "
-                "run the job again",
-            )
-        output, site = "\n".join(found.get("out", [])).strip(), self.config.ssh_profile
-        rc, w = _one(found, "rc"), self.config.install_walltime_s
-        jarvis_exits.refuse(
-            rc, output, output, spec=spec, site=site, install_walltime_s=w, what="the install"
-        )
-        handle = jarvis_submit.parse_handle("\n".join(found.get("handle", [])))
-        base = {"root": str(root), "job_name": job_name(operation_id), "install": True}
-        if here := jarvis_exits.without_job(self.name, rc, output, handle, "detached", base):
-            return here
-        if rc != "0" or handle is None:
-            raise Refusal(
-                RefusalReason.SUBMIT_FAILED,
-                f"{self.config.ssh_profile} refused the install job: "
-                f"{output[-500:] or 'no output'}",
-                scheduler="jarvis",
-                exit_code=_int(rc),
-            )
-        native, data = jarvis_submit.handle_data(
-            handle, job_dir=str(job_dir), shared=jarvis_submit.shared_dir(output)
-        )
-        data.update(base)
-        return JobHandle(adapter=self.name, native_id=native, data=data)
-
-    async def install_jarvis(self) -> str:
         result = await self.transport.ssh(
-            jarvis_submit.bootstrap_command(self.config.remote_dir, self.config.jarvis_python),
+            jarvis_remote.install_script(str(job_dir), command),
             timeout_s=None,
-            what="installing jarvis-cd",
-            check_timeout=False,
+            what="submitting the install",
         )
-        return jarvis_submit.bootstrap_result(
-            result.exit_code,
-            result.text() + "\n" + result.error_text(),
+        return jarvis_remote.installed(
+            self.name,
+            result.text(),
+            spec=spec,
             site=self.config.ssh_profile,
+            install_walltime_s=self.config.install_walltime_s,
+            login_mode="detached",
+            data={"root": str(root), "job_dir": str(job_dir), "job_name": job_name(operation_id)},
         )
+
+    async def jarvis_home(self) -> str:
+        return self.config.remote_dir
 
     # exec
 

@@ -19,7 +19,7 @@ def _service() -> tuple[Any, Any]:
     def found(_id: str) -> Any:
         return site
 
-    def titles() -> dict[str, str]:
+    def titles(_site: str = "") -> dict[str, str]:
         return {"repo.solver": "Solver"}
 
     packages = SimpleNamespace(titles=titles)

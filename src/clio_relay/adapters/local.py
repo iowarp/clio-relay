@@ -6,13 +6,13 @@ own status command, so no PSI/J thread owns the job and any relay process can
 observe it. With no scheduler, a job runs under a detached supervisor that
 writes its state to the job directory.
 
-A package job is JARVIS's (:mod:`clio_relay.jarvis_submit`). With Slurm, relay
-writes the pipeline with its ``scheduler:`` block and runs ``jarvis ppl submit``;
+A package job is JARVIS's (:mod:`clio_relay.jarvis_submit`) on every scheduler:
+relay writes the pipeline with its ``scheduler:`` block (the local scheduler, or
+JARVIS's ``local`` with none) and runs ``jarvis ppl submit``;
 status and outputs come from ``jarvis execution get`` and ``artifacts``, and
 cancel and stop are ``jarvis execution cancel`` and ``stop``. A submit that
 finds software to install becomes the install ask, and ``install`` submits the
-install job. With no scheduler, the supervisor runs JARVIS's direct run on this
-machine. The CLIO site home, where relay installs jarvis-cd and keeps the
+install job. The CLIO site home, where relay installs jarvis-cd and keeps the
 install answers, is the work directory.
 """
 
@@ -37,7 +37,7 @@ from typing import Any, ClassVar, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from clio_relay import jarvis_exits, jarvis_plan, jarvis_submit, site_outputs
+from clio_relay import jarvis_exits, jarvis_plan, jarvis_remote, jarvis_submit, site_outputs
 from clio_relay.adapters._files import LocalFileAccess
 from clio_relay.adapters._process import POSIX, run_bounded
 from clio_relay.adapters.base import AdapterContext, BaseAdapter, SiteInfo, Verb
@@ -126,14 +126,6 @@ def detect_scheduler() -> SchedulerName | None:
     return None
 
 
-def _in_job(job_dir: Path, path: str | None) -> str | None:
-    """Return ``path`` as an absolute path, relative ones under the job directory."""
-    if path is None:
-        return None
-    found = Path(path)
-    return (found if found.is_absolute() else job_dir / found).as_posix()
-
-
 class LocalConfig(BaseModel):
     """Settings for the ``local`` adapter."""
 
@@ -153,7 +145,6 @@ class LocalConfig(BaseModel):
     submit_timeout_s: float = Field(default=60, gt=0)
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
-    jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
     install_walltime_s: int | None = Field(
         default=None,
         ge=60,
@@ -169,11 +160,6 @@ class LocalConfig(BaseModel):
     @classmethod
     def _jarvis_graph(cls, value: str) -> str:
         return jarvis_submit.published_graph(value)
-
-    @field_validator("jarvis_python")
-    @classmethod
-    def _jarvis_python(cls, value: str) -> str:
-        return jarvis_submit.explicit_python(value)
 
 
 _PSIJ_STATES = {
@@ -324,26 +310,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             hints = await asyncio.to_thread(batch_hints)
             if hints:
                 raise direct_refused(hints, site=self.context.site_id)
-        jarvis_mode = False
-        if spec.steps():
-            if scheduler is None:
-                spec = jarvis_submit.direct_job(
-                    site_outputs.with_outputs(spec, self.config.outputs_dir),
-                    jarvis=self.config.jarvis,
-                    job_dir=job_dir.as_posix(),
-                    home=self._home(),
-                    site=self.context.site_id,
-                    graph=self.config.jarvis_graph,
-                )
-            elif scheduler == "slurm":
-                spec = jarvis_submit.with_archive(spec)
-                jarvis_mode = True
-            else:
-                raise jarvis_submit.scheduler_refusal(scheduler, site=self.context.site_id)
-        elif spec.executable is None:
+        jarvis_mode = bool(spec.steps())
+        if not jarvis_mode and spec.executable is None:
             raise Refusal(RefusalReason.INVALID_SPEC, "give an executable or a package")
-        if check_only and not jarvis_mode:
-            raise jarvis_exits.install_only_refused(scheduler, site=self.context.site_id)
         if plan and not jarvis_mode:
             return None
         if jarvis_mode and not check_only and not plan:
@@ -384,19 +353,12 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
     def _jarvis_document(
         self, spec: JobSpec, job_dir: Path, operation_id: str
     ) -> dict[str, object]:
-        directory = job_dir.as_posix()
-        block = jarvis_submit.scheduler_block(
+        return jarvis_remote.document(
             spec,
+            operation_id,
+            job_dir.as_posix(),
+            scheduler=self.scheduler() or "local",
             job_name=self.job_name(operation_id),
-            stdout=_in_job(job_dir, spec.stdout_path),
-            stderr=_in_job(job_dir, spec.stderr_path),
-            job_dir=directory,
-        )
-        return jarvis_submit.pipeline_document(
-            spec,
-            pipeline=jarvis_submit.pipeline_id(operation_id),
-            scheduler=block,
-            job_dir=directory,
         )
 
     async def _site_script(
@@ -457,7 +419,6 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
                 RefusalReason.INPUT_MISSING,
                 f"the job directory {job_dir} has no pipeline; run the job again",
             )
-        spec = jarvis_submit.with_archive(spec)
         document = self._jarvis_document(spec, job_dir, operation_id)
         argv = shlex.split(
             jarvis_submit.install_command(
@@ -491,17 +452,8 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         handle.data["install"] = True
         return handle
 
-    async def install_jarvis(self) -> str:
-        await asyncio.to_thread(self.work_dir.mkdir, parents=True, exist_ok=True)
-        result = await run_bounded(
-            shlex.split(jarvis_submit.bootstrap_command(self._home(), self.config.jarvis_python)),
-            timeout_s=None,
-            max_output_bytes=1 << 20,
-            cwd=self.work_dir,
-        )
-        return jarvis_submit.bootstrap_result(
-            result.exit_code, result.stdout + "\n" + result.stderr, site=self.context.site_id
-        )
+    async def jarvis_home(self) -> str:
+        return self._home()
 
     def _jarvis_handle(self, found: dict[str, Any], job_dir: Path, operation_id: str) -> JobHandle:
         try:
@@ -511,6 +463,7 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         native, data = jarvis_submit.handle_data(
             found,
             job_dir=job_dir.as_posix(),
+            root=jarvis_submit.site_root(self._home()),
             shared=Path(said).as_posix() if said and Path(said).is_absolute() else None,
         )
         data["job_name"] = self.job_name(operation_id)
@@ -714,7 +667,11 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
             )
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         argv = jarvis_submit.execution_argv(
-            verb, execution_id, job_dir=job_dir.as_posix(), jarvis=jarvis, pipeline=pipeline
+            verb,
+            execution_id,
+            root=jarvis_submit.site_root(self._home()),
+            jarvis=jarvis,
+            pipeline=pipeline,
         )
         # stop waits for nothing here: JARVIS signals the job and returns its record.
         return await run_bounded(argv, timeout_s=120, max_output_bytes=1 << 20, cwd=job_dir)
@@ -738,7 +695,9 @@ class LocalAdapter(BaseAdapter[LocalConfig]):
         status = jarvis_submit.record_status(record, job_id=handle.native_id)
         execution_id, pipeline = jarvis_submit.handle_pipeline(handle.data)
         execution = str(handle.data.get("execution_dir") or "") or (
-            jarvis_submit.execution_dir(job_dir.as_posix(), execution_id, pipeline=pipeline)
+            jarvis_submit.execution_dir(
+                jarvis_submit.site_root(self._home()), execution_id, pipeline=pipeline
+            )
         )
         if not handle.data.get("install"):
             states = Path(execution) / jarvis_plan.STATES_FILE

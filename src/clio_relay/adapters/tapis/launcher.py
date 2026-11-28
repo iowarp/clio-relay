@@ -13,7 +13,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.stable_gzip import stable_gzip
 
-LAUNCHER_FORMAT = "1"
+LAUNCHER_FORMAT = "2"
 SCRIPT_NAME = "tapisjob_app.sh"
 
 
@@ -63,39 +63,18 @@ def decode(arg: str) -> list[str]:
     return [part.decode("utf-8") for part in raw.split(b"\x00")[:-1]]
 
 
-def record(spec: JobSpec, *, content_dir: str, package_root: str, guarded: bool) -> list[str]:
-    """Build the launcher's fields for ``spec``. ``guarded`` refuses free-form jobs."""
-    mode = "exec"
-    if spec.package is not None:
-        mode = "package-service" if spec.package.service else "package"
+def record(spec: JobSpec, *, content_dir: str) -> list[str]:
+    """Build the launcher's fields for ``spec``, a job with an executable."""
     head = [
         LAUNCHER_FORMAT,
-        mode,
         spec.directory or "",
         spec.stdin_path or "",
         spec.stdout_path or "",
         spec.stderr_path or "",
         content_dir,
-        package_root,
         str(len(spec.inputs)),
     ]
     for item in spec.inputs:
         head += [item.name, item.sha256]
-    if spec.package is not None:
-        package = spec.package
-        params = [f"{key}={value}" for key, value in package.parameters.items()]
-        return head + [package.name, *package.pinned(), *params]
-    if guarded:
-        raise guarded_refusal()
     assert spec.executable is not None
     return head + [spec.executable, *spec.arguments]
-
-
-def guarded_refusal() -> Refusal:
-    return Refusal(
-        RefusalReason.POLICY_REFUSED,
-        "this Tapis site is guarded: it runs reviewed packages only, not a free-form "
-        "executable. Write the work as a package and have it reviewed, then run the package",
-        policy="guarded",
-        next_step="package_review",
-    )

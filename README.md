@@ -30,6 +30,8 @@ questions (a one-time code, a spend approval) through the task. A client
 without tasks gets an operation id instead, which `describe(job=...)` follows.
 `install` installs a package's software on a site ahead of any run, with the
 same questions as a run's install, and launches nothing.
+On a site whose JARVIS root relay has not set up yet, it sets that up
+(jarvis-cd and clio-jarvis, see [operations](docs/operations.md#the-sites-jarvis-root-and-its-packages)).
 See [MCP tasks](docs/mcp-tasks.md). `files` behaves the same on every site; see
 [files](docs/files.md).
 

@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel, ValidationError
 
-from clio_relay import jarvis_submit, programs
+from clio_relay import jarvis_site, jarvis_submit, programs
 from clio_relay.adapters.base import BaseAdapter, Reach, SignInNeed, SiteInfo, Verb
 from clio_relay.adapters.ssh import hosts as ssh_hosts
 from clio_relay.adapters.worker.batch_ssh import batch_ssh
@@ -704,11 +704,8 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         keep = site_keeps(posixpath.join(remote_dir, "adapter", "*"), graph)
         if self.config.work_dir is not None:
             work_dir = self.config.work_dir
-            targets += [
-                posixpath.join(work_dir, jarvis_submit.BOOTSTRAP_DIR),
-                posixpath.join(work_dir, "jobs"),
-                posixpath.join(work_dir, "psij"),
-            ]
+            owned = (jarvis_submit.BOOTSTRAP_DIR, *jarvis_site.SETUP_DIRS, "jobs", "psij")
+            targets += [posixpath.join(work_dir, name) for name in owned]
             keep += site_keeps(work_dir, graph)
         return targets, list(dict.fromkeys(keep))
 
@@ -736,8 +733,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
             "jarvis": self.config.jarvis,
             "outputs_dir": self.config.outputs_dir,
         }
-        if self.config.jarvis_python:
-            config["jarvis_python"] = self.config.jarvis_python
         if self.config.jarvis_graph:
             config["jarvis_graph"] = self.config.jarvis_graph
         if self.config.install_walltime_s is not None:
@@ -840,8 +835,6 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         self, route: str, spec: JobSpec, operation_id: str, *, stage: bool = True, **extra: Any
     ) -> Any:
         if stage:
-            if spec.steps():
-                spec = jarvis_submit.with_archive(spec)  # stage the reviewed archives too
             await self._stage(spec)
         body = {"spec": spec.model_dump(mode="json"), "operation_id": operation_id, **extra}
         return await self.call(route, body, timeout_s=self.config.submit_timeout_s + 120)
@@ -897,8 +890,11 @@ class WorkerAdapter(BaseAdapter[WorkerConfig]):
         return self._wrap(JobHandle.model_validate(reported))
 
     async def install_jarvis(self) -> str:
-        # Building a virtual environment and installing jarvis-cd takes minutes.
+        # Installing jarvis-cd and cloning clio-jarvis takes minutes.
         return str(await self.call("/install-jarvis", {}, timeout_s=3600))
+
+    async def site_packages(self, add: str = "", *, force: bool = False) -> str:
+        return str(await self.call("/packages", {"add": add, "force": force}, timeout_s=900))
 
     async def find(self, operation_id: str) -> JobHandle | None:
         if self.load_link() is None:

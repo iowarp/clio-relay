@@ -1,70 +1,44 @@
-"""JARVIS on a site: package archives, the package runner and clio-jarvis (RL24, RL42).
+"""JARVIS on a site: its one JARVIS root, how relay sets it up, and its packages (RL24, RL42).
 
-A package archive is a gzipped tar of one JARVIS repository trimmed to one
-package. Its SHA-256 is the hash relay pins a review to (RL24). The layout is
-``<repo>/<repo>/<package>/...``, so ``jarvis repo add <unpacked>/<repo>``
-registers the repository under its own name and ``<repo>.<package>`` resolves.
-Shared modules of the repository (``<repo>/<repo>/_*``), the repository's
-top-level files, and a ``schemas/`` directory next to the repository ride
-along, because packages import or read them (clio-jarvis's contract reads
-``<repo dir>/../schemas``), and so do the Spack repositories a package's
-``contract.yaml`` installs from (:func:`contract_repos`). The repository's Python
-requirements ride along as ``<repo>/.clio-relay-requirements.txt``
-(:func:`repository_requirements`).
+Every site has one JARVIS root of relay's, ``<CLIO site home>/jarvis``
+(:data:`SITE_ROOT_DIR`), and every JARVIS call relay makes there exports it as
+``JARVIS_ROOT``. The person's own ``~/.ppi-jarvis`` is never touched.
+:data:`SETUP_SCRIPT` sets it up in three steps: jarvis-cd at :data:`JARVIS_PIN`
+as a uv tool, the root (without jarvis-cd's builtin), and clio-jarvis at
+:data:`CLIO_JARVIS_REF`. A person's own repository joins it with ``jarvis repo
+add <path>`` (:data:`PACKAGES_SCRIPT`'s ``add``).
 
-JARVIS runs the package: :mod:`clio_relay.jarvis_submit` renders the
-pipeline and the site script that checks the archive's SHA-256 against the
-reviewed one, unpacks it into a JARVIS root private to the job and hands the
-pipeline to ``jarvis ppl submit`` or JARVIS's direct run.
-
-RL42 adds clio-jarvis, at a tagged release, to a site's own JARVIS the first
-time a package is needed there. :func:`clio_jarvis_script` is the script and
-:func:`add_clio_jarvis` runs it through an adapter's ``exec``.
+A package's review identity is its digest (:data:`DIGEST_FUNCTIONS`), computed
+on the site from the package as it sits in the root, however it got there.
+:data:`PACKAGES_SCRIPT` lists every package of the root with its digest, files,
+``pkg.py`` and ``contract.yaml``; the site script recomputes the digest of each
+step before JARVIS runs it and refuses one that changed since its review.
 """
 
 from __future__ import annotations
 
-import hashlib
-import io
-import json
+import base64
 import re
-import subprocess
-import tarfile
-import tomllib
-from collections.abc import Iterator
-from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any
 
-import yaml
-
-from clio_relay import programs
-from clio_relay.jarvis_submit import ARCHIVE_DIR as ARCHIVE_DIR
-from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
-from clio_relay.stable_gzip import stable_gzip
 
-SOURCE_FILE = ".clio-relay-source.json"
-"""The archive member that says where the package came from."""
+JARVIS_PIN = "539027f430a8ed2a5ac22bdc9c2d12d03abb8f30"
+"""The jarvis-cd commit relay installs on a site (branch ``relay_ready``)."""
+JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
+CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
+CLIO_JARVIS_REF = "a3b73614f0901b4df516808b1795031d83046b06"
+"""The clio-jarvis ref relay registers in a site's root."""
+CLIO_JARVIS = "clio_jarvis"
+SITE_ROOT_DIR = "jarvis"
+"""The site's JARVIS root, under the CLIO site home."""
+SETUP_DIRS = (SITE_ROOT_DIR, "bin", "uv-tools", "uv-python")
+"""What setup writes under the CLIO site home: the root, uv and jarvis, and uv's Python."""
+PIN_FILE = "relay.pin"
+"""In the root: what relay set it up with, ``<jarvis-cd pin or program> <clio-jarvis ref>``."""
+GRAPH_REPO = "clio_relay_site"
+"""Relay's own network-collection repository (:mod:`clio_relay.jarvis_graph`), never listed."""
 
-SHARED_SIBLINGS = ("schemas",)
-"""Directories next to the repository directory that its packages read."""
-
-REQUIREMENTS_FILE = ".clio-relay-requirements.txt"
-"""The archive member ``<repo>/<this>``: the repository's Python requirements, one a line.
-
-They are the ``[project] dependencies`` of the repository's ``pyproject.toml``, or of
-the checkout's beside it, without jarvis-cd, which relay pins itself. The site
-script installs them into relay's jarvis-cd environment before JARVIS loads the
-package.
-"""
-
-_PINNED_BY_RELAY = frozenset({"jarvis-cd"})
-_REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
-
-_SKIP_DIRS = frozenset({"__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
-_SKIP_SUFFIXES = (".pyc", ".pyo")
-_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 _NAME_PART = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -81,15 +55,12 @@ def split_name(name: str) -> tuple[str, str]:
 
 
 JARVIS_BUILTIN = "builtin"
-"""jarvis-cd's own repository, which relay never installs, registers, stages, lists or runs.
+"""jarvis-cd's own repository, which relay never registers, lists or runs.
 
 They hardcode a case or a site's setup and are meant for a person to drive, so
-they are a reference for writing a generic package, not packages to run.
-jarvis-cd's wheel still ships them, but relay runs every JARVIS call with
-``JARVIS_NO_BUILTIN=1`` and every root it sets up records ``no_builtin: true``
-(:data:`clio_relay.jarvis_graph.NO_BUILTIN_ENV`), so JARVIS never registers or
-resolves them. Relay collects the site's networks with its own package
-(:mod:`clio_relay.jarvis_graph`).
+they are a reference for writing a generic package, not packages to run. Setup
+runs ``jarvis repo rm builtin`` in the root, and relay runs every JARVIS call
+with ``JARVIS_NO_BUILTIN=1`` too (:data:`clio_relay.jarvis_graph.NO_BUILTIN_ENV`).
 """
 
 
@@ -98,323 +69,267 @@ def refuse_builtin(name: str) -> None:
     if name.partition(".")[0] == JARVIS_BUILTIN:
         raise Refusal(
             RefusalReason.POLICY_REFUSED,
-            f"{name} is one of jarvis-cd's builtin packages, which relay does not stage or "
-            "run. Read it only as a reference, and use a package relay's sources hold for "
-            "the application or write a generic one with the jarvis-package skill",
+            f"{name} is one of jarvis-cd's builtin packages, which relay does not run. Read "
+            "it only as a reference, and use a clio-jarvis package for the application or "
+            "write a generic one with the jarvis-package skill",
             package=name,
             next_step="write_package",
         )
 
 
-# Building an archive
+def site_pin(jarvis: str = "") -> str:
+    """What the root's :data:`PIN_FILE` holds once set up, for the site's ``jarvis`` setting."""
+    return f"{jarvis or JARVIS_PIN} {CLIO_JARVIS_REF}"
 
 
-def _files(directory: Path) -> Iterator[Path]:
-    for path in sorted(directory.rglob("*")):
-        relative = path.relative_to(directory)
-        if any(part in _SKIP_DIRS for part in relative.parts):
-            continue
-        if path.is_symlink():
-            raise Refusal(
-                RefusalReason.INVALID_SPEC,
-                f"{path} is a symbolic link; a package archive holds regular files only",
-            )
-        if path.is_file() and not path.name.endswith(_SKIP_SUFFIXES):
-            yield path
+HOME_LINES = r"""case $home in
+  "~") home=$HOME ;;
+  "~/"*) home="$HOME/${home#??}" ;;
+  /*) ;;
+  *) home="$HOME/$home" ;;
+esac
+root="$home/jarvis"
+"""
+"""Shell lines that make ``$home`` absolute (relative is from the home directory) and set
+``$root``, the site's JARVIS root."""
 
+DIGEST_FUNCTIONS = r"""relay_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64
+  else shasum -a 256 | cut -c1-64; fi
+}
+relay_files() (
+  cd "$1" || exit 66
+  pkg=$2
+  set -- "$pkg"
+  for f in _*; do if [ -e "$f" ] || [ -L "$f" ]; then set -- "$@" "$f"; fi; done
+  links=$(find "$@" \( -name __pycache__ -o -name .git \) -prune -o -type l -print)
+  [ -z "$links" ] || { echo "$pkg has symbolic links: $links" >&2; exit 65; }
+  find "$@" \( -name __pycache__ -o -name .git \) -prune -o -type f \
+    ! -name '*.pyc' ! -name '*.pyo' -print | while IFS= read -r f; do
+    case $(ls -ld -- "$f" | cut -c4) in x|s) m=x ;; *) m=- ;; esac
+    printf '%s %s %s %s\n' "$(relay_hash < "$f")" "$m" "$(wc -c < "$f" | tr -d ' ')" "$f"
+  done
+)
+relay_digest() {
+  printf '%s\n' "$1" | sed 's/^\([^ ]* [^ ]*\) [0-9]* /\1 /' | LC_ALL=C sort | relay_hash
+}
+repo_paths() {
+  sed -n 's/^ *- *//p' "$root/repos.yaml" 2>/dev/null | sed "s/^['\"]//; s/['\"]\$//"
+}
+root_shared() {
+  sed -n 's/^shared_dir:[[:space:]]*//p' "$root/jarvis_config.yaml" 2>/dev/null \
+    | sed "s/^['\"]//; s/['\"]\$//" | head -n 1
+}
+"""
+"""The review digest of a package, one way for every package on every site.
 
-def package_files(repo_dir: Path, name: str) -> list[tuple[str, Path]]:
-    """Return ``(archive path, file)`` for what the archive of ``name`` holds.
+``relay_files R PKG`` prints ``<sha256> <x|-> <size> <path>`` for every regular
+file under ``R/PKG/``, every file at R's top level whose name starts with ``_``
+and every file under such a top-level directory, skipping ``__pycache__``,
+``.git``, ``*.pyc`` and ``*.pyo``. R is ``<repo dir>/<repo name>``, the path is
+relative to it, and ``x`` is the owner's execute bit. A symbolic link refuses
+(exit 65). ``relay_digest`` takes that listing and returns the SHA-256 of its
+``<sha256> <x|-> <path>`` lines, sorted bytewise, each ending in a newline:
+clio-jarvis's ``package_sha256`` computes the same value. ``repo_paths`` prints
+the repositories the root's ``repos.yaml`` registers, and ``root_shared`` the
+root's JARVIS shared directory.
+"""
 
-    ``repo_dir`` is the JARVIS repository: the directory ``jarvis repo add``
-    takes, holding a Python package of the same name.
-    """
-    repo, package = split_name(name)
-    if repo_dir.name != repo:
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            f"{name} lives in a repository named {repo!r}, and {repo_dir} is not one",
-        )
-    inner = repo_dir / repo
-    if not (inner / package / "pkg.py").is_file():
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            f"{inner / package / 'pkg.py'} does not exist, so {name} is not in {repo_dir}",
-        )
-    chosen: list[Path] = [path for path in sorted(repo_dir.iterdir()) if path.is_file()]
-    chosen += [path for path in sorted(inner.iterdir()) if path.is_file()]
-    for path in sorted(inner.iterdir()):
-        if path.is_dir() and (path.name == package or path.name.startswith("_")):
-            chosen += list(_files(path))
-    entries = [
-        (str(PurePosixPath(repo, *path.relative_to(repo_dir).parts)), path)
-        for path in chosen
-        if path.name not in _SKIP_DIRS and not path.name.endswith(_SKIP_SUFFIXES)
-    ]
-    for sibling in (*SHARED_SIBLINGS, *contract_repos(repo_dir, inner / package)):
-        shared = repo_dir.parent / sibling
-        if shared.is_dir() and not shared.is_symlink():
-            entries += [
-                (str(PurePosixPath(sibling, *path.relative_to(shared).parts)), path)
-                for path in _files(shared)
-            ]
-    return sorted(set(entries))
-
-
-def contract_repos(repo_dir: Path, package_dir: Path) -> list[str]:
-    """Return the Spack repositories the package's ``contract.yaml`` installs from.
-
-    ``install.repos`` names directories of the checkout, beside ``repo_dir`` as
-    ``schemas/`` is, so they ride along in the archive. One that is not there is
-    refused here, on the relay host, rather than on the site.
-    """
-    contract = package_dir / "contract.yaml"
-    if not contract.is_file():
-        return []
-    try:
-        loaded: object = yaml.safe_load(contract.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
-        return []
-    install = cast(dict[str, object], loaded).get("install") if isinstance(loaded, dict) else None
-    listed = cast(dict[str, object], install).get("repos") if isinstance(install, dict) else None
-    repos: list[str] = []
-    for item in cast(list[object], listed) if isinstance(listed, list) else []:
-        relative = PurePosixPath(str(item))
-        where = repo_dir.parent / str(item)
-        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-            raise Refusal(
-                RefusalReason.INVALID_SPEC,
-                f"{contract} installs from {item!r}, which is not a directory of the checkout",
-            )
-        if not (where / "repo.yaml").is_file():
-            raise Refusal(
-                RefusalReason.INVALID_SPEC,
-                f"{contract} installs from the Spack repository {item!r}, and {where} is not "
-                "one: copy it beside the repository, as in the package's checkout",
-                path=str(where),
-            )
-        repos.append(relative.as_posix())
-    return repos
-
-
-def repository_requirements(repo_dir: Path) -> list[str]:
-    """Return the Python requirements of the JARVIS repository at ``repo_dir``.
-
-    They come from ``repo_dir/pyproject.toml``, else from the checkout's
-    ``repo_dir/../pyproject.toml``, without jarvis-cd (:data:`REQUIREMENTS_FILE`).
-    """
-    for pyproject in (repo_dir / "pyproject.toml", repo_dir.parent / "pyproject.toml"):
-        if not pyproject.is_file():
-            continue
-        try:
-            loaded = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-            raise Refusal(
-                RefusalReason.INVALID_SPEC, f"{pyproject} is not a readable pyproject.toml: {exc}"
-            ) from exc
-        project: object = loaded.get("project")
-        listed: object = (
-            cast(dict[str, object], project).get("dependencies")
-            if isinstance(project, dict)
-            else None
-        )
-        requirements: list[str] = []
-        for item in cast(list[object], listed) if isinstance(listed, list) else []:
-            text = str(item).strip()
-            match = _REQUIREMENT_NAME.match(text)
-            if not match or "\n" in text:
-                raise Refusal(
-                    RefusalReason.INVALID_SPEC,
-                    f"{pyproject} lists {text!r}, which is not a Python requirement",
-                )
-            if re.sub(r"[-_.]+", "-", match.group(1)).lower() not in _PINNED_BY_RELAY:
-                requirements.append(text)
-        return requirements
-    return []
-
-
-def _member(name: str, size: int, mode: int) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name)
-    info.size = size
-    info.mode = mode
-    info.mtime = 0
-    info.uid = info.gid = 0
-    info.uname = info.gname = ""
-    return info
-
-
-def _portable(data: bytes) -> tuple[bytes, int]:
-    """Return a file's archive bytes and mode, the same from any checkout of it.
-
-    A text file (UTF-8, no NUL byte) has its CRLF line ends made LF, as git keeps
-    them, so a Windows checkout with ``core.autocrlf`` packs what a POSIX one packs.
-    The mode is 0755 for a file that starts with ``#!`` and 0644 otherwise: a host's
-    permission bits are not part of the package (Windows has none to give).
-    """
-    if b"\0" not in data:
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError:
-            pass
-        else:
-            data = data.replace(b"\r\n", b"\n")
-    return data, 0o755 if data.startswith(b"#!") else 0o644
-
-
-def archive_package(repo_dir: Path, name: str, *, source: dict[str, Any] | None = None) -> bytes:
-    """Return the deterministic archive of package ``name`` from ``repo_dir``.
-
-    The same files give the same bytes, so the same SHA-256, on any machine, from
-    any checkout of them (:func:`_portable`) and under any Python, whatever zlib it
-    links (:func:`~clio_relay.stable_gzip.stable_gzip`).
-    """
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        if source is not None:
-            data = (json.dumps(source, sort_keys=True, indent=2) + "\n").encode("utf-8")
-            tar.addfile(_member(SOURCE_FILE, len(data), 0o644), io.BytesIO(data))
-        members = [
-            (arcname, *_portable(path.read_bytes()))
-            for arcname, path in package_files(repo_dir, name)
-        ]
-        requirements = repository_requirements(repo_dir)
-        if requirements:
-            listed = "".join(f"{line}\n" for line in requirements).encode("utf-8")
-            members.append((f"{split_name(name)[0]}/{REQUIREMENTS_FILE}", listed, 0o644))
-        for arcname, data, mode in sorted(members):
-            tar.addfile(_member(arcname, len(data), mode), io.BytesIO(data))
-    return stable_gzip(raw.getvalue())
-
-
-def _git(checkout: Path, *args: str) -> str | None:
-    git = programs.find("git")
-    if git is None:
-        return None
-    try:
-        done = subprocess.run(
-            [git, "-C", str(checkout), *args], capture_output=True, text=True, check=False
-        )
-    except OSError:
-        return None
-    return done.stdout.strip() if done.returncode == 0 else None
-
-
-def git_source(repo_dir: Path) -> dict[str, Any] | None:
-    """Describe where ``repo_dir`` came from: remote, tag, commit and path, if it is in git."""
-    top = _git(repo_dir, "rev-parse", "--show-toplevel")
-    commit = _git(repo_dir, "rev-parse", "HEAD")
-    if top is None or commit is None:
-        return None
-    source: dict[str, Any] = {
-        "repository": _git(repo_dir, "config", "--get", "remote.origin.url") or top,
-        "commit": commit,
-        "path": repo_dir.resolve().relative_to(Path(top).resolve()).as_posix() or ".",
+SETUP_SCRIPT = (
+    r"""set -eu
+home=$1 pin=$2 source=$3 url=$4 ref=$5 jarvis=${6:-} outputs=${7:-}
+want="${jarvis:-$pin} $ref"
+"""
+    + HOME_LINES
+    + DIGEST_FUNCTIONS
+    + r"""case $jarvis in "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
+# JARVIS's shared directory, where every pipeline writes: the site's outputs directory.
+case $outputs in
+  "") outputs="$root/shared" ;;
+  "~/"*) outputs="$HOME/${outputs#??}" ;;
+  /*) ;;
+  *) outputs="$HOME/$outputs" ;;
+esac
+mkdir -p "$outputs"
+outputs=$(cd "$outputs" && pwd -P)
+dir="$home/jarvis-cd"
+mkdir -p "$home/bin" "$dir"
+# One setup at a time per site home, across relay instances and operations: the lock
+# is held until this script exits. Whoever waited reuses the setup it waited for.
+lock="$dir/.relay.lock"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>>"$lock"
+  flock 9
+else
+  waited=0
+  until mkdir "$lock.d" 2>/dev/null; do
+    waited=$((waited + 2))
+    [ "$waited" -lt 3600 ] || {
+      echo "another setup holds $lock.d; remove it if none is running" >&2
+      exit 1
     }
-    tag = _git(repo_dir, "describe", "--tags", "--exact-match", "HEAD")
-    if tag:
-        source["tag"] = tag
-    if _git(repo_dir, "status", "--porcelain", "--", ".") not in ("", None):
-        source["modified"] = True
-    return source
+    sleep 2
+  done
+  trap 'rmdir "$lock.d" 2>/dev/null || true' EXIT
+fi
+program=${jarvis:-$home/bin/jarvis}
+log="$dir/setup.log"
+said() {
+  printf '{"jarvis":"%s","root":"%s","pin":"%s","log":"%s","from":"%s"}\n' \
+    "$program" "$root" "$want" "$log" "$1"
+}
+if [ "$(cat "$root/relay.pin" 2>/dev/null)" = "$want" ] && [ -x "$program" ] \
+  && [ "$(root_shared)" = "$outputs" ]; then
+  said reused
+  exit 0
+fi
+: > "$log"
+fail() { tail -n 40 "$log" >&2; echo "clio-relay setup: $1" >&2; exit 1; }
+step() { echo "+ $*" >>"$log"; "$@" >>"$log" 2>&1 </dev/null || fail "$* failed"; }
+rm -f "$root/relay.pin"
+# 1. jarvis-cd at the pin, as a uv tool with uv's own Python.
+if [ -z "$jarvis" ]; then
+  uv=$(command -v uv 2>/dev/null) || uv="$home/bin/uv"
+  if [ ! -x "$uv" ]; then
+    echo "+ install uv into $home/bin" >>"$log"
+    curl -LsSf https://astral.sh/uv/install.sh 2>>"$log" \
+      | env UV_INSTALL_DIR="$home/bin" UV_NO_MODIFY_PATH=1 sh >>"$log" 2>&1 \
+      || fail "installing uv failed"
+    uv="$home/bin/uv"
+  fi
+  step env UV_TOOL_DIR="$home/uv-tools" UV_TOOL_BIN_DIR="$home/bin" \
+    UV_PYTHON_INSTALL_DIR="$home/uv-python" "$uv" tool install --force -p 3.12 "$source"
+fi
+[ -x "$program" ] || fail "there is no jarvis program at $program"
+# 2. The site's root, without jarvis-cd's builtin.
+export JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1
+[ -f "$root/jarvis_config.yaml" ] && [ "$(root_shared)" = "$outputs" ] \
+  || step "$program" init "$root/config" "$root/private" "$outputs"
+[ "$(root_shared)" = "$outputs" ] || fail "jarvis init did not set up $root with $outputs"
+step "$program" repo rm builtin
+# 3. clio-jarvis at the ref. JARVIS may print an error and exit 0, so the clone is checked.
+clone="$root/repos/clio_jarvis"
+if [ -d "$clone/.git" ]; then
+  step "$program" repo update clio_jarvis --ref "$ref"
+else
+  step "$program" repo add "$url" --ref "$ref"
+fi
+[ -d "$clone/clio_jarvis" ] || fail "jarvis did not clone clio-jarvis into $clone"
+case $ref in
+  *[!0-9a-f]*) ;;
+  ????????????????????????????????????????)
+    [ "$(git -C "$clone" rev-parse HEAD)" = "$ref" ] || fail "clio-jarvis is not at $ref" ;;
+esac
+repo_paths() { sed -n 's/^ *- *//p' "$root/repos.yaml" 2>/dev/null; }
+repo_paths | grep -q "clio_jarvis" || fail "jarvis did not register clio-jarvis"
+printf '%s\n' "$want" > "$root/relay.pin"
+said installed
+"""
+)
+"""Set up the site's JARVIS root. ``bash -c SETUP_SCRIPT <$0> <home> <pin> <source> <url>
+<ref> [jarvis] [outputs]`` (:func:`clio_relay.jarvis_submit.setup_command`).
+
+1. jarvis-cd: ``uv`` on ``PATH``, else ``<home>/bin/uv``, else uv's installer
+   puts it there; then ``uv tool install`` of jarvis-cd at the pin, with uv's
+   tools, Python and the ``jarvis`` program under the home
+   (``<home>/bin/jarvis``). The site's ``jarvis`` setting names another
+   program instead, and this step is skipped.
+2. The root ``<home>/jarvis``: ``jarvis init`` with the site's outputs
+   directory (``<outputs>``, else ``<home>/jarvis/shared``) as JARVIS's shared
+   directory, when it has none or another one, then ``jarvis repo rm builtin``.
+3. clio-jarvis: ``jarvis repo add <url> --ref <ref>``, or ``jarvis repo update
+   clio_jarvis --ref <ref>`` when the clone exists.
+
+The pin file is written only after all three, and a root already at the pin is
+reused under the lock (``"from": "reused"``). It prints ``{"jarvis", "root",
+"pin", "log", "from"}``, and exits 1 with the log's tail when a step fails.
+"""
+
+PACKAGES_SCRIPT = (
+    r"""set -u
+mode=$1 home=$2 want=$3 jarvis=${4:-} path=${5:-} force=${6:-}
+"""
+    + HOME_LINES
+    + DIGEST_FUNCTIONS
+    + r"""if [ "$(cat "$root/relay.pin" 2>/dev/null)" != "$want" ]; then echo "@@unset"; exit 0; fi
+case $jarvis in "") jarvis="$home/bin/jarvis" ;; "~/"*) jarvis="$HOME/${jarvis#??}" ;; esac
+if [ "$mode" = add ]; then
+  case $path in "~/"*) path="$HOME/${path#??}" ;; /*) ;; *) path="$HOME/$path" ;; esac
+  path=$(cd "$path" 2>/dev/null && pwd -P) || { echo "no directory $5 on the site" >&2; exit 66; }
+  JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1 "$jarvis" repo add "$path" $force </dev/null >&2
+  repo_paths | grep -qxF -- "$path" || { echo "jarvis did not register $path" >&2; exit 65; }
+fi
+repo_paths | while IFS= read -r dir; do
+  name=${dir##*/}
+  case $name in builtin|clio_relay_site) continue ;; esac
+  url= commit=
+  if [ -e "$dir/.git" ]; then
+    url=$(git -C "$dir" config --get remote.origin.url 2>/dev/null) || url=
+    commit=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || commit=
+  fi
+  for p in "$dir/$name"/*/pkg.py; do
+    [ -f "$p" ] || continue
+    pkg=${p%/pkg.py}; pkg=${pkg##*/}
+    files=$(relay_files "$dir/$name" "$pkg") || { echo "@@refused $name.$pkg"; continue; }
+    echo "@@package $name.$pkg $(relay_digest "$files")"
+    echo "@@repo $dir"
+    [ -z "$commit" ] || echo "@@git $commit $url"
+    printf '%s\n' "$files" | sed 's/^/@@file /'
+    echo "@@pkg $(base64 < "$p" | tr -d '\n')"
+    c="$dir/$name/$pkg/contract.yaml"
+    [ ! -f "$c" ] || echo "@@contract $(base64 < "$c" | tr -d '\n')"
+  done
+done
+"""
+)
+"""List the packages of the site's root; with ``add``, register a repository first.
+
+``sh -c PACKAGES_SCRIPT <$0> list|add <home> <pin> [jarvis] [path] [+force]``
+(:func:`clio_relay.jarvis_submit.packages_command`). ``add`` runs ``jarvis repo add
+<path>`` in the root. It prints ``@@unset`` when the root is not set up at the
+pin, else each package as ``@@package <name> <digest>``, ``@@repo``, ``@@git
+<commit> <url>`` for a git clone, an ``@@file`` line per reviewed file, and
+``pkg.py`` and ``contract.yaml`` in base64 (:func:`parse_packages`).
+"""
 
 
-# Reading an archive
-
-
-@dataclass(frozen=True)
-class ArchiveFile:
-    """One file in a package archive."""
-
-    path: str
-    size: int
-    sha256: str
-    executable: bool
-
-
-@dataclass
-class ArchiveInfo:
-    """What a package archive holds, for the review question."""
-
-    sha256: str
-    size: int
-    files: list[ArchiveFile] = field(default_factory=list[ArchiveFile])
-    source: dict[str, Any] | None = None
-    requirements: list[str] = field(default_factory=list[str])
-
-
-def inspect_archive(data: bytes, name: str) -> ArchiveInfo:
-    """Read a package archive and check it holds package ``name`` and nothing odd.
-
-    Refuses with ``invalid_spec`` for links, devices, absolute paths, ``..``,
-    or an archive without ``<repo>/<repo>/<package>/pkg.py``.
-    """
-    repo, package = split_name(name)
-    info = ArchiveInfo(sha256=hashlib.sha256(data).hexdigest(), size=len(data))
-    if len(data) > _MAX_ARCHIVE_BYTES:
-        raise Refusal(RefusalReason.INVALID_SPEC, "the package archive is larger than 64 MiB")
-    try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            for member in tar.getmembers():
-                path = PurePosixPath(member.name)
-                if path.is_absolute() or ".." in path.parts:
-                    raise Refusal(
-                        RefusalReason.INVALID_SPEC,
-                        f"the package archive has the unsafe path {member.name!r}",
-                    )
-                if member.isdir():
-                    continue
-                if not member.isfile():
-                    raise Refusal(
-                        RefusalReason.INVALID_SPEC,
-                        f"{member.name!r} in the package archive is not a regular file",
-                    )
-                extracted = tar.extractfile(member)
-                body = extracted.read() if extracted is not None else b""
-                if member.name == SOURCE_FILE:
-                    try:
-                        loaded = json.loads(body)
-                    except ValueError:
-                        loaded = None
-                    info.source = loaded if isinstance(loaded, dict) else None
-                    continue
-                if member.name == f"{repo}/{REQUIREMENTS_FILE}":
-                    info.requirements = [
-                        line.strip()
-                        for line in body.decode("utf-8", errors="replace").splitlines()
-                        if line.strip()
-                    ]
-                info.files.append(
-                    ArchiveFile(
-                        path=member.name,
-                        size=member.size,
-                        sha256=hashlib.sha256(body).hexdigest(),
-                        executable=bool(member.mode & 0o111),
-                    )
+def parse_packages(text: str) -> list[dict[str, Any]] | None:
+    """Return the packages :data:`PACKAGES_SCRIPT` printed, or ``None`` for ``@@unset``."""
+    found: list[dict[str, Any]] = []
+    item: dict[str, Any] | None = None
+    for line in text.splitlines():
+        tag, _space, rest = line.partition(" ")
+        if tag == "@@unset":
+            return None
+        if tag == "@@package":
+            name, _space, digest = rest.partition(" ")
+            item = None
+            if re.fullmatch(r"[0-9a-f]{64}", digest) and _NAME_PART.fullmatch(
+                name.partition(".")[2] or "-"
+            ):
+                item = {"name": name, "digest": digest, "files": [], "pkg": "", "contract": ""}
+                found.append(item)
+        elif item is None:
+            continue
+        elif tag == "@@repo":
+            item["repo_dir"] = rest
+        elif tag == "@@git":
+            commit, _space, url = rest.partition(" ")
+            item["git"] = {"commit": commit, "url": url}
+        elif tag == "@@file":
+            parts = rest.split(" ", 3)
+            if len(parts) == 4 and parts[2].isdigit():
+                item["files"].append(
+                    {
+                        "path": parts[3],
+                        "sha256": parts[0],
+                        "size": int(parts[2]),
+                        "executable": parts[1] == "x",
+                    }
                 )
-    except (tarfile.TarError, EOFError, OSError) as exc:
-        raise Refusal(
-            RefusalReason.INVALID_SPEC, f"the package archive is not a gzipped tar: {exc}"
-        ) from exc
-    wanted = f"{repo}/{repo}/{package}/pkg.py"
-    if not any(item.path == wanted for item in info.files):
-        raise Refusal(
-            RefusalReason.INVALID_SPEC,
-            f"the package archive has no {wanted}, so it does not hold {name}",
-            package=name,
-        )
-    return info
-
-
-def read_archive(content: ContentStore, name: str, digest: str) -> ArchiveInfo:
-    """Inspect the archive staged in relay's own content store."""
-    if not content.has(digest):
-        raise Refusal(
-            RefusalReason.INPUT_MISSING,
-            f"the archive of {name} ({digest}) is not in relay's content store, so nobody can "
-            "review what would run. Stage it with the packages tool: "
-            'packages(op="stage", package="<repo.package>"), from relay\'s package sources or '
-            "from a directory on the relay host (dir), then run again",
-            digest=digest,
-            package=name,
-        )
-    return inspect_archive(content.get(digest), name)
+        elif tag in ("@@pkg", "@@contract"):
+            try:
+                item[tag[2:]] = base64.b64decode(rest).decode("utf-8", errors="replace")
+            except ValueError:
+                continue
+    return found

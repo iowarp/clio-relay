@@ -51,7 +51,6 @@ class SshConfig(BaseModel):
     )
     jarvis: str = Field(default="", description=jarvis_submit.JARVIS_SETTING_HELP)
     jarvis_graph: str = Field(default="", description=jarvis_submit.GRAPH_SETTING_HELP)
-    jarvis_python: str = Field(default="", description=jarvis_submit.PYTHON_SETTING_HELP)
     install_walltime_s: int | None = Field(
         default=None,
         ge=60,
@@ -107,11 +106,6 @@ class SshConfig(BaseModel):
     @classmethod
     def _jarvis_graph(cls, value: str) -> str:
         return jarvis_submit.published_graph(value)
-
-    @field_validator("jarvis_python")
-    @classmethod
-    def _jarvis_python(cls, value: str) -> str:
-        return jarvis_submit.explicit_python(value)
 
     @model_validator(mode="after")
     def _outputs_outside(self) -> SshConfig:

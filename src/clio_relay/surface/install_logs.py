@@ -29,12 +29,13 @@ def log_path(handle: JobHandle) -> str | None:
         return log if isinstance(log, str) and log else None
     data = site_data(handle)
     execution = data.get("execution_dir")
-    job_dir = data.get("job_dir") or data.get("root")
+    home = data.get("root")
     if not isinstance(execution, str) or not execution:
-        if not isinstance(job_dir, str) or not job_dir:
+        if not isinstance(home, str) or not home:
             return None
         execution_id, pipeline = jarvis_submit.handle_pipeline(data)
-        execution = jarvis_submit.execution_dir(job_dir, execution_id, pipeline=pipeline)
+        root = jarvis_submit.site_root(home)
+        execution = jarvis_submit.execution_dir(root, execution_id, pipeline=pipeline)
     return posixpath.join(execution, "install", "install.log")
 
 

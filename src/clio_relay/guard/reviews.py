@@ -1,9 +1,11 @@
-"""Package reviews, pinned by hash (RL24).
+"""Package reviews, pinned by digest (RL24).
 
-A review is the person's yes to one package archive on one site. It is kept at
-``<state>/guard/reviews/<site>/<key>.json``, where the key is the digest of the
-package's name, version and SHA-256, so a changed archive, a new version or a
-new name is never covered by an old yes. Deleting the file withdraws the review.
+A review is the person's yes to one package on one site, as the site's JARVIS
+root holds it. It is kept at ``<state>/guard/reviews/<site>/<key>.json``, where
+the key is the digest of the package's name, version and review digest
+(``sha256``, :data:`clio_relay.jarvis_site.DIGEST_FUNCTIONS`), so a changed
+package, a new version or a new name is never covered by an old yes. Deleting
+the file withdraws the review.
 
 Relay asks for a review through an approve ask whose binding has
 ``kind: package_review``: one package's name, version and hash, or a job's

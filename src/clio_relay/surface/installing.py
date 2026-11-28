@@ -33,14 +33,13 @@ Either refusal turns the operation back into asks instead of a failure:
   (``login_limited``), JARVIS's own ``ppl install --answers`` runs there in the
   background under JARVIS's limits (:func:`~clio_relay.jarvis_exits.login_build`),
   relay follows it the same way with no time limit, and only a cancel stops it;
-- JARVIS: one approval, then relay installs jarvis-cd at the pinned commit
-  in the site's CLIO home and submits the run again. The approval is
-  site-scoped: operations that find the site without JARVIS at the same time
-  share it, and the install script's site lock makes the later install wait
-  for the first and reuse it. On a guarded site the package review already
-  says relay installs its jarvis-cd when the site has none, so an accepted
-  review covers it and relay asks no second question
-  (:func:`~clio_relay.surface.install_share.jarvis_consented`).
+- JARVIS: one approval, then relay sets up the site's JARVIS root in its CLIO
+  home (:data:`~clio_relay.jarvis_site.SETUP_SCRIPT`) and submits the run
+  again. An ``install`` on a site not set up yet is that setup alone
+  (:func:`~clio_relay.surface.install_op.set_up`): it ends once the root is
+  set up. The approval is site-scoped: operations that find the site not set
+  up at the same time share it, and the setup script's site lock makes the
+  later setup wait for the first and reuse it.
 
 JARVIS's site-scope questions (which MPI) are shared the same way: operations on
 the site that get the same question hold one ask, and one answer moves them all
@@ -96,7 +95,6 @@ from clio_relay.surface.install_share import JARVIS_KIND as JARVIS_KIND
 from clio_relay.surface.install_share import (
     choice_answers,
     choice_ask,
-    jarvis_consented,
     offer_map,
     shared_jarvis_ask,
 )
@@ -123,6 +121,8 @@ START_GRACE = timedelta(hours=6)
 """How long installing jarvis-cd or submitting the install job may hold ``submitting``."""
 
 InstallKind = Literal["software", "jarvis"]
+SETUP_KEY = "setup_only"
+"""In ``record.result``: the install operation only sets up the site's JARVIS root."""
 
 
 def install_kind(refusal: Refusal) -> InstallKind | None:
@@ -172,8 +172,8 @@ def _can_install(service: RelayService, site: SiteEntry, adapter: str, kind: Ins
         found = service.adapter_named(site, adapter)
     except Refusal:
         return False
-    hook = "install_jarvis" if kind == "jarvis" else "install"
-    return getattr(type(found), hook, None) is not getattr(BaseAdapter, hook)
+    hooks = ("jarvis_home", "install_jarvis") if kind == "jarvis" else ("install",)
+    return any(getattr(type(found), hook, None) is not getattr(BaseAdapter, hook) for hook in hooks)
 
 
 def _what(job: JobSpec) -> str:
@@ -289,25 +289,23 @@ async def ask_install(
                 state[OFFERS_KEY][ask.ask_id] = offer_map(issue)
                 asks.append(ask)
     else:
-        if jarvis_consented(service, site.id, record):
-            # The package review the person accepted already said relay installs it.
-            _hold(service, operation_id, state, [], refusal.message)
-            return await service.advance(operation_id)
         with service.asks.locked(site_lock_id(site.id)):
             ask = shared_jarvis_ask(service, site.id, operation_id) or await provider.approve(
                 site=site,
                 operation_id=operation_id,
                 message=(
-                    f"{refusal.message}. Relay installs jarvis-cd "
-                    f"{jarvis_submit.JARVIS_PIN[:8]} in a virtual environment under the CLIO "
-                    "home on the site, which needs the site to reach github.com. Install "
-                    f"jarvis-cd on {site.title}?"
+                    f"{site.title}'s JARVIS root is not set up. Relay installs uv under the "
+                    "CLIO home on the site, "
+                    f"installs jarvis-cd {jarvis_submit.JARVIS_PIN[:8]} with uv's own Python, "
+                    "sets up the site's JARVIS root there and clones clio-jarvis "
+                    f"{jarvis_submit.CLIO_JARVIS_REF[:12]} into it. This needs the site to "
+                    f"reach github.com. Set up JARVIS on {site.title}?"
                 ),
                 binding={
                     "site": site.id,
                     "scope": "site",
                     "kind": JARVIS_KIND,
-                    "jarvis": jarvis_submit.JARVIS_PIN,
+                    "jarvis": jarvis_submit.site_pin(),
                 },
                 plain=False,
             )
@@ -455,7 +453,12 @@ async def start_install(
         if state.get("kind") == "jarvis":
             jarvis = await adapter.install_jarvis()
             _update(service, operation_id, stage="done", jarvis=jarvis)
-            return await _resubmit(service, operation_id, f"jarvis-cd is installed at {jarvis}")
+            await service.packages.refresh(site.id, adapter)
+            if (record.result or {}).get(SETUP_KEY):
+                return _set_up(service, operation_id, site, jarvis)
+            return await _resubmit(
+                service, operation_id, f"the site's JARVIS is set up at {jarvis}"
+            )
         job = await service.guard.prepare(
             site, job_of(record), adapter=adapter, service=record.kind == "serve"
         )
@@ -507,6 +510,20 @@ async def start_install(
     if cancelled:
         await adapter.cancel(handle)
     return record
+
+
+def _set_up(
+    service: RelayService, operation_id: str, site: SiteEntry, jarvis: str
+) -> OperationRecord:
+    """End an install that only set up the site's root: the job is installed or run again."""
+    with service.operations.locked(operation_id):
+        record = service.operation(operation_id)
+        record.result = {
+            **(record.result or {}),
+            "message": f"JARVIS is set up on {site.title} ({jarvis}); install or run the job again",
+        }
+        service.operations.put(operation_id, record)
+    return service.finish(operation_id, OperationState.COMPLETED, None)
 
 
 async def _resubmit(service: RelayService, operation_id: str, note: str) -> OperationRecord:

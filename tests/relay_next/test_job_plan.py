@@ -12,8 +12,8 @@ import pytest
 
 from clio_relay import jarvis_plan
 from clio_relay.adapters.hooks import Ask, ask_text
-from clio_relay.adapters.ssh.scripts import jarvis_status_script
 from clio_relay.guard.reviews import Review
+from clio_relay.jarvis_remote import status_script
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationRecord, OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -199,9 +199,9 @@ def test_the_summary_names_the_directives_and_components() -> None:
 
 
 def test_the_status_script_reads_the_component_states_when_asked() -> None:
-    plain = jarvis_status_script("/j", "op_x")
+    plain = status_script("/j", "op_x")
     assert "@@components" not in plain
-    states = jarvis_status_script("/j", "op_x", states="/e/op_x/components.jsonl")
+    states = status_script("/j", "op_x", states="/e/op_x/components.jsonl")
     assert "@@components" in states
     assert "/e/op_x/components.jsonl" in states
 

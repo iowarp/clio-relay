@@ -3,7 +3,8 @@
 It implements the guard hook (RL24 to RL26):
 
 - ``check_run``: an open site runs anything. A guarded site runs only a JARVIS
-  package, named with its version and SHA-256, or a pipeline of them. Each
+  package, pinned to its review digest in the site's JARVIS root
+  (:class:`~clio_relay.packages.PackageCatalog`), or a pipeline of them. Each
   package nobody has reviewed on that site comes back allowed with a review
   question in ``data["asks"]``, which relay asks before it submits: one for a
   package, or one for all of a pipeline's unreviewed packages, whose binding
@@ -38,13 +39,13 @@ from clio_relay.guard import execlist, limits
 from clio_relay.guard.config import SiteGuard, load_config
 from clio_relay.guard.reviews import REVIEW_KIND, Review, ReviewStore
 from clio_relay.guard.warm import WARM_EXECUTABLE, holder_job, is_warm
-from clio_relay.jarvis_site import ArchiveInfo, read_archive
 from clio_relay.jarvis_submit import not_run_here
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import utc_now
 from clio_relay.jobs.records import OperationRecord, RecordStore
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
+from clio_relay.packages import ADD_COMMAND, PackageCatalog, PackageEntry
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.routing import route
 
@@ -58,86 +59,63 @@ DESCRIBE_TIMEOUT_S = 60.0
 """How long the guard waits for a site's ``describe`` before it skips the layout check."""
 
 PROCEED = (
-    "Pick a JARVIS package for the work: describe(site=...) lists the packages relay has, "
-    "with their parameters. Call run with `package: {name, parameters}` instead of an "
-    "executable; relay pins the one archive it has of that name. When it has several, "
-    "it lists them: ask the person which one and give its version or sha256. For a "
-    "package relay does "
-    "not have yet (a new one written with the JARVIS package skill), stage it first with "
-    'the packages tool: packages(op="stage", package="<repo.package>"), from relay\'s '
-    "package sources or from a directory on the relay host (dir). The person "
-    "reviews each package once, by its hash, before it runs."
+    "Pick a JARVIS package for the work: describe(site=...) lists the packages the "
+    "site's JARVIS root holds, with their parameters. Call run with "
+    "`package: {name, parameters}` instead of an executable; relay pins the digest the "
+    "site holds of it. For a package the site does not have yet (a new one written "
+    "with the JARVIS package skill), copy its repository to the site with files and "
+    f"register it with {ADD_COMMAND}. The person reviews each package once, by its "
+    "digest, before it runs."
 )
 
 
-def _source_line(source: dict[str, Any] | None) -> str:
-    if not source:
-        return "Source: not recorded; the archive was not built from a git checkout"
-    where = str(source.get("repository", "?"))
-    parts = [f"Source: {where}"]
-    if source.get("tag"):
-        parts.append(f"tag {source['tag']}")
-    if source.get("commit"):
-        parts.append(f"commit {source['commit']}")
-    if source.get("path"):
-        parts.append(f"path {source['path']}")
-    line = ", ".join(parts)
-    if source.get("modified"):
-        line += " (with uncommitted changes)"
-    return line
-
-
-def _package_lines(package: PackageRef, info: ArchiveInfo, archive: Path) -> list[str]:
+def _package_lines(package: PackageRef, entry: PackageEntry) -> list[str]:
+    source = entry.source or {}
     lines = [
-        f"SHA-256 of the package archive: {package.sha256}",
-        _source_line(info.source),
-        f"Archive on this relay host: {archive}",
-        f"Files ({len(info.files)}, {info.size} bytes packed):",
+        f"Review digest of the package in the site's JARVIS root: {package.sha256}",
+        f"Source: {source.get('repository', '?')}, commit {source.get('commit', '?')}"
+        if source
+        else f"Source: the repository at {entry.repo_dir} on the site",
     ]
-    for item in info.files[:_MAX_LISTED_FILES]:
-        mode = " x" if item.executable else ""
-        lines.append(f"  {item.sha256[:12]}  {item.size:>8}  {item.path}{mode}")
-    if len(info.files) > _MAX_LISTED_FILES:
-        lines.append(f"  ... and {len(info.files) - _MAX_LISTED_FILES} more")
-    if info.requirements:
-        lines.append(
-            "Python requirements relay installs from PyPI into its jarvis-cd environment on "
-            f"the site: {', '.join(info.requirements)}"
-        )
+    files = entry.files
+    lines.append(f"Files ({len(files)}, {sum(int(item['size']) for item in files)} bytes):")
+    for item in files[:_MAX_LISTED_FILES]:
+        mode = " x" if item.get("executable") else ""
+        lines.append(f"  {str(item['sha256'])[:12]}  {item['size']:>8}  {item['path']}{mode}")
+    if len(files) > _MAX_LISTED_FILES:
+        lines.append(f"  ... and {len(files) - _MAX_LISTED_FILES} more")
     if package.parameters:
         shown = ", ".join(f"{key}={value}" for key, value in sorted(package.parameters.items()))
         lines.append(f"Parameters for this run: {shown}")
     return lines
 
 
-def review_message(site: SiteEntry, package: PackageRef, info: ArchiveInfo, archive: Path) -> str:
-    """Return the review question's text: what the package is, where it came from, its hash."""
+def review_message(site: SiteEntry, package: PackageRef, entry: PackageEntry) -> str:
+    """Return the review question's text: what the package is, where it came from, its digest."""
     lines = [
         f"Approve the JARVIS package {package.name} {package.version} to run on "
         f"{site.title}, a guarded site?",
-        *_package_lines(package, info, archive),
-        "A yes records this hash as reviewed on this site. A changed package has a "
-        "different hash and needs a new review.",
+        *_package_lines(package, entry),
+        "A yes records this digest as reviewed on this site. A changed package has a "
+        "different digest and needs a new review.",
     ]
     return "\n".join(lines)
 
 
-def reviews_message(site: SiteEntry, packages: list[tuple[PackageRef, ArchiveInfo, Path]]) -> str:
+def reviews_message(site: SiteEntry, packages: list[tuple[PackageRef, PackageEntry]]) -> str:
     """Return one question that reviews several packages of one job at once."""
-    names = ", ".join(f"{package.name} {package.version}" for package, _, _ in packages)
+    names = ", ".join(f"{package.name} {package.version}" for package, _ in packages)
     lines = [
         f"Approve {len(packages)} JARVIS packages to run on {site.title}, a guarded "
         f"site? They are {names}."
     ]
-    for package, info, archive in packages:
-        lines.extend(
-            ["", f"{package.name} {package.version}", *_package_lines(package, info, archive)]
-        )
+    for package, entry in packages:
+        lines.extend(["", f"{package.name} {package.version}", *_package_lines(package, entry)])
     lines.extend(
         [
             "",
-            "A yes records each of these hashes as reviewed on this site. A changed package "
-            "has a different hash and needs a new review.",
+            "A yes records each of these digests as reviewed on this site. A changed package "
+            "has a different digest and needs a new review.",
         ]
     )
     return "\n".join(lines)
@@ -161,6 +139,7 @@ class Guard:
         config_dir = context.settings.get("config_dir")
         self.config_dir = Path(config_dir) if config_dir else None
         self.content = ContentStore(context.state_dir / "content")
+        self.packages = PackageCatalog(context.state_dir / "packages")
         self.reviews = ReviewStore(context.state_dir / "guard" / "reviews")
         self.operations: RecordStore[OperationRecord] = RecordStore(
             context.state_dir / "operations", OperationRecord
@@ -265,7 +244,7 @@ class Guard:
         # Each step of a pipeline is its own package with its own review, and the
         # unreviewed ones of one job are asked as one question.
         reviews: list[dict[str, Any] | None] = []
-        unreviewed: list[tuple[PackageRef, ArchiveInfo, Path]] = []
+        unreviewed: list[tuple[PackageRef, PackageEntry]] = []
         bindings: list[dict[str, Any]] = []
         asked: set[str] = set()
         for package in steps:
@@ -275,23 +254,32 @@ class Guard:
             if review is not None or sha256 in asked:
                 continue
             asked.add(sha256)
-            info = await asyncio.to_thread(read_archive, self.content, package.name, sha256)
-            unreviewed.append((package, info, self.content.path_for(sha256)))
+            entry = self.packages.entry(site.id, package)
+            if entry is None:
+                raise Refusal(
+                    RefusalReason.INPUT_MISSING,
+                    f"{site.title}'s JARVIS root has no {package.name} at digest {sha256}, so "
+                    "nobody can review what would run. describe(site=...) lists what it holds; "
+                    f"add a package with {ADD_COMMAND}, then run again",
+                    digest=sha256,
+                    package=package.name,
+                )
+            unreviewed.append((package, entry))
             bindings.append(
                 {
                     "package": package.name,
                     "version": version,
                     "package_hash": sha256,
-                    "source": info.source,
-                    "files": len(info.files),
+                    "source": entry.source,
+                    "files": len(entry.files),
                 }
             )
         data: dict[str, Any] = {"review": reviews[0]} if len(steps) == 1 else {"reviews": reviews}
         if len(unreviewed) == 1:
-            package, info, archive = unreviewed[0]
+            package, entry = unreviewed[0]
             data["asks"] = [
                 {
-                    "message": review_message(site, package, info, archive),
+                    "message": review_message(site, package, entry),
                     "binding": {"kind": REVIEW_KIND, **bindings[0]},
                 }
             ]

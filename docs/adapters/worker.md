@@ -104,7 +104,6 @@ rendezvous or a site `frpc` set as in
 | `frpc_binary` | none | A local frpc built for the cluster, which relay copies in instead of fetching one |
 | `python` | `3.12` | The Python `uv` installs the worker with |
 | `submit_timeout_s` | 60 | How long one scheduler submit command may take |
-| `jarvis_python` | empty | The Python relay installs its jarvis-cd with on the cluster, as in the [ssh adapter](ssh.md#settings) |
 | `jarvis_graph` | empty | The cluster's published JARVIS resource graph, as in the [ssh adapter](ssh.md#settings) |
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software, as in the [ssh adapter](ssh.md#settings) |
 | `link_mode` | `brokered_tcp` | `brokered_tcp` or `udp_rendezvous`; see [the link](#the-link) |

@@ -2,8 +2,8 @@
 
 It stops relay's processes on the site first (:mod:`clio_relay.shutdown`), then
 removes this site's own deployment: its configured ``remote_dir``, which holds the
-worker and its binaries, relay's scripts and job directories, the JARVIS bootstrap
-venv with JARVIS's resource graph, and the login hop. Nothing outside it goes, so
+worker and its binaries, relay's scripts and job directories, the site's JARVIS
+root and relay's jarvis-cd, JARVIS's resource graph, and the login hop. Nothing outside it goes, so
 another relay home on the same account (its own ``remote_dir``) is untouched; a
 ``hop_dir`` setting elsewhere adds only this site's hop directory. The person's
 Spack store (``<site home>/spack`` and

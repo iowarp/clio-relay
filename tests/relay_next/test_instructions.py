@@ -1,8 +1,9 @@
-"""The server's instructions name the configured sites and the staged packages."""
+"""The server's instructions name the configured sites and the packages they hold."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ import pytest
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters
 
-from clio_relay.packages import PackageCatalog, PackageEntry
+from clio_relay.packages import PackageEntry
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import instructions
 from clio_relay.surface.service import RelayService
@@ -27,7 +28,14 @@ SUMMARY = (
 
 
 def _package(name: str = "clio_jarvis.xcompact3d", summary: str | None = SUMMARY) -> PackageEntry:
-    return PackageEntry(name=name, version="0.2.1", sha256="ab" * 32, summary=summary)
+    return PackageEntry(name=name, version="0.2.1", digest="ab" * 32, summary=summary)
+
+
+def _listed(paths: RelayPaths, site: str) -> None:
+    """Record that the site's JARVIS root lists the package."""
+    paths.packages_dir.mkdir(parents=True, exist_ok=True)
+    found = [_package().model_dump(mode="json")]
+    (paths.packages_dir / f"{site}.json").write_text(json.dumps(found), encoding="utf-8")
 
 
 def _site(site_id: str, **fields: Any) -> SiteEntry:
@@ -46,7 +54,7 @@ def test_the_text_names_each_site_and_package() -> None:
     assert "only through relay's tools (describe, run, exec, files, serve" in text
     assert f"{instructions.SITES_LEAD}: ares (Ares cluster; ssh); lab (ssh)." in text
     assert (
-        "Packages staged to run on them: clio_jarvis.xcompact3d 0.2.1 "
+        "Packages their JARVIS roots hold: clio_jarvis.xcompact3d 0.2.1 "
         "(Xcompact3d (Incompact3d v5.0) incompressible flow simulation); lab_kit.echo 0.2.1."
         in text
     )
@@ -94,7 +102,7 @@ async def test_the_text_follows_the_sites_file(relay_paths: RelayPaths) -> None:
     )
     try:
         add_site(relay_paths, "later")
-        PackageCatalog(relay_paths.packages_dir).put(_package())
+        _listed(relay_paths, "later")
         for _ in range(500):
             if "clio_jarvis.xcompact3d" in server.instructions:
                 break
@@ -111,7 +119,7 @@ async def test_the_text_follows_the_sites_file(relay_paths: RelayPaths) -> None:
 @pytest.mark.parametrize("mode", ["legacy", "auto"])
 def test_a_plain_client_reads_them_when_it_connects(relay_paths: RelayPaths, mode: str) -> None:
     add_site(relay_paths, "ares", adapter="fixture", policy="guarded")
-    PackageCatalog(relay_paths.packages_dir).put(_package())
+    _listed(relay_paths, "ares")
     env = dict(os.environ)
     env["CLIO_RELAY_CONFIG_DIR"] = str(relay_paths.config_dir)
     env["CLIO_RELAY_STATE_DIR"] = str(relay_paths.state_dir)

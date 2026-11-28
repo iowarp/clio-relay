@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, cast
 
+from clio_relay import jarvis_submit
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import VERBS
+from clio_relay.jarvis_site import JARVIS_PIN
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.jobs.spec import PackageRef
-from clio_relay.packages import refresh_from_sources
 from clio_relay.sites.models import SiteEntry
 from clio_relay.surface import exec_plan, job_watch
 from clio_relay.surface.job_card import site_jobs
@@ -59,33 +60,48 @@ async def relay_report(service: RelayService) -> dict[str, Any]:
     }
 
 
-def package_listing(service: RelayService, site: SiteEntry) -> list[dict[str, Any]]:
-    """List the newest staged version of each package, and whether this site reviewed it.
+async def package_listing(service: RelayService, site: SiteEntry) -> dict[str, Any]:
+    """List the packages the site's JARVIS root holds now, and whether this site reviewed each.
 
-    A change in relay's package sources is staged first, so a name shows the
-    archive a run by that name pins.
+    ``jarvis`` says whether the root is set up: its path and the jarvis-cd pin,
+    or ``set_up: false`` with the setup step (:data:`~clio_relay.jarvis_submit.SETUP_STEP`).
+
+    The listing runs on the site (:meth:`~clio_relay.packages.PackageCatalog.refresh`);
+    when it cannot, the last one relay read is shown with the reason.
     """
-    refresh_from_sources(service.paths.state_dir, service.paths.package_sources)
+    note: dict[str, Any] = {}
+    try:
+        adapter = service.adapter_for(site, "run")
+        if not adapter.runs_packages:
+            return {"packages": [], "packages_note": f"the {adapter.name} adapter runs no packages"}
+        home = await adapter.jarvis_home()
+        root = None if home is None else jarvis_submit.site_root(home)
+        if await service.packages.refresh(site.id, adapter) is None:
+            # A root that is not set up holds nothing, whatever relay listed before.
+            setup = {"root": root, "set_up": False, "setup": jarvis_submit.SETUP_STEP}
+            return {"packages": [], "jarvis": setup}
+        note["jarvis"] = {"root": root, "set_up": True, "jarvis_cd": JARVIS_PIN}
+    except Refusal as refusal:
+        note["packages_note"] = (
+            f"the last listing relay read; listing now failed: {refusal.message}"
+        )
     reviewed = getattr(service.guard, "reviewed", None)
-    entries = [entry for entry in service.packages.all() if entry.superseded_by is None]
     listed: list[dict[str, Any]] = []
-    for entry in service.packages.newest():
-        item = entry.model_dump(mode="json", exclude={"staged_at"})
-        older = [other.version for other in entries if other.name == entry.name]
-        if len(older) > 1:
-            item["versions"] = older
+    for entry in service.packages.all(site.id):
+        item = entry.model_dump(mode="json", exclude={"files"})
         if site.policy == "guarded" and callable(reviewed):
-            package = PackageRef(name=entry.name, version=entry.version, sha256=entry.sha256)
+            package = PackageRef(name=entry.name, version=entry.version, sha256=entry.digest)
             item["reviewed"] = reviewed(site.id, package) is not None
         listed.append(item)
-    return listed
+    return {"packages": listed, **note}
 
 
 async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
     """Report one site: its entry, the route for each verb, and what its adapter says.
 
-    ``packages`` are the JARVIS packages relay can run there. ``run`` takes one
-    as ``package: {name, parameters}`` and pins its version and SHA-256.
+    ``packages`` are the JARVIS packages the site's root holds, as the site lists
+    them. ``run`` takes one as ``package: {name, parameters}`` and pins its
+    version and review digest.
     The site's cluster facts are JARVIS's, not relay's: an adapter that reads
     them reports ``info.facts.resource_graph``, with the graph's path and
     ``source`` (``setting``, ``site`` for the graph the site publishes as
@@ -103,7 +119,7 @@ async def site_report(service: RelayService, site: SiteEntry) -> dict[str, Any]:
         "skill": await asyncio.to_thread(
             skill_link, site, service.paths.config_dir, with_text=True
         ),
-        "packages": await asyncio.to_thread(package_listing, service, site),
+        **(await package_listing(service, site)),
         "jobs": site_jobs(service, site.id),
     }
     try:

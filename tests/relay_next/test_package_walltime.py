@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -10,17 +9,15 @@ from typing import Any
 import pytest
 
 from clio_relay.adapters.hooks import ask_text
-from clio_relay.jarvis_site import archive_package
-from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.records import OperationState
-from clio_relay.jobs.spec import JobSpec, PackageRef
-from clio_relay.packages import PackageCatalog, PackageEntry, contract_value, stage
+from clio_relay.jobs.spec import JobSpec
+from clio_relay.packages import PackageCatalog, PackageEntry, contract_value
 from clio_relay.sites.models import SiteEntry
 from clio_relay.sites.store import SiteStore
 from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 
-from ..guard.conftest import make_repo
+from ..guard.conftest import listed, make_repo
 
 pytestmark = [pytest.mark.release_platform("posix")]
 
@@ -43,7 +40,8 @@ resources:
 def _stage(paths: RelayPaths, tmp_path: Path) -> PackageEntry:
     repo = make_repo(tmp_path / "src")
     (repo / "demo" / "hello" / "contract.yaml").write_text(CONTRACT)
-    return stage(paths.state_dir, archive_package(repo, "demo.hello"), "demo.hello")
+    [entry] = PackageCatalog(paths.packages_dir).store("fx", [listed(repo, "demo.hello")])
+    return entry
 
 
 def _site(paths: RelayPaths, *, duration: str | None = None) -> None:
@@ -122,22 +120,3 @@ async def test_the_site_default_fills_what_the_package_leaves_open(
     stored = JobSpec.model_validate(service.operation(record.operation_id).spec)
     assert stored.resources.process_count is None
     await service.close()
-
-
-def test_an_entry_staged_before_resources_reads_them_from_its_archive(
-    relay_paths: RelayPaths, tmp_path: Path
-) -> None:
-    entry = _stage(relay_paths, tmp_path)
-    path = relay_paths.packages_dir / f"{entry.sha256}.json"
-    old = json.loads(path.read_text())
-    del old["resources"]
-    path.write_text(json.dumps(old))
-    catalog = PackageCatalog(relay_paths.packages_dir)
-    content = ContentStore(relay_paths.content_dir)
-    pinned = PackageRef(name="demo.hello", version=entry.version, sha256=entry.sha256)
-    found = catalog.entry(pinned, content)
-    assert found is not None
-    assert found.resources == entry.resources
-    assert found.resources is not None and found.resources["duration"] == {"param": "walltime"}
-    assert "resources" in json.loads(path.read_text())
-    assert catalog.entry(PackageRef(name="demo.hello"), content) is None

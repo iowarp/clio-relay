@@ -26,7 +26,7 @@ SOLVER = PackageRef(name="clio_jarvis.gray_scott", version="1", sha256="b" * 64)
 
 
 def _entry(ref: PackageRef, **extra: Any) -> PackageEntry:
-    return PackageEntry(name=ref.name, version="1", sha256=ref.sha256 or SHA, **extra)
+    return PackageEntry(name=ref.name, version="1", digest=ref.sha256 or SHA, **extra)
 
 
 VIEWER = _entry(

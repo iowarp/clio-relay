@@ -1,72 +1,60 @@
-"""The packages relay can run: its catalog of staged package archives (RL24, RL42).
+"""The packages relay can run: each site's JARVIS root, as the site lists it (RL24, RL42).
 
-Staging a package puts its archive in relay's content store and records it in
-the catalog, one entry per archive at ``<state>/packages/<sha256>.json``. An
-agent stages one with the ``packages`` tool (:mod:`clio_relay.surface.staging`),
-from a directory on the relay host or, naming only the package, from relay's
-package sources (``CLIO_RELAY_PACKAGE_SOURCES``: directories a host installed,
-such as a plugin's copy of clio-jarvis). Staging runs no git and fetches
-nothing. ``python -m clio_relay.packages`` does the same from a shell. The
-entry says what the archive holds, read from the archive itself and never by
-running it: the parameters of ``_configure_menu`` in ``pkg.py``, and the
-title, summary, version, outputs, progress and resources of a ``contract.yaml``
-beside it when the package has one.
+Every package relay runs on a site is in that site's JARVIS root
+(:data:`clio_relay.jarvis_site.SITE_ROOT_DIR`): clio-jarvis, which the site's
+setup clones, and any repository the person's agent copied to the site and
+registered with ``packages(op="add")``. :data:`~clio_relay.jarvis_site.PACKAGES_SCRIPT`
+lists them through the adapter's exec, each with its review digest, its files,
+its git source and the text of ``pkg.py`` and ``contract.yaml``. Relay reads
+those texts here, never by running them: the parameters of ``_configure_menu``,
+and the title, summary, version, outputs, progress and resources of the
+contract. The catalog keeps one file per site at ``<state>/packages/<site>.json``.
 
 ``describe(site=...)`` lists the catalog, so an agent finds a package by name.
 ``run`` takes ``package: {name, parameters}``, and :meth:`PackageCatalog.resolve`
-fills the version and SHA-256 before the guard sees the job, so the review is
-still pinned to one archive. The contract's resources, read with the run's
-parameters, fill the walltime, queue and process layout the job leaves unset.
+fills the version and digest before the guard sees the job, so the review is
+pinned to the package's content on the site. The contract's resources, read
+with the run's parameters, fill the walltime, queue and process layout the job
+leaves unset.
 """
 
 from __future__ import annotations
 
-import argparse
 import ast
-import hashlib
-import io
 import json
 import re
-import sys
-import tarfile
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from pydantic import BaseModel, Field
 
-from clio_relay.jarvis_site import (
-    JARVIS_BUILTIN,
-    SOURCE_FILE,
-    archive_package,
-    git_source,
-    inspect_archive,
-    refuse_builtin,
-    split_name,
-)
-from clio_relay.jobs.content import ContentStore
-from clio_relay.jobs.handles import utc_now
-from clio_relay.jobs.records import RecordStore
+from clio_relay.jarvis_site import parse_packages, refuse_builtin
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import COUPLING_KINDS, Coupling, JobSpec, PackageRef, step_ids
 
-STAGE_COMMAND = (
-    'the packages tool: packages(op="stage", package="<repository>.<package>"), from '
-    "relay's package sources or from a directory on the relay host (dir)"
+if TYPE_CHECKING:
+    from clio_relay.adapters.base import BaseAdapter
+
+ADD_COMMAND = (
+    "the files tool, to copy a repository laid out <name>/<name>/<package>/pkg.py to the "
+    'site, then packages(op="add", site=..., path=<its path on the site>)'
 )
-"""How an agent stages a package. Refusals that find none name it."""
+"""How an agent adds a package of its own. Refusals that find none name it."""
 _MENU_TYPES = {"int": "integer", "float": "number", "str": "string", "bool": "boolean"}
 _OUTPUT_KEYS = ("name", "path", "path_kind", "format", "reader")
 
 
 class PackageEntry(BaseModel):
-    """One staged package archive."""
+    """One package of a site's JARVIS root."""
 
     name: str
     version: str
-    sha256: str
+    digest: str
+    """The review digest of the package's content in the root
+    (:data:`clio_relay.jarvis_site.DIGEST_FUNCTIONS`)."""
     kind: str | None = None
     title: str | None = None
     """The contract's ``title``: the software's name as a person knows it (LAMMPS)."""
@@ -78,15 +66,12 @@ class PackageEntry(BaseModel):
     data_flow: dict[str, Any] | None = None
     """A service's ``service.data_flow``: ``direction`` (``in``, the other steps' outputs
     feed it; ``out``, it feeds them), ``kind`` and ``label``."""
+    repo_dir: str = ""
     source: dict[str, Any] | None = None
-    origin: Literal["sources", "dir"] | None = None
-    """``sources`` when staged by name from relay's package sources, ``dir`` when the
-    person named a directory. An entry staged before relay recorded it counts as
-    ``sources``."""
-    superseded_by: str | None = None
-    """The SHA-256 relay's package sources now give for this name, when they changed
-    after this archive was staged from them. A bare name no longer resolves to it."""
-    staged_at: datetime = Field(default_factory=utc_now)
+    """``{repository, commit}`` when the repository is a git clone."""
+    files: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
+    """The reviewed files: ``path`` (from the repository's package directory),
+    ``sha256``, ``size`` and ``executable``."""
 
 
 def _json(value: Any) -> Any:
@@ -156,49 +141,21 @@ def _parameters(menu: list[dict[str, Any]] | None, contract: dict[str, Any]) -> 
     return schema
 
 
-def _members(data: bytes, wanted: set[str]) -> dict[str, str]:
-    found: dict[str, str] = {}
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name in wanted and member.isfile():
-                extracted = tar.extractfile(member)
-                if extracted is not None:
-                    found[member.name] = extracted.read().decode("utf-8", errors="replace")
-    return found
+def describe_package(listed: dict[str, Any]) -> PackageEntry:
+    """Return the catalog entry of one package :func:`~clio_relay.jarvis_site.parse_packages` read.
 
-
-def describe_archive(data: bytes, name: str, *, version: str | None = None) -> PackageEntry:
-    """Return the catalog entry of the archive ``data`` of package ``name``.
-
-    The version is ``version`` when given, else the contract's, else the git
-    tag the archive was built at, else the first 12 characters of the commit its
-    source record names when that copy is unmodified (a source copied at a
-    pinned commit). With none of these it refuses.
+    The version is the contract's, else the git commit's first 12 characters,
+    else the digest's.
     """
-    info = inspect_archive(data, name)
-    repo, package = split_name(name)
-    base = f"{repo}/{repo}/{package}"
-    texts = _members(data, {f"{base}/pkg.py", f"{base}/contract.yaml"})
-    contract: dict[str, Any] = {}
-    if f"{base}/contract.yaml" in texts:
-        try:
-            loaded = yaml.safe_load(texts[f"{base}/contract.yaml"])
-        except yaml.YAMLError:
-            loaded = None
-        contract = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
-    source = info.source or {}
-    commit = source.get("commit")
-    # An unmodified pinned commit names the files exactly, so it is a version too.
-    unmodified = isinstance(commit, str) and bool(commit) and not source.get("modified")
-    pinned = cast(str, commit)[:12] if unmodified else None
-    chosen = version or contract.get("version") or source.get("tag") or pinned
-    if not chosen:
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            f"{name} has no contract.yaml version, no git tag and no unmodified commit; "
-            "give one with --version",
-            package=name,
-        )
+    try:
+        loaded = yaml.safe_load(listed.get("contract") or "")
+    except yaml.YAMLError:
+        loaded = None
+    contract = cast(dict[str, Any], loaded) if isinstance(loaded, dict) else {}
+    git = cast(dict[str, str], listed.get("git") or {})
+    source = {"repository": git.get("url", ""), "commit": git["commit"]} if git else None
+    digest = str(listed["digest"])
+    chosen = contract.get("version") or (git.get("commit") or digest)[:12]
     outputs = [
         {key: _json(item[key]) for key in _OUTPUT_KEYS if key in item}
         for item in cast(list[Any], contract.get("outputs") or [])
@@ -209,13 +166,13 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
     service = contract.get("service")
     flow = cast(dict[str, Any], service).get("data_flow") if isinstance(service, dict) else None
     return PackageEntry(
-        name=name,
+        name=str(listed["name"]),
         version=str(chosen),
-        sha256=info.sha256,
+        digest=digest,
         kind=str(contract["kind"]) if contract.get("kind") else None,
         title=" ".join(str(contract["title"]).split()) if contract.get("title") else None,
         summary=" ".join(str(contract["summary"]).split()) if contract.get("summary") else None,
-        parameters=_parameters(_menu(texts.get(f"{base}/pkg.py", "")), contract),
+        parameters=_parameters(_menu(str(listed.get("pkg") or "")), contract),
         outputs=outputs,
         progress={
             key: _json(value)
@@ -226,7 +183,9 @@ def describe_archive(data: bytes, name: str, *, version: str | None = None) -> P
         else None,
         resources=_json(resources) if isinstance(resources, dict) else None,
         data_flow=contract_data_flow(flow),
-        source=info.source,
+        repo_dir=str(listed.get("repo_dir") or ""),
+        source=source,
+        files=cast(list[dict[str, Any]], listed.get("files") or []),
     )
 
 
@@ -435,437 +394,93 @@ def slice_end(steps: Sequence[PackageRef]) -> int | None:
     return max(ends) if ends else None
 
 
-def pipeline_conflict(entries: Sequence[PackageEntry | None]) -> Refusal | None:
-    """Return why the steps cannot share one pipeline, or None when they can.
-
-    JARVIS loads every step's archive into one tree per repository, so two steps
-    from one repository must come from the same commit.
-    """
-    commits: dict[str, tuple[str, str]] = {}
-    for entry in entries:
-        commit = (entry.source or {}).get("commit") if entry is not None else None
-        if entry is None or not isinstance(commit, str) or not commit:
-            continue
-        repo, _package = split_name(entry.name)
-        seen = commits.setdefault(repo, (commit, entry.name))
-        if seen[0] != commit:
-            return Refusal(
-                RefusalReason.INVALID_SPEC,
-                f"{seen[1]} and {entry.name} come from different commits of the {repo} "
-                f"repository ({seen[0][:12]} and {commit[:12]}); a pipeline's steps from one "
-                "repository must be staged from the same commit",
-                repository=repo,
-            )
-    return None
-
-
 def person_name(package: str, titles: Mapping[str, str] | None = None) -> str:
     """The name a person knows a package by: its contract's title, else its short name."""
     return (titles or {}).get(package) or package.partition(".")[2] or package
 
 
 class PackageCatalog:
-    """The package archives staged on this relay host."""
+    """The packages each site's JARVIS root holds, as the site last listed them."""
 
     def __init__(self, root: Path) -> None:
-        self.records: RecordStore[PackageEntry] = RecordStore(root, PackageEntry)
+        self.root = root
 
-    def put(self, entry: PackageEntry) -> None:
-        """Record ``entry``, replacing an earlier entry of the same archive."""
-        self.records.put(entry.sha256, entry)
+    def _path(self, site: str) -> Path:
+        return self.root / f"{site}.json"
 
-    def remove(
-        self, name: str, *, version: str | None = None, sha256: str | None = None
-    ) -> list[PackageEntry]:
-        """Remove every entry of ``name`` matching ``version`` and ``sha256``; return them."""
-        removed: list[PackageEntry] = []
-        for entry in self.all():
-            if entry.name != name or version not in (None, entry.version):
-                continue
-            if sha256 is not None and entry.sha256 != sha256.lower():
-                continue
-            if self.records.delete(entry.sha256):
-                removed.append(entry)
-        return removed
+    def all(self, site: str) -> list[PackageEntry]:
+        """Return the site's packages, by name; none before relay listed them."""
+        try:
+            raw = json.loads(self._path(site).read_text(encoding="utf-8"))
+            return [PackageEntry.model_validate(item) for item in cast(list[Any], raw)]
+        except (OSError, ValueError):
+            return []
 
-    def all(self) -> list[PackageEntry]:
-        """Return every entry, newest version of each name last.
+    def titles(self, site: str) -> dict[str, str]:
+        """Each package's contract title, by package name."""
+        return {entry.name: entry.title for entry in self.all(site) if entry.title}
 
-        An archive of jarvis-cd's builtin staged by an earlier relay is left out.
-        """
-        kept = (e for e in self.records.all() if e.name.partition(".")[0] != JARVIS_BUILTIN)
-        return sorted(kept, key=lambda entry: (entry.name, entry.staged_at))
+    def store(self, site: str, listed: list[dict[str, Any]]) -> list[PackageEntry]:
+        """Record what the site listed. A package whose digest relay read before is kept."""
+        known = {(entry.name, entry.digest): entry for entry in self.all(site)}
+        entries: dict[str, PackageEntry] = {}
+        for item in listed:
+            key = (str(item["name"]), str(item["digest"]))
+            entries.setdefault(key[0], known.get(key) or describe_package(item))
+        found = sorted(entries.values(), key=lambda entry: entry.name)
+        self.root.mkdir(parents=True, exist_ok=True)
+        partial = self._path(site).with_suffix(".part")
+        partial.write_text(json.dumps([e.model_dump(mode="json") for e in found]), "utf-8")
+        partial.replace(self._path(site))
+        return found
 
-    def newest(self) -> list[PackageEntry]:
-        """Return the newest entry of each package name, by when it was staged.
+    async def refresh(
+        self, site: str, adapter: BaseAdapter[Any], *, add: str = "", force: bool = False
+    ) -> list[PackageEntry] | None:
+        """List the site's root again through the adapter; ``None`` when it is not set up."""
+        listed = parse_packages(await adapter.site_packages(add, force=force))
+        return None if listed is None else self.store(site, listed)
 
-        A superseded entry is left out: a bare name no longer resolves to it.
-        """
-        latest: dict[str, PackageEntry] = {}
-        for entry in self.all():
-            if entry.superseded_by is None:
-                latest[entry.name] = entry
-        return list(latest.values())
+    def resolve(self, site: str, package: PackageRef) -> PackageRef:
+        """Fill ``package``'s version and digest from the site's catalog.
 
-    def titles(self) -> dict[str, str]:
-        """Each staged package's contract title, by package name, newest entry first."""
-        return {entry.name: entry.title for entry in self.newest() if entry.title}
-
-    def supersede(self, current: PackageEntry) -> list[PackageEntry]:
-        """Mark the other archives of ``current``'s name staged from the sources as superseded.
-
-        ``current`` is what relay's package sources give now. An archive the
-        person staged from a directory is kept as it is.
-        """
-        marked: list[PackageEntry] = []
-        for entry in self.all():
-            if (
-                entry.name != current.name
-                or entry.sha256 == current.sha256
-                or entry.origin == "dir"
-                or entry.superseded_by == current.sha256
-            ):
-                continue
-            updated = entry.model_copy(update={"superseded_by": current.sha256})
-            self.put(updated)
-            marked.append(updated)
-        return marked
-
-    def resolve(self, package: PackageRef) -> PackageRef:
-        """Fill ``package``'s version and SHA-256 from the catalog.
-
-        A package that gives both is returned as it is. Otherwise the one
-        staged archive of that name matching what it gives is pinned. None
-        refuses with ``invalid_spec``, and so do several: relay never picks one
-        for the person. The refusal lists the candidates, so the caller asks
-        which one and pins its ``version`` or ``sha256``. A superseded archive
-        is pinned only by its ``sha256``; call :func:`stage_current` first, so
-        a change in relay's package sources supersedes what they gave before.
+        The package is pinned to what the site's root holds now. A digest the
+        root no longer holds refuses with ``invalid_spec``, naming the current
+        one, so the caller asks the person again. A pinned package the catalog
+        has no entry of passes as it is, for the site script to check.
         jarvis-cd's builtin packages are refused (:func:`refuse_builtin`).
         """
         refuse_builtin(package.name)
-        if package.version is not None and package.sha256 is not None:
+        found = self.entry(site, package.model_copy(update={"sha256": None}))
+        if found is None and package.version is not None and package.sha256 is not None:
             return package
-        found = [
-            entry
-            for entry in self.all()
-            if entry.name == package.name
-            and package.version in (None, entry.version)
-            and package.sha256 in (None, entry.sha256)
-            and (entry.superseded_by is None or package.sha256 is not None)
-        ]
-        wanted = " ".join(part for part in (package.name, package.version, package.sha256) if part)
-        if not found:
-            known = sorted({entry.name for entry in self.all()})
+        if found is None:
+            known = sorted(entry.name for entry in self.all(site))
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
-                f"relay has no package {wanted}. It has: {', '.join(known) or 'none'}. "
-                f"Stage one with {STAGE_COMMAND}",
+                f"{site} has no package {package.name}. It has: {', '.join(known) or 'none'}. "
+                f"Add one with {ADD_COMMAND}",
                 package=package.name,
                 known=known,
             )
-        if len(found) > 1:
-            candidates = [
-                {
-                    "version": entry.version,
-                    "sha256": entry.sha256,
-                    "staged_at": entry.staged_at.isoformat(),
-                }
-                for entry in reversed(found)
-            ]
-            listed = "; ".join(
-                f"{item['version'] or 'no version'} sha256 {item['sha256'][:12]} "
-                f"staged {item['staged_at']}"
-                for item in candidates
-            )
+        if package.sha256 not in (None, found.digest) or package.version not in (
+            None,
+            found.version,
+        ):
             raise Refusal(
                 RefusalReason.INVALID_SPEC,
-                f"relay has {len(found)} archives of {wanted}: {listed}. Ask the person "
-                "which one, then pin its version or sha256",
+                f"{package.name} on {site} is now version {found.version} digest "
+                f"{found.digest[:12]}, not the one the job pins; leave the pin out or use it",
                 field="package",
                 package=package.name,
-                candidates=candidates,
+                candidates=[{"version": found.version, "sha256": found.digest}],
                 next_step="pin_package",
             )
-        chosen = found[0]
-        return package.model_copy(update={"version": chosen.version, "sha256": chosen.sha256})
+        return package.model_copy(update={"version": found.version, "sha256": found.digest})
 
-    def entry(self, package: PackageRef, content: ContentStore) -> PackageEntry | None:
-        """Return the entry of the pinned ``package``, or ``None`` if it was not staged here.
-
-        An entry staged before relay read the contract's resources, data flow and title
-        is read again from its archive in ``content``, and saved.
-        """
-        found = None if package.sha256 is None else self.records.get(package.sha256)
-        current = (
-            found is not None and {"resources", "data_flow", "title"} <= found.model_fields_set
-        )
-        if found is None or current or not content.has(found.sha256):
-            return found
-        try:
-            fresh = describe_archive(content.get(found.sha256), found.name, version=found.version)
-        except Refusal:
-            return found
-        updated = found.model_copy(
-            update={
-                "resources": fresh.resources,
-                "data_flow": fresh.data_flow,
-                "title": fresh.title,
-            }
-        )
-        self.put(updated)
-        return updated
-
-
-def stage(
-    state_dir: Path,
-    data: bytes,
-    name: str,
-    *,
-    version: str | None = None,
-    origin: Literal["sources", "dir"] = "dir",
-) -> PackageEntry:
-    """Put an archive in relay's content store and record it in the catalog.
-
-    An archive from relay's package sources supersedes what they gave before
-    under that name (:meth:`PackageCatalog.supersede`). jarvis-cd's builtin
-    packages are refused (:func:`refuse_builtin`).
-    """
-    refuse_builtin(name)
-    entry = describe_archive(data, name, version=version).model_copy(update={"origin": origin})
-    ContentStore(state_dir / "content").put(data)
-    catalog = PackageCatalog(state_dir / "packages")
-    catalog.put(entry)
-    if origin == "sources":
-        catalog.supersede(entry)
-    return entry
-
-
-def repository_dir(root: Path, name: str) -> Path:
-    """Return the JARVIS repository of package ``name`` at ``root`` or just below it.
-
-    That is a directory named like the repository, holding a Python package of
-    the same name with ``<package>/pkg.py``: ``root`` itself, or ``root/<repo>``
-    as in clio-jarvis, whose checkout holds ``clio_jarvis/clio_jarvis/...``.
-    """
-    repo, package = split_name(name)
-    for candidate in (root, root / repo):
-        if candidate.name == repo and (candidate / repo / package / "pkg.py").is_file():
-            return candidate
-    raise Refusal(
-        RefusalReason.INVALID_ARGUMENTS,
-        f"{root} holds no JARVIS repository with {name}: relay looks for a directory "
-        f"named {repo} holding {repo}/{package}/pkg.py, at {root} or {root / repo}",
-        package=name,
-    )
-
-
-def package_source(repo_dir: Path) -> dict[str, Any] | None:
-    """Say where ``repo_dir`` came from, for the archive's source record.
-
-    A copy installed without git (a plugin's package source) says it in a
-    ``.clio-relay-source.json`` beside the repository or in the repository; a git
-    checkout says it through git, read only.
-    """
-    for holder in (repo_dir, repo_dir.parent):
-        recorded = holder / SOURCE_FILE
-        if recorded.is_file():
-            try:
-                loaded: object = json.loads(recorded.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if isinstance(loaded, dict):
-                return cast(dict[str, Any], loaded)
-    return git_source(repo_dir)
-
-
-def _archive_and_stage(
-    state_dir: Path,
-    repo_dir: Path,
-    name: str,
-    version: str | None,
-    origin: Literal["sources", "dir"],
-) -> tuple[PackageEntry, int]:
-    data = archive_package(repo_dir, name, source=package_source(repo_dir))
-    return stage(state_dir, data, name, version=version, origin=origin), len(data)
-
-
-def stage_dir(
-    state_dir: Path, directory: Path, name: str, *, version: str | None = None
-) -> tuple[PackageEntry, int]:
-    """Stage package ``name`` from a directory on the relay host; return it and its size.
-
-    ``directory`` is the JARVIS repository or the checkout that holds it.
-    """
-    root = directory.expanduser()
-    if not root.is_absolute():
-        raise Refusal(
-            RefusalReason.INVALID_ARGUMENTS,
-            f"{directory} is relative; give the directory's absolute path on the relay host",
-            path=str(directory),
-        )
-    if not root.is_dir():
-        raise Refusal(
-            RefusalReason.PATH_NOT_FOUND,
-            f"{root} is not a directory on the relay host",
-            path=str(root),
-        )
-    return _archive_and_stage(state_dir, repository_dir(root.resolve(), name), name, version, "dir")
-
-
-PACKAGE_SOURCES_ENV = "CLIO_RELAY_PACKAGE_SOURCES"
-"""Where a host names relay's package sources (:class:`~clio_relay.surface.settings.RelayPaths`).
-
-Each is a JARVIS repository, a checkout holding one, or a folder of such checkouts.
-A host fills them at install time (a plugin's copy of clio-jarvis), so staging from
-them needs no network and no git.
-"""
-
-
-def source_dirs(source: Path) -> list[Path]:
-    """Return the directories directly inside ``source``, sorted; none when unreadable."""
-    try:
-        children = sorted(child for child in source.iterdir() if child.is_dir())
-    except OSError:
-        children = []
-    return [source, *children]
-
-
-def find_repository(sources: Sequence[Path], name: str) -> Path:
-    """Return the JARVIS repository holding package ``name`` in one of ``sources``."""
-    repo, _package = split_name(name)
-    for source in sources:
-        for candidate in source_dirs(source):
-            try:
-                return repository_dir(candidate, name)
-            except Refusal:
-                continue
-    where = ", ".join(str(source) for source in sources)
-    if not sources:
-        detail = (
-            f"relay has no package sources ({PACKAGE_SOURCES_ENV} is not set), so it has no "
-            f"copy of the {repo} repository"
-        )
-    else:
-        detail = f"none of relay's package sources ({where}) holds {name}"
-    raise Refusal(
-        RefusalReason.INPUT_MISSING,
-        f"{detail}. Stage it from a directory on the relay host with dir, or install a "
-        f"package source that has it (a plugin that provides {repo}) and set "
-        f"{PACKAGE_SOURCES_ENV} to it",
-        package=name,
-        sources=[str(source) for source in sources],
-    )
-
-
-def stage_source(
-    state_dir: Path, sources: Sequence[Path], name: str, *, version: str | None = None
-) -> tuple[PackageEntry, int]:
-    """Stage package ``name`` from relay's package sources; return it and its size."""
-    return _archive_and_stage(state_dir, find_repository(sources, name), name, version, "sources")
-
-
-def stage_current(state_dir: Path, sources: Sequence[Path], name: str) -> PackageEntry | None:
-    """Stage what relay's package sources give for ``name`` now, if they hold it.
-
-    ``run`` calls it before it resolves a bare name, so after a host updates its
-    package sources (a plugin update), the archive they give now is staged and
-    the one they gave before is superseded: the run pins the new archive and its
-    review is asked, never an old archive quietly. The archive is deterministic,
-    so an unchanged source stages the same entry and changes nothing. Returns
-    ``None`` when no source holds ``name``. jarvis-cd's builtin is refused.
-    """
-    refuse_builtin(name)
-    try:
-        repo_dir = find_repository(sources, name)
-    except Refusal:
+    def entry(self, site: str, package: PackageRef) -> PackageEntry | None:
+        """Return the site's entry of ``package``, or ``None`` when the root has none."""
+        for entry in self.all(site):
+            if entry.name == package.name and package.sha256 in (None, entry.digest):
+                return entry
         return None
-    data = archive_package(repo_dir, name, source=package_source(repo_dir))
-    catalog = PackageCatalog(state_dir / "packages")
-    digest = hashlib.sha256(data).hexdigest()
-    known = catalog.records.get(digest)
-    if known is not None and known.superseded_by is None and known.origin is not None:
-        catalog.supersede(known)
-        return known
-    return stage(state_dir, data, name, origin="sources")
-
-
-def refresh_from_sources(state_dir: Path, sources: Sequence[Path]) -> None:
-    """Run :func:`stage_current` for each staged name relay's package sources hold.
-
-    ``packages list`` and ``describe`` call it, so what they show as a name's
-    archive is what a run by that name would pin.
-    """
-    if not sources:
-        return
-    names = {
-        entry.name
-        for entry in PackageCatalog(state_dir / "packages").all()
-        if entry.origin != "dir"
-    }
-    for name in sorted(names):
-        try:
-            stage_current(state_dir, sources, name)
-        except Refusal:
-            continue
-
-
-# Command line
-
-
-def _state_dir() -> Path:
-    from clio_relay.surface.settings import RelayPaths
-
-    return RelayPaths.from_env().state_dir
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """``python -m clio_relay.packages``: stage and list package archives."""
-    parser = argparse.ArgumentParser(
-        prog="python -m clio_relay.packages",
-        description="Stage JARVIS package archives relay can run, and list them.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-    put = sub.add_parser("stage", help="archive one package of a JARVIS repository and stage it")
-    put.add_argument("repo_dir", type=Path, help="the directory `jarvis repo add` takes")
-    put.add_argument("package", help="<repository>.<package>")
-    put.add_argument("--version", help="the version, when the package has no contract or tag")
-    put.add_argument("--output", type=Path, help="also write the archive here")
-    put.add_argument("--dry-run", action="store_true", help="build and describe it, stage nothing")
-    sub.add_parser("list", help="list the staged packages")
-    args = parser.parse_args(argv)
-    if args.command == "list":
-        entries = PackageCatalog(_state_dir() / "packages").all()
-        fields = {"name", "version", "sha256", "kind", "staged_at"}
-        print(
-            json.dumps(
-                [entry.model_dump(mode="json", include=fields) for entry in entries], indent=2
-            )
-        )
-        return 0
-    try:
-        data = archive_package(args.repo_dir, args.package, source=package_source(args.repo_dir))
-        if args.dry_run:
-            entry = describe_archive(data, args.package, version=args.version)
-        else:
-            entry = stage(_state_dir(), data, args.package, version=args.version)
-    except Refusal as refusal:
-        print(refusal.message, file=sys.stderr)
-        return 2
-    if args.output is not None:
-        args.output.write_bytes(data)
-    print(
-        json.dumps(
-            {
-                **entry.model_dump(mode="json", include={"name", "version", "sha256", "source"}),
-                "size": len(data),
-                "staged": not args.dry_run,
-            },
-            indent=2,
-        )
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

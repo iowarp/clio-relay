@@ -142,10 +142,10 @@ async def test_find_reconciles_through_tapis_search(
     await service.close()
 
 
-async def test_describe_routes_exec_and_serve_to_ssh(
+async def test_describe_routes_serve_to_ssh(
     stub: TapisStub, relay_paths: RelayPaths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """LQ37: ``exec`` and ``serve`` route to the ``ssh`` alternative."""
+    """LQ37: ``serve`` routes to the ``ssh`` alternative; ``exec`` is a Tapis job."""
     use_memory_keyring(monkeypatch)
     await sign_in(stub)
     seed_host(stub, SITE, tmp_path / "site")
@@ -157,15 +157,14 @@ async def test_describe_routes_exec_and_serve_to_ssh(
     described = await service.describe(SITE)
     routes = {item["verb"]: item for item in described["routes"]}
     print(f"LQ37 routes {routes}")
-    for verb in ("describe", "run", "files"):
+    for verb in ("describe", "run", "exec", "files"):
         assert routes[verb]["adapter"] == "tapis", routes[verb]
-    for verb in ("exec", "serve"):
-        assert routes[verb]["adapter"] == "ssh", routes[verb]
-        assert routes[verb]["via"] == "alternative"
+    assert routes["serve"]["adapter"] == "ssh", routes["serve"]
+    assert routes["serve"]["via"] == "alternative"
     info = described["info"]
     assert info["adapter"] == "tapis"
     assert info["facts"]["credential"] == "ok"
-    assert info["facts"]["job_type"] == "FORK"
+    assert info["facts"]["job_type"] == info["facts"]["exec_job_type"] == "FORK"
     await service.close()
 
 
@@ -178,7 +177,7 @@ async def test_guarded_site_refuses_a_free_form_run(
     seed_host(stub, SITE, tmp_path / "site")
     add_site(
         relay_paths,
-        _site(stub, config=tapis_config(stub, launcher="guarded"), policy="guarded"),
+        _site(stub, config=tapis_config(stub), policy="guarded"),
     )
     before = len(stub.state.requests_to("/v3/jobs"))
     service = RelayService(relay_paths)
@@ -191,12 +190,6 @@ async def test_guarded_site_refuses_a_free_form_run(
         RefusalReason.POLICY_REFUSED,
     )
     assert service.operations.ids() == []
-    # The adapter refuses on its own as well, for a guard that let it through.
-    adapter = service.adapter_named(service.site(SITE), "tapis")
-    with pytest.raises(Refusal) as direct:
-        await adapter.run(spec, operation_id="op-guarded")
-    print(f"LQ38 adapter refusal {direct.value.to_dict()}")
-    assert direct.value.reason == RefusalReason.POLICY_REFUSED
     assert len(stub.state.requests_to("/v3/jobs")) == before
     await service.close()
 
@@ -212,9 +205,7 @@ async def test_a_tacc_host_gets_a_tms_credential_and_no_key(
     context = AdapterContext(
         site_id="stampede3", state_dir=tmp_path / "relay", content=ContentStore(tmp_path / "c")
     )
-    config = TapisConfig.model_validate(
-        tapis_config(stub, authn="tms", system_id=tacc_system, launcher="guarded")
-    )
+    config = TapisConfig.model_validate(tapis_config(stub, authn="tms", system_id=tacc_system))
     adapter = TapisAdapter(config, context)
     made: list[str] = []
 

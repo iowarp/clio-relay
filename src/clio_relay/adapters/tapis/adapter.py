@@ -1,10 +1,20 @@
 """The ``tapis`` adapter (RL46 to RL50): jobs and files through Tapis v3.
 
 Relay submits every job to one Tapis app of its own, the launcher (RL47),
-whose only argument is a record of the job spec. The app's archive and the
+whose only argument names a record of the job spec. The app's archive and the
 inputs live in relay's work directory on the system, and the job's
 directory is ``<work dir>/jobs/<operation id>``. Inputs reach the job by
 ``tapislocal`` file inputs, so Tapis moves no bytes for them.
+
+``exec`` is a launcher job too: a FORK job on the login host when the system
+allows one, else a batch job (:func:`mapping.exec_job_type`). Relay's JARVIS
+root is under the work directory, so setup, the package listing and
+``packages(op="add")`` run through ``exec`` as on every adapter. A package job
+is JARVIS's, as over ssh (:mod:`clio_relay.jarvis_remote`): the pipeline and
+the site script go into the job directory through the files API, ``exec`` runs
+``jarvis ppl submit`` there (to the system's scheduler, or JARVIS's ``local``
+one with none), and status, cancel, stop and move are ``jarvis execution``
+commands run the same way.
 
 The person's TACC sign-in (RL48) comes from :mod:`clio_relay.identity.tacc`.
 Every Tapis call is made with the person's own token.
@@ -12,16 +22,21 @@ Every Tapis call is made with the person's own token.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import posixpath
 import re
+import time
+import uuid
+from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from pydantic import BaseModel
 
+from clio_relay import jarvis_remote, jarvis_submit
 from clio_relay.adapters.base import (
     AdapterContext,
     BaseAdapter,
@@ -30,13 +45,23 @@ from clio_relay.adapters.base import (
     SiteInfo,
     Verb,
     api_place,
+    not_implemented,
 )
 from clio_relay.adapters.tapis import launcher, mapping
 from clio_relay.adapters.tapis.client import TapisCallError, acall, make_client
 from clio_relay.adapters.tapis.config import TapisConfig
 from clio_relay.adapters.tapis.files import TapisFiles
 from clio_relay.identity.tacc import PROVIDER, TaccIdentity, TaccSettings
-from clio_relay.jobs.handles import FileAccess, JobHandle, JobState, JobStatus, OutputRef
+from clio_relay.jobs.handles import (
+    STALL_S,
+    ExecResult,
+    FileAccess,
+    JobHandle,
+    JobState,
+    JobStatus,
+    OutputRef,
+    StallReport,
+)
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 
@@ -50,6 +75,9 @@ WAY_IN_FILE = "way-in.json"
 WAY_IN_KEYS = ("ssh_profile", "ssh_config", "ssh_options")
 _EXIT_IN_MESSAGE = re.compile(r"exit(?:ed)?(?: with)? code[ :=]*(-?\d+)", re.IGNORECASE)
 _HIDDEN_OUTPUTS = ("tapisjob", "relay.")
+RECORD_FILE = "relay.record"
+EXEC_POLL_S = 3.0
+BOUNDED = 'n=$1; shift; "$@" > >(head -c "$n") 2> >(head -c "$n" >&2); rc=$?; wait; exit $rc'
 
 
 class TapisAdapter(BaseAdapter[TapisConfig]):
@@ -57,8 +85,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
 
     name: ClassVar[str] = "tapis"
     Config: ClassVar[type[BaseModel]] = TapisConfig
-    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "files"})
-    # The launcher's package mode runs a reviewed package through jarvis (tapisjob_app.sh).
+    implements: ClassVar[frozenset[Verb]] = frozenset({"describe", "run", "exec", "files"})
     runs_packages: ClassVar[bool] = True
 
     @classmethod
@@ -216,6 +243,10 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     async def files(self) -> FileAccess:
         return await self._files()
 
+    async def jarvis_home(self) -> str | None:
+        system = await self.system()
+        return self.host_path(system, self.work_dir(system))
+
     # setting the site up
 
     async def on_site_added(self, site: SiteEntry) -> dict[str, Any] | None:
@@ -281,7 +312,6 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             "tenant": self.config.tenant_id,
             "base_url": self.config.base_url,
             "authn": self.config.authn,
-            "launcher": self.config.launcher,
         }
         status = await self.identity.status()
         facts["signed_in"] = status.state == "signed_in"
@@ -309,6 +339,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             if item.get("name")
         }
         facts["job_type"] = mapping.job_type(system)
+        facts["exec_job_type"] = mapping.exec_job_type(system)
         try:
             await self.tapis_call(
                 "systems",
@@ -386,19 +417,10 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             await files.stage(self.context.content.get(digest))
 
     async def run(self, spec: JobSpec, *, operation_id: str) -> JobHandle:
-        steps = spec.steps()
-        if len(steps) > 1:
-            raise Refusal(
-                RefusalReason.VERB_NOT_IMPLEMENTED,
-                "the Tapis adapter runs one package per job; a pipeline of several packages "
-                "runs through the ssh, local or worker adapter",
-                verb="run",
-            )
-        if steps and spec.package is None:
-            spec = spec.model_copy(update={"package": steps[0], "packages": []})
-        guarded = self.config.launcher == "guarded"
-        if guarded and spec.package is None:
-            raise launcher.guarded_refusal()
+        if spec.steps():
+            handle = cast(JobHandle, await self._jarvis(spec, operation_id, "submit"))
+            self._remember(operation_id, handle)
+            return handle
         system = await self.system()
         kind = mapping.job_type(system)
         if kind is None:
@@ -408,20 +430,116 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
                 scheduler=system.get("batchScheduler"),
                 verb="run",
             )
+        handle = await self._submit(spec, operation_id, system, kind, await self._files())
+        self._remember(operation_id, handle)
+        return handle
+
+    async def install_check(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any]:
+        return cast(dict[str, Any], await self._jarvis(spec, operation_id, "check"))
+
+    async def plan_job(self, spec: JobSpec, *, operation_id: str) -> dict[str, Any] | None:
+        if not spec.steps():
+            return None
+        return cast(dict[str, Any] | None, await self._jarvis(spec, operation_id, "plan"))
+
+    async def _jarvis_job(
+        self, spec: JobSpec, operation_id: str
+    ) -> tuple[dict[str, Any], dict[str, object], dict[str, Any]]:
+        """The system, the job's pipeline and its handle data, for JARVIS's job directory."""
+        system, files = await self.system(), await self._files()
+        name = str(system.get("batchScheduler") or "").lower()
+        scheduler = name if system.get("canRunBatch") and name not in ("", "none") else "local"
+        root = self.host_path(system, files.root)
+        job_dir = f"{root}/jobs/{operation_id}"
+        document = jarvis_remote.document(
+            spec, operation_id, job_dir, scheduler=scheduler, job_name=f"relay-{operation_id}"
+        )
+        data = {"root": root, "job_dir": job_dir, "job_name": f"relay-{operation_id}"}
+        return system, document, {**data, "system_id": str(system["id"])}
+
+    async def _jarvis(
+        self, spec: JobSpec, operation_id: str, mode: jarvis_submit.SiteMode
+    ) -> JobHandle | dict[str, Any] | None:
+        """Run the site script's ``mode`` in the job directory through :meth:`exec`."""
+        system, document, data = await self._jarvis_job(spec, operation_id)
         files = await self._files()
-        digests = [item.sha256 for item in spec.inputs]
-        if spec.package is not None:
-            digests.append(spec.package.pinned()[1])
-        await self._stage_inputs(files, digests)
+        await self._stage_inputs(files, [item.sha256 for item in spec.inputs])
+        job_dir = f"{files.root}/jobs/{operation_id}"
+        for name, text in (
+            (jarvis_submit.PIPELINE_FILE, jarvis_submit.render_pipeline(document)),
+            (jarvis_submit.SCRIPT_FILE, jarvis_submit.SITE_SCRIPT),
+        ):
+            await files.write(f"{job_dir}/{name}", text.encode(), overwrite=True)
+        command = jarvis_submit.submit_command(
+            spec, operation_id=operation_id, jarvis="", home=data["root"], mode=mode, graph=""
+        )
+        links = [
+            (item.name, self.host_path(system, files.content_path(item.sha256)))
+            for item in spec.inputs
+        ]
+        script = jarvis_remote.submit_script(data["job_dir"], command, links, keep=mode == "submit")
+        return jarvis_remote.submitted(
+            self.name,
+            jarvis_remote.parse_sections(await self._sh(script, f"the {mode}")),
+            mode=mode,
+            spec=spec,
+            site=self.context.site_id,
+            install_walltime_s=None,
+            data=data,
+        )
+
+    async def install(
+        self, spec: JobSpec, *, operation_id: str, answers: dict[str, Any]
+    ) -> JobHandle:
+        """Submit ``ppl install +submit`` from the job directory the refused submit left."""
+        _, document, data = await self._jarvis_job(spec, operation_id)
+        command = jarvis_submit.install_command(
+            spec,
+            operation_id=operation_id,
+            jarvis="",
+            answers=answers,
+            pipeline=jarvis_submit.install_pipeline(document, None, answers),
+            home=data["root"],
+            graph="",
+        )
+        text = await self._sh(jarvis_remote.install_script(data["job_dir"], command), "the install")
+        return jarvis_remote.installed(
+            self.name,
+            text,
+            spec=spec,
+            site=self.context.site_id,
+            install_walltime_s=None,
+            login_mode="detached",
+            data=data,
+        )
+
+    async def _sh(self, script: str, what: str) -> str:
+        """Run ``script`` with ``sh`` on the system through :meth:`exec`; its stdout."""
+        result = await self.exec(["sh", "-c", script], max_output_bytes=1 << 20)
+        if result.exit_code != 0:
+            error = result.stderr.strip() or result.stdout.strip()
+            raise Refusal(
+                RefusalReason.UNREACHABLE,
+                f"{what} did not finish on {self.context.site_id}: {error[-500:] or 'no output'}",
+            )
+        return result.stdout
+
+    async def _submit(
+        self,
+        spec: JobSpec,
+        operation_id: str,
+        system: dict[str, Any],
+        kind: str,
+        files: TapisFiles,
+    ) -> JobHandle:
+        """Submit ``spec`` to the launcher app as a ``kind`` job, its record in the job's dir."""
+        await self._stage_inputs(files, [item.sha256 for item in spec.inputs])
         app_id, app_version = await self.ensure_app()
         job_dir = f"{files.root}/jobs/{operation_id}"
         content_host = self.host_path(system, posixpath.dirname(files.content_path("x")))
-        fields = launcher.record(
-            spec,
-            content_dir=content_host,
-            package_root=self.host_path(system, f"{files.root}/packages"),
-            guarded=guarded,
-        )
+        fields = launcher.record(spec, content_dir=content_host)
+        record = f"{job_dir}/{RECORD_FILE}"
+        await files.write(record, launcher.encode(fields).encode("ascii"), overwrite=True)
         request = mapping.job_request(
             spec,
             operation_id=operation_id,
@@ -431,7 +549,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             system_type=kind,
             job_dir=job_dir,
             content_dir_host=content_host,
-            launcher_arg=launcher.encode(fields),
+            launcher_arg="@" + self.host_path(system, record),
             max_minutes=mapping.max_minutes(spec, system, kind),
             exec_prefix=bool(system.get("enableCmdPrefix")),
         )
@@ -439,9 +557,81 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             submitted = cast(dict[str, Any], await self.tapis_call("jobs", "submitJob", **request))
         except TapisCallError as exc:
             raise exc.refusal(RefusalReason.SUBMIT_FAILED, site=self.context.site_id) from None
-        handle = self._handle(str(submitted["uuid"]), str(system["id"]), job_dir)
-        self._remember(operation_id, handle)
-        return handle
+        return self._handle(str(submitted["uuid"]), str(system["id"]), job_dir)
+
+    # exec
+
+    async def exec(
+        self,
+        command: list[str],
+        *,
+        timeout_s: float | None = None,
+        max_output_bytes: int,
+        on_stall: StallReport | None = None,
+    ) -> ExecResult:
+        """Run ``command`` in relay's work directory as one launcher job, and wait for it."""
+        if not command:
+            raise Refusal(RefusalReason.INVALID_ARGUMENTS, "give a command")
+        system = await self.system()
+        kind = mapping.exec_job_type(system)
+        if kind is None:
+            raise Refusal(
+                RefusalReason.VERB_NOT_IMPLEMENTED,
+                "this Tapis system runs neither FORK nor Slurm jobs, so relay cannot exec there",
+                verb="exec",
+            )
+        files = await self._files()
+        # The launcher writes output to files, so the site keeps only what relay reads.
+        keep = str(max_output_bytes + 1)
+        spec = JobSpec.model_validate(
+            {
+                "executable": "bash",
+                "arguments": ["-c", BOUNDED, "relay-exec", keep, *command],
+                "directory": self.host_path(system, files.root),
+                "attributes": {
+                    "duration": None if timeout_s is None else max(60, int(timeout_s) + 60)
+                },
+            }
+        )
+        operation_id = f"exec-{uuid.uuid4().hex[:16]}"
+        started = time.monotonic()
+        handle = await self._submit(spec, operation_id, system, kind, files)
+        timed_out = False
+        try:
+            while not (status := await self.status(handle)).state.final:
+                waited = time.monotonic() - started
+                if timeout_s is not None and waited > timeout_s:
+                    timed_out = True
+                    status = await self.cancel(handle)
+                    break
+                if on_stall is not None and waited >= STALL_S:
+                    await on_stall(waited, EXEC_POLL_S)
+                await asyncio.sleep(EXEC_POLL_S)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await self.cancel(handle)
+            raise
+        out = await self._read_bounded(files, f"{handle.data['job_dir']}/stdout", max_output_bytes)
+        err = await self._read_bounded(files, f"{handle.data['job_dir']}/stderr", max_output_bytes)
+        with suppress(Refusal, TapisCallError):
+            await files.remove_tree(str(handle.data["job_dir"]))
+        return ExecResult(
+            argv=list(command),
+            exit_code=None if timed_out else status.exit_code,
+            stdout=out[:max_output_bytes].decode("utf-8", "replace"),
+            stderr=err[:max_output_bytes].decode("utf-8", "replace"),
+            stdout_truncated=len(out) > max_output_bytes,
+            stderr_truncated=len(err) > max_output_bytes,
+            timed_out=timed_out,
+            duration_s=time.monotonic() - started,
+        )
+
+    @staticmethod
+    async def _read_bounded(files: TapisFiles, path: str, limit: int) -> bytes:
+        try:
+            return await files.read(path, limit=limit + 1)
+        except Refusal:
+            return b""
 
     def _handle(self, uuid: str, system_id: str, job_dir: str) -> JobHandle:
         return JobHandle(
@@ -460,6 +650,9 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
     # observe
 
     async def status(self, handle: JobHandle) -> JobStatus:
+        if handle.data.get("mode") == "jarvis":
+            found, _ = await jarvis_remote.status(self._sh, handle, site=self.context.site_id)
+            return found
         uuid = self._uuid(handle)
         try:
             job = cast(dict[str, Any], await self.tapis_call("jobs", "getJobStatus", jobUuid=uuid))
@@ -518,6 +711,8 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         return outputs
 
     async def cancel(self, handle: JobHandle) -> JobStatus:
+        if handle.data.get("mode") == "jarvis":
+            return await jarvis_remote.control(self._sh, handle, "cancel", self.status)
         uuid = self._uuid(handle)
         try:
             await self.tapis_call("jobs", "cancelJob", jobUuid=uuid)
@@ -526,6 +721,17 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
             if exc.status is None or exc.status >= 500:
                 raise exc.refusal(job=uuid) from None
         return await self.status(handle)
+
+    async def stop(self, handle: JobHandle) -> JobStatus:
+        """``jarvis execution stop`` for a JARVIS job; any other job is cancelled."""
+        if handle.data.get("mode") == "jarvis":
+            return await jarvis_remote.control(self._sh, handle, "stop", self.status)
+        return await self.cancel(handle)
+
+    async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
+        if handle.data.get("mode") != "jarvis":
+            raise not_implemented(self.name, "move_queue")
+        await jarvis_remote.move(self._sh, handle, queue_name, site=self.context.site_id)
 
     async def find(self, operation_id: str) -> JobHandle | None:
         path = self.records_dir / f"{operation_id}.json"

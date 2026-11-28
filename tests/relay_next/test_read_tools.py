@@ -124,13 +124,17 @@ def test_files_read_and_describe_packages_only_read(relay_paths: RelayPaths) -> 
                 raise_on_error=False,
             )
             assert wrong.is_error
-            staged = await client.call_tool("describe", {"packages": True})
-            assert "packages" in _structured(staged)
-            catalog = await client.call_tool("packages_read", {})
-            assert _structured(catalog)["schema"] == "relay.packages.v1"
-            assert _structured(catalog)["packages"] == _structured(staged)["packages"]
-            old = await client.call_tool("packages", {"op": "list"}, raise_on_error=False)
-            assert old.is_error, "listing moved to packages_read"
+            described = _structured(await client.call_tool("describe", {"site": "fx"}))
+            # The fixture adapter has no JARVIS root to list, so describe shows the
+            # last listing (none) with the reason, and packages_read refuses.
+            assert described["packages"] == [] and "packages_note" in described
+            catalog = await client.call_tool("packages_read", {"site": "fx"}, raise_on_error=False)
+            assert catalog.is_error
+            assert _structured(catalog)["refusal"]["reason"] == "verb_not_implemented"
+            old = await client.call_tool(
+                "packages", {"op": "list", "site": "fx", "path": "x"}, raise_on_error=False
+            )
+            assert old.is_error, "listing is packages_read"
 
     asyncio.run(scenario())
     assert RelayService(relay_paths).asks.all() == []

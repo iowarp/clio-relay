@@ -50,6 +50,13 @@ def job_type(system: dict[str, Any]) -> str | None:
     return None
 
 
+def exec_job_type(system: dict[str, Any]) -> str | None:
+    """``FORK`` on the login host for ``exec``, else ``BATCH`` on a Slurm system."""
+    if system.get("canExec", True):
+        return "FORK"
+    return job_type(system) if job_type(system) == "BATCH" else None
+
+
 def scheduler_options(spec: JobSpec) -> list[dict[str, str]]:
     """Slurm flags for what the Tapis request has no field for."""
     attributes = spec.attributes

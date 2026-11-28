@@ -1,9 +1,9 @@
 """A package job's live step and outputs, from its JARVIS execution records (RL40, RL43).
 
-Relay gives each package job a private JARVIS root at
-``<job dir>/.relay-jarvis`` (see :mod:`clio_relay.jarvis_submit`), and JARVIS
-keeps each execution's records under
-``shared/<pipeline>/executions/<execution id>/``: ``progress/*.jsonl``, one
+Each package job runs in its site's JARVIS root (see :mod:`clio_relay.jarvis_submit`),
+and JARVIS keeps each execution's records under
+``<pipeline dir>/executions/<execution id>/``, where the site script names the
+``<pipeline dir>`` in the job directory's ``relay.shared``: ``progress/*.jsonl``, one
 ``jarvis.progress.v1`` line per step, and ``artifacts/*.jsonl``, one
 ``jarvis.artifact.v1`` line per change to an output. A package that follows the
 clio step contract puts the step, the output it wrote and that output's view
@@ -39,9 +39,6 @@ from clio_relay.jobs.spec import JobSpec
 
 logger = logging.getLogger(__name__)
 
-JARVIS_SHARED = ".relay-jarvis/shared"
-"""Where the package runner's JARVIS keeps pipelines, under the job directory."""
-
 TAIL_BYTES = 64 * 1024
 """How much of each record file relay reads: the latest lines are enough."""
 
@@ -76,12 +73,8 @@ def _name(path: str) -> str:
     return posixpath.basename(path.rstrip("/"))
 
 
-async def _shared(files: FileAccess, directory: str) -> str:
-    """Return where the job's JARVIS shared directory is: what the site script wrote, if any.
-
-    The site script names the outputs directory there, so outputs are named
-    where they live and never through the job root's link to them.
-    """
+async def _shared(files: FileAccess, directory: str) -> str | None:
+    """Return the job's pipeline directory in JARVIS's shared one: what the site script wrote."""
     try:
         said = (
             (await files.read(posixpath.join(directory, jarvis_submit.SHARED_FILE), limit=4096))
@@ -90,27 +83,26 @@ async def _shared(files: FileAccess, directory: str) -> str:
         )
     except Exception:
         said = ""
-    return said.rstrip("/") if said.startswith("/") else posixpath.join(directory, JARVIS_SHARED)
+    return said.rstrip("/") if said.startswith("/") else None
 
 
 async def _execution(files: FileAccess, directory: str) -> str | None:
     """Return the newest execution directory under the job's JARVIS root, if any."""
     shared = await _shared(files, directory)
+    if shared is None:
+        return None
     newest: tuple[float, str] | None = None
-    for pipeline in await files.list(shared):
-        if pipeline.kind != "dir":
+    executions = posixpath.join(shared, "executions")
+    try:
+        runs = await files.list(executions)
+    except Exception:
+        return None
+    for run in runs:
+        if run.kind != "dir":
             continue
-        executions = posixpath.join(shared, _name(pipeline.path), "executions")
-        try:
-            runs = await files.list(executions)
-        except Exception:
-            continue
-        for run in runs:
-            if run.kind != "dir":
-                continue
-            key = (run.modified.timestamp() if run.modified else 0.0, run.path)
-            if newest is None or key > newest:
-                newest = (key[0], posixpath.join(executions, _name(run.path)))
+        key = (run.modified.timestamp() if run.modified else 0.0, run.path)
+        if newest is None or key > newest:
+            newest = (key[0], posixpath.join(executions, _name(run.path)))
     return newest[1] if newest else None
 
 

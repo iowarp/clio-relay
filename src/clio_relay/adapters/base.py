@@ -45,21 +45,23 @@ setting is ``invalid_config``, and a missing path is ``path_not_found``.
 Policy: a site is open or guarded. The guard sits in front of every adapter,
 so an adapter does not enforce it. A JARVIS pipeline job (:meth:`JobSpec.steps`:
 ``package``, or the ordered ``packages``) goes only to an adapter that sets
-``runs_packages``, which hands it to ``jarvis ppl submit`` on a batch site
-(:mod:`clio_relay.jarvis_submit`), or to JARVIS's direct run on a machine with
-no scheduler. Relay never turns a package into its own command job inside an
-allocation; any other adapter refuses it
-(:func:`clio_relay.jarvis_submit.not_run_here`). Such an adapter also
-implements the JARVIS lifecycle:
+``runs_packages``, which hands it to ``jarvis ppl submit`` on every scheduler,
+JARVIS's ``local`` one on a machine with none (:mod:`clio_relay.jarvis_submit`).
+Relay never turns a package into its own command job inside an allocation;
+any other adapter refuses it (:func:`clio_relay.jarvis_submit.not_run_here`).
+Such an adapter also implements the JARVIS lifecycle:
 
 - ``cancel`` and :meth:`~BaseAdapter.stop` run ``jarvis execution cancel`` and
   ``stop``; ``stop`` lets the pipeline run ``ppl stop`` and finish.
 - When ``run`` finds software to install, it raises
   :func:`clio_relay.jarvis_report.install_needed`; relay asks the person and calls
   :meth:`~BaseAdapter.install` with the answers, then ``run`` again.
-- When the site has no JARVIS, ``run`` raises
+- When the site's JARVIS root is not set up, ``run`` raises
   :func:`clio_relay.jarvis_submit.missing_jarvis`; after the person agrees, relay
   calls :meth:`~BaseAdapter.install_jarvis`.
+- :meth:`~BaseAdapter.jarvis_home` names the site home, and the default
+  :meth:`~BaseAdapter.install_jarvis` and :meth:`~BaseAdapter.site_packages` run
+  relay's setup and package listing there with ``exec``.
 
 Optional hooks, found by name when an adapter defines them:
 
@@ -503,12 +505,54 @@ class BaseAdapter[ConfigT: BaseModel]:
         """
         raise not_implemented(self.name, "install")
 
-    async def install_jarvis(self) -> str:
-        """Install jarvis-cd at :data:`clio_relay.jarvis_submit.JARVIS_PIN` in the site home.
+    async def jarvis_home(self) -> str | None:
+        """The site home relay's JARVIS root is under, as the site's shell names it.
 
-        Returns the path of the ``jarvis`` program it linked.
+        ``None`` (the default) when the adapter runs no packages through ``exec``.
         """
-        raise not_implemented(self.name, "install_jarvis")
+        return None
+
+    async def install_jarvis(self) -> str:
+        """Set up the site's JARVIS root (:data:`clio_relay.jarvis_site.SETUP_SCRIPT`).
+
+        Returns the path of the ``jarvis`` program it uses.
+        """
+        from clio_relay import jarvis_submit
+
+        home = await self.jarvis_home()
+        if home is None:
+            raise not_implemented(self.name, "install_jarvis")
+        jarvis = str(getattr(self.config, "jarvis", "") or "")
+        outputs = str(getattr(self.config, "outputs_dir", "") or "")
+        argv = jarvis_submit.setup_command(home, jarvis, outputs)
+        result = await self.exec(argv, timeout_s=None, max_output_bytes=1 << 20)
+        return jarvis_submit.setup_result(
+            result.exit_code, result.stdout + "\n" + result.stderr, site=self.context.site_id
+        )
+
+    async def site_packages(self, add: str = "", *, force: bool = False) -> str:
+        """Print the packages of the site's JARVIS root, after ``jarvis repo add <add>``.
+
+        It runs :data:`clio_relay.jarvis_site.PACKAGES_SCRIPT`, whose output
+        :func:`clio_relay.jarvis_site.parse_packages` reads.
+        """
+        from clio_relay import jarvis_submit
+
+        home = await self.jarvis_home()
+        if home is None:
+            raise not_implemented(self.name, "packages")
+        jarvis = str(getattr(self.config, "jarvis", "") or "")
+        argv = jarvis_submit.packages_command(home, jarvis, add=add, force=force)
+        result = await self.exec(argv, timeout_s=None, max_output_bytes=1 << 21)
+        if result.exit_code == 0 and not result.stdout_truncated:
+            return result.stdout
+        tail = "\n".join(result.stderr.strip().splitlines()[-10:]) or "no output"
+        raise Refusal(
+            RefusalReason.INVALID_ARGUMENTS if add else RefusalReason.UNREACHABLE,
+            f"{'adding ' + add if add else 'listing the packages'} on {self.context.site_id} "
+            f"failed: {tail}",
+            exit_code=result.exit_code,
+        )
 
     async def move_queue(self, handle: JobHandle, queue_name: str) -> None:
         """Move a job that still waits in the scheduler's queue to ``queue_name``.

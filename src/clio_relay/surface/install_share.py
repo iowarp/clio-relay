@@ -1,9 +1,9 @@
 """One ask per site for what is the site's, however many operations need it at once.
 
-Operations that find a site without JARVIS at the same time share one site-scoped
-approval (its binding names the site and the pin, not one job). The bootstrap
-script takes a lock in the site's jarvis-cd home, so a second install waits for
-the first and reuses it (:data:`~clio_relay.jarvis_bootstrap.BOOTSTRAP_SCRIPT`).
+Operations that find a site's JARVIS root not set up at the same time share one
+site-scoped approval (its binding names the site and the pins, not one job). The
+setup script takes a lock in the site's CLIO home, so a second setup waits for
+the first and reuses it (:data:`~clio_relay.jarvis_site.SETUP_SCRIPT`).
 
 JARVIS's own site-scope questions (which MPI, which compiler) are shared the same
 way: operations on the site that get the same question, the same ``issue_id``
@@ -22,9 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.hooks import Ask, with_choice_context, with_recommended_basis
-from clio_relay.guard.reviews import REVIEW_KIND
 from clio_relay.jobs.records import OperationRecord
-from clio_relay.jobs.spec import canonical_digest
 from clio_relay.sites.models import SiteEntry
 
 if TYPE_CHECKING:
@@ -55,11 +53,11 @@ def _live_elsewhere(service: RelayService, operation_id: str) -> list[OperationR
 
 
 def shared_jarvis_ask(service: RelayService, site_id: str, operation_id: str) -> Ask | None:
-    """Return the jarvis-cd ask another live operation on the site already holds.
+    """Return the setup ask another live operation on the site already holds.
 
-    It covers this operation too: one still pending, or one approved for an
-    install of jarvis-cd that has not finished yet. The bootstrap's site lock
-    makes the second install wait for the first and reuse it.
+    It covers this operation too: one still pending, or one approved for a
+    setup that has not finished yet. The setup's site lock makes the second
+    setup wait for the first and reuse it.
     """
     for other in _live_elsewhere(service, operation_id):
         if other.site != site_id:
@@ -71,39 +69,11 @@ def shared_jarvis_ask(service: RelayService, site_id: str, operation_id: str) ->
                 ask.kind == "approve"
                 and ask.binding.get("scope") == "site"
                 and ask.binding.get("kind") == JARVIS_KIND
-                and ask.binding.get("jarvis") == jarvis_submit.JARVIS_PIN
+                and ask.binding.get("jarvis") == jarvis_submit.site_pin()
                 and (ask.state == "pending" or (ask.state == "accepted" and installing))
             ):
                 return ask
     return None
-
-
-def jarvis_consented(service: RelayService, site_id: str, record: OperationRecord) -> bool:
-    """Say whether the person already agreed that relay installs its jarvis-cd here.
-
-    A package review that named relay's jarvis-cd at this pin covers it
-    (:func:`~clio_relay.surface.guarding.review_asks`): this operation's own,
-    accepted and unchanged, or one on another live operation of the site that is
-    installing jarvis-cd now. The bootstrap's site lock makes the second install
-    wait for the first and reuse it.
-    """
-    for other in [record, *_live_elsewhere(service, record.operation_id)]:
-        if other.site != site_id:
-            continue
-        own = other.operation_id == record.operation_id
-        other_state = _install_state(other)
-        if not own and (other_state.get("kind") != "jarvis" or other_state.get("stage") == "done"):
-            continue
-        for ask in service.operation_asks(other):
-            if (
-                ask.kind == "approve"
-                and ask.state == "accepted"
-                and ask.binding.get("kind") == REVIEW_KIND
-                and ask.binding.get("jarvis") == jarvis_submit.JARVIS_PIN
-                and ask.binding_digest == canonical_digest(ask.binding)
-            ):
-                return True
-    return False
 
 
 def choice_binding(site_id: str, issue: dict[str, Any]) -> dict[str, Any] | None:

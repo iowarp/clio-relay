@@ -14,6 +14,7 @@ from clio_relay.guard import WARM_EXECUTABLE, Guard
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
+from clio_relay.packages import ADD_COMMAND
 from clio_relay.surface.stubs import DefaultGuard
 from clio_relay.testing.fixture_adapter import FixtureAdapter, FixtureConfig
 
@@ -74,7 +75,7 @@ async def test_a_free_form_run_on_a_guarded_site_is_refused_with_the_way_on(guar
     assert decision.data["next_step"] == "package_review"
     assert "reviewed JARVIS packages" in (decision.message or "")
     assert "describe(site=...)" in decision.data["how"]
-    assert 'packages(op="stage"' in decision.data["how"]
+    assert ADD_COMMAND in decision.data["how"]
     with pytest.raises(Refusal) as raised:
         decision.raise_if_refused()
     assert raised.value.reason == RefusalReason.POLICY_REFUSED
@@ -85,7 +86,7 @@ async def test_a_package_relay_has_not_got_cannot_be_reviewed(guard: Guard) -> N
     with pytest.raises(Refusal) as raised:
         await guard.check_run(site(), package_spec("a" * 64))
     assert raised.value.reason == RefusalReason.INPUT_MISSING
-    assert 'packages(op="stage"' in raised.value.message
+    assert ADD_COMMAND in raised.value.message
 
 
 @pytest.mark.asyncio
@@ -93,8 +94,8 @@ async def test_a_new_package_comes_back_with_a_review_question(
     guard: Guard, tmp_path: Path
 ) -> None:
     repo = make_repo(tmp_path)
-    source = {"repository": "https://example.org/demo.git", "tag": "v0.1.0", "commit": "c" * 40}
-    digest = stage(guard, repo, "demo.hello", source)
+    git = {"url": "https://example.org/demo.git", "commit": "c" * 40}
+    digest = stage(guard, repo, "demo.hello", git)
     decision = await guard.check_run(site(), package_spec(digest))
     assert decision.allowed
     [review] = decision.data["asks"]
@@ -103,11 +104,12 @@ async def test_a_new_package_comes_back_with_a_review_question(
     assert binding["package"] == "demo.hello"
     assert binding["version"] == "0.1.0"
     assert binding["package_hash"] == digest
-    assert binding["source"] == source
+    assert binding["source"] == {"repository": git["url"], "commit": git["commit"]}
     message = review["message"]
     assert digest in message
-    assert "https://example.org/demo.git, tag v0.1.0, commit " + "c" * 40 in message
-    assert "demo/demo/hello/pkg.py" in message
+    assert "https://example.org/demo.git, commit " + "c" * 40 in message
+    assert "hello/pkg.py" in message and "_contract/base.py" in message
+    assert "other/pkg.py" not in message and "__pycache__" not in message
     assert "out=result.txt" in message
 
 
@@ -129,18 +131,21 @@ async def test_a_yes_reviews_that_hash_and_an_edit_needs_a_new_review(
     assert again.data["review"]["ask_id"] == "ask-1"
     assert [item.sha256 for item in guard.reviews.all(hpc.id)] == [digest]
 
-    (repo / "demo" / "hello" / "pkg.py").write_text("# edited\n")
-    edited = stage(guard, repo, "demo.hello")
-    assert edited != digest
-    after_edit = await guard.check_run(hpc, package_spec(edited))
-    assert after_edit.data["asks"][0]["binding"]["package_hash"] == edited
-
+    stage(guard, repo, "demo.hello", site_id="other")
     other_site = await guard.check_run(site(site_id="other"), package_spec(digest))
     assert "asks" in other_site.data, "a review is per site"
     other_version = package_spec(digest).model_copy(deep=True)
     assert other_version.package is not None
     other_version.package.version = "0.2.0"
     assert "asks" in (await guard.check_run(hpc, other_version)).data
+
+    (repo / "demo" / "_contract" / "base.py").write_text("SHARED = 2\n")
+    shared_edit = stage(guard, repo, "demo.hello")
+    (repo / "demo" / "hello" / "pkg.py").write_text("# edited\n")
+    edited = stage(guard, repo, "demo.hello")
+    assert len({digest, shared_edit, edited}) == 3
+    after_edit = await guard.check_run(hpc, package_spec(edited))
+    assert after_edit.data["asks"][0]["binding"]["package_hash"] == edited
 
 
 @pytest.mark.asyncio
@@ -217,6 +222,8 @@ async def test_a_pipelines_unreviewed_packages_are_one_review_question(
     assert [item["ask_id"] for item in again.data["reviews"]] == ["ask-1", "ask-1"]
     assert sorted(item.sha256 for item in guard.reviews.all(hpc.id)) == sorted([hello, other])
 
+    stage(guard, repo, "demo.hello", site_id="other")
+    stage(guard, repo, "demo.other", site_id="other")
     tampered = answer(
         guard, "ask-t", "other", review["message"], copy.deepcopy({**binding, "site": "other"})
     )

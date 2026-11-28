@@ -126,26 +126,24 @@ finish() {
     code=$2
     extra=${3:-}
     : > "$S/artifacts.txt.tmp"
-    # The package runner's archive and JARVIS tree are relay's own; package
-    # outputs land in .relay-jarvis/shared, which may link to the site's outputs
-    # directory (find -L follows it). Those are named where they are, as the site
-    # script's relay.shared says, never through the link. The adapter's own
-    # records and the scheduler's <job id>.* files are not the program's.
+    # Package outputs land in the job's pipeline directory in JARVIS's shared
+    # one, which the site script names in relay.shared; they are named where
+    # they are. The adapter's own records and
+    # the scheduler's <job id>.* files are not the program's.
     real=$(cat "$JOB/relay.shared" 2>/dev/null) || real=
     case $real in /*) ;; *) real= ;; esac
-    (cd "$JOB" && find -L . -type f -newer "$S/started" ! -path './serve/*' \
-        ! -path './.relay-package/*' ! -path '*/__pycache__/*' \
-        ! \( -path './.relay-jarvis/*' ! -path './.relay-jarvis/shared/*' \) \
+    [ -z "$real" ] || find "$real" -type f -newer "$S/started" 2>/dev/null |
+        while IFS= read -r file; do
+            printf '%s\t%s\n' "$(wc -c < "$file" | tr -d ' ')" "$file"
+        done >> "$S/artifacts.txt.tmp"
+    (cd "$JOB" && find . -type f -newer "$S/started" ! -path './serve/*' \
+        ! -path './shared/*' ! -path '*/__pycache__/*' \
         ! -name stdout ! -name stderr ! -name state.json ! -name job.json \
         ! -name spec.json ! -name native_id ! -name submit.sh ! -name supervisor.log \
         ! -name cancel ! -name states ! -name signalled ! -name final ! -name relay.shared \
         ! -name "${SLURM_JOB_ID:-/}.*" ! -name "${PBS_JOBID:-/}.*" 2>/dev/null) |
         while IFS= read -r file; do
-            named=${file#./}
-            case $named in
-                .relay-jarvis/shared/*) [ -z "$real" ] || named="$real/${named#.relay-jarvis/shared/}" ;;
-            esac
-            printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "$named"
+            printf '%s\t%s\n' "$(wc -c < "$JOB/$file" | tr -d ' ')" "${file#./}"
         done >> "$S/artifacts.txt.tmp"
     if [ "$SVC_DIR" != "$JOB" ] && [ -d "$SVC_DIR" ]; then
         find "$SVC_DIR" -maxdepth 2 -type f -newer "$S/started" 2>/dev/null | head -n 200 |

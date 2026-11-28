@@ -8,9 +8,9 @@ description: Use this skill to run jobs, commands, file transfers or services on
 
 Relay reaches the compute sites the person has set up, such as a cluster over
 SSH, a Globus Compute endpoint or a Tapis tenant. Its five verbs are
-`describe`, `run`, `exec`, `files` and `serve`. Beside them, `packages` stages
-and removes the JARVIS packages `run` takes, `install` installs a package's
-software on a site ahead of any run, and `shutdown` stops relay's long-lived
+`describe`, `run`, `exec`, `files` and `serve`. Beside them, `packages` adds
+a JARVIS repository to a site's JARVIS root, `install` installs a package's
+software on a site ahead of any run (and sets the site's JARVIS root up), and `shutdown` stops relay's long-lived
 processes when the host closes.
 
 ## Reads never ask
@@ -21,10 +21,11 @@ freely, in planning too, and keep `exec`, `files` and `packages` for changes.
 
 - `describe` lists sites, describes one (`site`), observes a job or a
   service (`job`; for a service it gives the endpoint and whether it is
-  ready) and lists the staged packages (`packages=true`).
-- `packages_read` lists the packages relay has staged, with their versions,
-  SHA-256s and where each came from, and relay's package sources. It takes no
-  arguments. `packages` has no list: it only stages and removes.
+  ready). For a site it also lists the packages the site's JARVIS root holds
+  and says under `jarvis` whether that root is set up.
+- `packages_read(site=...)` lists the packages a site's JARVIS root holds,
+  with their versions, digests and where each came from (`match` narrows it).
+  `packages` has no list: it only adds.
 - `exec_read` runs one read-only command, given as an argument list with no
   shell: listings and file reads (`ls`, `cat`, `head`, `tail`, `grep`,
   `stat`, `du`, `df`), the scheduler (`squeue`, `sinfo`, `sacct`,
@@ -182,57 +183,44 @@ Size a job's time request from what was measured, then pad it generously:
 A package's contract can say how to project its own run; the padding and the
 approval above still apply.
 
-## Stage a package before it runs
+## Packages on a site
 
 `run` takes a JARVIS package by name, `package: {name, parameters}`, and runs
-only a package relay has staged. `describe(site=...)` lists the staged ones
-under `packages`; `packages_read` lists them too, with where each came from.
-When the package you need is not there, stage it with the `packages`
-tool. Do not look for relay's files or build an archive by hand.
+only a package the site's JARVIS root holds. `describe(site=...)` lists them
+under `packages`; `packages_read(site=...)` lists them too, with where each
+came from. Relay lists them on the site itself, and pins the version and
+digest it finds there. Do not look for relay's files or build an archive.
 
-Stage from one of two sources:
+- **clio-jarvis** is in every site's root once the site is set up. When
+  `describe(site=...)` shows `jarvis.set_up: false`, or a `run` refuses
+  because the site is not set up, call `install` with the site and the job:
+  it asks the person, sets the root up and ends. Then run again. Do not look
+  for another way to place JARVIS.
+- **A repository the person wrote**, such as one just written with the JARVIS
+  package skill, laid out `<name>/<name>/<package>/pkg.py`: copy its directory
+  into the person's space on the site with `files`, then call
+  `packages(op="add", site=..., path=<that path on the site>)`. Give
+  `force: true` to replace a repository of that name after an edit. Never
+  push a person's package to a git repository to get it onto a site. The
+  repository may need nothing beyond jarvis-cd's own Python dependencies.
 
-- **Relay's package sources.** `packages(op="stage",
-  package="clio_jarvis.xcompact3d")` with nothing else stages it from the
-  package repositories installed beside relay. This plugin ships clio-jarvis
-  at its pin, so its packages need no download, no account and no sign-in.
-  The result's `sources` lists the directories relay looked in.
-- **A directory on the relay host.** `packages(op="stage", package="...",
-  dir="/abs/path")` stages a package from the person's workspace, such as one
-  just written with the JARVIS package skill. `dir` is the JARVIS repository
-  or the folder that holds it. The archive reaches the site as a job input,
-  through the site's own file transfer (scp on an ssh site). Never push a
-  person's package to a git repository to get it onto a site.
-
-Give `version` only when the package has no `contract.yaml` version and no
-git tag. Staging
-runs nothing and touches no site: on a guarded site the person still reviews
-the archive, by its SHA-256, before its first run there. A job's packages that
-are not reviewed yet come as one review, so one yes covers a pipeline.
-
-`packages(op="remove", package="...")` takes a package out of relay's
-catalog, every version of it unless `version` or `sha256` narrows it. Use it
-when the person resets a demo or wants an older archive gone; staging the
-same files again gives the same SHA-256, so an earlier review still holds.
-When several archives of one name are staged, `run` refuses and lists them:
-ask the person which one and pin its `version` or `sha256`.
-
-After a plugin update the package sources may build a new archive of a name.
-A run, stage or list by name then stages it, and the older archive shows
-`superseded_by`. Run the name, not the old `sha256`, unless the person asks for
-that archive; a guarded site reviews the new one before it runs.
+Adding runs nothing: on a guarded site the person still reviews each package,
+by its digest, before its first run there. The digest covers the package's
+files as they sit on the site, so an edited package is reviewed again. A job's
+packages that are not reviewed yet come as one review, so one yes covers a
+pipeline. When a `run` pins a digest the site no longer holds, it refuses with
+the current one: leave the pin out to take it.
 
 ## Install ahead of a run
 
 When the person wants a package's software on a site before running it ("install
 xcompact3d on ares, don't run anything yet"), call `install` with the site and
-the same `spec` a run would take, `package: {name, parameters}`, with the
-package staged first. It is `run`'s install step on its own, and nothing
+the same `spec` a run would take, `package: {name, parameters}`. It is `run`'s install step on its own, and nothing
 launches:
 
-- A site without JARVIS gets relay's jarvis-cd first, after the person says
-  yes. `install` does this itself; do not look for another way to place JARVIS.
-  On a guarded site the package review says so, and its yes covers jarvis-cd.
+- On a site whose JARVIS root is not set up, `install` sets it up (uv,
+  relay's jarvis-cd and clio-jarvis) after the person says yes, and ends.
+  Call it again for the software.
 - JARVIS checks what the site has where the site chose (below): on the login
   node under JARVIS's limits, or inside a short job on the compute nodes, and
   the task waits while that job queues and runs. Later installs and runs of

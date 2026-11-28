@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import gzip
-import io
 import json
-import os
-import tarfile
-from pathlib import Path
 
 import pytest
 
@@ -29,19 +24,10 @@ from clio_relay.jarvis_report import (
     choice_issues,
     choice_message,
 )
-from clio_relay.jarvis_site import (
-    SOURCE_FILE,
-    archive_package,
-    inspect_archive,
-    package_files,
-    read_archive,
-)
 from clio_relay.jarvis_submit import (
-    ARCHIVE_DIR,
     JARVIS_PIN,
     PIN_ENV,
     SITE_SCRIPT,
-    direct_job,
     explicit_jarvis,
     graph_pipeline,
     graph_report,
@@ -51,149 +37,11 @@ from clio_relay.jarvis_submit import (
     pipeline_document,
     queue_message,
     record_status,
-    steps_digest,
 )
-from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobState
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.login_load import light_argv
-
-from .conftest import make_repo
-
-
-def _tar(members: list[tuple[tarfile.TarInfo, bytes]]) -> bytes:
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as tar:
-        for info, body in members:
-            info.size = len(body)
-            tar.addfile(info, io.BytesIO(body))
-    return gzip.compress(raw.getvalue())
-
-
-def test_the_archive_holds_the_package_and_its_shared_code_only(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    paths = [path for path, _ in package_files(repo, "demo.hello")]
-    assert paths == [
-        "demo/README.md",
-        "demo/demo/__init__.py",
-        "demo/demo/_contract/__init__.py",
-        "demo/demo/_contract/base.py",
-        "demo/demo/hello/__init__.py",
-        "demo/demo/hello/pkg.py",
-        "schemas/package-contract.v1.json",
-    ]
-
-
-def test_the_same_files_give_the_same_bytes(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    first = archive_package(repo, "demo.hello")
-    pkg = repo / "demo" / "hello" / "pkg.py"
-    os.utime(pkg, (1_000_000, 1_000_000))
-    assert archive_package(repo, "demo.hello") == first
-    pkg.write_text(pkg.read_text() + "# changed\n")
-    assert archive_package(repo, "demo.hello") != first
-
-
-def test_inspect_reads_files_and_source(tmp_path: Path) -> None:
-    source = {"repository": "https://example.org/demo.git", "commit": "c" * 40}
-    data = archive_package(make_repo(tmp_path), "demo.hello", source=source)
-    info = inspect_archive(data, "demo.hello")
-    assert info.source == source
-    assert SOURCE_FILE not in [item.path for item in info.files]
-    assert "demo/demo/hello/pkg.py" in [item.path for item in info.files]
-    with pytest.raises(Refusal) as raised:
-        inspect_archive(data, "demo.other")
-    assert raised.value.reason == RefusalReason.INVALID_SPEC
-
-
-@pytest.mark.parametrize(
-    ("member", "kind"),
-    [
-        ("../escape.py", tarfile.REGTYPE),
-        ("/abs/pkg.py", tarfile.REGTYPE),
-        ("demo/demo/hello/link", tarfile.SYMTYPE),
-        ("demo/demo/hello/fifo", tarfile.FIFOTYPE),
-    ],
-)
-def test_inspect_refuses_odd_members(member: str, kind: bytes) -> None:
-    good = tarfile.TarInfo("demo/demo/hello/pkg.py")
-    odd = tarfile.TarInfo(member)
-    odd.type = kind
-    if kind == tarfile.SYMTYPE:
-        odd.linkname = "/etc/passwd"
-    with pytest.raises(Refusal) as raised:
-        inspect_archive(_tar([(good, b"x"), (odd, b"")]), "demo.hello")
-    assert raised.value.reason == RefusalReason.INVALID_SPEC
-
-
-def test_inspect_refuses_what_is_not_a_gzipped_tar() -> None:
-    with pytest.raises(Refusal) as raised:
-        inspect_archive(b"not an archive", "demo.hello")
-    assert raised.value.reason == RefusalReason.INVALID_SPEC
-
-
-def test_archive_refuses_a_name_the_repository_does_not_hold(tmp_path: Path) -> None:
-    repo = make_repo(tmp_path)
-    with pytest.raises(Refusal):
-        archive_package(repo, "demo.missing")
-    with pytest.raises(Refusal):
-        archive_package(repo, "other.hello")
-    for bad in ("nodot", "demo.he-llo", "demo.hello.x", "1demo.hello", "dém.hello"):
-        with pytest.raises(Refusal):
-            archive_package(repo, bad)
-
-
-def test_read_archive_explains_how_to_stage(tmp_path: Path) -> None:
-    content = ContentStore(tmp_path / "content")
-    with pytest.raises(Refusal) as raised:
-        read_archive(content, "demo.hello", "a" * 64)
-    assert raised.value.reason == RefusalReason.INPUT_MISSING
-    data = archive_package(make_repo(tmp_path), "demo.hello")
-    digest = content.put(data)
-    assert read_archive(content, "demo.hello", digest).sha256 == digest
-
-
-def test_direct_job_keeps_resources_and_inputs() -> None:
-    spec = JobSpec.model_validate(
-        {
-            "package": {
-                "name": "demo.hello",
-                "version": "1",
-                "sha256": "b" * 64,
-                "parameters": {"flag": True, "n": 2},
-            },
-            "inputs": [{"name": "in.dat", "sha256": "c" * 64}],
-            "resources": {"node_count": 2},
-            "attributes": {"queue_name": "debug"},
-        }
-    )
-    job = direct_job(spec, jarvis="~/jv/bin/jarvis")
-    assert job.package is None
-    assert job.executable == "/bin/bash"
-    assert job.arguments[1] == SITE_SCRIPT
-    assert job.arguments[2:7] == [
-        "clio-relay-jarvis",
-        "run",
-        "~/jv/bin/jarvis",
-        "",
-        f"demo.hello@{'b' * 64}",
-    ]
-    assert job.arguments[7].splitlines() == [
-        f"name: relay_{steps_digest(spec)[:12]}",
-        "pkgs:",
-        "- pkg_type: demo.hello",
-        "  pkg_name: pkg",
-        "  flag: true",
-        "  n: 2",
-    ]
-    assert [item.name for item in job.inputs] == ["in.dat", f".relay-package/{'b' * 64}.tar.gz"]
-    assert job.resources.node_count == 2
-    assert job.attributes.queue_name == "debug"
-    assert job.name == "demo-hello"
-    with pytest.raises(Refusal) as raised:
-        direct_job(spec.model_copy(update={"directory": "/scratch/run"}))
-    assert raised.value.reason == RefusalReason.INVALID_SPEC
 
 
 @pytest.mark.parametrize(
@@ -235,12 +83,14 @@ def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
             },
             "inputs": [
                 {"name": "body.stl", "sha256": "c" * 64},
-                {"name": f"{ARCHIVE_DIR}/{'b' * 64}.tar.gz", "sha256": "b" * 64},
+                {"name": "notes.txt", "sha256": "d" * 64},
             ],
         }
     )
-    archive = f"{ARCHIVE_DIR}/{'b' * 64}.tar.gz"
-    assert input_paths(spec, "/scratch/job") == {"body.stl": "/scratch/job/body.stl"}
+    assert input_paths(spec, "/scratch/job") == {
+        "body.stl": "/scratch/job/body.stl",
+        "notes.txt": "/scratch/job/notes.txt",
+    }
     entry = pipeline_document(spec, pipeline="p", job_dir="/scratch/job")["pkgs"]
     assert entry == [
         {
@@ -254,9 +104,6 @@ def test_a_parameter_naming_an_input_becomes_its_path_in_the_job() -> None:
     kept = pipeline_document(spec, pipeline="p")["pkgs"]
     assert isinstance(kept, list)
     assert kept[0]["stl"] == "body.stl"
-    assert archive not in str(entry)
-    job = direct_job(spec, job_dir="/scratch/job")
-    assert "  stl: /scratch/job/body.stl" in job.arguments[7].splitlines()
 
 
 def test_the_jarvis_setting_is_a_path_or_relays_pinned_one() -> None:
@@ -269,10 +116,10 @@ def test_the_jarvis_setting_is_a_path_or_relays_pinned_one() -> None:
             explicit_jarvis(bare)
 
 
-def test_the_site_script_expects_relays_pin() -> None:
+def test_the_site_script_expects_relays_pin_in_the_sites_root() -> None:
     assert PIN_ENV == "CLIO_RELAY_JARVIS_PIN"
     assert 'command -v "$jarvis"' not in SITE_SCRIPT
-    assert '"${found%/*}/pin"' in SITE_SCRIPT
+    assert '"$root/relay.pin"' in SITE_SCRIPT
 
 
 def test_a_missing_jarvis_says_whose_it_is() -> None:
@@ -311,7 +158,7 @@ def test_the_graph_collection_runs_on_compute_nodes() -> None:
         "pkgs": [{"pkg_type": "clio_relay_site.net_graph"}],
         "scheduler": {"nodes": 2, "time": "00:05:00"},
     }
-    assert "scheduler" not in graph_pipeline("none")
+    assert graph_pipeline("none")["scheduler"] == {"name": "local"}
 
 
 def test_the_graph_collection_is_relays_own_package_never_jarvis_builtin() -> None:
@@ -652,38 +499,22 @@ def test_a_bare_jarvis_in_exec_is_relays_jarvis_with_its_arguments_unparsed() ->
     assert exec_script(read).startswith('cd "$HOME" 2>/dev/null\nset -- jarvis rg')
 
 
-def test_site_level_jarvis_calls_initialize_the_site_root_without_builtin() -> None:
-    """sched info, the graph collection and the exec prefix run JARVIS with the
-    site-level root, which JARVIS refuses until ``jarvis init`` has made it. The
-    user: builtins "should not even be installed for relay to use"."""
+def test_site_level_jarvis_calls_use_the_set_up_site_root_without_builtin() -> None:
+    """sched info, the graph collection and the exec prefix run JARVIS in the site's
+    root, which relay's setup made; they never initialize it themselves. The user:
+    builtins "should not even be installed for relay to use"."""
     home = "/home/me/.clio-relay"
-    scripts = {
-        "exec": jarvis_command(home)[2],
-        "sched": sched_script(home),
-        "collect": graph_collect_command(home, "slurm")[2],
-        "describe": graph_script(home),
-    }
-    init = 'JARVIS_ROOT="$R" "$JB" init "$R/config" "$R/private" "$R/shared"'
-    for name, script in scripts.items():
-        # A root without the record, from an earlier relay, is set up again once.
-        guard = "grep -qsx 'no_builtin: true' \"$R/jarvis_config.yaml\" || " + init
-        assert guard in script, name
-        option = script.index("export JARVIS_NO_BUILTIN=1\n")
-        assert option < script.index(guard) < script.rindex('"$JB"'), name
-        assert "repo remove builtin" not in script, name
-    assert 'ppl submit "$S/site_net.yaml" +json' in scripts["collect"]
-    assert 'ppl run yaml "$S/site_net.yaml" +json' in graph_collect_command(home, "none")[2]
-
-
-def test_a_site_named_jarvis_initializes_its_root_only_once() -> None:
-    """An older site jarvis never writes the record, so only a missing root is set up."""
-    home = "/home/me/.clio-relay"
-    for script in (
-        jarvis_command(home, "/opt/jarvis")[2],
-        sched_script(home, "/opt/jarvis"),
-        graph_collect_command(home, "slurm", "/opt/jarvis")[2],
-        graph_script(home, "/opt/jarvis"),
-    ):
-        assert '[ -f "$R/jarvis_config.yaml" ] || JARVIS_ROOT="$R" "$JB" init' in script
-        assert "no_builtin: true" not in script
-        assert "export JARVIS_NO_BUILTIN=1\n" in script
+    for jarvis in ("", "/opt/jarvis"):
+        scripts = {
+            "exec": jarvis_command(home, jarvis)[2],
+            "sched": sched_script(home, jarvis),
+            "collect": graph_collect_command(home, "slurm", jarvis)[2],
+            "describe": graph_script(home, jarvis),
+        }
+        for name, script in scripts.items():
+            assert "R=/home/me/.clio-relay/jarvis\n" in script, name
+            assert '[ -x "$JB" ] && [ -f "$R/jarvis_config.yaml" ]' in script, name
+            assert " init " not in script and "repo remove builtin" not in script, name
+            assert "export JARVIS_NO_BUILTIN=1\n" in script, name
+    for scheduler in ("slurm", "none"):
+        assert 'ppl submit "$S/site_net.yaml" +json' in graph_collect_command(home, scheduler)[2]

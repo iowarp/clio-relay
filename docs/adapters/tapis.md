@@ -6,8 +6,8 @@ tenant over HTTPS, and Tapis logs in to the host and runs the job. Your
 machine needs no SSH access to the host while a job runs.
 
 It serves `describe`, `run` (with `status`, `cancel` and `find` on the jobs it
-starts) and `files`. `exec` and `serve` are not Tapis operations. A site that
-needs them names an `ssh` or `worker` alternative, and `describe` shows which
+starts), `exec` and `files`. `serve` is not a Tapis operation. A site that
+needs it names an `ssh` or `worker` alternative, and `describe` shows which
 adapter serves each verb.
 
 The catalog has four Tapis sites:
@@ -115,7 +115,6 @@ Always allow (`spend: {ask: never}`) on the Compute page.
 | `authn` | `pki` | `pki`: relay makes a key pair for a host you reach over SSH. `tms`: TACC's trust manager makes and holds the key |
 | `system_id` | `clio-relay.<username>.<site id>` | The Tapis system. Set it to use a system someone else registered |
 | `work_dir` | the system's job working directory | Relay's directory on the system, as a Tapis path |
-| `launcher` | `open` | `open` runs the job's executable. `guarded` runs reviewed packages only |
 | `client_id` | the environment | Relay's OAuth client, when not the shipped one |
 
 ## Registering a host
@@ -198,47 +197,35 @@ your work directory as well.
    relay operation id, and the app arguments carry the job spec as one base64
    argument, so nothing is quoted through a shell.
 4. The launcher links the inputs into the job's directory, runs the
-   executable (or, on a guarded site, the reviewed package) and writes the
-   exit code to `relay.exitcode`.
+   executable and writes the exit code to `relay.exitcode`.
 5. `status` reads the Tapis job status, and the exit code once the job ends.
    `cancel` calls `cancelJob`. Cancelling a job that already ended reports how
    it ended.
 
-A package runs through the `jarvis` on the system's PATH. Its name is
-`<repo>.<package>`, for example `clio_jarvis.gray_scott`, and its archive
-holds `<repo>/<repo>/<package>/...` at its root, with anything the repo reads
-beside it (clio-jarvis's `schemas/`). The launcher checks the archive's
-SHA-256, unpacks it once into `<work dir>/packages/<sha256>/`, and runs jarvis
-with a `JARVIS_ROOT` of the job's own, in `<job dir>/.relay-jarvis`:
+## exec
 
-```bash
-jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared"
-jarvis repo add "<unpacked>/<repo>"
-jarvis ppl create "relay_<job uuid>"
-jarvis ppl append "<repo>.<package>" pkg key=value ...
-jarvis ppl run
-```
+`exec` is a launcher job too, so it means the same here as on the other
+adapters and keeps their read-only rules. Relay runs it as a `FORK` job, on the
+login host with no queue, unless the system does not allow one (`canExec`
+false); then it runs as a `BATCH` job on a Slurm system, and waits in the
+queue. `describe` says which in `info.facts.exec_job_type`. The command runs in
+relay's work directory; the site keeps only as much of its output as relay
+reads, and relay removes the job's directory once it has read it.
 
-So a job never reads or changes your own `~/.ppi-jarvis`, and two jobs never
-share a pipeline. jarvis's output is the job's `stdout` and `stderr`.
+## Packages
 
-A service package, such as a ParaView server, runs `jarvis ppl start` in place
-of `jarvis ppl run` and stays up until the job is cancelled. On cancel, the
-launcher runs `jarvis ppl stop`, and the job ends with the stop's exit code.
-If the service fails to start, the launcher still runs `jarvis ppl stop` and
-the job fails with the start's exit code.
-
-How the cancel reaches the launcher depends on the job type:
-
-- On a `FORK` system, Tapis kills the launcher's children. The launcher sees
-  its wait end and stops the service.
-- On a `BATCH` system, Slurm sends `TERM` only to the batch step's main
-  process. Relay asks Tapis to start the launcher with `exec` (`cmdPrefix`), so
-  the launcher is that process and gets `TERM` with the scheduler's grace time.
-  Tapis takes `cmdPrefix` only on a system with `enableCmdPrefix`, which relay
-  sets on the systems it creates. On a system without it, such as TACC's own,
-  a cancel ends the job at once with no stop step. The scheduler still ends
-  every process the job started.
+The site's JARVIS root is under relay's work directory, `<work dir>/jarvis`,
+and relay sets it up, lists its packages and adds a repository through `exec`,
+as on every adapter (see
+[operations](../operations.md#the-sites-jarvis-root-and-its-packages)). On a
+package `run` (and an install's check and plan) is the same JARVIS job as on
+the ssh adapter: relay writes the pipeline and its site script into the job
+directory with Tapis Files, then runs the site script's `jarvis ppl submit`
+through `exec`. JARVIS submits to the system's batch scheduler, or to PSI/J's
+local executor on a system with none. `status`, `cancel`, `stop` and moving
+the job between queues run `jarvis execution` through `exec` too, so each one
+is a short launcher job. A package service is served by the site's `ssh` or
+`worker` alternative, as every `serve` is.
 
 Tapis stops any job that runs past its time limit, and gives a job 10 minutes
 when none is asked for. So relay always asks for one. A job with a duration
@@ -274,9 +261,10 @@ system, `~` is the work directory.
 ## Guarded sites
 
 On `vista` and `stampede3` the site is guarded: `run` takes a reviewed
-clio-jarvis package by name, version and SHA-256, with its parameters. A
+clio-jarvis package by name, version and digest, with its parameters. A
 free-form executable is refused with `policy_refused` before anything reaches
 Tapis. Every job on these sites asks you before it spends allocation hours.
+Both are Slurm systems, where JARVIS submits the package job to Slurm.
 
 ## Refusals you may see
 
@@ -286,7 +274,7 @@ Tapis. Every job on these sites asks you before it spends allocation hours.
 | `invalid_config` | The site has no Tapis system yet, and registering it on first use failed or the site names a `system_id`. Add or switch to the site again, or run `register-host`. On a TACC host, set `system_id` to one of the `candidates` it lists |
 | `policy_refused` | A free-form executable on a guarded site |
 | `submit_failed` | Tapis refused the job or the credential. The message carries Tapis's own words |
-| `verb_not_implemented` | The system uses a scheduler other than Slurm, which relay does not run jobs on yet |
+| `verb_not_implemented` | A free-form `run` on a system whose scheduler is not Slurm, which relay does not run its own jobs on yet |
 
 ## Testing without TACC
 

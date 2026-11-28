@@ -107,8 +107,8 @@ clio-relay site clean my-site +json
 This asks you first, since it deletes files on the site. After a yes it stops
 relay's processes there, then removes this site's own deployment: its
 configured `remote_dir`, which holds the worker and its binaries, site-serve,
-relay's scripts and job directories, the login hop and the JARVIS bootstrap
-venv. Nothing outside it goes, so another relay home on the same account,
+relay's scripts and job directories, the login hop and the site's JARVIS root
+with the jarvis-cd relay set up for it. Nothing outside it goes, so another relay home on the same account,
 with its own `remote_dir`, is left alone. If you moved the login hop with the
 site's serve `hop_dir`, clean also removes this site's directory in it. It
 keeps the Spack store (`<site home>/spack`, with every package built there):
@@ -172,57 +172,55 @@ it will remove; once the person says yes, the same call, or the next one with
 the same site, cleans. It refuses while one of relay's jobs still runs, the
 same way.
 
-## Stage and remove packages
+## The site's JARVIS root and its packages
 
-`run` takes only packages relay has staged, so a package is staged before its
-first run. The catalog and the archives live on the relay host, under relay's
-state directory, not on any site: `site clean` leaves them alone, and staging
-deploys nothing. The `packages` tool does it over MCP:
+Each site has one JARVIS root of relay's, `<site home>/jarvis`, and every
+JARVIS call relay makes there runs with `JARVIS_ROOT` set to it. Your own
+`~/.ppi-jarvis` is never touched. Setting a site up takes three steps, which
+relay runs as one script after you approve them:
+
+1. jarvis-cd at relay's pinned commit, installed with `uv tool install`. Relay
+   uses the `uv` on the site's `PATH`, else `<site home>/bin/uv`, else installs
+   uv there. uv brings its own Python, so the site needs none. The program is
+   `<site home>/bin/jarvis`.
+2. `jarvis init` of the root, then `jarvis repo rm builtin`: jarvis-cd's own
+   packages are never listed or run.
+3. clio-jarvis, cloned into the root at relay's pinned ref (`jarvis repo add`,
+   or `jarvis repo update` when the clone is at another commit).
+
+The setup is the `install` tool's: a `run`, `serve` or `install` on a site that
+is not set up refuses and names that step, and `describe(site=...)` reports
+`jarvis.set_up` with the root and the jarvis-cd pin, or `set_up: false` with
+the same step. Two setups at once share a lock, and a root already at the pins
+is reused. `site clean` removes the root with the rest of relay's deployment.
+
+The packages `run` takes are the ones the root holds, named
+`<repository>.<package>`. Relay lists them on the site, through the adapter's
+`exec`, with each package's review digest (below), its files and the text of
+its `pkg.py` and `contract.yaml`, and keeps the listing per site.
+`packages_read(site=...)` and `describe(site=...)` list them; neither changes
+anything.
+
+A package you wrote reaches the site with the `files` tool. Copy its
+repository, laid out `<name>/<name>/<package>/pkg.py`, into your space on the
+site, then register it:
 
 ```json
-{"op": "stage", "package": "clio_jarvis.xcompact3d"}
-{"op": "stage", "package": "demo.hello", "dir": "/home/me/src/demo"}
-{"op": "remove", "package": "clio_jarvis.xcompact3d"}
+{"op": "add", "site": "my-site", "path": "~/my_repo"}
 ```
 
-The `packages_read` tool lists what is staged. It takes no arguments and only
-reads, so a host that allows only reads (a plan mode) can call it.
+The `packages` tool runs `jarvis repo add <path>` in the root (`force: true`
+replaces a repository of that name) and lists the site's packages again. A
+repository needs nothing beyond jarvis-cd's own Python dependencies. See
+[guarded sites](guarded-sites.md#running-a-package) for how a guarded site
+reviews a package before it runs.
 
-With only a package name, relay stages it from its package sources: the
-directories `CLIO_RELAY_PACKAGE_SOURCES` names (`os.pathsep` apart), listed in
-the result's `sources`. Each is a JARVIS repository, a checkout that holds one,
-or a folder of such checkouts. The host fills them when it installs relay, so
-staging fetches nothing and runs no git, and it works for anyone, with no
-account and no write access to any repository. The CLIO plugin ships a copy of
-clio-jarvis at its pinned commit and points `CLIO_RELAY_PACKAGE_SOURCES` at it.
-A copy says where it came from in a `.clio-relay-source.json`, which goes into
-the archive; a git checkout says it through git, read only. With no source that
-holds the package, the refusal names the repository and the directories relay
-looked in. A `dir` is a directory on the relay host, such as a package the
-person wrote: it is never pushed anywhere, and its archive reaches a site as a
-job input through the site adapter's transfer (scp for ssh). Each call returns
-`relay.packages.v1`: what
-it staged or removed, and the catalog after it. Removing takes every version
-of the package out of the catalog unless `version` or `sha256` narrows it, and
-drops each archive from the content store unless an unfinished operation still
-needs it (`archive_kept`). `python -m clio_relay.packages stage` and `list` do
-the same from a shell. See [guarded sites](guarded-sites.md#running-a-package)
-for how a guarded site reviews a staged package.
-
-When the package sources change, for example after a plugin update ships a
-newer clio-jarvis, a name follows them. A stage or run by name, `list` and
-`describe` build the name's archive from the current sources. If its SHA-256
-is new, relay stages it and marks the older archives of that name with
-`superseded_by`. A name then never resolves to a superseded archive, so a run
-pins the new one and a guarded site asks its review again. A superseded archive
-stays in the catalog: an operation that pinned it keeps working, and a run that
-gives its `sha256` still uses it. An archive staged from a `dir` is never
-superseded, and `site clean` leaves the catalog alone.
-
-The archive of the same files has the same SHA-256 on any relay host, from any
-checkout and under any Python: members are sorted, with no times or owners, text
-files keep LF line ends (a Windows checkout's CRLF is packed as LF), and a file's
-mode is 0755 when it starts with `#!` and 0644 otherwise. The gzip holds stored
-(uncompressed) deflate blocks, because compressed bytes differ between zlib builds
-(CPython 3.14 on Windows links zlib-ng), so an archive is about the size of its
-files.
+A package's digest is the SHA-256 of its content as it sits in the root,
+computed the same way on the site however it got there. Its lines are one per
+file, `<sha256> <x or -> <path>`, for every file under
+`<repository>/<package>/` and the repository's shared `_*` files and
+directories (`__init__.py`, `_contract/`), skipping `__pycache__`, `.git`,
+`*.pyc` and `*.pyo`. The paths are relative to `<repository>`, the lines are
+sorted bytewise, and the digest is the SHA-256 of those lines, each ending in a
+newline. A `run` pins it, and the site script computes it again before JARVIS
+runs the step, exiting 65 when the package changed since.

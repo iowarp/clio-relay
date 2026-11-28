@@ -54,8 +54,6 @@ from clio_relay.login_load import light_argv
 from clio_relay.packages import (
     PackageCatalog,
     person_name,
-    pipeline_conflict,
-    stage_current,
     with_contract_couplings,
     with_contract_resources,
 )
@@ -305,19 +303,12 @@ class RelayService:
 
         The packages' contracts (walltime, queue and process layout, read from
         their parameters) come before the site's defaults, so the price, the
-        spend ask and the submitted job agree. What the job sets itself wins. A
-        pipeline whose steps cannot share one JARVIS tree is refused.
+        spend ask and the submitted job agree. What the job sets itself wins.
         """
         if spec.steps():
-            for step in spec.steps():
-                if step.sha256 is None:
-                    stage_current(self.paths.state_dir, self.paths.package_sources, step.name)
-            steps = [self.packages.resolve(step) for step in spec.steps()]
+            steps = [self.packages.resolve(site.id, step) for step in spec.steps()]
             spec = spec.with_steps(steps)
-            entries = [self.packages.entry(step, self.content) for step in steps]
-            conflict = pipeline_conflict(entries)
-            if conflict is not None:
-                raise conflict
+            entries = [self.packages.entry(site.id, step) for step in steps]
             spec = with_contract_resources(spec, entries)
             spec = with_contract_couplings(spec, entries)
         if spec.install_settings:
@@ -341,24 +332,30 @@ class RelayService:
         """Check, price and record a run, ask what must be asked, and submit if nothing must."""
         site = self.site(site_id)
         spec = await self.prepared_run(site, spec)
-        what = spec.executable or _steps_label(spec, self.step_titles(spec)) or "a job"
+        what = spec.executable or _steps_label(spec, self.packages.titles(site.id)) or "a job"
         digest, dumped = spec.digest(), spec.model_dump(mode="json")
         return await self.open_operation(
             site, "run", spec, dumped, digest, f"Run {what}", task=task, confirm=confirm
         )
 
+    async def list_packages(self, site: SiteEntry, job: JobSpec, verb: Verb) -> None:
+        """List the site's packages when the catalog lacks a step, refusing when not set up.
+
+        A cached entry is enough: the site script checks each step's digest again.
+        So is a pinned step on an open site; a guarded one reviews from the listing.
+        """
+        missing = [step for step in job.steps() if self.packages.entry(site.id, step) is None]
+        pinned = all(step.version and step.sha256 for step in missing)
+        if not missing or (pinned and site.policy != "guarded"):
+            return
+        adapter = self.adapter_for(site, verb)
+        if adapter.runs_packages and await self.packages.refresh(site.id, adapter) is None:
+            raise jarvis_submit.missing_jarvis("", site=site.title)
+
     async def prepared_run(self, site: SiteEntry, spec: JobSpec) -> JobSpec:
         """Return the run's job as relay records and digests it."""
+        await self.list_packages(site, spec, "run")
         return self.apply_defaults(site, spec)
-
-    def step_titles(self, spec: JobSpec) -> dict[str, str]:
-        """Each staged step's contract title, by package name, for the person's question."""
-        titles: dict[str, str] = {}
-        for step in spec.steps():
-            entry = self.packages.entry(step, self.content)
-            if entry is not None and entry.title:
-                titles[step.name] = entry.title
-        return titles
 
     def prepare_service(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Fill the service job's site defaults.
@@ -371,6 +368,7 @@ class RelayService:
 
     async def prepared_serve(self, site: SiteEntry, spec: ServiceSpec) -> ServiceSpec:
         """Return the service as relay records and digests it."""
+        await self.list_packages(site, spec.job, "serve")
         return self.prepare_service(site, spec)
 
     async def start_serve(
@@ -389,7 +387,9 @@ class RelayService:
         spec = await self.prepared_serve(site, spec)
         ports = ", ".join(port.name for port in spec.ports)
         what = (
-            spec.job.executable or _steps_label(spec.job, self.step_titles(spec.job)) or "a service"
+            spec.job.executable
+            or _steps_label(spec.job, self.packages.titles(site.id))
+            or "a service"
         )
         return await self.open_operation(
             site,

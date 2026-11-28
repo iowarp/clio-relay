@@ -1,7 +1,7 @@
 """The server's ``instructions``: what relay does, and on which sites and packages.
 
 Clients read ``instructions`` from ``initialize`` or ``server/discover``, and many
-put it in the agent's system prompt. It names the sites and the staged packages,
+put it in the agent's system prompt. It names the sites and the packages they hold,
 so an agent asked to run a code on a site knows relay is the way before it
 calls any tool. The text comes from the sites file and the package catalog, and
 :func:`keep_current` refreshes it while the server runs.
@@ -44,15 +44,15 @@ GENERAL = (
     "run submits a job (a PSI/J JobSpec) and is a task when the client supports tasks; "
     "exec runs one short command; files lists, reads, writes and stages files; "
     "serve starts a service, and serve(service=..., until='steps') waits for its job's "
-    "compute steps to end; packages stages a JARVIS package (from relay's package "
-    "sources, or a directory on the relay host) before its first run, or removes one. "
-    "install installs a staged package's software on a site ahead of a run, and runs "
-    "nothing: JARVIS builds it where the site chose, and relay installs JARVIS "
-    "first when the site lacks it. "
+    "compute steps to end; packages(op='add') registers a JARVIS repository the person "
+    "wrote, copied to the site with files, with the site's JARVIS root. "
+    "install installs a package's software on a site ahead of a run, and runs "
+    "nothing: JARVIS builds it where the site chose, and relay sets up the site's "
+    "JARVIS first when it is not. "
     "Reads never change anything and never ask: describe (a site, an operation or a "
-    "service with job=..., the staged packages with packages=true), exec_read (a command "
+    "service with job=...), exec_read (a command "
     "on relay's read-only list, such as squeue or jarvis sched info +json), files_read "
-    "(list, stat, read, has) and packages_read (the packages relay can run). "
+    "(list, stat, read, has) and packages_read (the packages a site's JARVIS root holds). "
     "cancel cancels a job or stops a service; site_clean removes relay's deployment from "
     "a site after the person's yes, keeping the Spack store. "
     "Refusals carry a typed reason in structuredContent.refusal. "
@@ -106,7 +106,7 @@ def compose(sites: list[SiteEntry], packages: list[PackageEntry]) -> str:
     ]
     if packages:
         ordered = sorted(packages, key=lambda entry: entry.name)
-        parts.append(f"Packages staged to run on them: {_listed(map(package_line, ordered))}.")
+        parts.append(f"Packages their JARVIS roots hold: {_listed(map(package_line, ordered))}.")
     parts.append(
         "To run a code or a package on these sites, use relay's describe and run tools "
         "instead of building or launching it by hand: describe(site=...) gives a site's "
@@ -123,7 +123,8 @@ def current(service: RelayService) -> str:
         logger.debug("relay could not read the sites file for its instructions", exc_info=True)
         sites = []
     try:
-        packages = service.packages.newest()
+        found = {entry.name: entry for site in sites for entry in service.packages.all(site.id)}
+        packages = list(found.values())
     except Exception:
         logger.debug("relay could not read the package catalog", exc_info=True)
         packages = []
@@ -135,11 +136,12 @@ async def keep_current(
 ) -> None:
     """Refresh ``server.instructions`` until cancelled.
 
-    The CLI and the Compute page edit the sites file, and packages are staged, from
-    any process, so relay looks again every ``interval_s`` seconds. A client reads the
-    text when it connects (``initialize``) or asks again (``server/discover``, which
-    answers with the current text), so a site added or removed reaches it there: MCP
-    has no notification for changed instructions.
+    The CLI and the Compute page edit the sites file, and site listings land in the
+    package catalog, from any process, so relay looks again every ``interval_s``
+    seconds. A client reads the text when it connects (``initialize``) or asks
+    again (``server/discover``, which answers with the current text), so a site
+    added or removed reaches it there: MCP has no notification for changed
+    instructions.
     """
     while True:
         await asyncio.sleep(interval_s)

@@ -41,7 +41,6 @@ anything, see [sites that ask for a code](#sites-that-ask-for-a-code).
 | `outputs_dir` | `clio-relay-runs` | Where runs write: JARVIS's shared directory for each job, and where a case's `run_dir` belongs. Under your home unless absolute; it must be outside `remote_dir`. `site clean` keeps it unless you ask. `describe` shows it as `info.facts.outputs_dir` |
 | `scheduler` | `auto` | `auto`, `none`, `slurm`, `pbs`, `lsf` or `cobalt` |
 | `jarvis` | empty | Empty runs relay's pinned jarvis-cd. Set only to name another jarvis by path, for [package jobs](#package-jobs) |
-| `jarvis_python` | empty | The Python 3.11 or newer relay installs its jarvis-cd with: a path, `~/...`, a name on the site's `PATH` such as `python3.12`, or `module:<name>` for an environment module. Empty lets relay find one |
 | `jarvis_graph` | empty | The site's published JARVIS resource graph, absolute or `~/...`. Empty takes the graph the site's `$JARVIS_RESOURCE_GRAPH` names, else keeps one under `remote_dir`. Set it when the person names another: JARVIS reads it (with the install answers it holds) and never writes it, keeping what it records in its own graph under `remote_dir` (`info.facts.resource_graph.site_home`, jarvis-cd 1.9.16). `describe` reports it as `info.facts.resource_graph.path` with `published: true`, and `site clean` keeps it. `relay` keeps relay's own graph under `remote_dir` even where the site publishes one, so relay offers to collect it; the person's dotfiles stay as they are |
 | `install_walltime_s` | unset | The walltime of the job that builds a package's software. Unset, JARVIS sizes it from its estimate of the build, within the partition's limit. Set it only to override JARVIS |
 | `interactive_sign_in` | `false` | The site asks for a code on every connection |
@@ -164,9 +163,9 @@ directories made before the submit, and the bound interpreter and
    JARVIS's `+plan` shows what the ranks claim in its `cores` section
    (`jarvis.submit-cores.v1`); relay passes it to the agent unaltered as
    `plan.cores`, and the confirm ask quotes its `meaning`.
-2. `relay-jarvis.sh` checks the archive against the reviewed hash, unpacks it,
-   makes a JARVIS root for this job only (`<job dir>/.relay-jarvis`), adds the
-   package's repository and runs
+2. `relay-jarvis.sh` sets `JARVIS_ROOT` to the site's JARVIS root
+   (`<home>/jarvis` in the CLIO site home), computes each package's digest
+   there again, refuses one that differs from the reviewed digest, and runs
    `jarvis ppl submit relay.pipeline.yaml --execution-id <operation id> +json`.
    It keeps JARVIS's handle in `relay.submission.json`.
 3. `status` reads `jarvis execution get`, and the outputs come from
@@ -275,7 +274,7 @@ service crashed, and the card shows that service's component `failed`. A
 service kept as the job's purpose (`after_steps: keep`) still fails the job.
 The Spack environment is kept under the CLIO site home, at
 `jarvis-cd/pipelines/<digest>/`, where the digest is that of the set of package
-archives, so the next run of the same packages reuses it. Two installs into
+digests, so the next run of the same packages reuses it. Two installs into
 one environment take turns; the second shows `waiting_env_lock` until the
 first is done.
 JARVIS records your answers in the site's decisions file,
@@ -313,11 +312,10 @@ the agent runs through `exec` with `facts.jarvis.exec` (see below), with a plan
 on a guarded site. It never builds. When it cannot pick a compiler it exits 3
 with an `ambiguous_compiler` issue; answer it with `--answers`. Relay never
 builds into the site's own Spack.
-A package archive carries what the package needs on the site: the Spack
-repositories its repository's `contract.yaml` lists under `install.repos`,
-and the Python requirements its `pyproject.toml` names. Relay installs those
-requirements into its own jarvis-cd before it registers the repository, and
-the review lists them.
+A package's Spack repositories are its own repository's, which its `pkg.py`
+names in the `install_repos` default of its menu, relative to the package
+directory (`../_spack` in clio-jarvis). A repository needs nothing beyond
+jarvis-cd's own Python dependencies; relay installs no requirements of its own.
 
 `describe(site=...)` shows JARVIS's view of the scheduler: relay runs `jarvis
 sched info +json`, a light read that is safe on a login host, and fills
@@ -375,37 +373,36 @@ change; the person's override is `jarvis rg net set`. `site clean` removes
 relay's own graph with the rest of relay's directory, never a published one,
 and keeps the decisions file, unless
 `--forget-decisions` (`forget_decisions` over MCP) says otherwise.
-Relay runs its own pinned jarvis-cd, at `<home>/jarvis-cd/jarvis` in the CLIO
-site home, by absolute path for submit, install, check, execution and stop. It
-never runs a `jarvis` found on the site's `PATH`: an older one rejects the
-service reports and builds on the login node. When relay's is missing or at
-another pin, relay asks before it installs the pinned release there, in a fresh
-virtual environment made with a Python 3.11 or newer. The release is
-jarvis-cd's published wheel, and pip checks its SHA-256 before it installs it.
-Relay looks for a Python
-itself: `python3`, then any `python3.N` on the site's `PATH`, newest first, then
-a `python` environment module (`module avail`, newest first). Name
-another in `jarvis_python`. When none is new enough, the refusal lists what
-relay tried. Package jobs run jarvis-cd with that same Python. The install
-needs the site to reach github.com. Later runs on the site use it. On a guarded
-site the package review says this too, so a yes to the review covers the
-install and relay asks no second question about jarvis-cd. A site that really
-needs another jarvis names its path in the `jarvis` setting, absolute or from
-`~/`; a bare name is refused.
+Relay runs its own pinned jarvis-cd, at `<home>/bin/jarvis` in the CLIO site
+home, by absolute path for submit, install, check, execution and stop, always
+with `JARVIS_ROOT=<home>/jarvis`. It never runs a `jarvis` found on the site's
+`PATH`: an older one rejects the service reports and builds on the login node.
+When the root is not set up, or not at relay's pins, a `run`, `serve` or
+`install` refuses and names the setup step: an `install` with the site and job,
+which asks you before it sets up the site and ends. The setup installs uv (the
+one on `PATH`, else `<home>/bin/uv`, else uv's installer puts it there), then
+jarvis-cd at its pinned commit with `uv tool install`, which brings its own
+Python, then makes the root without jarvis-cd's builtin repository and clones
+clio-jarvis into it at its pinned ref. It needs the site to reach github.com.
+`describe(site=...)` shows whether the site is set up, with the root and the
+jarvis-cd pin, in its `jarvis` part. A site that really needs another jarvis
+names its path in the `jarvis` setting, absolute or from `~/`; a bare name is
+refused.
 
 Some things relay refuses rather than working around JARVIS:
 
-- Package jobs need Slurm. On PBS, LSF or Cobalt, `run` is refused with
-  `adapter_unavailable`, naming the JARVIS scheduler it needs.
 - A package job's `directory` and `stdin_path` are refused. Its inputs are in
   the job directory, and a package parameter whose value is an input's name
   becomes that input's absolute path there, so nobody spells out the job
   directory.
 - JARVIS has no cleanup command, so the execution directory stays on the site.
 
-The local and worker adapters run package jobs the same way, with the same
-refusals: `jarvis ppl submit` when the site's scheduler is Slurm, and
-JARVIS's direct run under the supervisor when it has none.
+Every package job is `jarvis ppl submit`, whatever the scheduler: JARVIS
+submits through PSI/J to Slurm, PBS, LSF, Flux or Cobalt, and on a host with
+none (`scheduler: none`) to PSI/J's local executor, whose job outlives the
+call that started it. A package service stops with `jarvis execution stop`
+everywhere. The local, worker and tapis adapters run package jobs the same
+way, with the same refusals.
 
 ## How relay connects
 

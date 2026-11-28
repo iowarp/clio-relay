@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from clio_relay import jarvis_remote
 from clio_relay.adapters.ssh import scripts, store
 from clio_relay.jobs.spec import InputRef
 
@@ -54,7 +55,7 @@ def test_a_final_record_drops_the_inputs_the_job_deleted(tmp_path: Path) -> None
     done = subprocess.run(
         ["sh", "-c", script], input=b"{}", capture_output=True, check=True, cwd=tmp_path
     )
-    dropped = scripts.parse_sections(done.stdout.decode()).get("dropped", [])
+    dropped = jarvis_remote.parse_sections(done.stdout.decode()).get("dropped", [])
     assert dropped == [digests["deleted"], digests["transient"]]
     assert {case for case, blob in stored.items() if blob.exists()} == {
         "kept",

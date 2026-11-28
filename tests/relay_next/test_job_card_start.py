@@ -197,10 +197,11 @@ class _Titles:
     """A service stand-in that knows the packages' contract titles."""
 
     def __init__(self, titles: dict[str, str]) -> None:
-        self.titles = titles
+        self.known = titles
+        self.packages = self
 
-    def step_titles(self, spec: Any) -> dict[str, str]:
-        return self.titles
+    def titles(self, site: str) -> dict[str, str]:
+        return self.known
 
 
 def _install(spec: dict[str, Any], **result: Any) -> OperationRecord:

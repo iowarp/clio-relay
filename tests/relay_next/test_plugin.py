@@ -71,7 +71,6 @@ def test_the_launch_maps_the_globus_grant_and_runs_relay() -> None:
         "CLIO_RELAY_CONFIG_DIR": "${PLUGIN_DATA}/config",
         "CLIO_RELAY_STATE_DIR": "${PLUGIN_DATA}/state",
         "CLIO_RELAY_GRANT_FILE_GLOBUS": "${CLIO_ACCOUNT_GLOBUS_FILE}",
-        "CLIO_RELAY_PACKAGE_SOURCES": "${PLUGIN_ROOT}/packages",
     }
     launched = {
         "CLIO_RELAY_CONFIG_DIR": "/plugin-data/config",

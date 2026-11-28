@@ -3,8 +3,8 @@
 Two ``install`` operations started together on a clean site both get
 ``missing_jarvis``. Relay asks once for the site: the second holds the first's
 ask, one answer moves both on, and cancelling one leaves the ask to the other.
-The install script on the site takes turns (``.relay.lock``) and the later one
-reuses the first install; the POSIX test runs the real script twice at once.
+The setup script on the site takes turns (``.relay.lock``) and the later one
+reuses the first setup; the POSIX test runs the real script twice at once.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import pytest
 from clio_relay import jarvis_submit
 from clio_relay.adapters.hooks import Ask
 from clio_relay.asks.core import stale_approval
+from clio_relay.jarvis_site import CLIO_JARVIS_REF, CLIO_JARVIS_URL, site_pin
 from clio_relay.jobs.handles import JobHandle, JobState, JobStatus
 from clio_relay.jobs.records import OperationState
 from clio_relay.jobs.spec import JobSpec, PackageRef
@@ -79,7 +80,7 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
                 await asyncio.sleep(0.01)
                 state.builds += 1
                 state.jarvis = True
-        return "/h/.clio-relay/jarvis-cd/jarvis"
+        return "/h/.clio-relay/bin/jarvis"
 
     async def install(self: FixtureAdapter, *args: Any, **kwargs: Any) -> JobHandle:
         raise AssertionError("the software is all there")
@@ -87,10 +88,14 @@ def site(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Site]:
     async def status(self: FixtureAdapter, handle: JobHandle) -> JobStatus:
         return JobStatus(state=JobState.COMPLETED, exit_code=0)
 
+    async def site_packages(self: FixtureAdapter, add: str = "", *, force: bool = False) -> str:
+        return ""
+
     for name, value in {
         "install_check": install_check,
         "install_jarvis": install_jarvis,
         "install": install,
+        "site_packages": site_packages,
         "status": status,
     }.items():
         monkeypatch.setattr(FixtureAdapter, name, value)
@@ -215,47 +220,47 @@ def test_a_declined_shared_ask_cancels_every_operation_holding_it(
     asyncio.run(scenario())
 
 
-FAKE_PYTHON = r"""#!/bin/bash
-# Stands in for python, venv and pip: a slow jarvis-cd install that counts builds.
-case "$1" in
-  -c) echo 3.12.0; exit 0 ;;
-  -m)
-    case "$2" in
-      venv) mkdir -p "$3/bin"; cp "$0" "$3/bin/python"; exit 0 ;;
-      pip)
-        case "$*" in
-          *"jarvis-cd @"*)
-            echo build >> "$FAKE_BUILDS"
-            sleep 1
-            [ -d "$(dirname "$0")" ] || { echo "venv removed under the install" >&2; exit 1; }
-            printf '#!/bin/sh\n' > "$(dirname "$0")/jarvis"
-            chmod +x "$(dirname "$0")/jarvis" ;;
-        esac
-        exit 0 ;;
-    esac ;;
+FAKE_UV = r"""#!/bin/bash
+# Stands in for uv: a slow jarvis-cd tool install that counts builds and leaves a jarvis.
+[ "$1 $2" = "tool install" ] || exit 1
+echo build >> "$FAKE_BUILDS"
+sleep 1
+cat > "$UV_TOOL_BIN_DIR/jarvis" <<'JARVIS'
+#!/bin/bash
+echo "$*" >> "$FAKE_BUILDS.jarvis"
+case "$1 $2" in
+  "init "*)
+    mkdir -p "$JARVIS_ROOT"
+    printf 'no_builtin: true\nshared_dir: %s\n' "$4" > "$JARVIS_ROOT/jarvis_config.yaml" ;;
+  "repo add")
+    mkdir -p "$JARVIS_ROOT/repos/clio_jarvis/.git" "$JARVIS_ROOT/repos/clio_jarvis/clio_jarvis"
+    printf 'repos:\n- %s\n' "$JARVIS_ROOT/repos/clio_jarvis" > "$JARVIS_ROOT/repos.yaml" ;;
 esac
-exit 1
+JARVIS
+chmod +x "$UV_TOOL_BIN_DIR/jarvis"
 """
 
 
 @pytest.mark.release_platform("posix")
-def test_two_bootstraps_at_once_build_jarvis_once(tmp_path: Path) -> None:
-    fake = tmp_path / "python3"
-    fake.write_text(FAKE_PYTHON, encoding="utf-8")
+def test_two_setups_at_once_set_the_site_up_once(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "uv"
+    fake.write_text(FAKE_UV, encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    # The fake clone has no commits, so git answers the ref setup checks it against.
+    git = bin_dir / "git"
+    git.write_text(f"#!/bin/bash\necho {CLIO_JARVIS_REF}\n", encoding="utf-8")
+    git.chmod(git.stat().st_mode | stat.S_IXUSR)
     builds = tmp_path / "builds"
-    env = {**os.environ, "HOME": str(tmp_path), "FAKE_BUILDS": str(builds)}
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "FAKE_BUILDS": str(builds),
+        "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+    }
     home = str(tmp_path / ".clio-relay")
-    argv = [
-        "bash",
-        "-c",
-        jarvis_submit.BOOTSTRAP_SCRIPT,
-        "clio-relay-jarvis",
-        home,
-        jarvis_submit.JARVIS_PIN,
-        "https://example.invalid/jarvis.tar.gz",
-        str(fake),
-    ]
+    argv = jarvis_submit.setup_command(home)
     runs = [
         subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for _ in range(2)
@@ -265,6 +270,22 @@ def test_two_bootstraps_at_once_build_jarvis_once(tmp_path: Path) -> None:
     assert builds.read_text(encoding="utf-8").splitlines() == ["build"]
     lines = [out.strip().splitlines()[-1] for out, _ in outputs]
     assert sum('"from":"reused"' in line for line in lines) == 1, lines
-    jarvis = Path(home) / "jarvis-cd" / "jarvis"
-    assert jarvis.is_file()
-    assert (Path(home) / "jarvis-cd" / "pin").read_text().strip() == jarvis_submit.JARVIS_PIN
+    root = Path(home) / "jarvis"
+    assert jarvis_submit.setup_result(0, outputs[0][0], site="lab") == f"{home}/bin/jarvis"
+    assert (root / "relay.pin").read_text().strip() == site_pin()
+    calls = Path(f"{builds}.jarvis").read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        f"init {root}/config {root}/private {(root / 'shared').resolve()}",
+        "repo rm builtin",
+        f"repo add {CLIO_JARVIS_URL} --ref {CLIO_JARVIS_REF}",
+    ]
+
+    # A root at another setup moves clio-jarvis's clone to the ref, without a new build.
+    (root / "relay.pin").write_text("older\n")
+    again = subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
+    assert again.returncode == 0, again.stderr
+    assert builds.read_text(encoding="utf-8").splitlines() == ["build"] * 2
+    assert Path(f"{builds}.jarvis").read_text(encoding="utf-8").splitlines()[3:] == [
+        "repo rm builtin",
+        f"repo update clio_jarvis --ref {CLIO_JARVIS_REF}",
+    ]

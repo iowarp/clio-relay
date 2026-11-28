@@ -1,10 +1,10 @@
 """Relay's read tools: each only reads, says so in its annotations, and never asks.
 
 A host that runs only reads, or runs them without a question, can honour that
-per tool: ``describe`` (relay, a site, an operation or a service, the staged
-packages), ``exec_read`` (a command on the guard's read-only list, on every
-site), ``files_read`` (list, stat, read, has) and ``packages_read`` (relay's
-package catalog).
+per tool: ``describe`` (relay, a site, an operation or a service),
+``exec_read`` (a command on the guard's read-only list, on every site),
+``files_read`` (list, stat, read, has) and ``packages_read`` (the packages a
+site's JARVIS root holds).
 """
 
 from __future__ import annotations
@@ -19,9 +19,8 @@ from pydantic import Field
 from clio_relay.jobs.refusals import Refusal
 from clio_relay.surface.elicit import refusal_result
 from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs
+from clio_relay.surface.package_tool import packages as packages_op
 from clio_relay.surface.results import READ, record_result, text
-from clio_relay.surface.staging import PackagesArgs
-from clio_relay.surface.staging import packages as packages_op
 
 if TYPE_CHECKING:
     from clio_relay.surface.server import RelayServer
@@ -42,23 +41,17 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
         job: Annotated[
             str | None, Field(description="An operation id, a service's included")
         ] = None,
-        packages: Annotated[
-            bool, Field(description="True: list the staged packages relay can run")
-        ] = False,
     ) -> ToolResult:
         """Without arguments, list the sites. With site, describe it, its routes and
-        the JARVIS packages relay can run there (packages, with their parameters),
+        the JARVIS packages its root holds (packages, with their parameters),
         and return its guide (skill.text) when it has one: read it before the first
         run there. describe reaches the site, and a site relay cannot reach comes
         back with a refusal or the sign-in it needs; the site's config is how relay
         reaches it, never a host or file to check yourself. With job, observe one
         operation, a service from serve included:
         its state, when relay last looked (result.observed_at), the latest step
-        (result.progress) and the outputs. With packages=true, list the staged
-        packages, as packages_read does. This only reads."""
+        (result.progress) and the outputs. This only reads."""
         try:
-            if packages:
-                return _shown(await packages_op(relay.service, PackagesArgs(op="list")))
             if job is not None:
                 return record_result(relay.service, await relay.service.refresh(job))
             described = await relay.service.describe(site)
@@ -98,22 +91,21 @@ def install(server: FastMCP[Any], relay: RelayServer) -> None:
 
     @server.tool(name="packages_read", title="List the packages relay can run", annotations=READ)
     async def packages_read(  # pyright: ignore[reportUnusedFunction]
+        site: Annotated[str, Field(description="The site id")],
         match: Annotated[
             str | None,
-            Field(description="Keep the available packages whose name or summary has these words"),
+            Field(description="Keep the packages whose name, title or summary has these words"),
         ] = None,
     ) -> ToolResult:
-        """List the JARVIS packages staged in relay's catalog, with their versions,
-        SHA-256s and sources, relay's package sources, and under available every
-        package those sources hold, staged or not, with its summary and whether it
-        has a relay contract. Look here for the application before writing a
-        package: an application's package takes its own input (a script, an input
-        bundle, a settings file), so a new case is that input, not a new package.
-        match ("lammps", "molecular dynamics") narrows available. run takes a
-        package by its name; stage an available one first with packages. An
-        archive its sources replaced shows superseded_by. This only reads."""
+        """List the JARVIS packages the site's JARVIS root holds, as the site lists
+        them now: each one's version, review digest, summary and git source. Look
+        here for the application before writing a package: an application's
+        package takes its own input (a script, an input bundle, a settings file),
+        so a new case is that input, not a new package. match ("lammps",
+        "molecular dynamics") narrows the list. run takes a package by its name.
+        This only reads."""
         try:
-            return _shown(await packages_op(relay.service, PackagesArgs(op="list", match=match)))
+            return _shown(await packages_op(relay.service, site, match=match))
         except Refusal as refusal:
             return refusal_result(refusal)
 

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from fastmcp import Context
 from fastmcp.tools import InputRequiredToolResult, ToolResult
 
-from clio_relay import jarvis_plan, jarvis_submit
+from clio_relay import jarvis_plan
 from clio_relay.adapters.base import BaseAdapter
 from clio_relay.adapters.hooks import (
     Ask,
@@ -58,9 +58,7 @@ from clio_relay.surface.elicit import (
 from clio_relay.surface.files_approval import NeedsPerson
 from clio_relay.surface.guarding import (
     approval_message,
-    bootstraps_jarvis,
     cost_text,
-    jarvis_line,
     review_asks,
 )
 
@@ -171,9 +169,6 @@ async def _card(
                 packages.append({k: v for k, v in found.items() if k != "kind"})
             message += "\n\n" + review["message"]
         binding.update(kind=REVIEW_KIND, packages=packages)
-        if bootstraps_jarvis(service, site, record.adapter):
-            binding["jarvis"] = jarvis_submit.JARVIS_PIN
-            message += "\n" + jarvis_line(site)
     held = await held_services.question(service, site, record.kind, record.operation_id)
     if held is not None:
         message += "\n\n" + held[0]

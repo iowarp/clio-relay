@@ -48,43 +48,30 @@ anywhere else the site lets relay write, does not ask.
 
 A package is one JARVIS package from a JARVIS repository, such as
 `clio_jarvis.gray_scott` from clio-jarvis, or one the agent writes with the
-JARVIS package skill. It is staged once, on the relay machine. An agent stages
-it with relay's `packages` tool:
+JARVIS package skill. It runs from the site's JARVIS root, `<site home>/jarvis`
+(see [operations](operations.md#the-sites-jarvis-root-and-its-packages)).
+Setting the site up clones clio-jarvis into it. A package the agent wrote
+reaches it with the `files` tool and one call:
 
-- `packages(op="stage", package="clio_jarvis.gray_scott")` stages the package
-  from relay's package sources, the copies its host installed with it (the
-  CLIO plugin ships clio-jarvis at its pinned commit). It fetches nothing.
-  When those copies change, the name follows them: the new archive is staged,
-  the old one is marked `superseded_by`, and the new SHA-256 needs its own
-  review;
-- `dir` stages from a directory on the relay machine, such as the person's
-  workspace. It is never pushed to any repository: the archive reaches the
-  site as a job input, through the site adapter's transfer;
-- `op="remove"` takes a package out of the catalog (every version, unless
-  `version` or `sha256` narrows it). Its archive leaves the content store
-  too, unless an unfinished operation still needs it;
-- `packages_read`, a tool of its own, lists what is staged. It only reads, so
-  a host that allows only reads can call it.
+- `files` copies the repository, laid out `<name>/<name>/<package>/pkg.py`,
+  into your space on the site;
+- `packages(op="add", site=..., path=<its path on the site>)` registers it in
+  the root with `jarvis repo add` (`force: true` replaces one of that name)
+  and lists the site's packages again;
+- `packages_read(site=...)` lists the packages the root holds. It only reads,
+  so a host that allows only reads can call it.
 
-Staging runs nothing and touches no site, so it asks nobody; the review below
-is where a guarded site's person decides. From a shell, the same is:
-
-```powershell
-python -m clio_relay.packages stage ~/src/clio-jarvis/clio_jarvis clio_jarvis.gray_scott
-```
-
-Either way relay builds the package's archive, puts it in relay's content store and adds
-it to relay's package catalog. It reports the name, the version, the archive's
-SHA-256 and where it came from (repository, tag, commit, and whether the
-checkout had uncommitted changes). The archive holds the package's own
-directory, the repository's shared Python modules, and the `schemas/`
-directory next to the repository. Building it twice from the same files gives
-the same hash. The version comes from the package's `contract.yaml`, else the
-checkout's git tag; give `--version` when it has neither.
-`python -m clio_relay.packages list` shows what is staged.
+Adding runs no package, so it asks nobody; the review below is where a guarded
+site's person decides. Relay lists the root on the site itself: each package
+comes with its digest, its files with their hashes, sizes and executable bits,
+the git URL and commit of a cloned repository, and the text of its `pkg.py` and
+`contract.yaml`, which relay reads without running them. The digest covers the
+package's own directory and the repository's shared `_*` modules, and the same
+files give the same digest however they reached the site. Relay keeps the
+listing per site.
 
 An agent finds the packages with `describe(site=...)`. Each one comes with its
-version, SHA-256, summary, parameters (as a JSON Schema, read from the
+version, digest, summary, parameters (as a JSON Schema, read from the
 package's `pkg.py` and `contract.yaml` without running them), outputs, and
 whether this site has reviewed it. The agent then calls `run` with a package
 instead of an executable, by name:
@@ -102,11 +89,9 @@ instead of an executable, by name:
 }
 ```
 
-When only one version of that name is staged, relay pins it and its SHA-256
-before anything is checked, so the review below is still of one exact archive.
-When several are staged, relay does not guess: `run` refuses with the
-candidates (version, SHA-256, when each was staged), and the agent asks you
-which one and gives `version`, or `version` and `sha256`.
+Relay pins the package's version and digest from the site's listing before
+anything is checked, so the review below is of one exact package. A name the
+site's root does not hold is refused with the packages it does hold.
 
 Before anything is asked or submitted, relay checks the job's layout against
 what JARVIS reports in `describe(site=...)` for its partition: the node
@@ -117,16 +102,14 @@ agent can size it again. The agent can say why it chose the layout, with up
 to four alternatives, in the run's `sizing`; the spend question then shows a
 "Why" line and the alternatives.
 
-Relay copies the archive to the site by its hash. A small site script
-checks the hash again, unpacks the archive into the job directory, makes a
-private JARVIS environment for that job only and adds the package's
-repository. Relay writes the pipeline, the package with its parameters, and
-on a batch site a `scheduler:` key with the job's nodes, processes per node,
-walltime, partition and account. JARVIS then submits it with
-`jarvis ppl submit`, so the batch job, its execution record and its hostfile
-are JARVIS's own. On a host with no scheduler the script runs the pipeline
-with `jarvis ppl run`. Your own JARVIS configuration on the site is not
-touched. This is the same on the local, worker, ssh and tapis adapters; the
+A small site script computes each package's digest in the site's root again
+and refuses one that changed since its review. Relay writes the pipeline, the package with its parameters, and
+a `scheduler:` key with the site's scheduler and the job's nodes, processes
+per node, walltime, partition and account. JARVIS then submits it with
+`jarvis ppl submit`, so the job, its execution record and its hostfile are
+JARVIS's own. On a host with no scheduler the scheduler is `local`, PSI/J's
+local executor. Your own JARVIS configuration on the site is not touched.
+This is the same on the local, worker, ssh and tapis adapters; the
 globus, iri and sky adapters do not run packages, and relay says so before it
 asks anything.
 
@@ -144,9 +127,11 @@ instead of `package`. Each one is reviewed and pinned on its own, they share
 one allocation, and the spend question lists which nodes each one gets from
 its `host_slice` parameter.
 
-When the site lacks software the packages need, or JARVIS is not on the site
-at all, relay asks you before it installs anything, and the install runs as
-its own job before the run. Nothing is submitted until you say yes. Nothing
+When the site lacks software the packages need, relay asks you before it
+installs anything, and the install runs as its own job before the run. When
+the site's JARVIS root is not set up, `run` refuses and names the setup step:
+an `install` with the site and job, which asks you, sets the root up and ends;
+the agent then runs again. Nothing is submitted until you say yes. Nothing
 is built on a site's login node: JARVIS refuses a build outside an allocation
 (exit 4), and relay reports that as a refusal and never retries it.
 
@@ -163,10 +148,9 @@ so an agent can see early that a run will not finish in time.
 
 The site script exits with a clear code when something is wrong: 4 when JARVIS
 refused to build outside an allocation, 64 for a package
-name that is not `<repository>.<package>`, 65 when the archive's hash does not
-match the reviewed one, 66 when the archive is missing or has no
-`<repository>/<repository>` directory, and 69 when `jarvis` is not on the
-site's `PATH`.
+name that is not `<repository>.<package>`, 65 when the package's digest in the
+root does not match the reviewed one or it holds a symbolic link, 66 when the
+root has no such package, and 69 when the site's JARVIS root is not set up.
 
 ## Reviewing a package
 
@@ -174,20 +158,21 @@ The first time a package runs on a guarded site, relay asks you to review it.
 The question shows:
 
 - the package's name and version;
-- the SHA-256 of the archive;
-- where it came from: repository, tag, commit, path;
+- its digest in the site's JARVIS root;
+- where it came from: the git repository and commit, or its directory on the
+  site;
 - every file, with its own hash, size and whether it is executable;
 - the parameters of this run.
 
 You answer where you answer any relay question: in your MCP host if it can
 ask you, on the approval page relay links, or with `clio-relay asks
-answer`. A yes records the review for that site and that hash. The next run of
-the same archive needs no review. A changed file changes the hash, so an
+answer`. A yes records the review for that site and that digest. The next run of
+the same package needs no review. A changed file changes the digest, so an
 edited package is a new package and is reviewed again. A review on one site
 does not count on another.
 
 Reviews are kept under relay's state directory, in `guard/reviews/<site>/`,
-one file per package name, version and hash, each naming the question it came
+one file per package name, version and digest, each naming the question it came
 from. Deleting a file withdraws that review: the next run of the package asks
 again. Relay records a yes only while the run that asked is still waiting to
 be submitted, so an old answer never brings a deleted review back.

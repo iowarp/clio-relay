@@ -11,8 +11,8 @@ An ``install`` operation is a run's install task on its own. JARVIS owns it:
    path (:mod:`clio_relay.surface.installing`): a check job when there is no
    record, the same approval and choices, then ``jarvis ppl install +submit`` as
    a job on the site's compute nodes, then the light check again;
-4. when the site has no JARVIS, relay asks to install jarvis-cd first, as a run
-   does, then checks.
+4. when the site's JARVIS root is not set up, the install is that setup alone
+   (:func:`set_up`): relay asks, sets the root up, and the operation ends.
 
 No app is launched, and no service starts.
 """
@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from clio_relay import jarvis_report, jarvis_submit
 from clio_relay.adapters.base import BaseAdapter
-from clio_relay.jobs.records import OperationRecord, OperationState
+from clio_relay.jobs.records import OperationRecord, OperationState, StateChange, new_id
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
 from clio_relay.sites.models import SiteEntry
@@ -68,7 +68,12 @@ async def start(
             site=site.id,
             adapter=adapter_name,
         )
-    spec = await service.prepared_run(site, spec)
+    try:
+        spec = await service.prepared_run(site, spec)
+    except Refusal as refusal:
+        if installing.install_kind(refusal) != "jarvis":
+            raise
+        return await set_up(service, site, adapter_name, spec, refusal, task=task)
     return await service.open_operation(
         site,
         "install",
@@ -78,6 +83,37 @@ async def start(
         f"Install the software of {_label(spec)}",
         task=task,
     )
+
+
+async def set_up(
+    service: RelayService,
+    site: SiteEntry,
+    adapter_name: str,
+    spec: JobSpec,
+    refusal: Refusal,
+    *,
+    task: bool,
+) -> OperationRecord:
+    """Record an install that sets up the site's JARVIS root, and ask the person to.
+
+    Nothing else is checked: the packages are listed and reviewed as the root
+    holds them, so the job is installed or run again once the root is set up.
+    """
+    record = OperationRecord(
+        operation_id=new_id("op"),
+        kind="install",
+        site=site.id,
+        adapter=adapter_name,
+        spec=spec.model_dump(mode="json"),
+        spec_digest=spec.digest(),
+        state=OperationState.AWAITING_INPUT,
+        history=[StateChange(state=OperationState.AWAITING_INPUT)],
+        task=task,
+        result={installing.SETUP_KEY: True},
+        owner=service.lease.owner(),
+    )
+    service.operations.put(record.operation_id, record)
+    return await installing.ask_install(service, record.operation_id, site, refusal)
 
 
 async def check(

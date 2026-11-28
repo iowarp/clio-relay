@@ -20,4 +20,5 @@ job.
 - The Tapis job UUID is in the task's result. Quote it when you report the run.
 - Outputs stay in the job's directory on the node. Read them with `files`, which
   goes through Tapis Files.
-- `exec` and `serve` go to the site's `ssh` alternative.
+- `exec` is a Tapis `FORK` job on the node; `serve` goes to the site's `ssh`
+  alternative.

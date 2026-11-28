@@ -5,6 +5,8 @@ Relay copies it to the site and runs it with :func:`clio_relay.jarvis_submit.sit
 
 from __future__ import annotations
 
+from clio_relay.jarvis_site import DIGEST_FUNCTIONS
+
 GRAPH_LOOKUP = (
     'if [ -n "$G" ]; then GS=setting; else\n'
     "  G=${JARVIS_RESOURCE_GRAPH:-}\n"
@@ -51,19 +53,16 @@ shift 4
 job=$PWD
 trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { echo "clio-relay jarvis: $2" >&2; exit "$1"; }
-case $mode in submit|plan|run|install|check|recheck) ;;
-  *) fail 64 "mode $mode is not submit, plan, run, install, check or recheck" ;;
+case $mode in submit|plan|install|check|recheck) ;;
+  *) fail 64 "mode $mode is not submit, plan, install, check or recheck" ;;
 esac
 printf '%s\n' "$steps" | tr , '\n' \
   | grep -Evq '^[A-Za-z0-9_]+\.[A-Za-z0-9_]+@[0-9a-f]{64}$' \
-  && fail 64 "the steps $steps are not <repo>.<package>@<sha256>,..."
+  && fail 64 "the steps $steps are not <repo>.<package>@<digest>,..."
 [ -n "$steps" ] || fail 64 "a pipeline needs a package"
-if [ -n "$execution" ]; then
-  printf '%s\n' "$execution" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' \
-    || fail 64 "execution id $execution is not a JARVIS id"
-elif [ "$mode" != run ]; then
-  fail 64 "a $mode needs an execution id"
-fi
+[ -n "$execution" ] || fail 64 "a $mode needs an execution id"
+printf '%s\n' "$execution" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' \
+  || fail 64 "execution id $execution is not a JARVIS id"
 pipeline="$job/relay.pipeline.yaml"
 answers="$job/relay.answers.json"
 if [ "$mode" = install ] || [ "$mode" = recheck ]; then
@@ -74,18 +73,9 @@ if [ "$mode" = install ] || [ "$mode" = recheck ]; then
 fi
 [ $# -eq 0 ] || printf '%s' "$1" > "$pipeline"
 [ -f "$pipeline" ] || fail 66 "the pipeline $pipeline is missing"
-sha() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  else shasum -a 256 "$1" | cut -d' ' -f1; fi
-}
-for step in $(printf '%s' "$steps" | tr , ' '); do
-  digest=${step##*@}
-  archive="$job/.relay-package/$digest.tar.gz"
-  [ -f "$archive" ] || fail 66 "the package archive $archive is missing"
-  got=$(sha "$archive")
-  [ "$got" = "$digest" ] || fail 65 "the archive's SHA-256 is $got, not the reviewed $digest"
-done
-home() {
+"""
+    + DIGEST_FUNCTIONS
+    + r"""home() {
   case $1 in
     "") ;;
     "~") printf '%s' "$HOME" ;;
@@ -94,7 +84,7 @@ home() {
     *) printf '%s' "$HOME/$1" ;;
   esac
 }
-fallback=$(home "${CLIO_RELAY_JARVIS_FALLBACK:-}")
+site=$(home "${CLIO_RELAY_JARVIS_HOME:-}")
 pin=${CLIO_RELAY_JARVIS_PIN:-}
 decisions=$(home "${CLIO_RELAY_JARVIS_DECISIONS:-}")
 G=$(home "${CLIO_RELAY_JARVIS_GRAPH:-}")
@@ -106,7 +96,7 @@ install_env=$(home "${CLIO_RELAY_JARVIS_INSTALL_ENV:-}")
 spack_root=$(home "${CLIO_RELAY_SPACK_ROOT:-}")
 outputs=$(home "${CLIO_RELAY_OUTPUTS:-}")
 bind=${CLIO_RELAY_PLAN:-}
-unset CLIO_RELAY_JARVIS_FALLBACK CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
+unset CLIO_RELAY_JARVIS_HOME CLIO_RELAY_JARVIS_PIN CLIO_RELAY_JARVIS_DECISIONS
 unset CLIO_RELAY_JARVIS_GRAPH CLIO_RELAY_JARVIS_GRAPH_OWN CLIO_RELAY_OUTPUTS CLIO_RELAY_PLAN
 unset CLIO_RELAY_JARVIS_SPACK_ENV CLIO_RELAY_JARVIS_INSTALL_ENV CLIO_RELAY_SPACK_ROOT
 unset JARVIS_ALLOW_LOCAL_BUILD
@@ -118,8 +108,8 @@ unset JARVIS_INSTALL_PLACEMENT_CHECK JARVIS_INSTALL_PLACEMENT_BUILD
 if [ -n "$spack_root" ] && [ -x "$spack_root/bin/spack" ]; then
   export JARVIS_SPACK_ROOT="$spack_root"
 fi
-# The site's own JARVIS record, shared by every per-job root: the resource graph and the
-# install decisions. A graph the site publishes ($JARVIS_RESOURCE_GRAPH) is the site's:
+# The site's own JARVIS record: the resource graph and the install decisions. A graph
+# the site publishes ($JARVIS_RESOURCE_GRAPH) is the site's:
 # JARVIS only reads it, and keeps what it records in relay's site home ($SH).
 if [ -n "$SH" ]; then mkdir -p "$SH"; export JARVIS_SITE_HOME="$SH"; fi
 if [ -n "$JG" ]; then export JARVIS_RESOURCE_GRAPH="$JG"; else unset JARVIS_RESOURCE_GRAPH; fi
@@ -132,7 +122,7 @@ if [ -n "$spack_env" ]; then
   export JARVIS_SPACK_ENV_DIR="$spack_env"
 fi
 # The pip venvs and conda envs JARVIS installs: shared by the install job and the runs,
-# as the Spack env is, since each job has its own JARVIS root.
+# as the Spack env is.
 if [ -n "$install_env" ]; then
   mkdir -p "$install_env"
   export JARVIS_INSTALL_ENV_DIR="$install_env"
@@ -145,107 +135,56 @@ refuse() {
   fail 69 "$3"
 }
 # Relay runs its pinned JARVIS, or the one the site's setting names by path, and never
-# looks one up on PATH.
+# looks one up on PATH, always in the site's one JARVIS root that relay set up.
+[ -n "$site" ] || refuse "" '' "relay has no CLIO site home here"
+root="$site/jarvis"
 if [ -n "$jarvis" ]; then
   found=$(home "$jarvis")
   [ -f "$found" ] && [ -x "$found" ] \
     || refuse "$found" ',"explicit":true' "the site's jarvis setting $found is not a program"
 else
-  found=$fallback
-  [ -n "$found" ] && [ -f "$found" ] && [ -x "$found" ] \
-    || refuse "$found" '' "relay's jarvis-cd is not installed at ${found:-the site home}"
-  got=$(tr -cd '0-9a-f' < "${found%/*}/pin" 2>/dev/null) || got=
-  [ -z "$pin" ] || [ "$got" = "$pin" ] \
-    || refuse "$found" ",\"pin\":\"$got\"" "relay's jarvis-cd is at ${got:-no pin}, not $pin"
+  found="$site/bin/jarvis"
+  [ -f "$found" ] && [ -x "$found" ] || refuse "$found" '' "relay has not set up jarvis-cd at $site"
 fi
+got=$(cat "$root/relay.pin" 2>/dev/null) || got=
+[ -z "$pin" ] || [ "$got" = "$pin" ] \
+  || refuse "$found" ",\"pin\":\"$got\"" "the site's JARVIS root is at ${got:-no setup}, not $pin"
 # Only relay's pinned JARVIS is known to plan. An older one ignores an unknown +plan and
 # would submit, so any other JARVIS makes no plan and submits unbound.
 plans=; [ -n "$jarvis" ] || [ -z "$pin" ] || plans=1
 printf '%s\n' "$found" > "$job/relay.jarvis"
-root="$job/.relay-jarvis"
-# jarvis-cd's builtin is never registered or resolved, and init records that in the root
-# (no_builtin: true) for JARVIS's own jobs there.
+# The Python JARVIS runs with (its script's shebang), for relay's reads of JSON.
+py=$(head -n 1 "$found" 2>/dev/null | sed -n 's/^#![[:space:]]*\([^[:space:]]*\).*/\1/p')
+case ${py##*/} in python*) [ -x "$py" ] || py= ;; *) py= ;; esac
+[ -n "$py" ] || py=$(command -v python3 2>/dev/null) || py=
+# jarvis-cd's builtin is never registered or resolved: setup removed it from the root.
 export JARVIS_ROOT="$root" JARVIS_NO_BUILTIN=1
-# What the pipeline writes (JARVIS's shared directory) lives in the site's outputs
-# directory, outside relay's own: a site clean removes the link, never the outputs.
-shared="$root/shared"
-[ -z "$outputs" ] || shared="$outputs/${job##*/}"
-# Set up once per set of archives: the root keeps the install records and executions.
-# Archives of one repository unpack into one tree, which JARVIS registers once.
-if [ "$(cat "$root/.relay-setup" 2>/dev/null)" != "$steps" ]; then
-  rm -rf "$root"
-  mkdir -p "$root/src" "$shared"
-  [ "$shared" = "$root/shared" ] || ln -sfn "$shared" "$root/shared"
-  "$found" init "$root/config" "$root/private" "$shared" >/dev/null
-  repos=" "
-  for step in $(printf '%s' "$steps" | tr , ' '); do
-    name=${step%@*} digest=${step##*@}
-    repo=${name%%.*}
-    tar -xzf "$job/.relay-package/$digest.tar.gz" -C "$root/src"
-    [ -d "$root/src/$repo/$repo" ] || fail 66 "the archive of $name has no $repo/$repo directory"
-    case $repos in *" $repo "*) ;; *) repos="$repos$repo " ;; esac
-  done
-  for repo in $repos; do
-    requirements="$root/src/$repo/.clio-relay-requirements.txt"
-    # Relay installs a repository's Python requirements only into its own jarvis-cd,
-    # never into the environment of a JARVIS the site's setting names.
-    if [ -z "$jarvis" ] && [ -s "$requirements" ]; then
-      pip="${found%/*}/pip"
-      [ -x "$pip" ] || pip="${found%/*}/venv/bin/pip"
-      [ -x "$pip" ] || fail 69 "relay's jarvis-cd at ${found%/*} has no pip"
-      # Under the bootstrap's lock: concurrent jobs must not install into one venv at once.
-      locked() {
-        if command -v flock >/dev/null 2>&1; then flock "${found%/*}/.relay.lock" "$@"
-        else "$@"; fi
-      }
-      locked "$pip" install --disable-pip-version-check --no-input -r "$requirements" \
-        >>"$job/relay.requirements.log" 2>&1 || {
-        tail -n 20 "$job/relay.requirements.log" >&2
-        listed_now=$(tr '\n' ' ' < "$requirements")
-        fail 1 "installing the Python requirements of $repo failed: $listed_now"
-      }
-    elif [ -n "$jarvis" ] && [ -s "$requirements" ]; then
-      # A JARVIS the site names is the site's environment: relay installs nothing there,
-      # but says which of the repository's requirements it lacks before JARVIS loads it.
-      py="${found%/*}/python"
-      [ -x "$py" ] || py="${found%/*}/venv/bin/python"
-      if [ -x "$py" ]; then
-        lacking=$("$py" -c 'import re, sys
-from importlib import metadata
-try:
-    from packaging.requirements import Requirement
-except ImportError:
-    Requirement = None
-lacking = []
-for line in open(sys.argv[1], encoding="utf-8"):
-    text = line.strip()
-    name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", text)
-    if not name:
-        continue
-    try:
-        version = metadata.version(name.group(0))
-    except metadata.PackageNotFoundError:
-        lacking.append(text)
-        continue
-    if Requirement is not None:
-        try:
-            if not Requirement(text).specifier.contains(version, prereleases=True):
-                lacking.append(text + " (has " + version + ")")
-        except Exception:
-            pass
-print(", ".join(lacking))' "$requirements") || lacking=
-        [ -z "$lacking" ] || fail 1 "the site's jarvis setting $found runs in an environment \
-without the Python requirements of $repo: $lacking. Install them there, or remove the \
-site's jarvis setting so relay uses its own jarvis-cd, which installs them."
-      fi
-    fi
-    # +force, in this job's own root only, so a staged archive always replaces any
-    # repository of its name. builtin never arrives here: relay refuses to stage it.
-    "$found" repo add "$root/src/$repo" +force >/dev/null
-  done
-  printf '%s\n' "$steps" > "$root/.relay-setup"
+# Each step runs only as reviewed: its digest in the root now is the one the person saw.
+for step in $(printf '%s' "$steps" | tr , ' '); do
+  name=${step%@*} digest=${step##*@}
+  repo=${name%%.*} pkg=${name#*.}
+  dir=$(repo_paths | grep -E "/$repo\$" | tail -n 1) || dir=
+  [ -n "$dir" ] && [ -f "$dir/$repo/$pkg/pkg.py" ] \
+    || fail 66 "$name is not in the site's JARVIS root $root"
+  files=$(relay_files "$dir/$repo" "$pkg") || fail 65 "$name holds a symbolic link"
+  now=$(relay_digest "$files")
+  [ "$now" = "$digest" ] || fail 65 "$name's digest on the site is $now, not the reviewed $digest"
+done
+# What the pipeline writes is its directory in JARVIS's shared one, which setup put in
+# the site's outputs directory when it has one: <outputs>/<operation id>.
+pname=$(sed -n "s/^name:[[:space:]]*['\"]\{0,1\}\([A-Za-z0-9_.-]*\).*/\1/p" "$pipeline" \
+  | head -n 1)
+[ -n "$pname" ] || fail 66 "the pipeline $pipeline has no name"
+shared=$(root_shared)
+[ -n "$shared" ] || fail 66 "the site's JARVIS root $root names no shared directory"
+if [ -n "$outputs" ]; then
+  real=$(mkdir -p "$outputs" && cd "$outputs" && pwd -P) \
+    || fail 66 "cannot reach the site's outputs directory $outputs"
+  [ "$real" = "$shared" ] || fail 66 "the site's JARVIS root keeps outputs in $shared, \
+not in this site's outputs_dir $real; call install with this site to set it up again"
 fi
-# Where the outputs really are, so relay names them there, never through the link.
+shared="$shared/$pname"
+mkdir -p "$shared"
 printf '%s\n' "$shared" > "$job/relay.shared"
 printf '{"schema_version":"clio-relay.shared.v1","path":"%s"}\n' \
   "$(printf '%s' "$shared" | sed 's/[\\"]/\\&/g')"
@@ -268,10 +207,8 @@ route() {
   # install_unchecked, or for an install also not_installed with a compute_job build),
   # "login" (an install whose build JARVIS placed on this host, login_limited, with the
   # host free) or "here" (the report is the answer: all there, or a question).
-  py="${found%/*}/python"
-  [ -x "$py" ] || py="${found%/*}/venv/bin/python"
   [ "$2" -eq 3 ] || { echo here; return 0; }
-  [ -x "$py" ] || { echo job; return 0; }
+  [ -n "$py" ] || { echo job; return 0; }
   printf '%s\n' "$1" | tail -n 1 | "$py" -c 'import json, sys
 try:
     report = json.loads(sys.stdin.read())
@@ -346,9 +283,7 @@ SUPERVISE
     [ -n "$pid" ] || fail 1 "JARVIS's build on this host did not start: $(cat "$lb/supervisor.log")"
   fi
   rm -f "$job/relay.install.json"
-  py="${found%/*}/python"
-  [ -x "$py" ] || py="${found%/*}/venv/bin/python"
-  "$py" -c 'import json, socket, sys
+  "${py:-python3}" -c 'import json, socket, sys
 try:
     log = json.loads(sys.argv[3]).get("log")
 except (ValueError, AttributeError):
@@ -373,10 +308,6 @@ if [ "$mode" = recheck ] || [ "$mode" = install ]; then
     printf '%s\n' "$out"
     exit "$rc"
   fi
-fi
-if [ "$mode" = run ]; then
-  "$found" ppl run yaml "$pipeline" ${execution:+--execution-id "$execution"} +json
-  exit 0
 fi
 plan() {
   # JARVIS plans the submit without making it: no Spack, no job and no record. The
@@ -406,7 +337,7 @@ rc=0
 if [ "$mode" = install ] || [ "$mode" = recheck ]; then
   # Each install round is its own execution, as JARVIS refuses to reuse one.
   base=$execution n=1
-  while ls -d "$root"/shared/*/executions/"$execution" >/dev/null 2>&1; do
+  while [ -e "$shared/executions/$execution" ]; do
     n=$((n + 1)); execution=$base-$n
   done
   check=; [ "$mode" = install ] || check=+check
@@ -423,9 +354,7 @@ else
     cat "$job/relay.check.json"
     exit "$crc"
   fi
-  py="${found%/*}/python"
-  [ -x "$py" ] || py="${found%/*}/venv/bin/python"
-  if [ -x "$py" ]; then
+  if [ -n "$py" ]; then
     "$py" -c 'import json, sys
 d = json.load(open(sys.argv[1]))
 s = (d.get("services") or [{}])[0]
@@ -464,14 +393,19 @@ mv -f "$job/$saved.tmp" "$job/$saved"
 )
 """The site script. ``bash -c SITE_SCRIPT <$0> <mode> <jarvis> <execution> <steps>
 [<answers JSON>] [<pipeline YAML>]``, run in the job directory. ``steps`` is
-``<repo>.<package>@<sha256>,...`` (:func:`steps_argument`).
+``<repo>.<package>@<digest>,...`` (:func:`steps_argument`).
 
-It checks each archive's SHA-256 against the reviewed one and picks JARVIS by
-absolute path, never from ``PATH``: the path the site's setting names when it
-names one, else ``$CLIO_RELAY_JARVIS_FALLBACK``, relay's pinned jarvis-cd,
-whose ``pin`` file must say ``$CLIO_RELAY_JARVIS_PIN``. When that JARVIS is
-missing or at another pin it writes ``relay.refusal.json`` (with ``explicit``
-or ``pin`` when they apply) and exits 69. A relative path is from the home
+It picks JARVIS by absolute path, never from ``PATH``: the path the site's
+setting names when it names one, else ``<$CLIO_RELAY_JARVIS_HOME>/bin/jarvis``,
+relay's pinned jarvis-cd. It runs every JARVIS call in the site's one root,
+``<$CLIO_RELAY_JARVIS_HOME>/jarvis``, whose ``relay.pin`` must say
+``$CLIO_RELAY_JARVIS_PIN`` (:func:`clio_relay.jarvis_site.site_pin`). When that
+JARVIS is missing or the root is not set up at the pin it writes
+``relay.refusal.json`` (with ``explicit`` or ``pin`` when they apply) and exits
+69. Then it recomputes each step's digest in the root
+(:data:`clio_relay.jarvis_site.DIGEST_FUNCTIONS`) and exits 65 when one differs
+from the reviewed digest, or holds a symbolic link; 66 when the root has no
+such package. A relative path is from the home
 directory. ``$CLIO_RELAY_JARVIS_GRAPH`` (the site's ``jarvis_graph`` setting) or,
 without it, the graph the site publishes as ``$JARVIS_RESOURCE_GRAPH``, else
 ``$CLIO_RELAY_JARVIS_GRAPH_OWN`` (:data:`GRAPH_LOOKUP`), and
@@ -486,18 +420,12 @@ When the CLIO Spack is on the site,
 ``bin/spack`` is there). The script unsets
 ``JARVIS_ALLOW_LOCAL_BUILD`` and JARVIS's placement variables: where checks and
 builds run is the site's answer to JARVIS's ``install_placement`` question, and
-relay sets no placement and no limits. It unpacks the
-archives into the job's private
-JARVIS root and registers each repository once, once per set of archives. Before
-it registers one whose archive lists Python requirements
-(:data:`~clio_relay.jarvis_site.REQUIREMENTS_FILE`), it installs them with relay's
-jarvis-cd ``pip`` (only for relay's own JARVIS, logged in
-``relay.requirements.log``, under the ``.relay.lock`` the bootstrap holds, so
-two jobs never install into that venv at once), and fails with exit 1 when that
-install fails. It writes where JARVIS's shared directory really is (the site's
-outputs directory when it has one) to ``relay.shared`` and prints it as a
-``clio-relay.shared.v1`` line, so relay names outputs there and never through
-the job root's link (:func:`~clio_relay.jarvis_submit.shared_dir`).
+relay sets no placement and no limits.
+It writes the pipeline's directory in JARVIS's shared one (which setup put in
+the site's outputs directory, and which it refuses when the site's outputs
+directory is now another) to ``relay.shared`` and prints it as a
+``clio-relay.shared.v1`` line, so relay names outputs there
+(:func:`~clio_relay.jarvis_submit.shared_dir`).
 Relay sets no MPI network: JARVIS's MPI launches apply the one the site's
 resource graph selects. Then it hands the pipeline to JARVIS:
 
@@ -541,7 +469,6 @@ resource graph selects. Then it hands the pipeline to JARVIS:
   line as ``relay.install.json``;
   ``recheck`` is ``install`` with ``+check``: the job only checks, and it never
   builds here;
-- ``run`` runs ``ppl run`` in place;
 - ``check`` runs only the light ``ppl install +check``, for an install ahead of
   any run: it exits 0 with the report when the software is all there, else 3.
 

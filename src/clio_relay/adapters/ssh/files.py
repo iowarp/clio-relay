@@ -12,8 +12,9 @@ import hashlib
 from datetime import UTC, datetime
 from typing import Literal
 
-from clio_relay.adapters.ssh.scripts import FRESH, parse_sections, q, root_expression
+from clio_relay.adapters.ssh.scripts import FRESH, q, root_expression
 from clio_relay.adapters.ssh.transport import SshTransport
+from clio_relay.jarvis_remote import parse_sections
 from clio_relay.jobs.file_rules import (
     check_offset,
     check_relative,

@@ -3,9 +3,7 @@
 ``CLIO_RELAY_CONFIG_DIR`` holds ``sites.yaml``. ``CLIO_RELAY_STATE_DIR`` holds
 operation and ask records, the content store and each site's adapter state.
 Both default to the platform's usual places. ``CLIO_RELAY_GRANT_FILE_<PROVIDER>``
-names a grant file a host keeps current (HS4a). ``CLIO_RELAY_PACKAGE_SOURCES``
-names the directories of JARVIS repositories a host installed for relay to stage
-packages from, ``os.pathsep`` apart.
+names a grant file a host keeps current (HS4a).
 """
 
 from __future__ import annotations
@@ -40,7 +38,6 @@ class RelayPaths:
     config_dir: Path
     state_dir: Path
     grant_files: dict[str, Path] = field(default_factory=dict[str, Path])
-    package_sources: tuple[Path, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> RelayPaths:
@@ -54,14 +51,10 @@ class RelayPaths:
             for key, value in values.items()
             if key.startswith(prefix) and value
         }
-        sources = values.get("CLIO_RELAY_PACKAGE_SOURCES") or ""
         return cls(
             config_dir=Path(config) if config else _default_config_dir(values),
             state_dir=Path(state) if state else _default_state_dir(values),
             grant_files=grants,
-            package_sources=tuple(
-                Path(part).expanduser() for part in sources.split(os.pathsep) if part.strip()
-            ),
         )
 
     @property
@@ -86,7 +79,7 @@ class RelayPaths:
 
     @property
     def packages_dir(self) -> Path:
-        """Return where the package catalog lives."""
+        """Return where the package catalog keeps each site's listing."""
         return self.state_dir / "packages"
 
     def adapter_dir(self, site_id: str, adapter: str) -> Path:

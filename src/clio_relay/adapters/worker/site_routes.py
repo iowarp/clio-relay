@@ -270,6 +270,14 @@ def register_adapter_routes(
 
         return await _answer(action)
 
+    @app.post(f"{prefix}/packages", dependencies=[auth_dependency])
+    async def adapter_packages(body: dict[str, Any] = _BODY) -> dict[str, Any]:
+        async def action() -> Any:
+            add, force = str(body.get("add") or ""), body.get("force") is True
+            return await _site_adapter(ctx, body).site_packages(add, force=force)
+
+        return await _answer(action)
+
     @app.post(f"{prefix}/find", dependencies=[auth_dependency])
     async def adapter_find(body: dict[str, Any] = _BODY) -> dict[str, Any]:
         async def action() -> Any:

@@ -80,6 +80,7 @@ from clio_relay.surface.files_verb import MAX_INLINE_BYTES, FilesArgs, files_too
 from clio_relay.surface.http_limits import allow_chunk_bodies
 from clio_relay.surface.install_share import advance_holders
 from clio_relay.surface.install_tool import install_tool
+from clio_relay.surface.package_tool import packages as packages_op
 from clio_relay.surface.progress import latest_note
 from clio_relay.surface.read_tools import install as install_read_tools
 from clio_relay.surface.results import CHANGE as _CHANGE
@@ -89,8 +90,6 @@ from clio_relay.surface.service import RelayService
 from clio_relay.surface.settings import RelayPaths
 from clio_relay.surface.site_tools import install as install_site_tools
 from clio_relay.surface.skills import SkillResources
-from clio_relay.surface.staging import PackagesArgs
-from clio_relay.surface.staging import packages as packages_op
 from clio_relay.wording import with_article
 
 logger = logging.getLogger(__name__)
@@ -667,40 +666,29 @@ class RelayServer:
 
         @server.tool(
             name="packages",
-            title="Stage and remove the packages relay can run",
+            title="Add a package repository to a site's JARVIS root",
             annotations=_CHANGE,
         )
         async def packages(  # pyright: ignore[reportUnusedFunction]
-            op: Literal["stage", "remove"],
-            package: Annotated[str, Field(description="<repository>.<package>")],
-            dir: Annotated[  # noqa: A002 - the source is a directory
-                str | None,
-                Field(description="Stage from this absolute directory on the relay host"),
-            ] = None,
-            version: Annotated[
-                str | None,
-                Field(
-                    description="stage: when the package has no contract version or tag. "
-                    "remove: only this version"
-                ),
-            ] = None,
-            sha256: Annotated[str | None, Field(description="remove: only this archive")] = None,
+            op: Literal["add"],
+            site: Annotated[str, Field(description="The site id")],
+            path: Annotated[
+                str,
+                Field(description="The repository directory on the site, from files"),
+            ],
+            force: Annotated[
+                bool, Field(description="Replace a repository of the same name")
+            ] = False,
         ) -> ToolResult:
-            """run needs a staged package: stage one before its first run. stage builds the
-            package's archive on the relay host and adds it to relay's catalog: naming only
-            package, from relay's package sources (directories its host installed, listed
-            in sources); with dir, from that directory on the relay host, such as a package
-            the person wrote. Staging fetches nothing and runs no git. remove takes a
-            package out (version or sha256 narrow it). When the package sources change, a
-            stage or run by name uses their new archive and lists the old one with
-            superseded_by; pin its sha256 to run it. Staging runs nothing: a guarded site
-            reviews the archive by its SHA-256 before its first run there, and the archive
-            reaches the site through relay's own transfer. To list what is staged and what
-            the package sources hold (available), use packages_read, which only reads."""
-            args = PackagesArgs(op=op, package=package, dir=dir, version=version, sha256=sha256)
-
+            """Register a JARVIS repository the person wrote with the site's JARVIS root,
+            then list the site's packages. Copy the repository's directory, laid out
+            <name>/<name>/<package>/pkg.py, into the site's user space with files first,
+            and give that site path. add runs jarvis repo add there (force replaces a
+            repository of that name) and nothing else: a guarded site reviews each
+            package by its digest before its first run there. To list what a site's root
+            holds, use packages_read, which only reads."""
             try:
-                result = await packages_op(relay.service, args)
+                result = await packages_op(relay.service, site, add=path, force=force)
             except Refusal as refusal:
                 return refusal_result(refusal)
             return ToolResult(

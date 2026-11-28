@@ -1,4 +1,4 @@
-"""The shell scripts relay sends to a site: the JARVIS site script and the warm holder.
+"""The shell scripts relay sends to a site: the JARVIS site script and the package listing.
 
 They run under /bin/sh or bash with stand-in ``jarvis``, ``scontrol`` and
 ``squeue`` programs that log what they were asked.
@@ -8,16 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
-import sys
-import time
 from pathlib import Path
 
 import pytest
 
-from clio_relay.guard.warm import HOLDER, WARM_EXECUTABLE
-from clio_relay.jarvis_site import archive_package
+from clio_relay.jarvis_site import PACKAGES_SCRIPT, parse_packages, site_pin
 from clio_relay.jarvis_submit import (
     EXIT_DIGEST,
     EXIT_MISSING,
@@ -35,23 +31,18 @@ from clio_relay.jarvis_submit import (
     missing_jarvis,
     parse_handle,
 )
-from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.refusals import RefusalReason
 
-from .conftest import make_repo
+from .conftest import listed, make_repo
 
 pytestmark = pytest.mark.release_platform("posix")
 
 FAKE_JARVIS = """#!/bin/sh
 echo "JARVIS_ROOT=${JARVIS_ROOT:-} $*" >> "$JARVIS_LOG"
+[ "${JARVIS_NO_BUILTIN:-}" = 1 ] || echo "builtin left on" >> "$JARVIS_LOG"
 [ -z "${JARVIS_INSTALL_ANSWERS:-}" ] || echo "answers $JARVIS_INSTALL_ANSWERS" >> "$JARVIS_LOG"
 case "$1 $2" in
-  "init "*)
-    [ "${JARVIS_NO_BUILTIN:-}" != 1 ] \\
-      || echo "no_builtin: true" > "$JARVIS_ROOT/jarvis_config.yaml" ;;
-  "repo list") cat "$JARVIS_REPOS" 2>/dev/null || true ;;
-  "repo add") echo "9. $(basename "$3") ($3) ok" >> "$JARVIS_REPOS" ;;
-  "ppl run") echo "ran in $(pwd)" ;;
+  "repo add") echo "- $3" >> "$JARVIS_ROOT/repos.yaml" ;;
   "ppl install")
     case " $* " in
       *" +submit "*)
@@ -114,21 +105,33 @@ def _env(tmp_path: Path, bin_dir: Path, **extra: str) -> dict[str, str]:
     }
     env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     env["JARVIS_LOG"] = str(tmp_path / "jarvis.log")
-    env["JARVIS_REPOS"] = str(tmp_path / "repos.txt")
+    env["CLIO_RELAY_JARVIS_HOME"] = str(tmp_path / "site")
     env.update(extra)
     return env
 
 
+def _root(tmp_path: Path) -> Path:
+    """The site's JARVIS root, set up the way relay's setup leaves it, holding ``src/demo``."""
+    root = tmp_path / "site" / "jarvis"
+    if not root.is_dir():
+        repo = make_repo(tmp_path / "src")
+        root.mkdir(parents=True)
+        (root / "shared").mkdir()
+        shared = (root / "shared").resolve()
+        (root / "jarvis_config.yaml").write_text(f"no_builtin: true\nshared_dir: {shared}\n")
+        (root / "repos.yaml").write_text(f"repos:\n- {repo}\n")
+        (root / "relay.pin").write_text(site_pin() + "\n")
+    return root
+
+
 def _job_dir(tmp_path: Path) -> tuple[Path, str]:
-    data = archive_package(make_repo(tmp_path / "src"), "demo.hello")
+    _root(tmp_path)
     job = tmp_path / "job"
-    digest = ContentStore(tmp_path / "content").put(data)
-    (job / ".relay-package").mkdir(parents=True)
-    (job / ".relay-package" / f"{digest}.tar.gz").write_bytes(data)
-    return job, digest
+    job.mkdir(exist_ok=True)
+    return job, listed(tmp_path / "src" / "demo", "demo.hello")["digest"]
 
 
-PIPELINE = "name: relay_op_x\npkgs:\n- pkg_type: demo.hello\n  pkg_name: pkg\n"
+PIPELINE = "name: op_x\npkgs:\n- pkg_type: demo.hello\n  pkg_name: pkg\n"
 
 
 def _site(
@@ -139,7 +142,7 @@ def _site(
     jarvis: str,
     execution: str,
     *rest: str,
-    mode: str = "run",
+    mode: str = "check",
 ) -> subprocess.CompletedProcess[str]:
     steps = f"{package}@{digest}"
     if jarvis and "/" not in jarvis and not jarvis.startswith("~"):
@@ -176,97 +179,37 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     env = _env(tmp_path, tmp_path / "bin")
     done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
     assert done.returncode == 0, done.stderr
-    root = job / ".relay-jarvis"
+    root = tmp_path / "site" / "jarvis"
     log = (tmp_path / "jarvis.log").read_text().splitlines()
     assert log == [
-        f"JARVIS_ROOT={root} init {root}/config {root}/private {root}/shared",
-        f"JARVIS_ROOT={root} repo add {root}/src/demo +force",
         f"JARVIS_ROOT={root} ppl install yaml {job}/{PIPELINE_FILE} +check +json",
         f"JARVIS_ROOT={root} ppl check yaml {job}/{PIPELINE_FILE} +json",
         f"JARVIS_ROOT={root} ppl submit {job}/{PIPELINE_FILE} --execution-id op_x +json",
     ]
-    assert (job / SERVICE_NODE_FILE).read_text() == "0\n"
+    # The fake check names a service whose first allocation index is 2.
+    assert (job / SERVICE_NODE_FILE).read_text() == "2\n"
     assert "sbatch" not in done.stdout
     handle = parse_handle((job / SUBMISSION_FILE).read_text())
     assert handle is not None and handle["execution_id"] == "op_x"
     assert (job / EXITCODE_FILE).read_text() == "0\n"
     assert (job / JARVIS_FILE).read_text() == f"{jarvis}\n"
-    assert (root / "src" / "demo" / "demo" / "hello" / "pkg.py").is_file()
-    assert (root / "src" / "schemas" / "package-contract.v1.json").is_file()
-    assert not (root / "src" / "demo" / "demo" / "other").exists()
+    # The pipeline writes its own directory in the root's JARVIS shared one, no link.
+    pipeline_dir = (root / "shared").resolve() / "op_x"
+    assert pipeline_dir.is_dir() and not pipeline_dir.is_symlink()
+    assert (job / "relay.shared").read_text() == f"{pipeline_dir}\n"
 
 
-def _job_with_requirements(tmp_path: Path, *requirements: str) -> tuple[Path, str]:
-    repo = make_repo(tmp_path / "src")
-    listed = ", ".join(f'"{text}"' for text in requirements)
-    (repo / "pyproject.toml").write_text(f'[project]\nname = "demo"\ndependencies = [{listed}]\n')
-    data = archive_package(repo, "demo.hello")
-    job = tmp_path / "job"
-    digest = ContentStore(tmp_path / "content").put(data)
-    (job / ".relay-package").mkdir(parents=True)
-    (job / ".relay-package" / f"{digest}.tar.gz").write_bytes(data)
-    return job, digest
-
-
-def _site_python(bin_dir: Path) -> None:
-    # The site-named JARVIS's environment is this test's own interpreter.
-    _program(bin_dir, "python", f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-
-
-def test_a_site_named_jarvis_without_the_package_requirements_says_which(
+def test_submit_refuses_a_root_whose_shared_directory_is_not_the_sites_outputs(
     tmp_path: Path,
 ) -> None:
-    """The a21 release check: a site venv without jsonschema failed only inside JARVIS."""
-    job, digest = _job_with_requirements(tmp_path, "pytest>=1", "clio-relay-absent-dist>=4.18")
-    _jarvis(tmp_path)
-    _site_python(tmp_path / "bin")
-    (job / PIPELINE_FILE).write_text(PIPELINE)
-    env = _env(tmp_path, tmp_path / "bin")
-    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
-    assert done.returncode == 1
-    assert "without the Python requirements of demo: clio-relay-absent-dist>=4.18." in done.stderr
-    assert "remove the site's jarvis setting" in done.stderr
-    log = (tmp_path / "jarvis.log").read_text()
-    assert "repo add" not in log and "ppl " not in log
-    assert not (job / "relay.requirements.log").exists()
-
-
-def test_a_site_named_jarvis_with_the_package_requirements_runs(tmp_path: Path) -> None:
-    job, digest = _job_with_requirements(tmp_path, "pytest>=1")
-    _jarvis(tmp_path)
-    _site_python(tmp_path / "bin")
-    (job / PIPELINE_FILE).write_text(PIPELINE)
-    env = _env(tmp_path, tmp_path / "bin")
-    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
-    assert done.returncode == 0, done.stderr
-    assert not (job / "relay.requirements.log").exists()
-    assert "ppl submit" in (tmp_path / "jarvis.log").read_text()
-
-
-def test_a_site_named_jarvis_at_an_older_requirement_says_its_version(tmp_path: Path) -> None:
-    job, digest = _job_with_requirements(tmp_path, "pytest>=999")
-    _jarvis(tmp_path)
-    _site_python(tmp_path / "bin")
-    (job / PIPELINE_FILE).write_text(PIPELINE)
-    env = _env(tmp_path, tmp_path / "bin")
-    done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
-    assert done.returncode == 1
-    assert re.search(r"of demo: pytest>=999 \(has [0-9][^)]*\)\.", done.stderr), done.stderr
-
-
-def test_the_job_root_leaves_jarvis_builtin_out(tmp_path: Path) -> None:
-    """The user: builtins "should not even be installed for relay to use"."""
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
     (job / PIPELINE_FILE).write_text(PIPELINE)
-    env = _env(tmp_path, tmp_path / "bin")
-    env.pop("JARVIS_NO_BUILTIN", None)
+    env = _env(tmp_path, tmp_path / "bin", CLIO_RELAY_OUTPUTS=str(tmp_path / "runs"))
     done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", mode="submit")
-    assert done.returncode == 0, done.stderr
-    root = job / ".relay-jarvis"
-    assert (root / "jarvis_config.yaml").read_text() == "no_builtin: true\n"
-    log = (tmp_path / "jarvis.log").read_text()
-    assert "repo remove builtin" not in log
+    assert done.returncode == 66
+    assert "not in this site's outputs_dir" in done.stderr
+    assert not (tmp_path / "jarvis.log").exists()
 
 
 def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> None:
@@ -405,31 +348,73 @@ def test_relay_sets_no_placement_and_no_limits_of_its_own() -> None:
     assert "+allow_local" not in SITE_SCRIPT and "nice " not in SITE_SCRIPT
 
 
-def test_run_takes_the_pipeline_as_an_argument(tmp_path: Path) -> None:
+def test_the_site_script_runs_only_the_reviewed_content(tmp_path: Path) -> None:
     job, digest = _job_dir(tmp_path)
     _jarvis(tmp_path)
     env = _env(tmp_path, tmp_path / "bin")
-    done = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE)
-    assert done.returncode == 0, done.stderr
-    # The script names the shared JARVIS home first, then JARVIS prints.
-    assert done.stdout.strip().splitlines()[-1] == f"ran in {job}"
-    assert (job / PIPELINE_FILE).read_text() == PIPELINE
-    last = (tmp_path / "jarvis.log").read_text().splitlines()[-1]
-    assert last.endswith(f"ppl run yaml {job}/{PIPELINE_FILE} +json")
-
-
-def test_the_site_script_runs_only_the_reviewed_bytes(tmp_path: Path) -> None:
-    job, digest = _job_dir(tmp_path)
-    _jarvis(tmp_path)
-    env = _env(tmp_path, tmp_path / "bin")
-    archive = job / ".relay-package" / f"{digest}.tar.gz"
-    archive.write_bytes(archive.read_bytes() + b"\0")
-    done = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE)
-    assert done.returncode == EXIT_DIGEST
-    assert "not the reviewed" in done.stderr
+    inner = tmp_path / "src" / "demo" / "demo"
+    (inner / "hello" / "pkg.py").chmod(0o755)
+    for change in ("mode", "content"):
+        done = _site(job, env, digest, "demo.hello", "jarvis", "op_x", PIPELINE)
+        assert done.returncode == EXIT_DIGEST, change
+        assert f"not the reviewed {digest}" in done.stderr
+        (inner / "_contract" / "base.py").write_text("SHARED = 2\n")
     assert not (tmp_path / "jarvis.log").exists()
-    missing = _site(job, env, "e" * 64, "demo.hello", "jarvis", "", PIPELINE)
+    (inner / "other" / "pkg.py").write_text("# another package's edit\n")
+    (inner / "hello" / "__pycache__" / "more.pyc").write_bytes(b"\0")
+    again = listed(tmp_path / "src" / "demo", "demo.hello")["digest"]
+    assert _site(job, env, again, "demo.hello", "jarvis", "op_x", PIPELINE).returncode == 0
+    (inner / "hello" / "link").symlink_to("/etc/passwd")
+    linked = _site(job, env, again, "demo.hello", "jarvis", "op_x", PIPELINE)
+    assert linked.returncode == EXIT_DIGEST
+    assert "symbolic link" in linked.stderr
+    missing = _site(job, env, again, "demo.nothing", "jarvis", "op_x", PIPELINE)
     assert missing.returncode == EXIT_MISSING
+    assert "demo.nothing is not in the site's JARVIS root" in missing.stderr
+
+
+def _packages(tmp_path: Path, mode: str, *rest: str) -> subprocess.CompletedProcess[str]:
+    env = _env(tmp_path, tmp_path / "bin")
+    jarvis = str(_jarvis(tmp_path))
+    home = str(tmp_path / "site")
+    return subprocess.run(
+        ["/bin/sh", "-c", PACKAGES_SCRIPT, "clio-relay-packages", mode, home, site_pin()]
+        + [jarvis, *rest],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_the_site_listing_reads_the_root_with_the_digest_relay_reviews(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    repo = tmp_path / "src" / "demo"
+    (repo / "demo" / "hello" / "run.sh").write_text("#!/bin/sh\n")
+    (repo / "demo" / "hello" / "run.sh").chmod(0o755)
+    (repo / "demo" / "hello" / "contract.yaml").write_text("version: 0.3.0\n")
+    done = _packages(tmp_path, "list")
+    assert done.returncode == 0, done.stderr
+    found = {item["name"]: item for item in parse_packages(done.stdout) or []}
+    assert sorted(found) == ["demo.hello", "demo.other"]
+    for name, item in found.items():
+        expected = listed(repo, name)
+        assert item["digest"] == expected["digest"], name
+        assert sorted(item["files"], key=lambda f: f["path"]) == expected["files"]
+        assert (item["pkg"], item["contract"]) == (expected["pkg"], expected["contract"])
+        assert item["repo_dir"] == str(repo) and "git" not in item
+    [run] = [f for f in found["demo.hello"]["files"] if f["path"] == "hello/run.sh"]
+    assert run["executable"] is True
+
+    mine = make_repo(tmp_path / "user", repo="mine", packages=("solver",))
+    added = _packages(tmp_path, "add", str(mine))
+    assert added.returncode == 0, added.stderr
+    assert "mine.solver" in {item["name"] for item in parse_packages(added.stdout) or []}
+    assert f"JARVIS_ROOT={root} repo add {mine.resolve()}" in (tmp_path / "jarvis.log").read_text()
+    assert _packages(tmp_path, "add", str(tmp_path / "nowhere")).returncode == EXIT_MISSING
+
+    (root / "relay.pin").write_text("an older setup\n")
+    assert parse_packages(_packages(tmp_path, "list").stdout) is None
 
 
 def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> None:
@@ -437,19 +422,19 @@ def test_the_site_script_checks_its_arguments_and_the_layout(tmp_path: Path) -> 
     _jarvis(tmp_path)
     env = _env(tmp_path, tmp_path / "bin")
     for bad in ("hello", "demo.hello.x", "demo.he-llo", "demo/x.hello"):
-        done = _site(job, env, digest, bad, "jarvis", "", PIPELINE)
+        done = _site(job, env, digest, bad, "jarvis", "op_x", PIPELINE)
         assert done.returncode == EXIT_USAGE, bad
         assert "are not <repo>.<package>" in done.stderr
     mode = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="up")
     assert mode.returncode == EXIT_USAGE
-    assert "mode up is not submit, plan, run, install, check or recheck" in mode.stderr
+    assert "mode up is not submit, plan, install, check or recheck" in mode.stderr
     unnamed = _site(job, env, digest, "demo.hello", "jarvis", "", PIPELINE, mode="submit")
     assert unnamed.returncode == EXIT_USAGE
     assert "needs an execution id" in unnamed.stderr
-    wrong_repo = _site(job, env, digest, "other.hello", "jarvis", "", PIPELINE)
+    wrong_repo = _site(job, env, digest, "other.hello", "jarvis", "op_x", PIPELINE)
     assert wrong_repo.returncode == EXIT_MISSING
-    assert "no other/other directory" in wrong_repo.stderr
-    assert "repo add" not in (tmp_path / "jarvis.log").read_text()
+    assert "other.hello is not in the site's JARVIS root" in wrong_repo.stderr
+    assert not (tmp_path / "jarvis.log").exists()
 
 
 def test_the_site_script_says_when_jarvis_is_missing(tmp_path: Path) -> None:
@@ -476,64 +461,9 @@ def test_the_site_script_expands_a_home_jarvis_path(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _program(home / "jv" / "bin", "jarvis", FAKE_JARVIS)
     env = _env(tmp_path, tmp_path / "bin", HOME=str(home))
-    done = _site(job, env, digest, "demo.hello", "~/jv/bin/jarvis", "", PIPELINE)
+    done = _site(job, env, digest, "demo.hello", "~/jv/bin/jarvis", "op_x", PIPELINE)
     assert done.returncode == 0, done.stderr
-    # The script names the shared JARVIS home first, then JARVIS prints.
-    assert done.stdout.strip().splitlines()[-1] == f"ran in {job}"
-
-
-def _holder(
-    env: dict[str, str], cwd: Path, limit: int, step: int
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["/bin/sh", "-c", HOLDER, WARM_EXECUTABLE, str(limit), str(step)],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
+    assert (
+        f"ppl install yaml {job}/{PIPELINE_FILE} +check +json"
+        in (tmp_path / "jarvis.log").read_text()
     )
-
-
-def test_the_holder_waits_while_a_step_runs_then_lets_go(tmp_path: Path) -> None:
-    bin_dir = tmp_path / "bin"
-    calls = tmp_path / "calls"
-    _program(bin_dir, "sacct", "#!/bin/sh\nprintf '7|Unknown\\n7.batch|Unknown\\n'\n")
-    # Busy (a step and a failing scheduler) for the first four looks, then idle.
-    _program(
-        bin_dir,
-        "squeue",
-        f"""#!/bin/sh
-echo x >> {calls}
-n=$(wc -l < {calls})
-[ "$n" -eq 2 ] && exit 1
-if [ "$n" -le 4 ]; then printf '7.batch\\n7.0\\n'; else printf '7.batch\\n7.extern\\n'; fi
-""",
-    )
-    done = _holder(_env(tmp_path, bin_dir, SLURM_JOB_ID="7"), tmp_path, limit=2, step=1)
-    assert done.returncode == 0, done.stderr
-    assert "relay warm allocation 7: held" in done.stdout
-    assert re.search(r"idle for [0-9]+ s; released", done.stdout), done.stdout
-    looks = len(calls.read_text().splitlines())
-    assert looks >= 7, "four busy looks, then idle looks for two seconds"
-
-
-def test_a_short_step_between_looks_still_counts_as_use(tmp_path: Path) -> None:
-    bin_dir = tmp_path / "bin"
-    start = int(time.time())
-    ended = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start + 3))
-    # squeue never sees a step, but sacct says one ended three seconds after the start.
-    _program(bin_dir, "squeue", "#!/bin/sh\nprintf '7.batch\\n'\n")
-    steps = f"7|Unknown\\n7.batch|Unknown\\n7.0|{ended}\\n"
-    _program(bin_dir, "sacct", f"#!/bin/sh\nprintf '{steps}'\n")
-    began = time.monotonic()
-    done = _holder(_env(tmp_path, bin_dir, SLURM_JOB_ID="7"), tmp_path, limit=2, step=1)
-    assert done.returncode == 0, done.stderr
-    assert "released" in done.stdout
-    assert time.monotonic() - began >= 4, "released before two idle seconds after the step"
-
-
-def test_a_holder_without_slurm_watches_its_marker(tmp_path: Path) -> None:
-    done = _holder(_env(tmp_path, tmp_path / "bin"), tmp_path, limit=1, step=1)
-    assert done.returncode == 0
-    assert "released" in done.stdout

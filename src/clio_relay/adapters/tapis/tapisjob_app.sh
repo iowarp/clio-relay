@@ -2,20 +2,15 @@
 # clio-relay's launcher for Tapis (RL47).
 #
 # Tapis's ZIP runtime unpacks this archive in the job's directory and runs
-# this script with the job's app arguments. Relay passes one argument: a
-# base64 record of NUL-terminated fields, so no shell quoting is involved.
+# this script with the job's app arguments. Relay passes one argument: the
+# path, after an @, of a file holding a base64 record of NUL-terminated
+# fields, so no shell quoting is involved and no argument grows long.
 #
-#   version, mode, directory, stdin, stdout, stderr, content dir, package dir,
-#   input count, then (name, sha256) per input, then
-#   for mode exec:    executable, arguments...
-#   for mode package or package-service: name, version, sha256, key=value parameters...
+#   version, directory, stdin, stdout, stderr, content dir, input count,
+#   then (name, sha256) per input, then executable, arguments...
 #
-# A package is `<repo>.<package>`, and its archive holds
-# `<repo>/<repo>/<package>/...`. The launcher runs it with JARVIS_ROOT in the
-# job's directory and JARVIS_NO_BUILTIN=1: jarvis init,
-# repo add <unpacked>/<repo>, ppl create,
-# ppl append <name> pkg key=value..., then ppl run. A package-service job runs
-# ppl start instead, holds until the job is cancelled, then runs ppl stop.
+# A package job is JARVIS's: relay's exec runs jarvis ppl submit through this
+# launcher like any command (clio_relay.jarvis_remote), so it only runs a command.
 #
 # The launcher writes the job's exit code to tapisjob.exitcode (which Tapis
 # reads for a FORK job) and relay.exitcode in the job's directory, and exits
@@ -40,18 +35,17 @@ fail() {
 }
 
 [ "$#" -ge 1 ] || fail 64 "no job record was passed"
-mapfile -d '' -t f < <(printf '%s' "$1" | base64 -d) || fail 64 "the job record is not base64"
-[ "${f[0]:-}" = "1" ] || fail 64 "unknown job record version ${f[0]:-none}"
+[ "${1#@}" != "$1" ] && [ -f "${1#@}" ] || fail 64 "no job record file was passed"
+mapfile -d '' -t f < <(base64 -d < "${1#@}") || fail 64 "the job record is not base64"
+[ "${f[0]:-}" = "2" ] || fail 64 "unknown job record version ${f[0]:-none}"
 
-mode="${f[1]}"
-work="${f[2]:-$job_dir}"
-stdin_path="${f[3]:-/dev/null}"
-stdout_path="${f[4]:-$job_dir/stdout}"
-stderr_path="${f[5]:-$job_dir/stderr}"
-content_dir="${f[6]}"
-package_root="${f[7]}"
-count="${f[8]}"
-i=9
+work="${f[1]:-$job_dir}"
+stdin_path="${f[2]:-/dev/null}"
+stdout_path="${f[3]:-$job_dir/stdout}"
+stderr_path="${f[4]:-$job_dir/stderr}"
+content_dir="${f[5]}"
+count="${f[6]}"
+i=7
 
 mkdir -p "$work" || fail 66 "cannot make the directory $work"
 for ((n = 0; n < count; n++)); do
@@ -66,68 +60,5 @@ done
 
 cd "$work" || fail 66 "cannot enter $work"
 
-case "$mode" in
-exec)
-    "${f[@]:i}" < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
-    finish "$?"
-    ;;
-package | package-service)
-    name="${f[i]}"
-    version="${f[i + 1]}"
-    digest="${f[i + 2]}"
-    params=("${f[@]:i+3}")
-    [[ "$name" =~ ^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$ ]] \
-        || fail 64 "package name $name is not <repo>.<package>"
-    repo="${name%%.*}"
-    archive="$content_dir/$digest"
-    [ -f "$archive" ] || fail 66 "package $name $version is not in the content store"
-    actual="$(sha256sum "$archive" | cut -d' ' -f1)"
-    [ "$actual" = "$digest" ] || fail 65 "package $name hash $actual does not match the reviewed $digest"
-    command -v jarvis > /dev/null || fail 69 "jarvis is not on PATH on this system"
-    unpacked="$package_root/$digest"
-    if [ ! -d "$unpacked" ]; then
-        mkdir -p "$unpacked.part" && tar -xzf "$archive" -C "$unpacked.part" \
-            && mv "$unpacked.part" "$unpacked" || fail 66 "cannot unpack package $name"
-    fi
-    [ -d "$unpacked/$repo/$repo" ] || fail 66 "package archive has no $repo/$repo directory"
-    pipeline="relay_${_tapisJobUUID:-job}"
-    pipeline="${pipeline//-/_}"
-    # A JARVIS of the job's own, so the site's ~/.ppi-jarvis is never read or changed.
-    # +force, in this job's own root only, so the staged archive always replaces any
-    # repository of its name. builtin never arrives here: relay refuses to stage it,
-    # and JARVIS_NO_BUILTIN (recorded by init in the root) leaves jarvis-cd's out.
-    export JARVIS_ROOT="$job_dir/.relay-jarvis" JARVIS_NO_BUILTIN=1
-    {
-        jarvis init "$JARVIS_ROOT/config" "$JARVIS_ROOT/private" "$JARVIS_ROOT/shared" \
-            && jarvis repo add "$unpacked/$repo" +force \
-            && jarvis ppl create "$pipeline" \
-            && jarvis ppl append "$name" pkg ${params[@]+"${params[@]}"} \
-            || finish "$?"
-        if [ "$mode" = package ]; then
-            jarvis ppl run
-            finish "$?"
-        fi
-        # A service runs until the job is cancelled, then stops cleanly.
-        # A Slurm cancel sends TERM. A Tapis FORK cancel is `pkill -9 -P`, which
-        # kills only the sleep, so a sleep that dies early also stops the service.
-        sleeper=
-        stop_service() {
-            trap - TERM INT HUP
-            [ -z "$sleeper" ] || kill "$sleeper" 2> /dev/null
-            jarvis ppl stop
-            finish "$?"
-        }
-        trap stop_service TERM INT HUP
-        jarvis ppl start || { started=$?; jarvis ppl stop; finish "$started"; }
-        while :; do
-            sleep 60 &
-            sleeper=$!
-            wait "$sleeper" || break
-        done
-        stop_service
-    } < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
-    ;;
-*)
-    fail 64 "unknown mode $mode"
-    ;;
-esac
+"${f[@]:i}" < "$stdin_path" > "$stdout_path" 2> "$stderr_path"
+finish "$?"

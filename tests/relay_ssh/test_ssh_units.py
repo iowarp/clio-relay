@@ -13,13 +13,14 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from clio_relay import jarvis_submit
+from clio_relay import jarvis_remote, jarvis_submit
 from clio_relay.adapters import registry
 from clio_relay.adapters.base import AdapterContext
 from clio_relay.adapters.ssh import SshAdapter, SshConfig, scripts
 from clio_relay.adapters.ssh import adapter as ssh_adapter
 from clio_relay.adapters.ssh.adapter import accounted_status, walltime
 from clio_relay.adapters.ssh.transport import Completed, SshTransport, run_process
+from clio_relay.jarvis_site import site_pin
 from clio_relay.jobs.content import ContentStore
 from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.refusals import Refusal, RefusalReason
@@ -148,11 +149,13 @@ def _package_spec(**update: object) -> JobSpec:
 def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path, jarvis="~/jv/bin/jarvis")
     job_dir = PurePosixPath("/home/u/.clio-relay/jobs/op_x")
-    rendered = adapter._render_jarvis(_package_spec(), "op_x", job_dir, "relay-op_x", "submit")  # pyright: ignore[reportPrivateUsage]
+    render = adapter._render_jarvis  # pyright: ignore[reportPrivateUsage]
+    rendered = render(_package_spec(), "op_x", job_dir, "relay-op_x", "submit", scheduler="slurm")
     pipeline = rendered.files["relay.pipeline.yaml"]
-    assert pipeline.splitlines()[:10] == [
-        "name: relay_op_x",
+    assert pipeline.splitlines()[:11] == [
+        "name: op_x",
         "scheduler:",
+        "  name: slurm",
         "  job_name: relay-op_x",
         "  nodes: 4",
         "  ntasks_per_node: 32",
@@ -166,7 +169,7 @@ def test_a_package_job_on_slurm_is_a_jarvis_pipeline(tmp_path: Path) -> None:
     assert rendered.files["relay-jarvis.sh"].startswith("set -eu")
     command = rendered.submit_command
     assert command.startswith("env ")
-    assert f"CLIO_RELAY_JARVIS_PIN={jarvis_submit.JARVIS_PIN}" in command
+    assert f"CLIO_RELAY_JARVIS_PIN={site_pin('~/jv/bin/jarvis')}" in command
     assert command.endswith(
         f"bash relay-jarvis.sh submit '~/jv/bin/jarvis' op_x clio_jarvis.xcompact3d@{'a' * 64}"
     )
@@ -176,7 +179,7 @@ def test_cores_per_rank_reach_jarvis_as_hardware_threads_and_exclusive_as_is() -
     def block(threads_per_core: int | None, **resources: object) -> dict[str, object]:
         spec = _package_spec(resources={"process_count": 32, "processes_per_node": 8, **resources})
         return jarvis_submit.scheduler_block(
-            spec, job_name="relay-op_x", threads_per_core=threads_per_core
+            spec, scheduler="slurm", job_name="relay-op_x", threads_per_core=threads_per_core
         )
 
     # 2 whole cores per rank on 2-thread cores: Slurm's cpus_per_task counts threads.
@@ -192,7 +195,7 @@ def test_cores_per_rank_reach_jarvis_as_hardware_threads_and_exclusive_as_is() -
 def test_a_jarvis_handle_comes_from_the_submit_line(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path)
     line = (
-        '{"cluster":null,"execution_id":"op_x","mode":"scheduler","pipeline_id":"relay_op_x",'
+        '{"cluster":null,"execution_id":"op_x","mode":"scheduler","pipeline_id":"op_x",'
         '"schema_version":"jarvis.execution.handle.v1","scheduler_native_id":"27873",'
         '"scheduler_provider":"slurm"}'
     )
@@ -201,31 +204,11 @@ def test_a_jarvis_handle_comes_from_the_submit_line(tmp_path: Path) -> None:
     assert handle.native_id == "27873"
     assert handle.data["mode"] == "jarvis"
     assert handle.data["execution_dir"] == (
-        "/home/u/.clio-relay/jobs/op_x/.relay-jarvis/shared/relay_op_x/executions/op_x"
+        "/home/u/.clio-relay/jarvis/shared/op_x/executions/op_x"
     )
     with pytest.raises(Refusal) as refused:
         adapter._handle("jarvis", "no json", root, root / "jobs/op_x", "relay-op_x")  # pyright: ignore[reportPrivateUsage]
     assert refused.value.reason == RefusalReason.SUBMIT_FAILED
-
-
-@pytest.mark.asyncio
-async def test_a_package_service_needs_jarvis_execution_stop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    spec = _package_spec()
-    assert spec.package is not None
-    service = spec.model_copy(update={"package": spec.package.model_copy(update={"service": True})})
-    adapter = _adapter(tmp_path)
-
-    async def site_without_scheduler(*_: object, **__: object) -> str:
-        return "@@root /home/u/.clio-relay\n@@ready\n@@scheduler none\n"
-
-    monkeypatch.setattr(adapter, "_ssh", site_without_scheduler)
-    with pytest.raises(Refusal) as refused:
-        await adapter.run(service, operation_id="op_x")
-    assert refused.value.reason == RefusalReason.ADAPTER_UNAVAILABLE
-    assert refused.value.data["needs"] == "jarvis ppl submit"
-    assert "jarvis execution stop" in refused.value.message
 
 
 @pytest.mark.asyncio
@@ -409,7 +392,7 @@ async def test_the_exec_watchdog_stops_the_command_when_stdin_closes(tmp_path: P
 
 def test_parse_sections() -> None:
     text = "noise\n@@root /home/u/.r\n@@have abc\n@@have def\n@@out\nline 1\nline 2\n@@ready\n"
-    sections = scripts.parse_sections(text)
+    sections = jarvis_remote.parse_sections(text)
     assert sections["root"] == ["/home/u/.r"]
     assert sections["have"] == ["abc", "def"]
     assert sections["out"] == ["line 1", "line 2"]
@@ -530,15 +513,14 @@ def test_render_detached(tmp_path: Path) -> None:
 def test_jarvis_execution_shell_keeps_the_env_ahead_of_jarvis(
     verb: jarvis_submit.ExecutionVerb, extra: tuple[str, ...]
 ) -> None:
-    shell = jarvis_submit.execution_shell(
-        verb, "ex1", job_dir="/scratch/job", pipeline="pl1", extra=extra
-    )
+    root = "/home/u/.clio-relay/jarvis"
+    shell = jarvis_submit.execution_shell(verb, "ex1", root=root, pipeline="pl1", extra=extra)
     tail = " ".join(["execution", verb, "ex1", *extra, "--pipeline-id", "pl1", "+json"])
     assert shell == (
-        f'env JARVIS_ROOT=/scratch/job/.relay-jarvis JARVIS_NO_BUILTIN=1 "$jarvis" {tail}'
+        f'env JARVIS_ROOT=/home/u/.clio-relay/jarvis JARVIS_NO_BUILTIN=1 "$jarvis" {tail}'
     )
     argv = jarvis_submit.execution_argv(
-        verb, "ex1", job_dir="/scratch/job", jarvis="/opt/jarvis", pipeline="pl1", extra=extra
+        verb, "ex1", root=root, jarvis="/opt/jarvis", pipeline="pl1", extra=extra
     )
-    assert argv[: argv.index("/opt/jarvis")] == jarvis_submit.execution_env("/scratch/job")
+    assert argv[: argv.index("/opt/jarvis")] == jarvis_submit.execution_env(root)
     assert argv[argv.index("/opt/jarvis") + 1 :] == tail.split()

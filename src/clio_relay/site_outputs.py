@@ -3,10 +3,11 @@
 ``site clean`` deletes relay's deployment on a site, so a run's outputs never
 belong there. Each remote adapter has an ``outputs_dir`` setting (default
 :data:`OUTPUTS_DIR` under the home directory), refused when it is inside
-relay's own directory. The adapter hands it to JARVIS's site script as
-:data:`OUTPUTS_ENV` in the job's environment (:func:`with_outputs`); the
-script keeps the job's JARVIS shared directory there and links it from the
-job's root, so what JARVIS and the packages write outlives the job directory.
+relay's own directory. The adapter hands it to relay's setup, which makes it
+JARVIS's shared directory in the site's root, and to JARVIS's site script as
+:data:`OUTPUTS_ENV` in the job's environment (:func:`with_outputs`), which
+checks it is still that one. So each pipeline writes ``<outputs>/<operation
+id>``, which outlives the job directory and relay's own.
 """
 
 from __future__ import annotations

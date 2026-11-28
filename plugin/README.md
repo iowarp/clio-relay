@@ -12,10 +12,6 @@ This folder is relay's plugin for CLIO. Installing it gives CLIO:
   security and spending;
 - a Globus account, whose grant file CLIO hands relay as
   `CLIO_RELAY_GRANT_FILE_GLOBUS`;
-- the JARVIS packages in `packages/`: clio-jarvis at the commit its
-  `.clio-relay-source.json` names. `mcp.json` hands that folder to relay as
-  `CLIO_RELAY_PACKAGE_SOURCES`, so staging one needs no download and no
-  account. Only the published copy carries `packages/`; this folder does not;
 - sign-in pages on the loopback address and on `https://tacc.tapis.io`;
 - the `use-relay` skill, which sends the agent to relay's skill resources.
 
@@ -33,9 +29,8 @@ folders.
 --no-dev` from `server/`, a hash-locked project whose one dependency is a released
 clio-relay wheel. The published copy lives in the CLIO agent marketplace as
 `plugins/clio-relay/`; when relay changes, cut a release, point
-`server/pyproject.toml` at its wheel and run `uv lock --project server`. To move clio-jarvis,
-copy its `clio_jarvis/`, `schemas/`, `spack/` and `pyproject.toml` from the new
-commit into `packages/clio-jarvis/` and update `commit` in its
-`.clio-relay-source.json`. Relay ships `spack/`, the Spack repository the
-contracts install from, with each package, reads the Python requirements from
-`pyproject.toml` and installs them on the site with its jarvis-cd.
+`server/pyproject.toml` at its wheel and run `uv lock --project server`. The
+plugin carries no JARVIS packages: relay clones clio-jarvis into each site's
+JARVIS root when it sets the site up, at the ref relay pins
+(`clio_relay.jarvis_site.CLIO_JARVIS_REF`), so moving clio-jarvis is a relay
+release.

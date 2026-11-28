@@ -36,7 +36,7 @@ STARTED = {
     "dir": "/home/u/job/relay.login-build",
     "pid": 4242,
     "host": "login1",
-    "log": "/home/u/job/.relay-jarvis/shared/p/install/install.log",
+    "log": "/home/u/job/shared/p/install/install.log",
 }
 
 

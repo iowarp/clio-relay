@@ -221,15 +221,3 @@ def _last_json(text: str) -> dict[str, Any]:
         if isinstance(found, dict) and "refused" in found:
             return cast(dict[str, Any], found)
     return {}
-
-
-def install_only_refused(scheduler: str | None, *, site: str) -> Refusal:
-    """An install ahead of a run on a site where JARVIS cannot submit its install job."""
-    return Refusal(
-        RefusalReason.ADAPTER_UNAVAILABLE,
-        f"installing a package's software ahead of a run is a job JARVIS submits to Slurm "
-        f"(ppl install +submit), and {site} has {scheduler or 'no batch scheduler'}; "
-        "run the package instead",
-        scheduler=scheduler,
-        needs="a Slurm site",
-    )

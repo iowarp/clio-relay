@@ -266,9 +266,12 @@ relay refuses a package for any other adapter before it asks anything
 job inside an allocation. A batch adapter hands the job to JARVIS rather than
 its own scheduler call: `clio_relay.jarvis_submit` renders the pipeline with its
 `scheduler:` key, the site script that runs `jarvis ppl submit`, and the parsers
-that turn JARVIS's execution record into a `JobStatus` and outputs. With no
-scheduler, `jarvis_submit.direct_job` runs JARVIS's direct run on the machine
-itself. The local, worker, ssh and tapis adapters all use it.
+that turn JARVIS's execution record into a `JobStatus` and outputs. A site
+with no scheduler names `local`, PSI/J's local executor, so there is one submit
+path. `clio_relay.jarvis_remote` holds the job scripts an adapter runs on the
+site (submit, status, `jarvis execution` controls), given a callable that runs
+shell text there, so an adapter differs only in how it runs it. The local,
+worker, ssh and tapis adapters all use it.
 
 ### Optional hooks
 
@@ -282,7 +285,7 @@ Relay calls these when the adapter defines them:
 | `system_id()` | The facility's own id for the site, shown in the Compute tab |
 | `stop(handle)` | Stop a package service so its package's own stop runs (`jarvis execution stop`) |
 | `install(spec, answers, *, operation_id)` | Submit `jarvis ppl install +submit` with the person's answers and return its handle. Pass the build its own walltime: `jarvis_submit.install_pipeline` of the run's pipeline as `install_command(pipeline=...)` |
-| `install_jarvis()` | Install the pinned jarvis-cd into the CLIO site home (`jarvis_submit.bootstrap_command`, with the site's `jarvis_python` setting) |
+| `jarvis_home()` | The CLIO site home, as the site's shell names it. With it and `exec`, the base class sets up the site's JARVIS root (`install_jarvis`, `jarvis_submit.setup_command`) and lists and adds its packages (`site_packages`, `jarvis_submit.packages_command`), so an adapter writes neither |
 | `plan_job(spec, *, operation_id)` | Return JARVIS's plan of the package job `run` would submit, submitting nothing: run the site script in its `plan` mode (`jarvis ppl submit +plan +json`) and parse it with `jarvis_plan.parse`. Relay draws the job card from it and passes the yes back as `jarvis_plan.bound(spec, plan)`, so `run` submits with `--plan_sha256`. `None` (the default) means no plan, and the card shows the job as relay records it |
 | `install_check(spec, *, operation_id)` | Run the site script in its `check` mode (`jarvis ppl install +check`) and return JARVIS's install report (`jarvis_exits.checked`). With `install`, it gives the site the `install` tool: the software ahead of any run |
 
