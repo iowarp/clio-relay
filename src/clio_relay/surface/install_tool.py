@@ -43,11 +43,12 @@ def install_tool(relay: RelayServer) -> Tool:
             float, Field(ge=0, le=300, description="Seconds to wait without a task")
         ] = 20,
     ) -> ToolResult | InputRequiredToolResult:
-        """Install a staged package's software (or a pipeline's) on a site ahead of a
+        """Install a package's software (or a pipeline's) on a site ahead of a
         run, and run nothing. JARVIS checks what the site has; when something is
         missing, relay asks the person to approve the install and any choice JARVIS
         needs, then JARVIS builds it as a job on the site's compute nodes and checks
-        again. A site without JARVIS gets relay's jarvis-cd first, after a yes. The
+        again. A site not set up gets its JARVIS root first (jarvis-cd and the site's
+        packages), after a yes. The
         operation completes with what is installed; describe(job=...) observes it."""
         return await relay.run(ctx, site, spec, cancel, resume, wait_s, kind="install")
 
