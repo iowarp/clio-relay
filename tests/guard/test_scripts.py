@@ -20,7 +20,6 @@ from clio_relay.jarvis_submit import (
     EXIT_NO_JARVIS,
     EXIT_REFUSED,
     EXIT_USAGE,
-    EXITCODE_FILE,
     JARVIS_FILE,
     PIPELINE_FILE,
     REFUSAL_FILE,
@@ -210,7 +209,7 @@ def test_submit_hands_the_pipeline_to_jarvis_ppl_submit(tmp_path: Path) -> None:
     assert "sbatch" not in done.stdout
     handle = parse_handle((job / SUBMISSION_FILE).read_text())
     assert handle is not None and handle["execution_id"] == "op_x"
-    assert (job / EXITCODE_FILE).read_text() == "0\n"
+    assert not (job / "relay.exitcode").exists()
     assert (job / JARVIS_FILE).read_text() == f"{jarvis}\n"
     # The pipeline writes its own directory in the root's JARVIS shared one, no link.
     pipeline_dir = (root / "shared").resolve() / "op_x"
@@ -240,7 +239,6 @@ def test_a_refused_submit_keeps_jarvis_code_and_no_handle(tmp_path: Path) -> Non
     assert done.returncode == 3
     assert "sbatch said no" in done.stderr
     assert not (job / SUBMISSION_FILE).exists()
-    assert (job / EXITCODE_FILE).read_text() == "3\n"
     # JARVIS stopped before sbatch: its stdout is the install report, kept as such.
     report = json.loads((job / "relay.install-report.json").read_text())
     assert report["submitted"] is False

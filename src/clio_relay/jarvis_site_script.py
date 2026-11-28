@@ -51,7 +51,6 @@ SITE_SCRIPT = (
 mode=$1 jarvis=$2 execution=$3 steps=$4
 shift 4
 job=$PWD
-trap 'rc=$?; printf "%s\n" "$rc" > "$job/relay.exitcode"' EXIT
 fail() { printf '%s\n' "clio-relay jarvis: $2" >&2; exit "$1"; }
 case $mode in submit|plan|install|check|recheck) ;;
   *) fail 64 "mode $mode is not submit, plan, install, check or recheck" ;;
@@ -482,6 +481,6 @@ exit 3 prints the same report, kept the same way.
 Answers already given reach every check through
 ``JARVIS_INSTALL_ANSWERS``. Exit 4 (JARVIS refused to build where it was asked,
 outside an allocation or on a login host too busy for its limits) passes through
-unchanged; relay reports it with :func:`build_refused` and never retries it. The
-exit code is also written to ``relay.exitcode``.
+unchanged; relay reports it with :func:`build_refused` and never retries it.
+The job's own outcome is JARVIS's execution record, never this script's exit.
 """

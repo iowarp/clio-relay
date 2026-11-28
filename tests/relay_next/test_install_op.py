@@ -303,6 +303,33 @@ def test_the_install_ask_names_each_method_jarvis_resolved() -> None:
     assert "JARVIS's Spack check finds no installed lammps@2Aug2023 on Ares" in message
     assert "JARVIS finds no rich-cli pyyaml on Ares and installs it with pip." in message
     assert "JARVIS finds no alpine:3.20 on Ares and installs it with container." in message
+
+
+def test_the_install_ask_names_the_provider_spack_picked_for_each_virtual() -> None:
+    picked = [
+        {"virtual": "fftw-api", "name": "fftw", "version": "2.1.5", "status": "installed"},
+        {"virtual": "mpi", "name": "openmpi", "version": "5.0.5", "status": "installed"},
+    ]
+    report: dict[str, Any] = {
+        "installers": {
+            "spack": {
+                "packages": {
+                    "mpb": {
+                        "status": "missing",
+                        "spec": "mpb",
+                        "mpi": {"name": "openmpi", "version": "5.0.5"},
+                        "providers": picked,
+                    }
+                }
+            }
+        },
+        "issues": [],
+    }
+    assert jarvis_report.build_facts(report)[0]["providers"] == picked
+    message = install_wording.install_message(
+        report, site="Ares", package="demo.mpb", names={}, walltime=None
+    )
+    assert "It builds against openmpi 5.0.5. Spack picks fftw 2.1.5 for fftw-api." in message
     assert "not installed" not in message
     refusal = jarvis_report.install_needed(report, site="Ares")
     assert "JARVIS installs 3 package(s)" in refusal.message

@@ -75,7 +75,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from clio_relay import (
     install_failures,
-    install_time,
     install_wording,
     jarvis_report,
     jarvis_submit,
@@ -112,7 +111,6 @@ SOFTWARE_KIND = "jarvis_install"
 BUILD_KEY = "build"
 """In an install approval's binding: JARVIS's keys of the software it approves building."""
 OFFERS_KEY = "offers"
-INSTALL_TIME_KEY = "install_time"
 MAX_ROUNDS = 8
 """How many install rounds (check jobs, questions, installs) one operation may go through
 before relay stops asking."""
@@ -196,12 +194,7 @@ async def ask_install(
     provider = service.ask_provider
     binding: dict[str, Any] = {"site": site.id, "spec_digest": record.spec_digest}
     state: dict[str, Any] = {"kind": kind, "stage": "asking", "rounds": rounds + 1}
-    chosen = state_of(record).get("install_scheduler")
-    if isinstance(chosen, dict):
-        state["install_scheduler"] = chosen
     asks: list[Ask] = []
-    if kind == "software" and refusal.data.get("kind") == install_time.KIND:
-        return await _ask_install_time(service, operation_id, site, refusal, state)
     if kind == "software":
         report = cast(dict[str, Any], refusal.data["install_report"])
         blocking = jarvis_report.blocking_issues(report)
@@ -359,62 +352,6 @@ def _offers(state: dict[str, Any]) -> dict[str, Any]:
     return dict(cast(dict[str, Any], found)) if isinstance(found, dict) else {}
 
 
-_CARRIED = ("missing_keys", "installed", "summary", "recheck", OFFERS_KEY)
-"""What an install round keeps when JARVIS stops it to ask how the build job runs."""
-
-
-async def _ask_install_time(
-    service: RelayService,
-    operation_id: str,
-    site: SiteEntry,
-    refusal: Refusal,
-    state: dict[str, Any],
-) -> OperationRecord:
-    """Ask how JARVIS's install job runs when its estimate is past the partition's limit.
-
-    The person already approved the install, so this is the only ask; the
-    round's other state stays (:data:`_CARRIED`). The pick applies in
-    :func:`start_install` (:func:`_install_time_answer`).
-    """
-    previous = state_of(service.operation(operation_id))
-    state.update({key: previous[key] for key in _CARRIED if key in previous})
-    issue = cast(dict[str, Any], refusal.data["install_report"])["issues"][0]
-    ask = await choice_ask(service, site, operation_id, issue)
-    state[INSTALL_TIME_KEY] = {"ask_id": ask.ask_id, OFFERS_KEY: offer_map(issue)}
-    return _hold(service, operation_id, state, [ask], refusal.message)
-
-
-def _install_time_answer(
-    service: RelayService, operation_id: str, state: dict[str, Any], answers: dict[str, Any]
-) -> dict[str, Any]:
-    """Turn the person's install-time pick into relay's answers; JARVIS gets none for it.
-
-    The question is relay's own (how its install job runs), so it is not among
-    the operation's offers and never reaches JARVIS's answers file.
-    """
-    found = state.get(INSTALL_TIME_KEY)
-    asked = cast(dict[str, Any], found) if isinstance(found, dict) else {}
-    ask = service.asks.get(str(asked.get("ask_id"))) if asked else None
-    content = cast(dict[str, Any], (ask.answer or {}).get("content") or {}) if ask else {}
-    offers = cast(dict[str, Any], asked.get(OFFERS_KEY) or {})
-    offer = offers.get(str(content.get(CHOICE_FIELD) or ""))
-    if isinstance(offer, (list, tuple)) and len(cast(list[Any], offer)) == 2:
-        settings = install_time.picked(str(cast(list[Any], offer)[1]))
-        if settings is None:
-            state = {**state, "recheck": True}
-        else:
-            state = {**state, "install_scheduler": settings, "recheck": False}
-        _update(
-            service,
-            operation_id,
-            recheck=state["recheck"],
-            install_scheduler=state.get("install_scheduler"),
-        )
-    if isinstance(state.get("install_scheduler"), dict):
-        answers[jarvis_submit.INSTALL_SCHEDULER] = state["install_scheduler"]
-    return state
-
-
 def _hold(
     service: RelayService,
     operation_id: str,
@@ -466,7 +403,6 @@ async def start_install(
             **install_failures.setting_answers(job_of(record)),
             **choice_answers(service, record, _offers(state)),
         }
-        state = _install_time_answer(service, operation_id, state, answers)
         if state.get("recheck"):
             answers[jarvis_submit.RECHECK] = True
         handle = await adapter.install(job, operation_id=operation_id, answers=answers)

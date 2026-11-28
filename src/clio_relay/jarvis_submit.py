@@ -81,7 +81,6 @@ SUBMISSION_FILE = "relay.submission.json"
 """The ``jarvis.execution.handle.v1`` line ``ppl submit`` printed."""
 REFUSAL_FILE = "relay.refusal.json"
 """Written when the site has no JARVIS, or no Spack for it: ``{"reason", "missing", "tried"}``."""
-EXITCODE_FILE = "relay.exitcode"
 JARVIS_FILE = "relay.jarvis"
 """The JARVIS program the site script found, for the ``execution`` commands later."""
 INSTALL_REPORT_FILE = "relay.install-report.json"
@@ -100,7 +99,6 @@ SITE_FILES = (
     SCRIPT_FILE,
     SUBMISSION_FILE,
     REFUSAL_FILE,
-    EXITCODE_FILE,
     JARVIS_FILE,
     INSTALL_REPORT_FILE,
     ANSWERS_FILE,
@@ -186,11 +184,7 @@ EXIT_REFUSED = 5
 RECHECK = "clio_relay_recheck"
 """The key in :func:`install_command`'s answers that makes it a ``recheck``: a job in
 which JARVIS checks the software with the person's answers, and builds nothing."""
-INSTALL_SCHEDULER = "clio_relay_install_scheduler"
-"""The key in :func:`install_command`'s answers for the ``scheduler.install`` settings
-the person picked (``{"partition": ...}`` or ``{"time": ...}``) when JARVIS's build
-estimate was longer than the partition allows (:mod:`clio_relay.install_time`)."""
-RELAY_ANSWERS = (RECHECK, INSTALL_SCHEDULER)
+RELAY_ANSWERS = (RECHECK,)
 """Relay's own keys in the answers; JARVIS's answers file gets none of them."""
 
 REFUSAL_SCHEMA = "jarvis.refusal.v1"
@@ -844,9 +838,7 @@ def install_pipeline(
     ``scheduler.install.time`` only when the site sets one (``walltime_s``) and
     the pipeline sets none; a check job (``answers`` make it a ``recheck``)
     builds nothing, so then it gets the shorter of ``walltime_s`` and
-    :data:`INSTALL_CHECK_WALLTIME_S`. The person's pick when JARVIS's estimate
-    was longer than the partition allows (:data:`INSTALL_SCHEDULER` in
-    ``answers``) sets ``scheduler.install`` over the pipeline's own.
+    :data:`INSTALL_CHECK_WALLTIME_S`.
     """
     found = document.get("scheduler")
     if not isinstance(found, Mapping):
@@ -858,11 +850,6 @@ def install_pipeline(
     }
     install = scheduler.get("install")
     own = dict(cast(Mapping[str, object], install)) if isinstance(install, Mapping) else {}
-    chosen = answers.get(INSTALL_SCHEDULER)
-    if isinstance(chosen, Mapping):
-        own.update(
-            {str(key): value for key, value in cast(Mapping[object, object], chosen).items()}
-        )
     if walltime_s:
         seconds = min(walltime_s, INSTALL_CHECK_WALLTIME_S) if is_recheck(answers) else walltime_s
         own.setdefault("time", slurm_time(timedelta(seconds=seconds)))

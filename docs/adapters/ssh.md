@@ -215,15 +215,14 @@ builds is the same choice, and relay declares no default for it, so a site
 that has not answered gets JARVIS's own recommendation in the question.
 When the site chose a compute job, JARVIS installs the software as its own
 job, `jarvis ppl install +submit`, on a compute node, and sizes that job
-itself, its walltime included, from its own estimate of the build within the
-partition's limit. Relay drops the run's walltime from that job, since a
-build is not the run, and gives `install_walltime_s` as
+itself, its walltime included: the build times JARVIS measured at the site,
+at most the partition's limit, or the partition's limit when any part of the
+build was never timed there. Relay drops the run's walltime from that job,
+since a build is not the run, and gives `install_walltime_s` as
 `scheduler.install.time` only when the site sets it; then the approval says
-how long the build may take. When JARVIS's estimate is longer than the
-partition allows, it stops with an `install_time_exceeds_partition` issue,
-and relay asks the person to pick one of its candidates: a partition whose
-limit fits or a time to build in parts (set in the install pipeline's
-`scheduler.install`), or a check job that refreshes the estimate. When
+how long the build may take. A build longer than the partition's limit takes
+more than one job, and the approval says so: Spack keeps every package a job
+built, so installing again builds only the rest. When
 the site chose the login host, relay starts JARVIS's own
 `jarvis ppl install --answers` there, detached, under the operation's
 `relay.login-build/` folder. JARVIS sets and applies its limits; relay sets

@@ -132,9 +132,12 @@ def build_facts(
     One entry per :func:`install_summary` build item, with what JARVIS reported
     beside it: for Spack, how many of the spec's packages the site already has
     (``present`` of ``total``), the MPI it builds against (``mpi``: name,
-    version, prefix, modules), and JARVIS's build estimate from its build
-    placement (``placement.build.packages[step].estimate``). A fact JARVIS did
-    not report is ``None``.
+    version, prefix, modules), the provider Spack picked on every virtual edge
+    (``providers``: virtual, name, version, hash, status), and JARVIS's build
+    estimate from its build placement
+    (``placement.build.packages[step].estimate``), and whether JARVIS has timed
+    every part of that build at the site (``measured``). A fact JARVIS did not
+    report is ``None``.
     """
     names = names or {}
     placement = _dict(report.get("placement"))
@@ -153,6 +156,7 @@ def build_facts(
                 else None
             )
             mpi = entry.get("mpi")
+            providers = entry.get("providers")
             estimate = _dict(_dict(planned.get(step)).get("estimate"))
             human = estimate.get("human")
             spec = entry.get("spec") or entry.get("image")
@@ -167,7 +171,15 @@ def build_facts(
                     "total": total if isinstance(total, int) else None,
                     "present": present,
                     "mpi": cast(dict[str, Any], mpi) if isinstance(mpi, dict) else None,
+                    "providers": [
+                        cast(dict[str, Any], item)
+                        for item in cast(list[object], providers)
+                        if isinstance(item, dict)
+                    ]
+                    if isinstance(providers, list)
+                    else None,
                     "estimate": human if isinstance(human, str) and human != "unknown" else None,
+                    "measured": estimate.get("seconds") is not None if estimate else None,
                 }
             )
     return found

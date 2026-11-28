@@ -17,7 +17,7 @@ import json
 import re
 from typing import Any, cast
 
-from clio_relay import install_failures, install_time, jarvis_report, jarvis_submit
+from clio_relay import install_failures, jarvis_report, jarvis_submit
 from clio_relay.jobs.handles import JobHandle
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec
@@ -40,9 +40,6 @@ def refuse(
         raise jarvis_submit.missing_jarvis(error, site=site)
     install_failures.raise_for(code, both, site=site)
     if code == jarvis_submit.EXIT_DECISION:
-        exceeds = install_time.exceeds_issue(both)
-        if exceeds is not None:
-            raise install_time.refusal(exceeds, site=site)
         report = jarvis_report.parse_install_report(output)
         if report is None:
             raise Refusal(

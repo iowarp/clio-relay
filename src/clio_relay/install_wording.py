@@ -105,6 +105,14 @@ def _install_message(
         parts.append(reuse.strip())
     job = f"an install job of up to {walltime}" if walltime else "an install job"
     parts.append(_where_built(report, site=site, job=job, last=last))
+    if _build_choice(report) != "login_limited" and any(
+        item.get("measured") is False for item in found
+    ):
+        parts.append(
+            f"JARVIS has not timed every part of this build on {site}, so its job asks for "
+            "the partition's longest time; the build may take more than one job, and each "
+            "job keeps what it built, so installing again builds only the rest."
+        )
     parts.append(f"Install the software {package} needs on {site}?")
     return " ".join(parts)
 
@@ -147,7 +155,29 @@ def _finding(item: Mapping[str, Any], *, site: str) -> str:
         sentence += f", {item['estimate']} by JARVIS's estimate"
     sentence += "."
     mpi = _mpi_text(item.get("mpi"))
-    return f"{sentence} It builds against {mpi}." if mpi else sentence
+    if mpi:
+        sentence += f" It builds against {mpi}."
+    picked = _providers_text(item.get("providers"))
+    return f"{sentence} Spack picks {picked}." if picked else sentence
+
+
+def _providers_text(providers: object) -> str | None:
+    """Name the provider Spack picked for each virtual other than MPI."""
+    if not isinstance(providers, list):
+        return None
+    named: list[str] = []
+    for raw in cast(list[object], providers):
+        if not isinstance(raw, dict):
+            continue
+        facts = cast(dict[str, Any], raw)
+        virtual, name, version = facts.get("virtual"), facts.get("name"), facts.get("version")
+        if virtual == "mpi" or not isinstance(virtual, str) or not isinstance(name, str):
+            continue
+        label = f"{name} {version}" if isinstance(version, str) and version else name
+        text = f"{label} for {virtual}"
+        if text not in named:
+            named.append(text)
+    return ", ".join(named) or None
 
 
 def _mpi_text(mpi: object) -> str | None:
@@ -211,11 +241,16 @@ def _joined(items: list[str]) -> str:
     return ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def _where_short(report: Mapping[str, Any]) -> str:
-    """Where JARVIS builds, as a phrase after the site, when its placement says."""
+def _build_choice(report: Mapping[str, Any]) -> object:
+    """JARVIS's build placement (``placement.build.choice``), ``None`` when unsaid."""
     placement: object = report.get("placement")
     build = cast(dict[str, Any], placement).get("build") if isinstance(placement, dict) else None
-    choice = cast(dict[str, Any], build).get("choice") if isinstance(build, dict) else None
+    return cast(dict[str, Any], build).get("choice") if isinstance(build, dict) else None
+
+
+def _where_short(report: Mapping[str, Any]) -> str:
+    """Where JARVIS builds, as a phrase after the site, when its placement says."""
+    choice = _build_choice(report)
     if choice == "login_limited":
         return ", on the login host under its own limits"
     if choice == "compute_job":

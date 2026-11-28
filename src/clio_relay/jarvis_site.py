@@ -24,7 +24,7 @@ from typing import Any, cast
 
 from clio_relay.jobs.refusals import Refusal, RefusalReason
 
-JARVIS_PIN = "0c0fe0830b1948acf5ee335eabb1f9b5198f51db"
+JARVIS_PIN = "dae7f4d87a49d99c0dd54e12c9d399320856537c"
 """The jarvis-cd commit relay installs on a site (branch ``relay_ready``)."""
 JARVIS_SOURCE = f"git+https://github.com/grc-iit/jarvis-cd@{JARVIS_PIN}"
 CLIO_JARVIS_URL = "https://github.com/iowarp/clio-jarvis"
