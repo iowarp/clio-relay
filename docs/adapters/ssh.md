@@ -156,10 +156,11 @@ directories made before the submit, and the bound interpreter and
    walltime above), `partition` and `account`, and `output` and `error` only
    when the job sets `stdout_path` or `stderr_path`. Otherwise JARVIS writes
    the logs into the execution directory. `cpu_cores_per_process` counts whole
-   cores; above 1 it becomes `cpus_per_task`, which keeps Slurm's meaning of
-   hardware threads, so relay multiplies it by the partition's threads per
-   core. One core per rank is JARVIS's own default (jarvis-cd 1.9.15), so
-   relay sends nothing for it. `exclusive_node_use` becomes `exclusive: true`.
+   cores; whenever it is set, 1 included, it becomes `cpus_per_task`, which
+   keeps Slurm's meaning of hardware threads, so relay multiplies it by the
+   partition's threads per core. Left out, JARVIS threads each rank with the
+   allocation's CPUs per node over its ranks per node, so on an exclusive node
+   the ranks share the whole node. `exclusive_node_use` becomes `exclusive: true`.
    JARVIS's `+plan` shows what the ranks claim in its `cores` section
    (`jarvis.submit-cores.v1`); relay passes it to the agent unaltered as
    `plan.cores`, and the confirm ask quotes its `meaning`.

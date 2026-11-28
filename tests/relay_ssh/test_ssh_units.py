@@ -185,8 +185,8 @@ def test_cores_per_rank_reach_jarvis_as_hardware_threads_and_exclusive_as_is() -
     # 2 whole cores per rank on 2-thread cores: Slurm's cpus_per_task counts threads.
     assert block(2, cpu_cores_per_process=2)["cpus_per_task"] == 4
     assert block(None, cpu_cores_per_process=3)["cpus_per_task"] == 3
-    # One core per rank is JARVIS's own default, so relay sends nothing.
-    assert "cpus_per_task" not in block(2, cpu_cores_per_process=1)
+    # An explicit 1 is sent: left out, JARVIS threads a rank across its share of the node.
+    assert block(2, cpu_cores_per_process=1)["cpus_per_task"] == 2
     assert "cpus_per_task" not in block(2)
     assert block(2, exclusive_node_use=True)["exclusive"] is True
     assert "exclusive" not in block(2)

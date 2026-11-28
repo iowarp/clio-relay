@@ -77,9 +77,10 @@ class JobResources(_Spec):
         default=None,
         ge=1,
         description=(
-            "Whole physical cores per rank, for a threaded rank. Leave it out for one: JARVIS "
-            "gives each rank a whole core by itself. Relay asks the scheduler for these cores "
-            "in its own unit (Slurm's hardware threads)"
+            "Whole physical cores per rank; each rank runs that many threads. Left out, JARVIS "
+            "threads each rank with the CPUs the allocation gives a node divided by its ranks "
+            "per node, so on an exclusive node the ranks share the whole node. Relay asks the "
+            "scheduler for these cores in its own unit (Slurm's hardware threads)"
         ),
     )
     gpu_cores_per_process: int | None = Field(default=None, ge=1)

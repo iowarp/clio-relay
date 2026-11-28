@@ -524,8 +524,9 @@ def scheduler_block(
     are those the spend ask priced: ``nodes()``, ``ranks_per_node()`` and ``duration``.
     ``cpu_cores_per_process`` counts whole cores and Slurm's ``cpus_per_task``
     hardware threads, so a rank's cores become ``cores x threads_per_core``,
-    the target partition's, as JARVIS reports it (1 when unknown). JARVIS gives
-    each rank one whole core by itself, so one core sends nothing.
+    the target partition's, as JARVIS reports it (1 when unknown). It is sent
+    whenever it is set, 1 included: without it JARVIS threads each rank with
+    the allocation's CPUs per node over its ranks per node.
     ``exclusive_node_use`` becomes ``exclusive: true``.
     A ``slurm.<key>`` custom attribute adds ``--<key>``. With no duration, JARVIS
     writes no ``--time`` and the scheduler's default applies. With no ``stdout``
@@ -543,7 +544,7 @@ def scheduler_block(
     if ranks is not None:
         block["ntasks_per_node"] = ranks
     cores = resources.cpu_cores_per_process
-    if cores is not None and cores > 1:
+    if cores is not None:
         block["cpus_per_task"] = cores * max(1, threads_per_core or 1)
     if resources.memory is not None:
         block["mem"] = f"{math.ceil(resources.memory / 2**20)}M"
