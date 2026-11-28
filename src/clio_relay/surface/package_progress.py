@@ -158,7 +158,7 @@ def _step_of(line: dict[str, Any]) -> int | None:
 
 
 def _at(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, UTC).isoformat()
+    return datetime.fromtimestamp(epoch, UTC).isoformat(timespec="seconds")
 
 
 def step_pace(lines: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -206,8 +206,8 @@ def step_pace(lines: list[dict[str, Any]]) -> dict[str, Any] | None:
         "from_at": _at(from_at),
         "to_step": to_step,
         "to_at": _at(to_at),
-        "seconds_per_step": round(per_step, 3),
-        "latest_seconds_per_step": round((to_at - before_at) / (to_step - before_step), 3),
+        "seconds_per_step": per_step,
+        "latest_seconds_per_step": (to_at - before_at) / (to_step - before_step),
     }
     if total is not None:
         pace["total"] = total
