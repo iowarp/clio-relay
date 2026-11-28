@@ -356,7 +356,9 @@ def _described(text: str) -> dict[str, dict[str, Any]]:
             position=exc.pos,
             length=len(text),
         ) from exc
-    schema = document.get("schema_version") if isinstance(document, dict) else None
+    schema = (
+        cast(dict[str, Any], document).get("schema_version") if isinstance(document, dict) else None
+    )
     if schema != "jarvis.repos.v1":
         raise Refusal(
             RefusalReason.UNREACHABLE,

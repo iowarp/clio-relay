@@ -476,7 +476,7 @@ class TapisAdapter(BaseAdapter[TapisConfig]):
         self, spec: JobSpec, operation_id: str, mode: jarvis_submit.SiteMode
     ) -> JobHandle | dict[str, Any] | None:
         """Run the site script's ``mode`` in the job directory through :meth:`exec`."""
-        system, document, data = await self._jarvis_job(spec, operation_id)
+        _system, document, data = await self._jarvis_job(spec, operation_id)
         files = await self._files()
         await self._stage_inputs(files, [item.sha256 for item in spec.inputs])
         job_dir = f"{files.root}/jobs/{operation_id}"
