@@ -27,7 +27,7 @@ from clio_relay.jobs.refusals import Refusal, RefusalReason
 from clio_relay.jobs.spec import JobSpec, PackageRef
 from clio_relay.surface.describing import site_report
 from clio_relay.surface.package_progress import with_package_progress
-from clio_relay.surface.progress import progress_message
+from clio_relay.surface.progress import pace_note, progress_message
 from clio_relay.surface.results import operation_result
 from clio_relay.surface.server import RelayTasksExtension
 from clio_relay.surface.service import RelayService
@@ -217,6 +217,8 @@ async def test_a_package_jobs_records_give_its_step_and_outputs(
     record.result = {"progress": seen.progress.model_dump(mode="json")}
     assert "measured 5 min per step over steps 1 to 3" in str(progress_message(record))
     assert "6 min after the job's time limit ends it" in str(progress_message(record))
+    fast = {"data": {"unit": "timestep", "pace": {"seconds_per_step": 0.0213}}}
+    assert "measured 0.021 s per timestep" in str(pace_note(fast))
     [snapshot] = seen.progress.outputs
     assert (snapshot.name, snapshot.path, snapshot.metadata) == (
         "snapshots",

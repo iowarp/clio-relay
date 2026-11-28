@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from math import floor, log10
 from typing import Any, cast
 
 from clio_relay.jarvis_submit import spoken_duration
@@ -17,7 +18,7 @@ def pace_note(step: dict[str, Any]) -> str | None:
         return None
     unit = cast(dict[str, Any], step.get("data") or {}).get("unit") or "step"
     said = (
-        f"measured {spoken_duration(int(per_step))} per {unit} "
+        f"measured {_spoken_rate(per_step)} per {unit} "
         f"over {unit}s {pace.get('from_step')} to {pace.get('to_step')}"
     )
     if pace.get("projected_end_at"):
@@ -28,6 +29,15 @@ def pace_note(step: dict[str, Any]) -> str | None:
     elif isinstance(margin, int):
         said += f", {spoken_duration(margin)} before the job's time limit"
     return said
+
+
+def _spoken_rate(seconds: float) -> str:
+    """Say a step's time: in seconds to two figures under a minute, else as a duration."""
+    if seconds >= 60:
+        return spoken_duration(int(seconds))
+    if seconds <= 0:
+        return "0 s"
+    return f"{seconds:.{max(0, 1 - floor(log10(seconds)))}f} s"
 
 
 def progress_message(record: OperationRecord) -> str | None:
